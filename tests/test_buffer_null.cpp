@@ -54,7 +54,7 @@ static std::vector<u32> shader(bool null_write) {
                 results.push_back(fp ? ctx.OpBitcast(ctx.U32[1], result) : result);
             }
         };
-        add_vector(EmitReadConstBuffer(ctx, 0, address), 1);
+        add_vector(EmitReadConstBuffer(ctx, 0, address, ctx.u32_zero_value), 1);
         results.push_back(ctx.OpUConvert(ctx.U32[1], EmitLoadBufferU8(ctx, nullptr, 0, address)));
         results.push_back(ctx.OpUConvert(ctx.U32[1], EmitLoadBufferU16(ctx, nullptr, 0, address)));
         results.push_back(ctx.OpUConvert(ctx.U32[1], EmitLoadBufferU64(ctx, nullptr, 0, address)));

@@ -73,7 +73,10 @@ Id EmitBufferAddress(EmitContext& ctx, IR::Inst* inst, u32 handle, Id index, Id 
     const auto flags = inst->Flags<IR::BufferInstInfo>();
     const auto& desc = ctx.info.buffers[handle];
     const auto sharp = desc.GetSharp(ctx.info);
-    Id valid = ctx.true_value;
+    // MUBUF does not replace an INVALID resource format with its implied format.
+    Id valid = sharp.GetDataFmt() == AmdGpu::DataFormat::FormatInvalid &&
+                       flags.inst_data_fmt == AmdGpu::DataFormat::FormatInvalid
+                   ? ctx.false_value : ctx.true_value;
     auto checked_add = [&](Id a, Id b) {
         const Id sum = ctx.OpIAdd(ctx.U32[1], a, b);
         valid = ctx.OpLogicalAnd(ctx.U1[1], valid, ctx.OpUGreaterThanEqual(ctx.U1[1], sum, a));
@@ -107,14 +110,12 @@ Id EmitBufferAddress(EmitContext& ctx, IR::Inst* inst, u32 handle, Id index, Id 
     }
     // GCN applies the SGPR offset to the base, after the swizzle calculation.
     address = checked_add(address, soffset);
-    const Id records = desc.sharp_fetch.load_mask & 4
-        ? ctx.EmitFlatbufferLoad(ctx.ConstU32(u32(desc.sharp_fetch.offsets[2])))
-        : ctx.ConstU32(desc.sharp_fetch.immediates[2]);
+    const Id records = ctx.BufferNumRecords(handle);
     const bool formatted = flags.typed.Value();
     const u32 bytes = flags.access_bytes.Value();
     std::array<Id, 4> predicates;
     for (u32 c = 0; c < predicates.size(); ++c) {
-        const u32 delta = (formatted ? 0u : c * 4) + bytes - 1;
+        const u32 delta = formatted ? 0u : c * 4;
         Id predicate = valid;
         if (sharp.stride == 0) {
             const Id end = ctx.OpIAdd(ctx.U32[1], address, ctx.ConstU32(delta));
@@ -135,23 +136,80 @@ Id EmitBufferAddress(EmitContext& ctx, IR::Inst* inst, u32 handle, Id index, Id 
         }
         predicates[c] = predicate;
     }
-    const Id aligned = ctx.OpShiftRightLogical(ctx.U32[1], address, ctx.ConstU32(u32(flags.address_shift.Value())));
+    // Alignment applies to the complete byte address, including the binding prefix.
+    const u32 shift = flags.address_shift.Value();
+    const Id prefix = ctx.buffers[handle].Offset(PointerSize::B8);
+    if (Sirit::ValidId(prefix)) {
+        const Id sum = ctx.OpIAdd(ctx.U32[1], address,
+            ctx.OpBitwiseAnd(ctx.U32[1], prefix, ctx.ConstU32((1u << shift) - 1)));
+        const Id no_carry = ctx.OpUGreaterThanEqual(ctx.U1[1], sum, address);
+        for (Id& predicate : predicates)
+            predicate = ctx.OpLogicalAnd(ctx.U1[1], predicate, no_carry);
+        address = sum;
+    }
+    const Id aligned = ctx.OpShiftRightLogical(ctx.U32[1], address, ctx.ConstU32(shift));
+    if (formatted) {
+        // A formatted instruction is one element: a partial host range drops the whole access,
+        // including component swizzles that would otherwise turn a zero load into constant ONE.
+        const auto alias = shift == 0 ? PointerType::U8 : shift == 1 ? PointerType::U16 : PointerType::U32;
+        const Id aligned_prefix = Sirit::ValidId(prefix)
+            ? ctx.OpShiftRightLogical(ctx.U32[1], prefix, ctx.ConstU32(shift)) : ctx.u32_zero_value;
+        const Id first = ctx.OpIAdd(ctx.U32[1], aligned, aligned_prefix);
+        const Id last = ctx.OpIAdd(ctx.U32[1], first, ctx.ConstU32((bytes >> shift) - 1));
+        Id complete = ctx.OpUGreaterThanEqual(ctx.U1[1], first, aligned);
+        complete = ctx.OpLogicalAnd(ctx.U1[1], complete, ctx.OpUGreaterThanEqual(ctx.U1[1], last, first));
+        complete = ctx.OpLogicalAnd(ctx.U1[1], complete,
+            ctx.OpULessThan(ctx.U1[1], last, ctx.BufferLength(handle, alias)));
+        for (Id& predicate : predicates)
+            predicate = ctx.OpLogicalAnd(ctx.U1[1], predicate, complete);
+    }
     const Id result = ctx.OpSelect(ctx.U32[1], predicates[0], aligned, ctx.ConstU32(UINT32_MAX));
     ctx.buffer_address_bounds.emplace(result.value, EmitContext::BufferAddressBounds{predicates, bytes, formatted});
     return result;
 }
 
-Id EmitReadConstBuffer(EmitContext& ctx, u32 handle, Id index) {
+Id EmitReadConstBuffer(EmitContext& ctx, u32 handle, Id index, Id previous) {
     const Id original_index = index;
     const auto& buffer = ctx.buffers[handle];
     if (const Id offset = buffer.Offset(PointerSize::B32); Sirit::ValidId(offset)) {
         index = ctx.OpIAdd(ctx.U32[1], index, offset);
     }
     const auto [id, pointer_type] = buffer.Alias(PointerType::U32);
-    return ctx.BufferRead(handle, EmitContext::PointerType::U32, original_index, index, ctx.U32[1], [&] {
-        const Id ptr{ctx.OpAccessChain(pointer_type, id, ctx.u32_zero_value, index)};
-        return ctx.OpLoad(ctx.U32[1], ptr);
-    });
+    const auto read = [&] {
+        return ctx.OpLoad(ctx.U32[1],
+            ctx.OpAccessChain(pointer_type, id, ctx.u32_zero_value, index));
+    };
+    if (!ctx.profile.emulate_robust_buffer_access || buffer.buffer_type != BufferType::Guest) {
+        return ctx.BufferRead(handle, PointerType::U32, original_index, index, ctx.U32[1], read);
+    }
+    if (buffer.is_null) return ctx.u32_zero_value;
+    const auto& desc = ctx.info.buffers[handle];
+    const auto sharp = desc.GetSharp(ctx.info);
+    const Id records = ctx.BufferNumRecords(handle);
+    // SMRD clamps each DWORD separately and leaves a clamped destination SGPR unchanged.
+    // Its bound uses only base, stride and num_records, including INVALID formats.
+    const Id bytes = ctx.OpShiftLeftLogical(ctx.U32[1], original_index, ctx.ConstU32(2u));
+    Id valid = ctx.OpULessThanEqual(ctx.U1[1], original_index, ctx.ConstU32(UINT32_MAX / 4));
+    const Id bound = sharp.stride == 0 ? records
+        : ctx.OpIMul(ctx.U32[1], records, ctx.ConstU32(u32(sharp.stride)));
+    const Id guest_valid = sharp.stride == 0
+        ? ctx.OpULessThan(ctx.U1[1], bytes, bound)
+        : ctx.OpULessThanEqual(ctx.U1[1], bytes, bound);
+    valid = ctx.OpLogicalAnd(ctx.U1[1], valid, guest_valid);
+    valid = ctx.OpLogicalAnd(ctx.U1[1], valid,
+        ctx.BufferInBounds(handle, PointerType::U32, original_index, index, 0));
+    const Id access_label = ctx.OpLabel();
+    const Id clamp_label = ctx.OpLabel();
+    const Id merge_label = ctx.OpLabel();
+    ctx.OpSelectionMerge(merge_label, spv::SelectionControlMask::MaskNone);
+    ctx.OpBranchConditional(valid, access_label, clamp_label);
+    ctx.AddLabel(access_label);
+    const Id value = read();
+    ctx.OpBranch(merge_label);
+    ctx.AddLabel(clamp_label);
+    ctx.OpBranch(merge_label);
+    ctx.AddLabel(merge_label);
+    return ctx.OpPhi(ctx.U32[1], value, access_label, previous, clamp_label);
 }
 
 Id EmitGetAttribute(EmitContext& ctx, IR::Attribute attr, u32 comp, u32 index) {

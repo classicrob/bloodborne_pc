@@ -30,11 +30,14 @@ struct BufferSpecialization {
     u32 num_format : 4;
     u32 index_stride : 2;
     u32 element_size : 2;
+    u32 add_tid_enable : 1;
+    u32 is_unbound : 1;
     AmdGpu::CompMapping dst_select{};
     AmdGpu::NumberConversion num_conversion{};
 
     bool operator==(const BufferSpecialization& other) const {
         return stride == other.stride && is_formatted == other.is_formatted &&
+               add_tid_enable == other.add_tid_enable && is_unbound == other.is_unbound &&
                swizzle_enable == other.swizzle_enable &&
                (!is_formatted ||
                 (data_format == other.data_format && num_format == other.num_format &&
@@ -92,12 +95,14 @@ struct StageSpecialization {
     boost::container::small_vector<SamplerSpecialization, 16> samplers;
     Backend::Bindings start{};
     bool emulate_null_descriptors{};
+    bool emulate_robust_buffer_access{};
 
     StageSpecialization() = default;
     StageSpecialization(const Info& info_, RuntimeInfo runtime_info_, const Profile& profile_,
                         Backend::Bindings start_)
         : info{&info_}, runtime_info{runtime_info_}, start{start_},
-          emulate_null_descriptors{profile_.emulate_null_descriptors} {
+          emulate_null_descriptors{profile_.emulate_null_descriptors},
+          emulate_robust_buffer_access{profile_.emulate_robust_buffer_access} {
         fetch_shader_data = Gcn::ParseFetchShader(info_);
         if (info_.sw_stage == SwStage::Vertex && fetch_shader_data) {
             // Specialize shader on VS input number types to follow spec.
@@ -121,10 +126,13 @@ struct StageSpecialization {
         }
         u32 binding{};
         ForEachSharp(binding, buffers, info->buffers,
-                     [](auto& spec, const auto& desc, AmdGpu::Buffer sharp) {
+                     [&](auto& spec, const auto& desc, AmdGpu::Buffer sharp) {
                          spec.stride = sharp.GetStride();
                          spec.is_formatted = desc.is_formatted;
                          spec.swizzle_enable = sharp.swizzle_enable;
+                         spec.add_tid_enable = profile_.emulate_robust_buffer_access && sharp.add_tid_enable;
+                         spec.is_unbound = profile_.emulate_robust_buffer_access && !desc.IsSpecial() &&
+                             sharp.GetDataFmt() == AmdGpu::DataFormat::FormatInvalid;
                          if (spec.is_formatted) {
                              spec.data_format = static_cast<u32>(sharp.GetDataFmt());
                              spec.num_format = static_cast<u32>(sharp.GetNumberFmt());
@@ -216,7 +224,8 @@ struct StageSpecialization {
             return false;
         }
 
-        if (emulate_null_descriptors != other.emulate_null_descriptors ||
+        if (emulate_robust_buffer_access != other.emulate_robust_buffer_access ||
+            emulate_null_descriptors != other.emulate_null_descriptors ||
             (emulate_null_descriptors && bitset != other.bitset)) {
             return false;
         }

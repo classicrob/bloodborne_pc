@@ -224,7 +224,8 @@ static void LowerBufferFormatInst(IR::Block& block, IR::Inst& inst, Info& info, 
     };
 
     if (data_format == AmdGpu::DataFormat::FormatInvalid) {
-        LOG_WARNING(Render_Recompiler, "Skipping lowering for null buffer sharp");
+        if (!profile.emulate_robust_buffer_access)
+            LOG_WARNING(Render_Recompiler, "Skipping lowering for null buffer sharp");
         if (IsBufferFormatLoad(inst)) {
             inst.ReplaceUsesWithAndRemove(
                 ir.CompositeConstruct(ir.Imm32(0.f), ir.Imm32(0.f), ir.Imm32(0.f), ir.Imm32(0.f)));

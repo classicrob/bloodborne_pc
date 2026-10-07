@@ -353,6 +353,8 @@ public:
         bool is_null = false;
         std::array<Id, u32(PointerSize::NumClass)> offsets;
         std::array<BufferSpv, u32(PointerType::NumAlias)> aliases;
+        std::array<Id, u32(PointerType::NumAlias)> lengths{};
+        Id num_records{};
 
         template <class Self>
         auto& Alias(this Self& self, PointerType alias) {
@@ -372,6 +374,20 @@ public:
     };
     std::unordered_map<u32, BufferAddressBounds> buffer_address_bounds;
 
+    Id BufferLength(u32 handle, PointerType alias) {
+        const auto& buffer = buffers[handle];
+        const Id cached = buffer.lengths[u32(alias)];
+        return Sirit::ValidId(cached) ? cached : OpArrayLength(U32[1], buffer.Alias(alias).id, 0);
+    }
+
+    Id BufferNumRecords(u32 handle) {
+        if (const Id cached = buffers[handle].num_records; Sirit::ValidId(cached)) return cached;
+        const auto& desc = info.buffers[handle];
+        return desc.sharp_fetch.load_mask & 4
+            ? EmitFlatbufferLoad(ConstU32(u32(desc.sharp_fetch.offsets[2])))
+            : ConstU32(desc.sharp_fetch.immediates[2]);
+    }
+
     Id BufferInBounds(u32 handle, PointerType alias, Id original_index, Id index, u32 component) {
         const auto& buffer = buffers[handle];
         Id valid = OpUGreaterThanEqual(U1[1], index, original_index);
@@ -387,7 +403,7 @@ public:
                 index = last;
             }
         }
-        const Id length = OpArrayLength(U32[1], buffer.Alias(alias).id, 0);
+        const Id length = BufferLength(handle, alias);
         return OpLogicalAnd(U1[1], valid, OpULessThan(U1[1], index, length));
     }
 

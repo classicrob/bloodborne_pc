@@ -229,6 +229,19 @@ Id EmitContext::GetBufferSize(const u32 sharp_idx) {
 }
 
 void EmitContext::DefineBufferProperties() {
+    if (profile.emulate_robust_buffer_access) {
+        // The prologue dominates every guest access. Query each binding once per invocation.
+        for (auto& buffer : buffers) {
+            for (u32 alias = 0; alias < buffer.aliases.size(); ++alias) {
+                if (Sirit::ValidId(buffer.aliases[alias].id))
+                    buffer.lengths[alias] = OpArrayLength(U32[1], buffer.aliases[alias].id, 0);
+            }
+        }
+        for (u32 handle = 0; handle < buffers.size(); ++handle) {
+            if (buffers[handle].buffer_type == BufferType::Guest)
+                buffers[handle].num_records = BufferNumRecords(handle);
+        }
+    }
     if (!profile.needs_buffer_offsets) {
         return;
     }
