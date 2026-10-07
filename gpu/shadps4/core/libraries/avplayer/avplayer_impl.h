@@ -3,6 +3,10 @@
 
 #pragma once
 
+#ifdef __APPLE__
+#include "bbport_guest_alloc.h"
+#endif
+
 #include "core/libraries/avplayer/avplayer.h"
 #include "core/libraries/avplayer/avplayer_state.h"
 
@@ -12,7 +16,11 @@
 
 namespace Libraries::AvPlayer {
 
-class AvPlayer {
+class AvPlayer
+#ifdef __APPLE__
+    : public BbPort::GuestAllocated
+#endif
+{
 public:
     AvPlayer(const AvPlayerInitData& data);
 
@@ -55,5 +63,9 @@ private:
 
     std::unique_ptr<AvPlayerState> m_state{};
 };
+
+#ifdef __APPLE__
+static_assert(alignof(AvPlayer) <= 64);
+#endif
 
 } // namespace Libraries::AvPlayer

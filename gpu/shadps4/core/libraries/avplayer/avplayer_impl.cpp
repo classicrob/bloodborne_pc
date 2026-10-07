@@ -41,7 +41,12 @@ int PS4_SYSV_ABI AvPlayer::OpenFile(void* handle, const char* filename) {
 
     const auto open = self->m_init_data_original.file_replacement.open;
     const auto ptr = self->m_init_data_original.file_replacement.object_ptr;
+#ifdef __APPLE__
+    BbPort::GuestCopy low_filename(filename, std::strlen(filename) + 1);
+    return open(ptr, static_cast<const char*>(low_filename.Data()));
+#else
     return open(ptr, filename);
+#endif
 }
 
 int PS4_SYSV_ABI AvPlayer::CloseFile(void* handle) {
@@ -59,7 +64,14 @@ int PS4_SYSV_ABI AvPlayer::ReadOffsetFile(void* handle, u8* buffer, u64 position
 
     const auto read_offset = self->m_init_data_original.file_replacement.read_offset;
     const auto ptr = self->m_init_data_original.file_replacement.object_ptr;
+#ifdef __APPLE__
+    BbPort::GuestCopy low_buffer(buffer, length);
+    const auto result = read_offset(ptr, static_cast<u8*>(low_buffer.Data()), position, length);
+    low_buffer.CopyBack(buffer);
+    return result;
+#else
     return read_offset(ptr, buffer, position, length);
+#endif
 }
 
 u64 PS4_SYSV_ABI AvPlayer::SizeFile(void* handle) {
