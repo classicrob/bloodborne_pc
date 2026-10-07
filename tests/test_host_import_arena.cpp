@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+// Vulkan-Hpp changes dispatcher layout with NDEBUG; match the shared release library.
+#define NDEBUG
 #include <array>
 #include <cassert>
 #include <cstdio>
@@ -10,9 +12,9 @@
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/buffer_cache/host_import_arena.h"
 #include <vk_mem_alloc.h>
+#undef NDEBUG
+#include <cassert>
 #include "video_core/renderer_vulkan/vk_platform.h"
-
-VULKAN_HPP_DEFAULT_DISPATCH_LOADER_DYNAMIC_STORAGE
 
 struct Resource {
     u64 cpu_addr;

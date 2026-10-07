@@ -287,7 +287,9 @@ if (APPLE)
         ../tests/test_gpu_runtime_stubs.cpp)
     add_executable(buffer-dead-resources-test EXCLUDE_FROM_ALL ../tests/test_buffer_dead_resources.cpp
         ../tests/test_gpu_runtime_stubs.cpp)
-    foreach(bounds_target buffer-bounds-test buffer-bounds-benchmark buffer-dead-resources-test)
+    add_executable(host-import-arena-test EXCLUDE_FROM_ALL ../tests/test_host_import_arena.cpp
+        ../tests/test_gpu_runtime_stubs.cpp)
+    foreach(bounds_target buffer-bounds-test buffer-bounds-benchmark buffer-dead-resources-test host-import-arena-test)
         target_include_directories(${bounds_target} PRIVATE shim shadps4 third_party/gcn/include)
         target_compile_options(${bounds_target} PRIVATE -UNDEBUG -fPIC)
         target_link_libraries(${bounds_target} PRIVATE bbgpu)
@@ -295,8 +297,9 @@ if (APPLE)
     set_source_files_properties(../tests/test_buffer_bounds.cpp ../tests/test_buffer_bounds_benchmark.cpp
         ../tests/test_buffer_dead_resources.cpp
         PROPERTIES COMPILE_OPTIONS "-fvisibility=hidden;-fvisibility-inlines-hidden")
+    target_compile_definitions(host-import-arena-test PRIVATE VK_USE_PLATFORM_METAL_EXT)
     find_package(Python3 REQUIRED COMPONENTS Interpreter)
-    foreach(test_target motion-shader-test scene-resolution-test taa-shader-test camera-motion-test null-descriptor-test buffer-bounds-test buffer-bounds-benchmark buffer-dead-resources-test)
+    foreach(test_target motion-shader-test scene-resolution-test taa-shader-test camera-motion-test null-descriptor-test buffer-bounds-test buffer-bounds-benchmark buffer-dead-resources-test host-import-arena-test)
         add_custom_command(TARGET ${test_target} POST_BUILD
             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../packaging/macos/check-exports.py
                 $<TARGET_FILE:bbgpu> $<TARGET_FILE:${test_target}> VERBATIM)

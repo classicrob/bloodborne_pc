@@ -144,31 +144,32 @@ fi
 sign_darwin out/bb-gpu-capabilities
 if [[ ${1:-} == --test ]]; then
     if [[ $(uname -s) == Darwin ]]; then
-        ninja -C out/gpu "${ninja_jobs[@]}" null-descriptor-test upscaler-support-test buffer-bounds-test buffer-dead-resources-test
-        sign_darwin out/gpu/null-descriptor-test out/gpu/upscaler-support-test out/gpu/buffer-bounds-test out/gpu/buffer-dead-resources-test
+        ninja -C out/gpu "${ninja_jobs[@]}" null-descriptor-test upscaler-support-test buffer-bounds-test buffer-dead-resources-test host-import-arena-test
+        sign_darwin out/gpu/null-descriptor-test out/gpu/upscaler-support-test out/gpu/buffer-bounds-test out/gpu/buffer-dead-resources-test out/gpu/host-import-arena-test
         out/gpu/null-descriptor-test
         out/gpu/upscaler-support-test
         mkdir -p out/macos-buffer-bounds
         out/gpu/buffer-bounds-test out/macos-buffer-bounds
         mkdir -p out/mac-inventory
         out/gpu/buffer-dead-resources-test
+        out/gpu/host-import-arena-test
         "$CC" "${platform_flags[@]}" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread -Isrc \
             tests/test_compat_mac.c src/compat_mac.c -o out/compat-mac-test
-            sign_darwin out/compat-mac-test
+        sign_darwin out/compat-mac-test
         out/compat-mac-test
         "$CC" "${platform_flags[@]}" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread -Isrc \
             tests/test_macos_ui.c src/macos_ui.c -o out/macos-ui-test
-            sign_darwin out/macos-ui-test
+        sign_darwin out/macos-ui-test
         out/macos-ui-test
         "$CC" "${platform_flags[@]}" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread \
             "${includes[@]}" -I. -Isrc tests/test_fault_mac.c "${compat[@]}" \
             -Wl,-dead_strip -o out/fault-mac-test
-            sign_darwin out/fault-mac-test
+        sign_darwin out/fault-mac-test
         out/fault-mac-test
         read -r -a media_flags <<< "$(pkg-config --cflags --libs libavformat libavcodec libavutil)"
         "${CXX:-clang++}" "${platform_flags[@]}" -std=c++23 -O2 -g -Wall -Wextra -Werror \
             -I. tests/test_media_mac.cpp "${media_flags[@]}" "${caps_link[@]}" -o out/media-mac-test
-            sign_darwin out/media-mac-test
+        sign_darwin out/media-mac-test
         out/media-mac-test
         read -r -a surface_flags <<< "$(pkg-config --cflags --libs vulkan sdl3 fmt)"
         "$CC" "${platform_flags[@]}" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread -Isrc \
@@ -179,7 +180,7 @@ if [[ ${1:-} == --test ]]; then
             gpu/shadps4/video_core/renderer_vulkan/vk_platform.cpp gpu/shim/common/logging/log.cpp \
             gpu/shim/common/assert.cpp gpu/shadps4/common/path_util.cpp out/macos-ui-surface.o \
             "${surface_flags[@]}" "${caps_link[@]}" -o out/macos-surface-test
-            sign_darwin out/macos-surface-test
+        sign_darwin out/macos-surface-test
         out/macos-surface-test
         sh tests/test_memory_macos.sh
         sh tests/test_memory_lifetime_macos.sh
