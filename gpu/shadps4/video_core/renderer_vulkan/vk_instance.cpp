@@ -274,11 +274,9 @@ bool Instance::CreateDevice() {
 #ifdef __APPLE__
     ASSERT_MSG(features.robustBufferAccess,
                "Required Vulkan feature unavailable: robustBufferAccess");
-    if (!robustness2_features.robustBufferAccess2) {
-        LOG_WARNING(Render_Vulkan,
-                    "robustBufferAccess2 unavailable; using robustBufferAccess. "
-                    "Out-of-bounds buffer reads may not return zero.");
-    }
+    ASSERT_MSG(robustness2_features.robustBufferAccess2,
+               "Required Vulkan feature unavailable on macOS: robustBufferAccess2; "
+               "exact out-of-bounds buffer semantics are not yet implemented");
 #else
     ASSERT_MSG(robustness2_features.robustBufferAccess2,
                "Required Vulkan feature unavailable: robustBufferAccess2");
