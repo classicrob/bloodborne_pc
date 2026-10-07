@@ -3,6 +3,7 @@
 #include <cassert>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <initializer_list>
 #include <unistd.h>
 #ifdef __APPLE__
@@ -106,6 +107,27 @@ int main() {
     setenv("BB_RENDER_RES", "", 1);
     assert(!FixedRenderSession() && !ResolutionNeedsRestart());
     unsetenv("BB_RENDER_RES");
+#ifdef __APPLE__
+    static_assert(OutputCount == 5);
+    static_assert(OutputWidths[3] == 3840 && OutputHeights[3] == 2160);
+    static_assert(OutputWidths[4] == 3456 && OutputHeights[4] == 1944);
+    s.upscaler = UpscalerFsr3;
+    s.preset = Quality;
+    s.output_res = 4;
+    Save();
+    s.output_res = OutputDefault;
+    Load();
+    assert(s.output_res == 4 && s.startup_output_res == 4);
+    assert(s.upscaler == UpscalerFsr3 && RenderPreset() == Quality);
+    FILE* config = std::fopen(path, "r");
+    assert(config);
+    char saved[4096]{};
+    assert(std::fread(saved, 1, sizeof(saved) - 1, config) > 0);
+    std::fclose(config);
+    assert(std::strstr(saved, "output_res=3456x1944"));
+#else
+    static_assert(OutputCount == 4);
+#endif
     std::remove(path);
 #ifdef __APPLE__
     std::puts("Upscaler support: saved choices and explicit FSR 4/4.1.1 rejection PASS");

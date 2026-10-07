@@ -49,9 +49,18 @@ inline constexpr Effect Effects[] = {
 };
 inline constexpr int EffectCount = int(sizeof(Effects) / sizeof(Effects[0]));
 /// Live output resolutions: the upscaler's output and the UI host targets.
-inline constexpr int OutputWidths[] = {1280, 1920, 2560, 3840};
-inline constexpr int OutputHeights[] = {720, 1080, 1440, 2160};
-inline constexpr int OutputCount = 4;
+inline constexpr int OutputWidths[] = {1280, 1920, 2560, 3840
+#ifdef __APPLE__
+    , 3456
+#endif
+};
+inline constexpr int OutputHeights[] = {720, 1080, 1440, 2160
+#ifdef __APPLE__
+    , 1944
+#endif
+};
+inline constexpr int OutputCount = int(sizeof(OutputWidths) / sizeof(OutputWidths[0]));
+static_assert(sizeof(OutputWidths) == sizeof(OutputHeights));
 inline constexpr int OutputDefault = 1; ///< 1920x1080, the game's own size
 
 struct Values {
