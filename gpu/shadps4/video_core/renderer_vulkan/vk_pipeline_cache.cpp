@@ -348,6 +348,7 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     profile.emulate_null_descriptors = instance.EmulatesNullDescriptors();
 #ifdef __APPLE__
     profile.emulate_robust_buffer_access = true;
+    profile.repair_mul_signed_zero = true;
 #endif
     WarmUp();
 

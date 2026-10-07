@@ -58,6 +58,7 @@ struct Profile {
 
     bool emulate_robust_buffer_access{};
     bool emulate_vertex_fetch{};
+    bool repair_mul_signed_zero{};
 
     bool operator==(const Profile&) const = default;
 };

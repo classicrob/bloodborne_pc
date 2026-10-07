@@ -78,6 +78,17 @@ Id EmitFPMedTri32(EmitContext& ctx, Id a, Id b, Id c) {
 }
 
 Id EmitFPMul32(EmitContext& ctx, IR::Inst* inst, Id a, Id b) {
+    if (ctx.profile.repair_mul_signed_zero) {
+        // SPIRV-Cross implements strict Metal multiply as fma(a, b, +0), losing
+        // negative-zero products. A same-sign zero retains multiply semantics
+        // without allowing contraction with a subsequent guest addition.
+        const Id sign = ctx.OpBitwiseAnd(
+            ctx.U32[1], ctx.OpBitwiseXor(ctx.U32[1], ctx.OpBitcast(ctx.U32[1], a),
+                                      ctx.OpBitcast(ctx.U32[1], b)),
+            ctx.ConstU32(0x80000000u));
+        return Decorate(ctx, inst,
+                        ctx.OpFma(ctx.F32[1], a, b, ctx.OpBitcast(ctx.F32[1], sign)));
+    }
     return Decorate(ctx, inst, ctx.OpFMul(ctx.F32[1], a, b));
 }
 
