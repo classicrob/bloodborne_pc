@@ -1,4 +1,4 @@
-// bbport: fault-handler registry. The C loader's SIGSEGV handler calls
+// bbport: fault-handler registry. The C loader's SIGSEGV/SIGBUS handler calls
 // bbgpu_handle_fault() first; registered handlers run in priority order.
 #pragma once
 #include <compare>
@@ -6,6 +6,9 @@
 #include <signal.h>
 #include "common/singleton.h"
 #include "common/types.h"
+#ifdef __APPLE__
+#include "common/signal_context.h"
+#endif
 
 namespace Core {
 using AccessViolationHandler = bool (*)(void* context, void* fault_address);
@@ -21,6 +24,10 @@ public:
         illegal_instruction_handlers.emplace(handler, priority);
     }
     bool DispatchAccessViolation(void* context, void* fault_address) const {
+#ifdef __APPLE__
+        // Darwin protection faults arrive as SIGBUS with a ucontext_t.
+        if (!Common::IsWriteError(context)) return false;
+#endif
         for (const auto& entry : access_violation_handlers)
             if (entry.handler(context, fault_address)) return true;
         return false;
