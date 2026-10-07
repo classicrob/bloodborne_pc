@@ -23,4 +23,5 @@ xcrun clang++ -arch x86_64 -std=c++23 -O1 -g -UNDEBUG \
     -L"$prefix/lib" -Wl,-rpath,"$prefix/lib" -Wl,-dead_strip \
     -lavformat -lavcodec -lavutil -lswresample -lswscale -lfmt \
     -o out/mac-avplayer/test-lifecycle
+python3 packaging/macos/sign.py out/mac-avplayer/test-lifecycle
 exec arch -x86_64 out/mac-avplayer/test-lifecycle out/mac-avplayer/fixture.mp4

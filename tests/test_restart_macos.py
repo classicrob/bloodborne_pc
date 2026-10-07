@@ -12,6 +12,7 @@ exe = out / 'test-restart'
 subprocess.run(['clang', '-arch', 'x86_64', '-std=c11', '-O2', '-Wall', '-Wextra', '-Werror',
                 '-I.', '-Isrc', 'tests/test_restart_macos.c', '-Wl,-dead_strip', '-o', str(exe)],
                cwd=root, check=True)
+subprocess.run(['python3', 'packaging/macos/sign.py', str(exe)], cwd=root, check=True)
 with tempfile.TemporaryDirectory(prefix='restart-', dir=out) as tmp:
     temp = Path(tmp).resolve()
     game = temp / 'game'
