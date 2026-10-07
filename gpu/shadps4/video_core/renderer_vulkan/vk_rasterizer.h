@@ -4,6 +4,10 @@
 #pragma once
 
 #include "common/recursive_lock.h"
+#ifdef __APPLE__
+#include <condition_variable>
+#include <mutex>
+#endif
 #include "common/shared_first_mutex.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/page_manager.h"
@@ -141,6 +145,11 @@ public:
     void MapMemory(VAddr addr, u64 size);
     void RegisterMemory(VAddr addr, u64 size);
     void UnmapMemory(VAddr addr, u64 size);
+#ifdef __APPLE__
+    void BeginImportedMemoryMutation();
+    void RetireImportedMemory(VAddr addr, u64 size);
+    void EndImportedMemoryMutation();
+#endif
 
     u64 Flush();
     void Finish();
@@ -322,6 +331,15 @@ private:
     std::unique_ptr<NullResources> null_resources;
     VideoCore::TextureCache texture_cache;
     AmdGpu::Liverpool* liverpool;
+#ifdef __APPLE__
+    std::mutex import_mutation_mutex;
+    std::mutex import_pause_mutex;
+    std::condition_variable import_pause_cv;
+    std::atomic<bool> imported_memory_mutating{false};
+    bool import_pause_ready = false;
+    bool import_pause_resume = false;
+    bool import_pause_direct = false;
+#endif
     Core::MemoryManager* memory;
     boost::icl::interval_set<VAddr> mapped_ranges;
     Common::SharedFirstMutex mapped_ranges_mutex;

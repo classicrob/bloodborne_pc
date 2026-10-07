@@ -3183,7 +3183,10 @@ bool Rasterizer::InvalidateMemory(VAddr addr, u64 size, bool assume_locks) {
         // Not GPU mapped memory, can skip invalidation logic entirely.
         return false;
     }
-    buffer_cache.InvalidateMemory(addr, size, assume_locks);
+#ifdef __APPLE__
+    if (!imported_memory_mutating.load(std::memory_order_acquire))
+#endif
+        buffer_cache.InvalidateMemory(addr, size, assume_locks);
     texture_cache.InvalidateMemory(addr, size);
     return true;
 }
@@ -3238,9 +3241,70 @@ void Rasterizer::RegisterMemory(VAddr addr, u64 size) {
     page_manager.OnGpuMap(addr, size);
 }
 
+#ifdef __APPLE__
+void Rasterizer::BeginImportedMemoryMutation() {
+    ASSERT_MSG(!DrawPipe::OnStageB(),
+               "macOS guest VM mutation cannot run on the draw recording thread");
+    import_mutation_mutex.lock();
+    import_pause_direct = OnStageA();
+    if (import_pause_direct) {
+        Finish();
+        scheduler.PopPendingOperations();
+        JoinBindHelper(this);
+        imported_memory_mutating.store(true, std::memory_order_release);
+        return;
+    }
+    {
+        std::scoped_lock lock{import_pause_mutex};
+        import_pause_ready = false;
+        import_pause_resume = false;
+    }
+    liverpool->SendCommand([this] {
+        Finish();
+        scheduler.PopPendingOperations();
+        JoinBindHelper(this);
+        std::unique_lock lock{import_pause_mutex};
+        imported_memory_mutating.store(true, std::memory_order_release);
+        import_pause_ready = true;
+        import_pause_cv.notify_all();
+        import_pause_cv.wait(lock, [this] { return import_pause_resume; });
+        import_pause_ready = false;
+        import_pause_cv.notify_all();
+    });
+    std::unique_lock lock{import_pause_mutex};
+    import_pause_cv.wait(lock, [this] { return import_pause_ready; });
+}
+
+void Rasterizer::RetireImportedMemory(VAddr addr, u64 size) {
+    ASSERT_MSG(imported_memory_mutating.load(std::memory_order_acquire),
+               "macOS host import retirement requires a drained GPU mutation barrier");
+    ResetBindings(false);
+    ResetBindings(true);
+    buffer_cache.RetireHostImports(addr, size);
+}
+
+void Rasterizer::EndImportedMemoryMutation() {
+    buffer_cache.FinishHostMutation();
+    ASSERT_MSG(imported_memory_mutating.exchange(false, std::memory_order_acq_rel),
+               "macOS host import mutation ended without begin");
+    if (!import_pause_direct) {
+        std::unique_lock lock{import_pause_mutex};
+        import_pause_resume = true;
+        import_pause_cv.notify_all();
+        import_pause_cv.wait(lock, [this] { return !import_pause_ready; });
+    }
+    import_mutation_mutex.unlock();
+}
+#endif
+
 void Rasterizer::UnmapMemory(VAddr addr, u64 size) {
     DrainDrawPipe();
+#ifdef __APPLE__
+    ASSERT_MSG(imported_memory_mutating.load(std::memory_order_acquire),
+               "macOS guest unmap requires host import lifetime hooks");
+#else
     buffer_cache.InvalidateMemory(addr, size);
+#endif
     texture_cache.UnmapMemory(addr, size);
     {
         std::scoped_lock lock{mapped_ranges_mutex};

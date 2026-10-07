@@ -254,6 +254,8 @@ bool Instance::CreateDevice() {
 
     // Required
 #ifdef __APPLE__
+    ASSERT_MSG(add_extension(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME),
+               "macOS guest buffer arenas require VK_EXT_external_memory_host");
     // Portability devices must enable the subset extension when they advertise it.
     if (std::ranges::find(available_extensions, "VK_KHR_portability_subset") !=
         available_extensions.end()) {
