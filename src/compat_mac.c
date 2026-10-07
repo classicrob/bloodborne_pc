@@ -6,6 +6,48 @@
 #include <sys/resource.h>
 #include <mach/mach.h>
 
+int compat_barrier_init(pthread_barrier_t *barrier, const pthread_barrierattr_t *attr, unsigned count) {
+    if (!count) return EINVAL;
+    if (attr) return ENOTSUP;
+    *barrier = (pthread_barrier_t){.count = count};
+    int error = pthread_mutex_init(&barrier->mutex, NULL);
+    if (error) return error;
+    error = pthread_cond_init(&barrier->event, NULL);
+    if (error) pthread_mutex_destroy(&barrier->mutex);
+    return error;
+}
+int compat_barrier_wait(pthread_barrier_t *barrier) {
+    int old_cancel;
+    pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &old_cancel);
+    int error = pthread_mutex_lock(&barrier->mutex);
+    if (error) { pthread_setcancelstate(old_cancel, NULL); return error; }
+    uint64_t generation = barrier->generation;
+    ++barrier->active;
+    int result = 0;
+    if (++barrier->arrived == barrier->count) {
+        barrier->arrived = 0;
+        ++barrier->generation;
+        result = PTHREAD_BARRIER_SERIAL_THREAD;
+        error = pthread_cond_broadcast(&barrier->event);
+    } else {
+        while (generation == barrier->generation && !error)
+            error = pthread_cond_wait(&barrier->event, &barrier->mutex);
+    }
+    if (error) { fprintf(stderr, "STOP: Darwin barrier synchronization failed (%d)\n", error); abort(); }
+    --barrier->active;
+    pthread_mutex_unlock(&barrier->mutex);
+    pthread_setcancelstate(old_cancel, NULL);
+    return result;
+}
+int compat_barrier_destroy(pthread_barrier_t *barrier) {
+    int error = pthread_mutex_lock(&barrier->mutex);
+    if (error) return error;
+    if (barrier->active) { pthread_mutex_unlock(&barrier->mutex); return EBUSY; }
+    pthread_mutex_unlock(&barrier->mutex);
+    error = pthread_cond_destroy(&barrier->event);
+    return error ? error : pthread_mutex_destroy(&barrier->mutex);
+}
+
 static int valid_time(const struct timespec *time) {
     return time && time->tv_nsec >= 0 && time->tv_nsec < 1000000000;
 }
