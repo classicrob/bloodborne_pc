@@ -88,3 +88,18 @@ FFmpeg 7.1.1 emits exactly the negation: fitted AJM/FFmpeg gain -1.0, residual R
 difference does not generalize to this real stream. The polarity disagreement is a
 platform-independent decoder reference question; this result does not establish
 which decoder matches the console. No decoder scaling or sign change was made.
+
+## Restart
+
+`python3 tests/test_restart_macos.py` compiles the actual `runtime_restart` from
+`probe.c` into an SDK-only x86_64 fixture. A worker pthread calls it, closes a
+sentinel descriptor, and execs the real `bash run.sh`; the launcher performs its
+translated-child preflight and execs the fixture again. Both default data-root
+paths and custom save/settings paths containing spaces pass under Rosetta. The
+final process retains the original PID, the sentinel fd is closed, and the
+launcher's `--app0`, `--user`, and `BB_CONFIG` values are correct.
+
+Only game preprocessing is stubbed to keep this test independent of copyrighted
+game data and the GPU. It validates the actual launcher/restart sequence and
+worker-thread exec, not live GPU device teardown or an interactive settings-menu
+restart. No production restart change was needed.
