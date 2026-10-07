@@ -1,0 +1,85 @@
+[
+  {
+    "file": "libSceFace.prx",
+    "sha256": "89e134d3162323b29ad89c4af77b9db6501acca4ea382a3d62284c5e99584bd5",
+    "executable_bytes": 278568,
+    "sse4a_candidates": [],
+    "map_imports": [],
+    "map_stubs": [],
+    "functions": 29
+  },
+  {
+    "file": "libSceFios2.prx",
+    "sha256": "3b8eb4d5a5c5a7b381d8d0610077e6cd404c29695a686274802f6b2737f6bf22",
+    "executable_bytes": 309956,
+    "sse4a_candidates": [],
+    "map_imports": [],
+    "map_stubs": [],
+    "functions": 165
+  },
+  {
+    "file": "libSceHand.prx",
+    "sha256": "0ef7de31c741b20a50b641bdc576ff9df467509eb511e60cb43d7ee5f240b070",
+    "executable_bytes": 22288,
+    "sse4a_candidates": [],
+    "map_imports": [],
+    "map_stubs": [],
+    "functions": 5
+  },
+  {
+    "file": "libSceHeadTracker.prx",
+    "sha256": "2ebfb4c208c3fbdd38c5f7a0f95f50b682ce2126a539c9be3fb9792ad761e1cb",
+    "executable_bytes": 316792,
+    "sse4a_candidates": [],
+    "map_imports": [],
+    "map_stubs": [],
+    "functions": 9
+  },
+  {
+    "file": "libSceS3DConversion.prx",
+    "sha256": "86a854022a1ad1a2940787acd7e47c7a84e67148b2b641dba5452771506d20b9",
+    "executable_bytes": 275856,
+    "sse4a_candidates": [],
+    "map_imports": [],
+    "map_stubs": [],
+    "functions": 4
+  },
+  {
+    "file": "libSceSmart.prx",
+    "sha256": "43f433e5459033e201bea857002343bb2436c03c33401c4f0c938b3e197df1ab",
+    "executable_bytes": 905272,
+    "sse4a_candidates": [],
+    "map_imports": [],
+    "map_stubs": [],
+    "functions": 48
+  },
+  {
+    "file": "libc.prx",
+    "sha256": "4378b47f46f1d856824a6f971db1a0c3f41833b77f49d2fba9538f667a139166",
+    "executable_bytes": 751908,
+    "sse4a_candidates": [],
+    "map_imports": [
+      {
+        "got": "0xb8740",
+        "name": "sceKernelMapNamedFlexibleMemory"
+      },
+      {
+        "got": "0xb87f0",
+        "name": "mmap"
+      }
+    ],
+    "map_stubs": [
+      {
+        "address": "0x350",
+        "got": "0xb8740",
+        "name": "sceKernelMapNamedFlexibleMemory"
+      },
+      {
+        "address": "0x4b0",
+        "got": "0xb87f0",
+        "name": "mmap"
+      }
+    ],
+    "functions": 1597
+  }
+]
