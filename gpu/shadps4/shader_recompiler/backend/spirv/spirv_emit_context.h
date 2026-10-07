@@ -163,12 +163,13 @@ public:
         // Fallback
         AddLabel(fallback_label);
         const Id fallback_result = fallback();
+        const Id fallback_exit_label = last_label;
         OpBranch(merge_label);
 
         // Merge
         AddLabel(merge_label);
         const Id final_result =
-            OpPhi(U32[1], fallback_result, fallback_label, result, available_label);
+            OpPhi(U32[1], fallback_result, fallback_exit_label, result, available_label);
         return final_result;
     }
 
@@ -185,9 +186,10 @@ public:
         ASSERT(flatbuf_buffer.binding >= 0 && flatbuf_buffer.buffer_type == BufferType::Flatbuf);
         const auto [flatbuf_buffer_id, flatbuf_pointer_type] =
             flatbuf_buffer.aliases[u32(PointerType::U32)];
-        const auto ptr{
-            OpAccessChain(flatbuf_pointer_type, flatbuf_buffer_id, u32_zero_value, flatbuf_offset)};
-        return OpLoad(U32[1], ptr);
+        return BufferRead(flatbuf_index, PointerType::U32, flatbuf_offset, flatbuf_offset, U32[1], [&] {
+            const auto ptr{OpAccessChain(flatbuf_pointer_type, flatbuf_buffer_id, u32_zero_value, flatbuf_offset)};
+            return OpLoad(U32[1], ptr);
+        });
     }
 
     Info& info;
@@ -352,6 +354,8 @@ public:
         bool is_null = false;
         std::array<Id, u32(PointerSize::NumClass)> offsets;
         std::array<BufferSpv, u32(PointerType::NumAlias)> aliases;
+        std::array<Id, u32(PointerType::NumAlias)> lengths{};
+        Id num_records{};
 
         template <class Self>
         auto& Alias(this Self& self, PointerType alias) {
@@ -364,13 +368,79 @@ public:
         }
     };
 
-    Id BufferRead(u32 handle, PointerType, Id, Id, Id type, auto&& read, u32 = 0) {
-        if (buffers[handle].is_null) return ConstantNull(type);
-        return read();
+    struct BufferAddressBounds {
+        std::array<Id, 4> components;
+        u32 bytes;
+        bool formatted;
+    };
+    std::unordered_map<u32, BufferAddressBounds> buffer_address_bounds;
+
+    Id BufferLength(u32 handle, PointerType alias) {
+        const auto& buffer = buffers[handle];
+        const Id cached = buffer.lengths[u32(alias)];
+        return Sirit::ValidId(cached) ? cached : OpArrayLength(U32[1], buffer.Alias(alias).id, 0);
     }
 
-    void BufferWrite(u32 handle, PointerType, Id, Id, auto&& write, u32 = 0) {
-        if (!buffers[handle].is_null) write();
+    Id BufferNumRecords(u32 handle) {
+        if (const Id cached = buffers[handle].num_records; Sirit::ValidId(cached)) return cached;
+        const auto& desc = info.buffers[handle];
+        return desc.sharp_fetch.load_mask & 4
+            ? EmitFlatbufferLoad(ConstU32(u32(desc.sharp_fetch.offsets[2])))
+            : ConstU32(desc.sharp_fetch.immediates[2]);
+    }
+
+    Id BufferInBounds(u32 handle, PointerType alias, Id original_index, Id index, u32 component) {
+        const auto& buffer = buffers[handle];
+        Id valid = OpUGreaterThanEqual(U1[1], index, original_index);
+        if (const auto it = buffer_address_bounds.find(original_index.value);
+            it != buffer_address_bounds.end()) {
+            valid = OpLogicalAnd(U1[1], valid, it->second.components[component]);
+            if (it->second.formatted) {
+                const u32 bytes = alias == PointerType::U8 ? 1 : alias == PointerType::U16 ? 2 :
+                                  alias == PointerType::U64 ? 8 : 4;
+                const u32 elements = (it->second.bytes + bytes - 1) / bytes;
+                const Id last = OpIAdd(U32[1], index, ConstU32(elements - 1 - component));
+                valid = OpLogicalAnd(U1[1], valid, OpUGreaterThanEqual(U1[1], last, index));
+                index = last;
+            }
+        }
+        const Id length = BufferLength(handle, alias);
+        return OpLogicalAnd(U1[1], valid, OpULessThan(U1[1], index, length));
+    }
+
+    Id BufferRead(u32 handle, PointerType alias, Id original_index, Id index,
+                  Id type, auto&& read, u32 component = 0) {
+        if (buffers[handle].is_null) return ConstantNull(type);
+        if (!profile.emulate_robust_buffer_access) return read();
+        const Id access_label = OpLabel();
+        const Id zero_label = OpLabel();
+        const Id merge_label = OpLabel();
+        const Id in_bounds = BufferInBounds(handle, alias, original_index, index, component);
+        OpSelectionMerge(merge_label, spv::SelectionControlMask::MaskNone);
+        OpBranchConditional(in_bounds, access_label, zero_label);
+        AddLabel(access_label);
+        const Id value = read();
+        const Id value_label = last_label;
+        OpBranch(merge_label);
+        AddLabel(zero_label);
+        OpBranch(merge_label);
+        AddLabel(merge_label);
+        return OpPhi(type, value, value_label, ConstantNull(type), zero_label);
+    }
+
+    void BufferWrite(u32 handle, PointerType alias, Id original_index, Id index,
+                     auto&& write, u32 component = 0) {
+        if (buffers[handle].is_null) return;
+        if (!profile.emulate_robust_buffer_access) { write(); return; }
+        const Id access_label = OpLabel();
+        const Id merge_label = OpLabel();
+        const Id in_bounds = BufferInBounds(handle, alias, original_index, index, component);
+        OpSelectionMerge(merge_label, spv::SelectionControlMask::MaskNone);
+        OpBranchConditional(in_bounds, access_label, merge_label);
+        AddLabel(access_label);
+        write();
+        OpBranch(merge_label);
+        AddLabel(merge_label);
     }
 
     Bindings& binding;

@@ -69,17 +69,147 @@ Id EmitReadConst(EmitContext& ctx, IR::Inst* inst, Id addr, Id offset) {
     }
 }
 
-Id EmitReadConstBuffer(EmitContext& ctx, u32 handle, Id index) {
+Id EmitBufferAddress(EmitContext& ctx, IR::Inst* inst, u32 handle, Id index, Id offset, Id soffset) {
+    const auto flags = inst->Flags<IR::BufferInstInfo>();
+    const auto& desc = ctx.info.buffers[handle];
+    const auto sharp = desc.GetSharp(ctx.info);
+    // MUBUF does not replace an INVALID resource format with its implied format.
+    Id valid = sharp.GetDataFmt() == AmdGpu::DataFormat::FormatInvalid &&
+                       flags.inst_data_fmt == AmdGpu::DataFormat::FormatInvalid
+                   ? ctx.false_value : ctx.true_value;
+    auto checked_add = [&](Id a, Id b) {
+        const Id sum = ctx.OpIAdd(ctx.U32[1], a, b);
+        valid = ctx.OpLogicalAnd(ctx.U1[1], valid, ctx.OpUGreaterThanEqual(ctx.U1[1], sum, a));
+        return sum;
+    };
+    auto checked_mul = [&](Id a, u32 factor) {
+        if (factor == 0) return ctx.u32_zero_value;
+        valid = ctx.OpLogicalAnd(ctx.U1[1], valid,
+            ctx.OpULessThanEqual(ctx.U1[1], a, ctx.ConstU32(UINT32_MAX / factor)));
+        return ctx.OpIMul(ctx.U32[1], a, ctx.ConstU32(factor));
+    };
+    if (!flags.index_enable) index = ctx.u32_zero_value;
+    if (sharp.stride != 0 && sharp.add_tid_enable) {
+        index = checked_add(index, ctx.OpLoad(ctx.U32[1], ctx.subgroup_local_invocation_id));
+    }
+    if (!flags.voffset_enable) offset = ctx.u32_zero_value;
+    offset = checked_add(offset, ctx.ConstU32(u32(flags.inst_offset.Value())));
+    Id address;
+    if (sharp.swizzle_enable) {
+        const u32 index_stride = sharp.GetIndexStride();
+        const u32 element = sharp.GetElementSize();
+        const Id index_msb = ctx.OpUDiv(ctx.U32[1], index, ctx.ConstU32(index_stride));
+        const Id index_lsb = ctx.OpUMod(ctx.U32[1], index, ctx.ConstU32(index_stride));
+        const Id offset_msb = ctx.OpUDiv(ctx.U32[1], offset, ctx.ConstU32(element));
+        const Id offset_lsb = ctx.OpUMod(ctx.U32[1], offset, ctx.ConstU32(element));
+        const Id msb = checked_mul(checked_add(checked_mul(index_msb, sharp.stride),
+                                              checked_mul(offset_msb, element)), index_stride);
+        address = checked_add(msb, checked_add(checked_mul(index_lsb, element), offset_lsb));
+    } else {
+        address = checked_add(checked_mul(index, sharp.stride), offset);
+    }
+    // GCN applies the SGPR offset to the base, after the swizzle calculation.
+    address = checked_add(address, soffset);
+    const Id records = ctx.BufferNumRecords(handle);
+    const bool formatted = flags.typed.Value();
+    const u32 bytes = flags.access_bytes.Value();
+    std::array<Id, 4> predicates;
+    for (u32 c = 0; c < predicates.size(); ++c) {
+        const u32 delta = formatted ? 0u : c * 4;
+        Id predicate = valid;
+        if (sharp.stride == 0) {
+            const Id end = ctx.OpIAdd(ctx.U32[1], address, ctx.ConstU32(delta));
+            predicate = ctx.OpLogicalAnd(ctx.U1[1], predicate,
+                ctx.OpUGreaterThanEqual(ctx.U1[1], end, address));
+            predicate = ctx.OpLogicalAnd(ctx.U1[1], predicate,
+                ctx.OpULessThan(ctx.U1[1], end, records));
+        } else {
+            predicate = ctx.OpLogicalAnd(ctx.U1[1], predicate,
+                ctx.OpULessThan(ctx.U1[1], index, records));
+            if (flags.index_enable || sharp.add_tid_enable) {
+                const Id end = ctx.OpIAdd(ctx.U32[1], offset, ctx.ConstU32(delta));
+                predicate = ctx.OpLogicalAnd(ctx.U1[1], predicate,
+                    ctx.OpUGreaterThanEqual(ctx.U1[1], end, offset));
+                predicate = ctx.OpLogicalAnd(ctx.U1[1], predicate,
+                    ctx.OpULessThan(ctx.U1[1], end, ctx.ConstU32(u32(sharp.stride))));
+            }
+        }
+        predicates[c] = predicate;
+    }
+    // Alignment applies to the complete byte address, including the binding prefix.
+    const u32 shift = flags.address_shift.Value();
+    const Id prefix = ctx.buffers[handle].Offset(PointerSize::B8);
+    if (Sirit::ValidId(prefix)) {
+        const Id sum = ctx.OpIAdd(ctx.U32[1], address,
+            ctx.OpBitwiseAnd(ctx.U32[1], prefix, ctx.ConstU32((1u << shift) - 1)));
+        const Id no_carry = ctx.OpUGreaterThanEqual(ctx.U1[1], sum, address);
+        for (Id& predicate : predicates)
+            predicate = ctx.OpLogicalAnd(ctx.U1[1], predicate, no_carry);
+        address = sum;
+    }
+    const Id aligned = ctx.OpShiftRightLogical(ctx.U32[1], address, ctx.ConstU32(shift));
+    if (formatted) {
+        // A formatted instruction is one element: a partial host range drops the whole access,
+        // including component swizzles that would otherwise turn a zero load into constant ONE.
+        const auto alias = shift == 0 ? PointerType::U8 : shift == 1 ? PointerType::U16 : PointerType::U32;
+        const Id aligned_prefix = Sirit::ValidId(prefix)
+            ? ctx.OpShiftRightLogical(ctx.U32[1], prefix, ctx.ConstU32(shift)) : ctx.u32_zero_value;
+        const Id first = ctx.OpIAdd(ctx.U32[1], aligned, aligned_prefix);
+        const Id last = ctx.OpIAdd(ctx.U32[1], first, ctx.ConstU32((bytes >> shift) - 1));
+        Id complete = ctx.OpUGreaterThanEqual(ctx.U1[1], first, aligned);
+        complete = ctx.OpLogicalAnd(ctx.U1[1], complete, ctx.OpUGreaterThanEqual(ctx.U1[1], last, first));
+        complete = ctx.OpLogicalAnd(ctx.U1[1], complete,
+            ctx.OpULessThan(ctx.U1[1], last, ctx.BufferLength(handle, alias)));
+        for (Id& predicate : predicates)
+            predicate = ctx.OpLogicalAnd(ctx.U1[1], predicate, complete);
+    }
+    const Id result = ctx.OpSelect(ctx.U32[1], predicates[0], aligned, ctx.ConstU32(UINT32_MAX));
+    ctx.buffer_address_bounds.emplace(result.value, EmitContext::BufferAddressBounds{predicates, bytes, formatted});
+    return result;
+}
+
+Id EmitReadConstBuffer(EmitContext& ctx, u32 handle, Id index, Id previous) {
     const Id original_index = index;
     const auto& buffer = ctx.buffers[handle];
     if (const Id offset = buffer.Offset(PointerSize::B32); Sirit::ValidId(offset)) {
         index = ctx.OpIAdd(ctx.U32[1], index, offset);
     }
     const auto [id, pointer_type] = buffer.Alias(PointerType::U32);
-    return ctx.BufferRead(handle, EmitContext::PointerType::U32, original_index, index, ctx.U32[1], [&] {
-        const Id ptr{ctx.OpAccessChain(pointer_type, id, ctx.u32_zero_value, index)};
-        return ctx.OpLoad(ctx.U32[1], ptr);
-    });
+    const auto read = [&] {
+        return ctx.OpLoad(ctx.U32[1],
+            ctx.OpAccessChain(pointer_type, id, ctx.u32_zero_value, index));
+    };
+    if (!ctx.profile.emulate_robust_buffer_access || buffer.buffer_type != BufferType::Guest) {
+        return ctx.BufferRead(handle, PointerType::U32, original_index, index, ctx.U32[1], read);
+    }
+    if (buffer.is_null) return ctx.u32_zero_value;
+    const auto& desc = ctx.info.buffers[handle];
+    const auto sharp = desc.GetSharp(ctx.info);
+    const Id records = ctx.BufferNumRecords(handle);
+    // SMRD clamps each DWORD separately and leaves a clamped destination SGPR unchanged.
+    // Its bound uses only base, stride and num_records, including INVALID formats.
+    const Id bytes = ctx.OpShiftLeftLogical(ctx.U32[1], original_index, ctx.ConstU32(2u));
+    Id valid = ctx.OpULessThanEqual(ctx.U1[1], original_index, ctx.ConstU32(UINT32_MAX / 4));
+    const Id bound = sharp.stride == 0 ? records
+        : ctx.OpIMul(ctx.U32[1], records, ctx.ConstU32(u32(sharp.stride)));
+    const Id guest_valid = sharp.stride == 0
+        ? ctx.OpULessThan(ctx.U1[1], bytes, bound)
+        : ctx.OpULessThanEqual(ctx.U1[1], bytes, bound);
+    valid = ctx.OpLogicalAnd(ctx.U1[1], valid, guest_valid);
+    valid = ctx.OpLogicalAnd(ctx.U1[1], valid,
+        ctx.BufferInBounds(handle, PointerType::U32, original_index, index, 0));
+    const Id access_label = ctx.OpLabel();
+    const Id clamp_label = ctx.OpLabel();
+    const Id merge_label = ctx.OpLabel();
+    ctx.OpSelectionMerge(merge_label, spv::SelectionControlMask::MaskNone);
+    ctx.OpBranchConditional(valid, access_label, clamp_label);
+    ctx.AddLabel(access_label);
+    const Id value = read();
+    ctx.OpBranch(merge_label);
+    ctx.AddLabel(clamp_label);
+    ctx.OpBranch(merge_label);
+    ctx.AddLabel(merge_label);
+    return ctx.OpPhi(ctx.U32[1], value, access_label, previous, clamp_label);
 }
 
 Id EmitGetAttribute(EmitContext& ctx, IR::Attribute attr, u32 comp, u32 index) {
@@ -471,6 +601,22 @@ Id EmitLoadBufferU32x4(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address)
 }
 
 Id EmitLoadBufferU64(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address) {
+    if (ctx.profile.emulate_robust_buffer_access && ctx.buffer_address_bounds.contains(address.value)) {
+        const Id original = address;
+        const auto& buffer = ctx.buffers[handle];
+        if (const Id offset = buffer.Offset(PointerSize::B32); Sirit::ValidId(offset)) {
+            address = ctx.OpIAdd(ctx.U32[1], address, offset);
+        }
+        const auto [id, pointer_type] = buffer.Alias(PointerType::U32);
+        std::array<Id, 2> values;
+        for (u32 c = 0; c < values.size(); ++c) {
+            const Id index = ctx.OpIAdd(ctx.U32[1], address, ctx.ConstU32(c));
+            values[c] = ctx.BufferRead(handle, PointerType::U32, original, index, ctx.U32[1], [&] {
+                return ctx.OpLoad(ctx.U32[1], ctx.OpAccessChain(pointer_type, id, ctx.u32_zero_value, index));
+            }, c);
+        }
+        return ctx.OpBitcast(ctx.U64, ctx.OpCompositeConstruct(ctx.U32[2], values));
+    }
     const Id original_index = address;
     const auto& spv_buffer = ctx.buffers[handle];
     if (const Id offset = spv_buffer.Offset(PointerSize::B64); Sirit::ValidId(offset)) {
@@ -567,6 +713,23 @@ void EmitStoreBufferU32x4(EmitContext& ctx, IR::Inst* inst, u32 handle, Id addre
 }
 
 void EmitStoreBufferU64(EmitContext& ctx, IR::Inst*, u32 handle, Id address, Id value) {
+    if (ctx.profile.emulate_robust_buffer_access && ctx.buffer_address_bounds.contains(address.value)) {
+        const Id original = address;
+        const auto& buffer = ctx.buffers[handle];
+        if (const Id offset = buffer.Offset(PointerSize::B32); Sirit::ValidId(offset)) {
+            address = ctx.OpIAdd(ctx.U32[1], address, offset);
+        }
+        const auto [id, pointer_type] = buffer.Alias(PointerType::U32);
+        const Id values = ctx.OpBitcast(ctx.U32[2], value);
+        for (u32 c = 0; c < 2; ++c) {
+            const Id index = ctx.OpIAdd(ctx.U32[1], address, ctx.ConstU32(c));
+            const Id component = ctx.OpCompositeExtract(ctx.U32[1], values, c);
+            ctx.BufferWrite(handle, PointerType::U32, original, index, [&] {
+                ctx.OpStore(ctx.OpAccessChain(pointer_type, id, ctx.u32_zero_value, index), component);
+            }, c);
+        }
+        return;
+    }
     const Id original_index = address;
     const auto& spv_buffer = ctx.buffers[handle];
     if (const Id offset = spv_buffer.Offset(PointerSize::B64); Sirit::ValidId(offset)) {

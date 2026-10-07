@@ -217,12 +217,8 @@ Id EmitContext::GetBufferSize(const u32 sharp_idx) {
     // Can this be done with memory access? Like we do now with ReadConst
     const auto& srt_flatbuf = buffers[flatbuf_index];
     ASSERT(srt_flatbuf.buffer_type == BufferType::Flatbuf);
-    const auto [id, pointer_type] = srt_flatbuf.Alias(PointerType::U32);
-
-    const auto rsrc1{
-        OpLoad(U32[1], OpAccessChain(pointer_type, id, u32_zero_value, ConstU32(sharp_idx + 1)))};
-    const auto rsrc2{
-        OpLoad(U32[1], OpAccessChain(pointer_type, id, u32_zero_value, ConstU32(sharp_idx + 2)))};
+    const auto rsrc1{EmitFlatbufferLoad(ConstU32(sharp_idx + 1))};
+    const auto rsrc2{EmitFlatbufferLoad(ConstU32(sharp_idx + 2))};
 
     const auto stride{OpBitFieldUExtract(U32[1], rsrc1, ConstU32(16u), ConstU32(14u))};
     const auto num_records{rsrc2};
@@ -233,6 +229,29 @@ Id EmitContext::GetBufferSize(const u32 sharp_idx) {
 }
 
 void EmitContext::DefineBufferProperties() {
+    if (profile.emulate_robust_buffer_access) {
+        // The prologue dominates every guest access. Query each binding once per invocation.
+        for (auto& buffer : buffers) {
+            constexpr std::array shifts{0u, 1u, 2u, 2u, 3u, 3u};
+            u32 source = u32(PointerType::NumAlias);
+            for (u32 alias = 0; alias < buffer.aliases.size(); ++alias) {
+                if (Sirit::ValidId(buffer.aliases[alias].id) &&
+                    (source == u32(PointerType::NumAlias) || shifts[alias] < shifts[source]))
+                    source = alias;
+            }
+            if (source == u32(PointerType::NumAlias)) continue;
+            const Id length = OpArrayLength(U32[1], buffer.aliases[source].id, 0);
+            for (u32 alias = 0; alias < buffer.aliases.size(); ++alias) {
+                if (Sirit::ValidId(buffer.aliases[alias].id))
+                    buffer.lengths[alias] = shifts[alias] == shifts[source] ? length
+                        : OpShiftRightLogical(U32[1], length, ConstU32(shifts[alias] - shifts[source]));
+            }
+        }
+        for (u32 handle = 0; handle < buffers.size(); ++handle) {
+            if (buffers[handle].buffer_type == BufferType::Guest)
+                buffers[handle].num_records = BufferNumRecords(handle);
+        }
+    }
     if (!profile.needs_buffer_offsets) {
         return;
     }
@@ -1237,8 +1256,10 @@ Id EmitContext::DefineGetBdaPointer() {
     const auto page32{OpUConvert(U32[1], page)};
     const auto& bda_buffer{buffers[bda_pagetable_index]};
     const auto [bda_buffer_id, bda_pointer_type] = bda_buffer.Alias(PointerType::U64);
-    const auto bda_ptr{OpAccessChain(bda_pointer_type, bda_buffer_id, u32_zero_value, page32)};
-    const auto bda{OpLoad(U64, bda_ptr)};
+    const auto bda = BufferRead(bda_pagetable_index, PointerType::U64, page32, page32, U64, [&] {
+        const auto ptr = OpAccessChain(bda_pointer_type, bda_buffer_id, u32_zero_value, page32);
+        return OpLoad(U64, ptr);
+    });
 
     // Check if page is GPU cached
     const auto is_fault{OpIEqual(U1[1], bda, u64_zero_value)};
@@ -1252,11 +1273,12 @@ Id EmitContext::DefineGetBdaPointer() {
     const auto page_div32{OpShiftRightLogical(U32[1], page32, ConstU32(5U))};
     const auto page_mod32{OpBitwiseAnd(U32[1], page32, ConstU32(31U))};
     const auto page_mask{OpShiftLeftLogical(U32[1], u32_one_value, page_mod32)};
-    const auto fault_ptr{
-        OpAccessChain(fault_pointer_type, fault_buffer_id, u32_zero_value, page_div32)};
-    const auto fault_value{OpLoad(U32[1], fault_ptr)};
-    const auto fault_value_masked{OpBitwiseOr(U32[1], fault_value, page_mask)};
-    OpStore(fault_ptr, fault_value_masked);
+    BufferWrite(fault_buffer_index, PointerType::U32, page_div32, page_div32, [&] {
+        const auto ptr = OpAccessChain(fault_pointer_type, fault_buffer_id, u32_zero_value, page_div32);
+        const auto value = OpLoad(U32[1], ptr);
+        OpStore(ptr, OpBitwiseOr(U32[1], value, page_mask));
+    });
+    const Id fault_exit_label = last_label;
 
     // Return null pointer
     const auto fallback_result{u64_zero_value};
@@ -1270,7 +1292,7 @@ Id EmitContext::DefineGetBdaPointer() {
 
     // Merge
     AddLabel(merge_label);
-    const auto result{OpPhi(U64, addr, available_label, fallback_result, fault_label)};
+    const auto result{OpPhi(U64, addr, available_label, fallback_result, fault_exit_label)};
     OpReturnValue(result);
     OpFunctionEnd();
     return func;

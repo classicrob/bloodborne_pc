@@ -12,9 +12,9 @@
 
 namespace Serialization {
 /* You should increment versions below once corresponding serialization scheme is changed. */
-static constexpr u32 ShaderBinaryVersion = 8u; // Explicit null resource shader semantics.
+static constexpr u32 ShaderBinaryVersion = 9u; // Explicit guest buffer bounds and scalar clamp semantics.
 static constexpr u32 ShaderMetaVersion = 7u; // bbport: ImageResource::needs_native
-static constexpr u32 PipelineKeyVersion = 6u; // Null descriptor validity specialization.
+static constexpr u32 PipelineKeyVersion = 7u; // MUBUF format validity and add-thread-ID specialization.
 } // namespace Serialization
 
 namespace Vulkan {
@@ -464,6 +464,7 @@ void StageSpecialization::Serialize(Serialization::Archive& ar) const {
 
     spec.Write(bitset.to_string());
     spec.Write(emulate_null_descriptors);
+    spec.Write(emulate_robust_buffer_access);
 
     if (fetch_shader_data) {
         spec.Write(sizeof(*fetch_shader_data));
@@ -489,6 +490,7 @@ bool StageSpecialization::Deserialize(Serialization::Archive& ar) {
     spec.Read(bits);
     bitset = std::bitset<MaxStageResources>(bits);
     spec.Read(emulate_null_descriptors);
+    spec.Read(emulate_robust_buffer_access);
 
     u64 fetch_data_size{};
     spec.Read(fetch_data_size);

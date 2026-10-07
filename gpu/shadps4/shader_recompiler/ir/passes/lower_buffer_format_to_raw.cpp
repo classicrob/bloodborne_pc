@@ -224,7 +224,8 @@ static void LowerBufferFormatInst(IR::Block& block, IR::Inst& inst, Info& info, 
     };
 
     if (data_format == AmdGpu::DataFormat::FormatInvalid) {
-        LOG_WARNING(Render_Recompiler, "Skipping lowering for null buffer sharp");
+        if (!profile.emulate_robust_buffer_access)
+            LOG_WARNING(Render_Recompiler, "Skipping lowering for null buffer sharp");
         if (IsBufferFormatLoad(inst)) {
             inst.ReplaceUsesWithAndRemove(
                 ir.CompositeConstruct(ir.Imm32(0.f), ir.Imm32(0.f), ir.Imm32(0.f), ir.Imm32(0.f)));
@@ -237,7 +238,16 @@ static void LowerBufferFormatInst(IR::Block& block, IR::Inst& inst, Info& info, 
     if (IsBufferFormatLoad(inst)) {
         const auto interpreted =
             LoadBufferFormat(ir, inst.Arg(0), IR::U32{inst.Arg(1)}, flags, format_info);
-        inst.ReplaceUsesWithAndRemove(interpreted);
+        if (profile.emulate_robust_buffer_access) {
+            const auto in_range = ir.INotEqual(IR::U32{inst.Arg(1)}, ir.Imm32(UINT32_MAX));
+            std::array<IR::Value, 4> components;
+            for (u32 c = 0; c < components.size(); ++c)
+                components[c] = ir.Select(in_range, ir.CompositeExtract(interpreted, c), ir.Imm32(0.f));
+            inst.ReplaceUsesWithAndRemove(ir.CompositeConstruct(components[0], components[1],
+                                                               components[2], components[3]));
+        } else {
+            inst.ReplaceUsesWithAndRemove(interpreted);
+        }
     } else if (IsBufferFormatStore(inst)) {
         StoreBufferFormat(ir, inst.Arg(0), IR::U32{inst.Arg(1)}, inst.Arg(2), flags, format_info);
         inst.Invalidate();

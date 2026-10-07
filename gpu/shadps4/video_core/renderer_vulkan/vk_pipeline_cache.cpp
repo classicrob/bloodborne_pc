@@ -346,6 +346,9 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         .supports_shader_stencil_export = instance_.IsShaderStencilExportSupported(),
     };
     profile.emulate_null_descriptors = instance.EmulatesNullDescriptors();
+#ifdef __APPLE__
+    profile.emulate_robust_buffer_access = true;
+#endif
     WarmUp();
 
     auto [cache_result, cache] = instance.GetDevice().createPipelineCacheUnique({});
