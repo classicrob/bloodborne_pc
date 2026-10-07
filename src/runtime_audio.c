@@ -13,6 +13,7 @@
 #include <string.h>
 #include <pthread.h>
 #include <time.h>
+#include <errno.h>
 #include <SDL3/SDL.h>
 
 #define PORTS 25
@@ -50,20 +51,43 @@ static Port ports[PORTS];
 static int initialized, sdl_ready=-1;
 static size_t buffers_out, ports_opened;
 
-static uint64_t now_ns(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return (uint64_t)t.tv_sec*1000000000u+(uint64_t)t.tv_nsec; }
+#ifdef __APPLE__
+static void audio_fail(const char *operation, const char *detail) {
+    fprintf(stderr,"STOP: macOS audio %s failed: %s\n",operation,detail);
+    abort();
+}
+#endif
+static uint64_t now_ns(void) {
+    struct timespec t;
+#ifdef __APPLE__
+    if (clock_gettime(CLOCK_MONOTONIC,&t)) audio_fail("monotonic clock",strerror(errno));
+#else
+    clock_gettime(CLOCK_MONOTONIC,&t);
+#endif
+    return (uint64_t)t.tv_sec*1000000000u+(uint64_t)t.tv_nsec;
+}
 static void sleep_until(uint64_t deadline) {
 #ifdef _WIN32
     /* winpthreads' clock_nanosleep only takes CLOCK_REALTIME (EINVAL otherwise). */
     for (uint64_t now=now_ns(); now<deadline; now=now_ns()) compat_sleep_ns(deadline-now);
 #else
     struct timespec t={(time_t)(deadline/1000000000u),(long)(deadline%1000000000u)};
+#ifdef __APPLE__
+    int error;
+    do { error=clock_nanosleep(CLOCK_MONOTONIC,TIMER_ABSTIME,&t,NULL); } while (error==EINTR);
+    if (error) audio_fail("absolute monotonic sleep",strerror(error));
+#else
     while (clock_nanosleep(CLOCK_MONOTONIC,TIMER_ABSTIME,&t,NULL)) {}
+#endif
 #endif
 }
 static int sdl_audio(void) {
     if (sdl_ready<0) {
         const char *mode=getenv("BB_AUDIO");
         sdl_ready = (!mode || strcmp(mode,"none")) && SDL_InitSubSystem(SDL_INIT_AUDIO);
+#ifdef __APPLE__
+        if ((!mode || strcmp(mode,"none")) && !sdl_ready) audio_fail("SDL initialization",SDL_GetError());
+#endif
         printf("Runtime: audio backend %s\n", sdl_ready ? SDL_GetCurrentAudioDriver() : "timer (silent)");
     }
     return sdl_ready;
@@ -117,8 +141,18 @@ static ABI int32_t audio_open(int32_t user, int32_t type, int32_t index, uint32_
     if (sdl_audio()) {
         SDL_AudioSpec spec={p->is_float ? SDL_AUDIO_F32 : SDL_AUDIO_S16, p->channels, 48000};
         p->stream=SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK,&spec,NULL,NULL);
-        if (p->stream) SDL_ResumeAudioStreamDevice(p->stream);
+        if (p->stream) {
+#ifdef __APPLE__
+            if (!SDL_ResumeAudioStreamDevice(p->stream)) audio_fail("device resume",SDL_GetError());
+#else
+            SDL_ResumeAudioStreamDevice(p->stream);
+#endif
+        }
+#ifdef __APPLE__
+        else audio_fail("device stream open",SDL_GetError());
+#else
         else fprintf(stderr,"Runtime: SDL audio stream failed (%s); port %d uses the timer sink\n",SDL_GetError(),id);
+#endif
     }
     p->stats=getenv("BB_AUDIO_STATS")!=NULL;
     const char *dump=getenv("BB_AUDIO_DUMP");
@@ -143,6 +177,9 @@ static ABI int32_t audio_close(int32_t handle) {
         p->dump=NULL;
         p->stream=NULL; p->used=0;
         pthread_mutex_unlock(&p->lock);
+#ifdef __APPLE__
+        pthread_mutex_destroy(&p->lock);
+#endif
     }
     pthread_mutex_unlock(&table_lock);
     return p ? 0 : error;
@@ -196,9 +233,17 @@ static int32_t output_port(int32_t handle, const void *data, int pace) {
             /* The device drains the queue in quanta (21 ms on PipeWire), so the level
                is a sawtooth: its minimum over ~32 buffers is what gets controlled. */
             int low=2*(int)bytes, queued=SDL_GetAudioStreamQueued(p->stream);
+#ifdef __APPLE__
+            if (queued<0) audio_fail("queue query",SDL_GetError());
+#endif
             if (queued<(int)bytes) {
                 static const unsigned char silence[2048*8*4];
-                SDL_PutAudioStreamData(p->stream,silence,low-queued<(int)bytes ? low-queued : (int)bytes);
+                bool queued_silence=SDL_PutAudioStreamData(p->stream,silence,low-queued<(int)bytes ? low-queued : (int)bytes);
+#ifdef __APPLE__
+                if (!queued_silence) audio_fail("silence submission",SDL_GetError());
+#else
+                (void)queued_silence;
+#endif
                 queued=low;
             }
             if (!p->window_count || queued<p->window_min) p->window_min=queued;
@@ -207,7 +252,12 @@ static int32_t output_port(int32_t handle, const void *data, int pace) {
                 p->window_count=0;
             }
             p->next_deadline_ns+=(uint64_t)p->adjust_ns;
-            SDL_PutAudioStreamData(p->stream,converted,(int)bytes);
+            bool queued_data=SDL_PutAudioStreamData(p->stream,converted,(int)bytes);
+#ifdef __APPLE__
+            if (!queued_data) audio_fail("sample submission",SDL_GetError());
+#else
+            (void)queued_data;
+#endif
         }
         ++buffers_out;
     }

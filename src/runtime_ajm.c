@@ -207,7 +207,7 @@ static uint32_t at9_frame(Instance *in, const unsigned char **input, uint64_t *i
         int16_t v=pcm[(skip+s)*(uint32_t)channels+(uint32_t)c];
         size_t index=non_interleaved ? (size_t)c*samples+s : (size_t)s*(size_t)channels+(size_t)c;
         if (in->format==FORMAT_S16) memcpy(converted+index*2,&v,2);
-        else if (in->format==FORMAT_S32) { int32_t w=(int32_t)v<<16; memcpy(converted+index*4,&w,4); }
+        else if (in->format==FORMAT_S32) { int32_t w=(int32_t)v*65536; memcpy(converted+index*4,&w,4); }
         else { float f=(float)v/32768.0f; memcpy(converted+index*4,&f,4); }
     }
     output_write(out,converted,(uint64_t)samples*(uint64_t)channels*(uint64_t)pcm_size(in->format));
