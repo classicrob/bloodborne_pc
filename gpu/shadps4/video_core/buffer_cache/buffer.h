@@ -33,6 +33,9 @@ enum class MemoryType : u8 {
     HostCached,   ///< Requires a host visible memory type optimized for GPU to CPU readbacks
     Stream,       ///< Requests device local host visible buffer, falling back host memory.
     Sparse,       ///< Requires an unbacked sparse resident buffer.
+#ifdef __APPLE__
+    ImportedHost, ///< Imports a live guest view without a CPU/GPU shadow copy.
+#endif
 };
 
 constexpr vk::BufferUsageFlags ReadFlags =
@@ -54,7 +57,13 @@ struct UniqueBuffer {
         : device{other.device}, buffer{std::exchange(other.buffer, VK_NULL_HANDLE)},
           bda_addr{std::exchange(other.bda_addr, 0)},
           allocator{std::exchange(other.allocator, VK_NULL_HANDLE)},
-          allocation{std::exchange(other.allocation, VK_NULL_HANDLE)} {}
+          allocation{std::exchange(other.allocation, VK_NULL_HANDLE)}
+#ifdef __APPLE__
+          , imported_memory{std::exchange(other.imported_memory, VK_NULL_HANDLE)},
+          imported_host_alias{std::exchange(other.imported_host_alias, 0)},
+          imported_host_size{std::exchange(other.imported_host_size, 0)}
+#endif
+    {}
 
     UniqueBuffer& operator=(UniqueBuffer&& other) noexcept {
         if (this != &other) {
@@ -64,6 +73,11 @@ struct UniqueBuffer {
             bda_addr = std::exchange(other.bda_addr, 0);
             allocator = std::exchange(other.allocator, VK_NULL_HANDLE);
             allocation = std::exchange(other.allocation, VK_NULL_HANDLE);
+#ifdef __APPLE__
+            imported_memory = std::exchange(other.imported_memory, VK_NULL_HANDLE);
+            imported_host_alias = std::exchange(other.imported_host_alias, 0);
+            imported_host_size = std::exchange(other.imported_host_size, 0);
+#endif
         }
         return *this;
     }
@@ -71,6 +85,9 @@ struct UniqueBuffer {
     void Create(vk::BufferCreateInfo& buffer_ci, MemoryType mem_type,
                 VmaAllocationInfo* out_alloc_info);
 
+#ifdef __APPLE__
+    void ImportHost(vk::PhysicalDevice physical, vk::BufferCreateInfo info, void* pointer);
+#endif
     void Destroy();
 
     vk::Device device;
@@ -78,6 +95,11 @@ struct UniqueBuffer {
     vk::DeviceAddress bda_addr{};
     VmaAllocator allocator;
     VmaAllocation allocation{};
+#ifdef __APPLE__
+    vk::DeviceMemory imported_memory{};
+    uintptr_t imported_host_alias{};
+    u64 imported_host_size{};
+#endif
 };
 
 struct Buffer {

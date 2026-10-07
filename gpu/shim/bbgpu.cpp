@@ -23,6 +23,7 @@
 #include "../bbgpu.h"
 #ifdef __APPLE__
 #include "../../src/macos_ui.h"
+#include "../../src/runtime_memory.h"
 #endif
 #include "common/elf_info.h"
 #include "common/logging/log.h"
@@ -89,6 +90,14 @@ public:
 
 void MemoryManager::SetRasterizer(Vulkan::Rasterizer* rasterizer_) {
     rasterizer = rasterizer_;
+#ifdef __APPLE__
+    runtime_memory_set_gpu_lifetime_hooks(
+        [] { Memory::Instance()->GetRasterizer()->BeginImportedMemoryMutation(); },
+        [](uintptr_t address, uint64_t size) {
+            Memory::Instance()->GetRasterizer()->RetireImportedMemory(address, size);
+        },
+        [] { Memory::Instance()->GetRasterizer()->EndImportedMemoryMutation(); });
+#endif
     // Existing guest mappings are replayed by the runtime when hooks are installed.
     runtime_memory_set_gpu_hooks(
         [](uintptr_t address, uint64_t size) {
@@ -107,6 +116,29 @@ void MemoryManager::InvalidateMemory(VAddr address, u64 size) {
 u64 MemoryManager::ClampRangeSize(VAddr virtual_addr, u64 size) {
     return runtime_memory_clamp(virtual_addr, size);
 }
+#ifdef __APPLE__
+bool MemoryManager::GetMappedRegion(VAddr address, VAddr& start, VAddr& end) {
+    uintptr_t region_start = 0, region_end = 0;
+    int mapped = 0;
+    if (!runtime_memory_region(address, &region_start, &region_end, &mapped) || !mapped) {
+        return false;
+    }
+    start = region_start;
+    end = region_end;
+    return true;
+}
+bool MemoryManager::GetBackingRegion(VAddr address, VAddr& start, VAddr& end, u64& offset) {
+    uintptr_t region_start = 0, region_end = 0;
+    uint64_t backing_offset = 0;
+    if (!runtime_memory_backing_region(address, &region_start, &region_end, &backing_offset)) {
+        return false;
+    }
+    start = region_start;
+    end = region_end;
+    offset = backing_offset;
+    return true;
+}
+#endif
 static void CopySparseSerial(VAddr source, u8* dest, u64 size) {
     while (size) {
         uintptr_t start = 0, end = 0;

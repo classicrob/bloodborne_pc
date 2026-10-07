@@ -6,6 +6,9 @@
 #include "bbport_copy.h"
 
 #include <deque>
+#ifdef __APPLE__
+#include "video_core/buffer_cache/host_import_arena.h"
+#endif
 #include <boost/container/small_vector.hpp>
 
 #include "common/interval_set.h"
@@ -109,6 +112,12 @@ public:
     /// Synchronizes all buffers needed for DMA.
     void SynchronizeDmaBuffers();
 
+#ifdef __APPLE__
+    // Called only after draw workers and submitted GPU work have retired.
+    void RetireHostImports(VAddr address, u64 size);
+    void FinishHostMutation();
+#endif
+
     /// Commits pending sparse buffer memory binds. Must be called before every scheduler submit.
     void SubmitPendingArenaBinds(Vulkan::SubmitInfo& info);
 
@@ -129,6 +138,13 @@ private:
     const Buffer* GetArena(u64 first_block, u64 last_block);
 
     void EnsureResident(const Buffer* arena, u64 first_block, u64 last_block);
+#ifdef __APPLE__
+    void UpdateImportedBdas(const Buffer* arena, u64 first_block, u64 end_block);
+    std::unique_ptr<HostImportArenaMap<Buffer>> imported_arenas;
+    u64 import_overlap_waits{};
+    HostImportBackingMap import_backings;
+    std::vector<std::pair<VAddr, u64>> retired_host_ranges;
+#endif
 
     void DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size);
 

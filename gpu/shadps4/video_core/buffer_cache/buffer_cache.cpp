@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <bit>
 #include <cstdlib>
+#include <cstdio>
 #include <magic_enum/magic_enum.hpp>
 #include "bbport_copy.h"
 #include "bbport_toggles.h"
@@ -71,8 +72,11 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
                  arena_page_size >> 20, instance.GetMaxBufferSize() >> 20);
     }
     const vk::BufferCreateInfo probe_ci = {
-        .flags =
-            vk::BufferCreateFlagBits::eSparseBinding | vk::BufferCreateFlagBits::eSparseResidency,
+#ifdef __APPLE__
+        .flags = {},
+#else
+        .flags = vk::BufferCreateFlagBits::eSparseBinding | vk::BufferCreateFlagBits::eSparseResidency,
+#endif
         .size = arena_page_size,
         .usage = ARENA_USAGE,
         .sharingMode = vk::SharingMode::eExclusive,
@@ -88,6 +92,17 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
     block_shift = std::bit_width(block_size) - 1;
     blocks_per_arena_page = arena_page_size / block_size;
     blocks_per_arena_page_shift = arena_page_bits - block_shift;
+#ifdef __APPLE__
+    const auto host_props = instance.GetPhysicalDevice().getProperties2<
+        vk::PhysicalDeviceProperties2, vk::PhysicalDeviceExternalMemoryHostPropertiesEXT>();
+    const auto host_alignment = host_props.get<vk::PhysicalDeviceExternalMemoryHostPropertiesEXT>()
+                                    .minImportedHostPointerAlignment;
+    ASSERT_MSG(host_alignment <= block_size && block_size % host_alignment == 0,
+               "macOS host-pointer import alignment {} exceeds BDA page size {}",
+               host_alignment, block_size);
+    imported_arenas = std::make_unique<HostImportArenaMap<Buffer>>(block_shift,
+                                                                  instance.GetMaxBufferSize());
+#endif
     arena_memory_type_index =
         FindMemoryType(instance.GetMemoryProperties(), vk::MemoryPropertyFlagBits::eDeviceLocal,
                        reqs.memoryTypeBits)
@@ -147,6 +162,17 @@ void BufferCache::ExtendWriteFault(VAddr device_addr) {
 }
 
 void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool assume_locks) {
+#ifdef __APPLE__
+    const auto synchronize = [this, device_addr, size, is_write] {
+        scheduler.Finish();
+        gpu_modified_ranges.Subtract(device_addr, size);
+        memory_tracker->UnmarkRegionAsGpuModified(device_addr, size);
+        if (is_write) memory_tracker->MarkRegionAsCpuModified(device_addr, size);
+    };
+    if (assume_locks) synchronize();
+    else liverpool->SendCommand<true>(synchronize);
+    return;
+#endif
     const auto flush_request = [this, device_addr, size, is_write] {
         const u32 first_block = device_addr >> block_shift;
         const u32 last_block = (device_addr + size - 1) >> block_shift;
@@ -301,6 +327,17 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
         PrintBufferStats();
         NoteHotUse(device_addr, size);
     }
+#ifdef __APPLE__
+    ASSERT_MSG(size && memory->ClampRangeSize(device_addr, size) == size,
+               "macOS host-import buffer range {:#x}+{:#x} is not fully mapped", device_addr, size);
+    const auto* imported = GetArena(device_addr >> block_shift,
+                                    (device_addr + size - 1) >> block_shift);
+    EnsureResident(imported, device_addr >> block_shift,
+                   (device_addr + size - 1) >> block_shift);
+    SynchronizeMemory(imported, device_addr, size, is_written, is_texel_buffer);
+    if (is_written) gpu_modified_ranges.Add(device_addr, size);
+    return {imported, imported->Offset(device_addr)};
+#endif
     // For read-only buffers use device local stream buffer to reduce renderpass breaks.
     if (!is_written && size <= STREAM_THRESHOLD && !IsRegionGpuModified(device_addr, size)) {
         if (stats) {
@@ -349,6 +386,9 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
 }
 
 std::pair<const Buffer*, u64> BufferCache::ObtainBufferForImage(VAddr device_addr, u32 size) {
+#ifdef __APPLE__
+    return ObtainBuffer(device_addr, size, false);
+#endif
     if (IsRegionGpuModified(device_addr, size)) {
         return ObtainBuffer(device_addr, size, false);
     }
@@ -397,11 +437,82 @@ void BufferCache::SynchronizeDmaBuffers() {
         const u64 page = range.start >> (arena_page_bits - block_shift);
         const VAddr device_addr = range.start << block_shift;
         const u64 size = (range.end - range.start) << block_shift;
+#ifdef __APPLE__
+        const auto* imported = imported_arenas->Find(device_addr);
+        ASSERT_MSG(imported, "macOS resident BDA page has no live guest import at {:#x}", device_addr);
+        SynchronizeMemory(imported, device_addr, size, false, false);
+#else
         SynchronizeMemory(address_space[page], device_addr, size, false, false);
+#endif
     }
 }
 
 const Buffer* BufferCache::GetArena(u64 first_block, u64 last_block) {
+#ifdef __APPLE__
+    const VAddr requested_start = first_block << block_shift;
+    const u64 requested_size = (last_block - first_block + 1) << block_shift;
+    if (const auto* existing = imported_arenas->Find(requested_start);
+        existing && requested_size <= existing->size_bytes - existing->Offset(requested_start)) {
+        return existing;
+    }
+    VAddr start = requested_start, end = requested_start + requested_size;
+    for (VAddr address = start; address < end;) {
+        VAddr region_start = 0, region_end = 0;
+        ASSERT_MSG(memory->GetMappedRegion(address, region_start, region_end),
+                   "macOS host import requested unmapped guest address {:#x}", address);
+        start = std::min(start, region_start);
+        end = std::max(end, region_end);
+        address = region_end;
+    }
+    const auto allocate = [this](u64 address, u64 bytes) {
+        ASSERT_MSG(memory->ClampRangeSize(address, bytes) == bytes,
+                   "macOS host import {:#x}+{:#x} includes unmapped guest memory", address, bytes);
+        std::vector<HostImportBackingRange> ranges;
+        for (VAddr current = address; current < address + bytes;) {
+            VAddr start = 0, end = 0;
+            u64 offset = 0;
+            ASSERT_MSG(memory->GetBackingRegion(current, start, end, offset),
+                       "macOS GPU host import {:#x}+{:#x} has no runtime direct/flexible backing "
+                       "identity at {:#x}", address, bytes, current);
+            const u64 size = std::min<u64>(end, address + bytes) - current;
+            ranges.push_back({current, size, offset + current - start});
+            current += size;
+        }
+        if (const auto conflict = import_backings.Check(address, bytes, ranges)) {
+            ASSERT_MSG(false,
+                "macOS GPU physical alias needs canonical import reuse: guest {:#x}+{:#x} "
+                "backing {:#x}, existing guest {:#x}+{:#x} backing {:#x}",
+                conflict->requested.guest, conflict->requested.size, conflict->requested.backing,
+                conflict->existing.guest, conflict->existing.size, conflict->existing.backing);
+        }
+        auto buffer = std::make_unique<Buffer>(instance, address, bytes, MemoryType::ImportedHost);
+        import_backings.Register(address, bytes, std::move(ranges));
+        return buffer;
+    };
+    const auto rebind = [this](const Buffer& previous, const Buffer& next) {
+        resident_ranges.ForEachInRange(previous.cpu_addr >> block_shift,
+            (previous.cpu_addr + previous.size_bytes) >> block_shift, [&](const Backing& range) {
+                UpdateImportedBdas(&next, std::max<u64>(range.start, previous.cpu_addr >> block_shift),
+                    std::min<u64>(range.end, (previous.cpu_addr + previous.size_bytes) >> block_shift));
+            });
+    };
+    return imported_arenas->Obtain(start, end - start, allocate, rebind,
+        [this](std::unique_ptr<Buffer> previous) {
+            scheduler.DeferOperation([previous = std::move(previous)] {});
+        }, [this](VAddr address, u64 bytes) {
+            const auto begin = std::chrono::steady_clock::now();
+            scheduler.Finish();
+            const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - begin).count();
+            ++import_overlap_waits;
+            std::fprintf(stderr,
+                "macOS host import overlap wait #%llu frame %llu range %#llx+%#llx, %lld us\n",
+                static_cast<unsigned long long>(import_overlap_waits),
+                static_cast<unsigned long long>(BbStats::gpu_frames.load(std::memory_order_relaxed)),
+                static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes),
+                static_cast<long long>(elapsed));
+        });
+#endif
     const u64 first_page = first_block >> blocks_per_arena_page_shift;
     const u64 last_page = last_block >> blocks_per_arena_page_shift;
     ASSERT_MSG(last_page - first_page <= 1,
@@ -456,6 +567,17 @@ const Buffer* BufferCache::GetArena(u64 first_block, u64 last_block) {
 }
 
 void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_block) {
+#ifdef __APPLE__
+    IntervalList<> missing;
+    resident_ranges.ForEachGap(first_block, last_block + 1, [&](u64 first, u64 end) {
+        missing.Add({first, end});
+    });
+    for (const auto& range : missing) {
+        resident_ranges.Add(Backing{{range.start, range.end}, VK_NULL_HANDLE, 0});
+        UpdateImportedBdas(arena, range.start, range.end);
+    }
+    return;
+#endif
     u32 resident_blocks{};
     IntervalList bind_ranges;
     resident_ranges.ForEachGap(first_block, last_block + 1, [&](u64 start, u64 end) {
@@ -512,8 +634,65 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
     runtime.CopyBuffer(staging.buffer, bda_pagetable_buffer.get(), copies);
 }
 
+#ifdef __APPLE__
+void BufferCache::UpdateImportedBdas(const Buffer* arena, u64 first_block, u64 end_block) {
+    const u64 bytes = (end_block - first_block) * sizeof(vk::DeviceAddress);
+    if (!bytes) return;
+    const auto staging = staging_pool.Request(bytes, MemoryType::HostUncached);
+    auto* entries = reinterpret_cast<vk::DeviceAddress*>(staging.mapped);
+    for (u64 block = first_block; block < end_block; ++block) {
+        entries[block - first_block] = arena->BufferDeviceAddress() +
+                                      arena->Offset(block << block_shift);
+    }
+    staging.Flush();
+    const vk::BufferCopy copy{.srcOffset = staging.offset,
+        .dstOffset = first_block * sizeof(vk::DeviceAddress), .size = bytes};
+    runtime.CopyBuffer(staging.buffer, bda_pagetable_buffer.get(), std::span{&copy, 1});
+}
+
+void BufferCache::RetireHostImports(VAddr address, u64 size) {
+    import_backings.EraseOverlapping(address, size);
+    imported_arenas->EraseOverlapping(address, size, [this](std::unique_ptr<Buffer> previous) {
+        const u64 first = previous->cpu_addr >> block_shift;
+        const u64 end = (previous->cpu_addr + previous->size_bytes) >> block_shift;
+        IntervalList<Backing> retained;
+        for (const auto& range : resident_ranges) {
+            if (range.start < first) retained.Add(range.SubRange(range.start, std::min(first, range.end)));
+            if (range.end > end) retained.Add(range.SubRange(std::max(end, range.start), range.end));
+        }
+        resident_ranges = std::move(retained);
+        runtime.FillBuffer(bda_pagetable_buffer.get(), first * sizeof(vk::DeviceAddress),
+                           (end - first) * sizeof(vk::DeviceAddress), 0);
+        gpu_modified_ranges.Subtract(previous->cpu_addr, previous->size_bytes);
+        retired_host_ranges.emplace_back(previous->cpu_addr, previous->size_bytes);
+        // begin has waited every prior command and popped deferred operations.
+        previous.reset();
+    });
+}
+
+void BufferCache::FinishHostMutation() {
+    // Protection changes query VMAs, so perform them after the backend writer
+    // unlocks and flushes notifications, while the GPU remains paused.
+    for (const auto [address, size] : retired_host_ranges) {
+        memory_tracker->UnmarkRegionAsGpuModified(address, size);
+        memory_tracker->MarkRegionAsCpuModified(address, size);
+    }
+    retired_host_ranges.clear();
+}
+#endif
+
 bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 size,
                                     bool is_written, bool is_texel_buffer) {
+#ifdef __APPLE__
+    // CPU and GPU already share these bytes. Retain dirty/protection bookkeeping
+    // for texture invalidation and queue ordering, without copying a shadow.
+    memory_tracker->ForEachUploadRange(device_addr, size, is_written,
+                                       [](u64, u64) {}, [] {});
+    if (is_texel_buffer && !is_written) {
+        return SynchronizeMemoryFromImage(arena, device_addr, size);
+    }
+    return false;
+#endif
     boost::container::small_vector<vk::BufferCopy, 4> copies;
     size_t total_size_bytes{};
     const Buffer* src_buffer{};
@@ -674,6 +853,10 @@ bool BufferCache::SynchronizeMemoryFromImage(const Buffer* arena, VAddr device_a
 }
 
 void BufferCache::SubmitPendingArenaBinds(Vulkan::SubmitInfo& info) {
+#ifdef __APPLE__
+    ASSERT_MSG(pending_binds.empty(), "macOS host-import arenas must never submit sparse binds");
+    return;
+#endif
     if (pending_binds.empty()) {
         return;
     }

@@ -2,6 +2,10 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <numeric>
+#ifdef __APPLE__
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
+#endif
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -26,6 +30,10 @@ std::string_view BufferTypeName(MemoryType type) {
         return "DeviceLocal";
     case MemoryType::Sparse:
         return "Sparse";
+#ifdef __APPLE__
+    case MemoryType::ImportedHost:
+        return "ImportedHost";
+#endif
     default:
         return "Invalid";
     }
@@ -76,6 +84,18 @@ void UniqueBuffer::Destroy() {
     } else if (buffer) {
         device.destroyBuffer(buffer);
     }
+#ifdef __APPLE__
+    if (imported_memory) {
+        device.freeMemory(imported_memory);
+        imported_memory = VK_NULL_HANDLE;
+    }
+    if (imported_host_alias) {
+        const auto result = mach_vm_deallocate(mach_task_self(), imported_host_alias, imported_host_size);
+        ASSERT_MSG(result == KERN_SUCCESS, "macOS GPU import alias retirement failed: {}", result);
+        imported_host_alias = 0;
+        imported_host_size = 0;
+    }
+#endif
     buffer = VK_NULL_HANDLE;
     allocation = VK_NULL_HANDLE;
     bda_addr = 0;
@@ -83,6 +103,10 @@ void UniqueBuffer::Destroy() {
 
 void UniqueBuffer::Create(vk::BufferCreateInfo& buffer_ci, MemoryType mem_type,
                           VmaAllocationInfo* out_alloc_info) {
+#ifdef __APPLE__
+    ASSERT_MSG(mem_type != MemoryType::Sparse && mem_type != MemoryType::ImportedHost,
+               "macOS guest buffers require the non-sparse host import path");
+#endif
     const bool with_bda = bool(buffer_ci.usage & vk::BufferUsageFlagBits::eShaderDeviceAddress);
     if (mem_type != MemoryType::Sparse) {
         const VmaAllocationCreateFlags bda_flag =
@@ -120,6 +144,73 @@ void UniqueBuffer::Create(vk::BufferCreateInfo& buffer_ci, MemoryType mem_type,
     }
 }
 
+#ifdef __APPLE__
+void UniqueBuffer::ImportHost(vk::PhysicalDevice physical, vk::BufferCreateInfo info, void* pointer) {
+    const auto props = physical.getProperties2<vk::PhysicalDeviceProperties2,
+        vk::PhysicalDeviceExternalMemoryHostPropertiesEXT>();
+    const u64 alignment = props.get<vk::PhysicalDeviceExternalMemoryHostPropertiesEXT>()
+                              .minImportedHostPointerAlignment;
+    ASSERT_MSG(info.size && info.size % alignment == 0 &&
+                   reinterpret_cast<uintptr_t>(pointer) % alignment == 0,
+               "macOS guest host import {:#x}+{:#x} violates alignment {}",
+               reinterpret_cast<uintptr_t>(pointer), info.size, alignment);
+    mach_vm_address_t alias = 0;
+    vm_prot_t current = 0, maximum = 0;
+    auto result = mach_vm_remap(mach_task_self(), &alias, info.size, alignment - 1, VM_FLAGS_ANYWHERE,
+        mach_task_self(), reinterpret_cast<uintptr_t>(pointer), FALSE, &current, &maximum, VM_INHERIT_NONE);
+    ASSERT_MSG(result == KERN_SUCCESS,
+               "macOS GPU host import alias for {:#x}+{:#x} failed: {}",
+               reinterpret_cast<uintptr_t>(pointer), info.size, result);
+    imported_host_alias = alias;
+    imported_host_size = info.size;
+    result = mach_vm_protect(mach_task_self(), alias, info.size, FALSE, VM_PROT_READ | VM_PROT_WRITE);
+    ASSERT_MSG(result == KERN_SUCCESS,
+               "macOS GPU host import requires a writable backing alias: guest={:#x}, max_prot={}, error={}",
+               reinterpret_cast<uintptr_t>(pointer), maximum, result);
+    pointer = reinterpret_cast<void*>(alias);
+    const vk::ExternalMemoryBufferCreateInfo external{
+        .handleTypes = vk::ExternalMemoryHandleTypeFlagBits::eHostAllocationEXT,
+    };
+    info.pNext = &external;
+    info.flags = {};
+    buffer = Vulkan::Check(device.createBuffer(info));
+    const auto requirements = device.getBufferMemoryRequirements(buffer);
+    ASSERT_MSG(requirements.size <= info.size,
+               "macOS host import memory requirement {:#x} exceeds live guest span {:#x}",
+               requirements.size, info.size);
+    const auto host = Vulkan::Check(device.getMemoryHostPointerPropertiesEXT(
+        vk::ExternalMemoryHandleTypeFlagBits::eHostAllocationEXT, pointer));
+    const auto memory = physical.getMemoryProperties();
+    const auto wanted = vk::MemoryPropertyFlagBits::eDeviceLocal |
+                        vk::MemoryPropertyFlagBits::eHostVisible |
+                        vk::MemoryPropertyFlagBits::eHostCoherent;
+    u32 type = memory.memoryTypeCount;
+    for (u32 index = 0; index < memory.memoryTypeCount; ++index) {
+        if ((requirements.memoryTypeBits & host.memoryTypeBits & (1u << index)) &&
+            (memory.memoryTypes[index].propertyFlags & wanted) == wanted) {
+            type = index;
+            break;
+        }
+    }
+    ASSERT_MSG(type < memory.memoryTypeCount,
+               "macOS guest host import requires coherent device-local host-visible memory");
+    const vk::MemoryAllocateFlagsInfo flags{
+        .flags = vk::MemoryAllocateFlagBits::eDeviceAddress,
+    };
+    const vk::ImportMemoryHostPointerInfoEXT import{
+        .pNext = &flags, .handleType = vk::ExternalMemoryHandleTypeFlagBits::eHostAllocationEXT,
+        .pHostPointer = pointer,
+    };
+    imported_memory = Vulkan::Check(device.allocateMemory(vk::MemoryAllocateInfo{
+        .pNext = &import, .allocationSize = requirements.size, .memoryTypeIndex = type,
+    }));
+    Vulkan::Check(device.bindBufferMemory(buffer, imported_memory, 0));
+    bda_addr = device.getBufferAddress(vk::BufferDeviceAddressInfo{.buffer = buffer});
+    ASSERT_MSG(bda_addr, "macOS guest host import {:#x}+{:#x} has no buffer device address",
+               reinterpret_cast<uintptr_t>(pointer), info.size);
+}
+#endif
+
 Buffer::Buffer(const Vulkan::Instance& instance, VAddr cpu_addr_, u64 size_bytes_,
                MemoryType mem_type_, std::string_view debug_name)
     : cpu_addr{cpu_addr_}, size_bytes{size_bytes_}, mem_type{mem_type_},
@@ -131,7 +222,17 @@ Buffer::Buffer(const Vulkan::Instance& instance, VAddr cpu_addr_, u64 size_bytes
         .sharingMode = vk::SharingMode::eExclusive,
     };
     VmaAllocationInfo alloc_info{};
-    buffer.Create(buffer_ci, mem_type, &alloc_info);
+#ifdef __APPLE__
+    if (mem_type == MemoryType::ImportedHost) {
+        buffer.ImportHost(instance.GetPhysicalDevice(), buffer_ci,
+                          reinterpret_cast<void*>(cpu_addr));
+        mapped_data = {reinterpret_cast<u8*>(cpu_addr), size_bytes};
+        is_coherent = true;
+    } else
+#endif
+    {
+        buffer.Create(buffer_ci, mem_type, &alloc_info);
+    }
 
     const auto device = instance.GetDevice();
     if (!debug_name.empty()) {
@@ -140,7 +241,11 @@ Buffer::Buffer(const Vulkan::Instance& instance, VAddr cpu_addr_, u64 size_bytes
         Vulkan::SetObjectName(device, Handle(), "Buffer {:#x}:{:#x}", cpu_addr, size_bytes);
     }
 
-    if (mem_type != MemoryType::Sparse) {
+    if (mem_type != MemoryType::Sparse
+#ifdef __APPLE__
+        && mem_type != MemoryType::ImportedHost
+#endif
+    ) {
         VkMemoryPropertyFlags property_flags{};
         vmaGetAllocationMemoryProperties(instance.GetAllocator(), buffer.allocation,
                                          &property_flags);
