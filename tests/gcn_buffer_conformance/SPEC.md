@@ -85,11 +85,12 @@ ignored").
 |---|---|---|---|
 | WRAP32 | index, offset and buffer_offset are exact integers (the final address is 40/48-bit) | 32-bit wrap of every intermediate | the ISA never states their width |
 | SOFF_SUM | raw: `buffer_offset >= (u32)(num_records - sgpr_offset)` | `buffer_offset + sgpr_offset >= num_records` | they differ when sgpr_offset > num_records (the literal 32-bit subtraction wraps to "huge") |
-| END_WHOLE | each unit is checked at its start byte only | a unit whose touched bytes run past the end is out of range | §8.1.5.3 shows only the start comparison; it doesn't say whether straddling bytes are masked |
+| END_WHOLE | each unit is checked at its start byte only | a unit whose touched bytes run past the end of the buffer (num_records bytes, or stride*num_records) is out of range | §8.1.5.3 shows only the start comparison; it doesn't say whether straddling bytes are masked |
 | SMEM_GE | scalar, stride≠0: clamp if `offset > stride*num_records` | `>=` | `>` admits one dword past the end, which may be a typo |
 | SMEM_ZERO | an out-of-range scalar dword leaves SDST unwritten | it writes 0 | §7.4 says "not performed"; drivers often describe zero |
 | FMT_SEL | out-of-range format load returns 0 in every component | dst_sel constants (SEL_1) still apply to the zero data | "return 0" vs the later dst_sel stage |
 | SHORT_ALIGN | 16-bit accesses use the exact byte address | the address LSB is ignored for 16-bit accesses | §8.1.6 only covers Dword or larger; misaligned shorts are not described |
+| SEL1_FLOAT | dst_sel ONE is 1 in the number format (integer 1 for UINT; "integer formats are returned as integers", §8.1.3) | ONE is 1.0f for every format | Table 8.5 only says "1=1" |
 | MTBUF_BOUND | resource dfmt INVALID makes TBUFFER_* unbound too | TBUFFER_* uses the instruction format and accesses normally | the NOTE is written for "derived" formats |
 
 A result is **STRICT PASS** when every reading agrees and the implementation matches. It is

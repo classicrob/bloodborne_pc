@@ -8,6 +8,7 @@ namespace GcnAsm {
 
 constexpr uint32_t VCC_LO = 106, VCC_HI = 107, EXEC_LO = 126, LITERAL = 255;
 constexpr uint32_t Inline(uint32_t value) { return 128 + value; } // 0..64
+constexpr uint32_t InlineNeg1 = 193;
 constexpr uint32_t Vgpr(uint32_t n) { return 256 + n; }
 
 struct Code {
@@ -26,6 +27,18 @@ struct Code {
     void SWaitcntAll() { Sopp(12, 0); }
     void SEndpgm() { Sopp(1, 0); }
 
+    void Vop2(uint32_t op, uint32_t vdst, uint32_t vsrc1, uint32_t src0) {
+        words.push_back((op << 25) | (vdst << 17) | (vsrc1 << 9) | src0);
+    }
+    void Vop1(uint32_t op, uint32_t vdst, uint32_t src0) {
+        words.push_back(0x7E000000u | (vdst << 17) | (op << 9) | src0);
+    }
+    // V_READLANE_B32 (VOP2 1): sdst = SGPR, lane select = SGPR (vsrc1 field).
+    void VReadlane(uint32_t sdst, uint32_t vgpr, uint32_t lane_sgpr) { Vop2(1, sdst, lane_sgpr, Vgpr(vgpr)); }
+    void VReadfirstlane(uint32_t sdst, uint32_t vgpr) { Vop1(2, sdst, Vgpr(vgpr)); }
+    void VMbcnt(bool hi, uint32_t vdst, uint32_t src0, uint32_t vsrc1) { Vop2(hi ? 36 : 35, vdst, vsrc1, src0); }
+    void VCndmask(uint32_t vdst, uint32_t src0, uint32_t vsrc1) { Vop2(0, vdst, vsrc1, src0); }
+    void SBcnt1B64(uint32_t sdst, uint32_t ssrc0) { Sop1(16, sdst, ssrc0); }
     void VMov(uint32_t vdst, uint32_t src0) { words.push_back(0x7E000000u | (vdst << 17) | (1u << 9) | src0); }
     void VMovLiteral(uint32_t vdst, uint32_t value) {
         VMov(vdst, LITERAL);
