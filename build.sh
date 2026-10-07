@@ -153,6 +153,7 @@ if [[ ${1:-} == --test ]]; then
         mkdir -p out/mac-inventory
         out/gpu/buffer-dead-resources-test
         out/gpu/host-import-arena-test
+        BB_GPU_BUILD="$PWD/out/gpu" sh tests/macos_float_modes/production.sh
         "$CC" "${platform_flags[@]}" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread -Isrc \
             tests/test_compat_mac.c src/compat_mac.c -o out/compat-mac-test
         sign_darwin out/compat-mac-test
