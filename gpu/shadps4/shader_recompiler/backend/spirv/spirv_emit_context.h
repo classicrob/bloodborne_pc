@@ -4,6 +4,7 @@
 #pragma once
 
 #include <array>
+#include <optional>
 #include <unordered_map>
 #include <sirit/sirit.h>
 
@@ -11,6 +12,10 @@
 #include "shader_recompiler/info.h"
 #include "shader_recompiler/ir/value.h"
 #include "shader_recompiler/profile.h"
+
+namespace Shader::IR {
+struct Program;
+}
 
 namespace Shader::Backend::SPIRV {
 
@@ -45,6 +50,7 @@ public:
     Id Def(const IR::Value& value);
 
     void DefineBufferProperties();
+    void CollectBufferUsage(const IR::Program& program);
     void DefineAmdPerVertexAttribs();
     void DefineWorkgroupIndex();
 
@@ -450,6 +456,7 @@ public:
     boost::container::small_vector<Id, 4> samplers;
     std::unordered_map<u32, Id> first_to_last_label_map;
 
+    std::optional<std::vector<bool>> live_buffer_accesses;
     size_t flatbuf_index{};
     size_t bda_pagetable_index{};
     size_t fault_buffer_index{};

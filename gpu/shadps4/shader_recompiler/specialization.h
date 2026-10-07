@@ -249,10 +249,13 @@ struct StageSpecialization {
             return false;
         }
 
-        // For VS which only generates geometry and doesn't have any inputs, its start
-        // bindings still may change as they depend on previously processed FS. The check below
-        // handles this case and prevents generation of redundant permutations. This is also safe
-        // for other types of shaders with no bindings.
+        // Validity bits exclude internal descriptors. Apple emulation still declares
+        // those bindings, and push data also depends on preceding stages' offsets.
+        if ((emulate_robust_buffer_access || emulate_null_descriptors) && start != other.start) {
+            return false;
+        }
+
+        // Retain the native resource-free module reuse behavior.
         if (bitset.none() && other.bitset.none()) {
             return true;
         }

@@ -15,7 +15,7 @@ namespace Serialization {
 #ifdef __APPLE__
 static constexpr u32 ShaderBinaryVersion = 12u; // Preserve strict multiply's signed zero on Metal.
 #else
-static constexpr u32 ShaderBinaryVersion = 10u; // Explicit guest buffer bounds and scalar clamp semantics.
+static constexpr u32 ShaderBinaryVersion = 11u; // Live buffer-query hoists and exact internal binding specialization.
 #endif
 static constexpr u32 ShaderMetaVersion = 8u; // bbport: ImageResource::needs_native
 static constexpr u32 PipelineKeyVersion = 8u; // MUBUF format validity and add-thread-ID specialization.
