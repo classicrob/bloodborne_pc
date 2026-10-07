@@ -72,3 +72,48 @@ arch -x86_64 out/macos_spike/scan_x86 out/macos_spike/eboot/code0.bin
 Pass start/end offsets to print a local disassembly. PLT target filters and the
 code-region boundary in this utility are specific to the audited eboot hash.
 Do not reuse those filters for another game or module without updating them.
+
+## Bundled PRX follow-up
+
+The read-only, verified base+v1.09 installation became available later the same
+day. All seven `sce_module/*.prx` files were parsed and their executable segments
+scanned with Zydis and the same all-start SSE4a candidate check. **All seven had
+zero EXTRQ/INSERTQ candidates.** File hashes and segment sizes are recorded in
+`module-audit.json`; no proprietary module bytes are committed.
+
+Only libc imports a mapping API from the searched set. Its PLT stubs are
+`sceKernelMapNamedFlexibleMemory` at 0x350 and `mmap` at 0x4b0. Raw relative-call
+candidates were checked with native LLVM disassembly (no translated execution
+needed):
+
+| libc call offsets | API | Address and flags |
+|---|---|---|
+| 0x23ec0, 0x23ff9, 0x24932 | sceKernelMapNamedFlexibleMemory | Address pointer initialized to zero; flags 0 |
+| 0x52fac, 0x54f25, 0x5536d, 0x578c5, 0x57912 | mmap | Address zero; flags 0x1002 (anonymous/private), no MAP_FIXED |
+| 0x530e1 | mmap | Address zero; flags 2 (private file mapping), no MAP_FIXED |
+
+None of these direct call sites requests a fixed address in the guard. Indirect
+calls and dynamically generated code remain outside this static guarantee.
+
+## First real game runs
+
+With the verified libc and Fios2 linked, the unmodified CPU-only debug run:
+
+- Patched 17,127 guest TCB loads and applied 237,298 relocations.
+- Ran both native module initializers successfully.
+- Created 16 guest threads, including FMOD audio/mixer/stream and GXRenderThread.
+- Allocated 4,812,046,336 bytes of direct memory in the valid low guest arena.
+- Opened two CoreAudio ports and emitted five audio buffers.
+- Stopped explicitly at `sceGnmGetTheTessellationFactorRingBufferBaseAddress`
+  (guest return offset 0x26d3fb9), because `--cpu-only` does not register Gnm.
+
+No ISA/TLS/protection fault occurred in that run. This is initialization evidence,
+not evidence of the game main loop or successful rendering. The team chose not
+to add fake CPU-only graphics behavior: milestone testing proceeds on the real
+GPU path. That path then stopped with exit 23 at the required `nullDescriptor`
+feature check on MoltenVK, before guest module initialization.
+
+A separate local, unmerged capability-bypass artifact was prepared only for
+later blocker discovery. It was not run at the time of this report because
+newly compiled x86_64 processes began stalling before main system-wide. None of
+the results above used that artifact; it has no role in correctness acceptance.
