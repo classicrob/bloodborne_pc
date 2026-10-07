@@ -2,6 +2,7 @@
 #define BB_RUNTIME_H
 #include <stdint.h>
 #include <stddef.h>
+#include <stdlib.h>
 #ifdef _WIN32
 #include "compat_win.h"
 /* No signals on Windows: the exception handler resumes the thread in bb_longjmp
@@ -70,7 +71,17 @@ void runtime_thread_keys_cleanup(void);
 /* Guest-visible errno values are FreeBSD's. */
 int32_t runtime_guest_errno(int host_errno);
 void *runtime_low_map(size_t size, int prot);
-/* Windows: reserves the PS4 user address range as a placeholder (no-op elsewhere). */
+/* Host objects whose addresses enter the guest's 40-bit pointer fields. */
+#ifdef __APPLE__
+void *runtime_guest_malloc(size_t size);
+void *runtime_guest_calloc(size_t count, size_t size);
+void runtime_guest_free(void *pointer);
+#else
+static inline void *runtime_guest_malloc(size_t size) { return malloc(size); }
+static inline void *runtime_guest_calloc(size_t count, size_t size) { return calloc(count,size); }
+static inline void runtime_guest_free(void *pointer) { free(pointer); }
+#endif
+/* Reserve the guest address arena before host libraries allocate their heaps. */
 void runtime_memory_reserve(void);
 uintptr_t runtime_ajm_resolve(const char *name);
 void runtime_ajm_report(void);
