@@ -246,6 +246,7 @@ private:
     EventCV m_video_buffers_cv{};
 
     std::mutex m_state_mutex{};
+    // Stop joins the demuxer; the demuxer alone joins both decoders.
     Kernel::Thread m_demuxer_thread{};
     Kernel::Thread m_video_decoder_thread{};
     Kernel::Thread m_audio_decoder_thread{};
