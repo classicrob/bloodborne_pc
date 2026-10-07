@@ -3,6 +3,9 @@
 
 #include <chrono>
 #include <pthread.h>
+#ifdef __APPLE__
+#include "bb_mac_compat.h"
+#endif
 #ifndef _WIN32
 #include <sys/resource.h>
 #endif
@@ -104,14 +107,14 @@ void Liverpool::ProcessCommands() {
 
 void Liverpool::Process(std::stop_token stoken) {
     Common::SetCurrentThreadName("shadPS4:GpuCommandProcessor");
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__APPLE__)
     if (clockid_t clock; pthread_getcpuclockid(pthread_self(), &clock) == 0) {
         BbStats::gpu_thread_clock.store(static_cast<int>(clock));
     }
 #endif
     gpu_id = std::this_thread::get_id();
-#if defined(__linux__) || defined(_WIN32)
-    gpu_tid = gettid();
+#if defined(__linux__) || defined(_WIN32) || defined(__APPLE__)
+    gpu_tid = static_cast<u32>(gettid());
 #endif
 
     while (!stoken.stop_requested()) {
@@ -1330,7 +1333,13 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
     }
     if (seq != NoSeq && BbStats::enabled) {
         BbStats::submissions.fetch_add(1, std::memory_order_relaxed);
-#ifndef _WIN32 // bbport: per-thread rusage statistics are Linux-only
+#ifdef __APPLE__
+        int64_t user_us = 0, system_us = 0;
+        if (compat_cpu_times(1, &user_us, &system_us) == 0) {
+            BbStats::gpu_user_us.store(static_cast<u64>(user_us), std::memory_order_relaxed);
+            BbStats::gpu_sys_us.store(static_cast<u64>(system_us), std::memory_order_relaxed);
+        }
+#elif !defined(_WIN32) // bbport: per-thread rusage statistics are Linux-only
         if (rusage usage{}; getrusage(RUSAGE_THREAD, &usage) == 0) {
             BbStats::gpu_user_us.store(u64(usage.ru_utime.tv_sec) * 1000000 + usage.ru_utime.tv_usec,
                                        std::memory_order_relaxed);

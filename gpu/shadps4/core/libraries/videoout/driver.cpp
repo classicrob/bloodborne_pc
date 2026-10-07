@@ -347,11 +347,15 @@ void VideoOutDriver::Flip(const Request& req) {
                   user_us = BbStats::gpu_user_us.load(), invol = BbStats::gpu_invol_switches.load(),
                   vol = BbStats::gpu_vol_switches.load();
         u64 gpu_ns = 0;
+#ifdef __APPLE__
+        gpu_ns = (user_us + sys_us) * 1000;
+#else
         if (const int clock = BbStats::gpu_thread_clock.load(); clock != -1) {
             timespec ts{};
             clock_gettime(static_cast<clockid_t>(clock), &ts);
             gpu_ns = u64(ts.tv_sec) * 1000000000ull + u64(ts.tv_nsec);
         }
+#endif
         const u64 images = BbStats::images_registered.load();
         const u64 image_bytes = BbStats::image_upload_bytes.load();
         const u64 buffer_bytes = BbStats::buffer_upload_bytes.load();
