@@ -302,3 +302,15 @@ if (APPLE)
                 $<TARGET_FILE:bbgpu> $<TARGET_FILE:${test_target}> VERBATIM)
     endforeach()
 endif()
+
+if (APPLE)
+    get_property(darwin_targets DIRECTORY PROPERTY BUILDSYSTEM_TARGETS)
+    foreach(darwin_target IN LISTS darwin_targets)
+        get_target_property(darwin_kind ${darwin_target} TYPE)
+        if (darwin_kind STREQUAL "EXECUTABLE" OR darwin_kind STREQUAL "SHARED_LIBRARY")
+            add_custom_command(TARGET ${darwin_target} POST_BUILD
+                COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../packaging/macos/sign.py
+                    $<TARGET_FILE:${darwin_target}> VERBATIM)
+        endif()
+    endforeach()
+endif()

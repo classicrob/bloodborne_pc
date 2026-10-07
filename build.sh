@@ -8,6 +8,11 @@ compat=()
 cmake_platform=()
 ninja_jobs=()
 default_lto=ON
+sign_darwin() {
+    if [[ $(uname -s) == Darwin ]]; then
+        python3 packaging/macos/sign.py "$@"
+    fi
+}
 case $(uname -s) in
 Darwin)
     # Guest code executes natively, so all linked libraries must contain x86_64.
@@ -109,6 +114,7 @@ if ! ninja -C out/gpu "${ninja_jobs[@]}" bbgpu > out/gpu-build.log 2>&1; then
     grep -v '^\[' out/gpu-build.log | tail -40 >&2
     echo 'GPU library build failed (full log: out/gpu-build.log)' >&2; exit 1
 fi
+sign_darwin out/gpu/libbbgpu.dylib
 # $ORIGIN/gpu: packaged copies keep the library next to the binary without patching it.
 gpu=(-Lout/gpu -lbbgpu -Wl,-rpath,'$ORIGIN/gpu' -Wl,-rpath,"$PWD/out/gpu" -rdynamic)
 if [[ $(uname -s) == Darwin ]]; then
@@ -124,6 +130,7 @@ if [[ ! -f out/libatrac9.a || -n $(find third_party/LibAtrac9/C/src -newer out/l
     ar rcs out/libatrac9.a out/atrac9/*.o
 fi
 "$CC" "${platform_flags[@]}" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread "${probe_link_flags[@]}" "${includes[@]}" -I. -Isrc src/probe.c "${runtime[@]}" src/vulkan_smoke.c out/libatrac9.a -lm "${gpu[@]}" "${libraries[@]}" -o out/bb-probe
+sign_darwin out/bb-probe
 echo "Built $PWD/out/bb-probe"
 if [[ $(uname -s) == Darwin ]]; then
     python3 packaging/macos/check-exports.py out/gpu/libbbgpu.dylib out/bb-probe
@@ -134,9 +141,11 @@ if [[ $(uname -s) == Darwin ]]; then
     caps_link=(-Wl,-rpath,@loader_path -Wl,-rpath,"$deps/lib")
 fi
 "$CC" "${platform_flags[@]}" -std=c11 -O2 -Wall -Wextra -Werror tools/gpu_capabilities.c "${includes[@]}" "${libraries[@]}" "${caps_link[@]}" -o out/bb-gpu-capabilities
+sign_darwin out/bb-gpu-capabilities
 if [[ ${1:-} == --test ]]; then
     if [[ $(uname -s) == Darwin ]]; then
         ninja -C out/gpu "${ninja_jobs[@]}" null-descriptor-test upscaler-support-test buffer-bounds-test buffer-dead-resources-test
+        sign_darwin out/gpu/null-descriptor-test out/gpu/upscaler-support-test out/gpu/buffer-bounds-test out/gpu/buffer-dead-resources-test
         out/gpu/null-descriptor-test
         out/gpu/upscaler-support-test
         mkdir -p out/macos-buffer-bounds
@@ -145,17 +154,21 @@ if [[ ${1:-} == --test ]]; then
         out/gpu/buffer-dead-resources-test
         "$CC" "${platform_flags[@]}" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread -Isrc \
             tests/test_compat_mac.c src/compat_mac.c -o out/compat-mac-test
+            sign_darwin out/compat-mac-test
         out/compat-mac-test
         "$CC" "${platform_flags[@]}" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread -Isrc \
             tests/test_macos_ui.c src/macos_ui.c -o out/macos-ui-test
+            sign_darwin out/macos-ui-test
         out/macos-ui-test
         "$CC" "${platform_flags[@]}" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread \
             "${includes[@]}" -I. -Isrc tests/test_fault_mac.c "${compat[@]}" \
             -Wl,-dead_strip -o out/fault-mac-test
+            sign_darwin out/fault-mac-test
         out/fault-mac-test
         read -r -a media_flags <<< "$(pkg-config --cflags --libs libavformat libavcodec libavutil)"
         "${CXX:-clang++}" "${platform_flags[@]}" -std=c++23 -O2 -g -Wall -Wextra -Werror \
             -I. tests/test_media_mac.cpp "${media_flags[@]}" "${caps_link[@]}" -o out/media-mac-test
+            sign_darwin out/media-mac-test
         out/media-mac-test
         read -r -a surface_flags <<< "$(pkg-config --cflags --libs vulkan sdl3 fmt)"
         "$CC" "${platform_flags[@]}" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread -Isrc \
@@ -166,6 +179,7 @@ if [[ ${1:-} == --test ]]; then
             gpu/shadps4/video_core/renderer_vulkan/vk_platform.cpp gpu/shim/common/logging/log.cpp \
             gpu/shim/common/assert.cpp gpu/shadps4/common/path_util.cpp out/macos-ui-surface.o \
             "${surface_flags[@]}" "${caps_link[@]}" -o out/macos-surface-test
+            sign_darwin out/macos-surface-test
         out/macos-surface-test
         sh tests/test_memory_macos.sh
         sh tests/test_memory_lifetime_macos.sh
@@ -176,19 +190,24 @@ if [[ ${1:-} == --test ]]; then
         python3 tests/test_restart_macos.py
     fi
     "$CC" "${platform_flags[@]}" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread "${includes[@]}" -I. -Isrc tests/test_pad.c "${libraries[@]}" "${caps_link[@]}" -o out/pad-test
+    sign_darwin out/pad-test
     out/pad-test
     "$CC" "${platform_flags[@]}" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread "${includes[@]}" -I. -Isrc tests/test_runtime.c "${runtime[@]}" out/libatrac9.a -lm "${gpu[@]}" "${libraries[@]}" -o out/runtime-test
+    sign_darwin out/runtime-test
     if [[ $(uname -s) == Darwin ]]; then
         python3 packaging/macos/check-exports.py out/gpu/libbbgpu.dylib out/runtime-test
     fi
     out/runtime-test
     "$CC" "${platform_flags[@]}" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread -Isrc tests/test_file_mods.c -o out/file-mods-test
+    sign_darwin out/file-mods-test
     out/file-mods-test
     "$CC" "${platform_flags[@]}" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread "${includes[@]}" -I. -Isrc tests/test_sema.c "${runtime[@]}" out/libatrac9.a -lm "${gpu[@]}" "${libraries[@]}" -o out/sema-test
+    sign_darwin out/sema-test
     if [[ $(uname -s) == Darwin ]]; then
         python3 packaging/macos/check-exports.py out/gpu/libbbgpu.dylib out/sema-test
     fi
     out/sema-test
     "$CC" "${platform_flags[@]}" -std=c11 -D_GNU_SOURCE -O2 -g -Wall -Wextra -Werror -I. -Isrc tests/test_content.c src/runtime_content.c -o out/content-test
+    sign_darwin out/content-test
     out/content-test
 fi
