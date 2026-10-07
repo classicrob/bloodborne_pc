@@ -128,6 +128,7 @@ struct Job {
     u64 base_delta = 0; // V# base = slot base + BaseInArena + base_delta (unless zero_sharp)
     bool zero_sharp = false;
     u32 sgpr_soff = 0, smem_sgpr = 0;
+    s32 vertex_offset = 0; // vertex jobs: drawIndexed vertexOffset (lanes hold index + offset)
     std::array<Lane, 64> lanes{};
     bool approved_struct_soff = false, approved_swizzle = false;
     bool isa_invalid = false; // violates an ISA programming rule (e.g. element_size < access size)
@@ -1063,6 +1064,14 @@ void AddVertexCases() {
         for (u32 i = 0; i < vc.v.num_records + 4 && i < 40; ++i) SetLane(j, i, i, 0);
         const u32 big[] = {0x10000000u, 0x7FFFFFC0u, 0xFFFFFF80u, 0x40000000u};
         for (u32 k = 0; k < 4; ++k) SetLane(j, 40 + k, big[k] | (40 + k), 0);
+    }
+    // direct draws with a base vertex: the fetch index is index + vertexOffset
+    for (s32 off : {64, 0x0FFFFFC0}) {
+        Job& j = NewJob("vertex-fetch", fmt, a, 0);
+        j.vertex_offset = off;
+        j.label += " vertexOffset=" + Hex(u32(off));
+        for (u32 i = 0; i < 9; ++i) SetLane(j, i, u32(off) + i, 0);
+        for (u32 i = 0; i < 4 && off == 64; ++i) SetLane(j, 60 + i, u32(off) + 60 + i - 64, 0); // negative-ish range
     }
 }
 
@@ -2278,7 +2287,7 @@ bool RecordDraw(Gpu& g, vk::CommandBuffer cmd, Job& j, const std::vector<vk::Des
     u32* idx = reinterpret_cast<u32*>(g.index.data + u64(j.slot) * 256);
     u32 count = 0;
     for (u32 lane = 0; lane < 64; ++lane) {
-        if (j.lanes[lane].active) idx[count++] = j.lanes[lane].vindex;
+        if (j.lanes[lane].active) idx[count++] = j.lanes[lane].vindex - u32(j.vertex_offset);
     }
     cmd.beginRendering({.renderArea = {.extent = {1, 1}}, .layerCount = 1});
     cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *pipe.pipeline);
@@ -2293,7 +2302,7 @@ bool RecordDraw(Gpu& g, vk::CommandBuffer cmd, Job& j, const std::vector<vk::Des
         }
     }
     cmd.bindIndexBuffer(*g.index.buffer, u64(j.slot) * 256, vk::IndexType::eUint32);
-    cmd.drawIndexed(count, 1, 0, 0, 0);
+    cmd.drawIndexed(count, 1, 0, j.vertex_offset, 0);
     cmd.endRendering();
     return true;
 }
