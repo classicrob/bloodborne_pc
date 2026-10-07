@@ -35,8 +35,7 @@ uses multiplication, avoiding undefined left shifts of negative samples.
 A cross-check with host FFmpeg 7.1.1 accepted the generated RIFF/ATRAC9 stream but
 produced reversed polarity at one-quarter amplitude (within rounding). It was
 therefore not used as an unquestioned oracle; the direct mathematical reference
-matches LibAtrac9. More codec modes and real game streams remain integration
-coverage beyond this synthesized-frame test.
+matches LibAtrac9. The real-stream comparison below checks whether this discrepancy generalizes.
 
 ## Saves and case-sensitive guest paths
 
@@ -57,12 +56,35 @@ matches filenames case-insensitively and uses the original game's spelling in th
 merged view; all 13 `test_mods.py` tests pass. The no-mod test resolves the `/var` to
 `/private/var` host alias before comparing paths.
 
-Validation during the system-wide Rosetta translation outage: strict x86_64 syntax
-checks pass; the full save/file test passes as a native ARM build of the same C
-sources. This does not claim a Rosetta execution pass; that run remains pending.
+Validation: strict x86_64 syntax checks pass, as do the full save/file test under
+Rosetta and a native ARM build of the same C sources. The Rosetta run completed
+after the temporary system-wide translation outage recovered.
 
 `run.sh` changes to its own directory, then defaults `BB_DATA_DIR` to `.`. Thus
 `out/`, `user/`, and `bbport.ini` live next to `run.sh`. `BB_DATA_DIR` relocates all
 three, while `BB_USER_DIR` and `BB_CONFIG` independently override saves and settings.
 Save paths are `user/savedata/<user>/<title>/<save>/`; metadata sits beside the save
 in `<save>.sce_sys/`, and SaveDataMemory in `<title>.memory/memory.dat`.
+
+
+## Real game ATRAC9 comparison
+
+`tests/test_ajm_asset.c` decodes a supplied configuration and frame sequence through
+actual AJM control/run/wait calls. Compile it against the normal LibAtrac9 archive,
+then use `tests/compare_atrac9_asset.py BANK --decoder EXECUTABLE --ffmpeg FFMPEG`.
+The script extracts one local FSB5 stream into `out/`, wraps identical encoded bytes
+in RIFF for FFmpeg, and reports PCM differences. Its FSB5 field layout follows the
+[vgmstream parser](https://github.com/vgmstream/vgmstream/blob/master/src/meta/fsb5.c).
+It supports single-layer ATRAC9 and retains decoder priming/padding samples for an
+identical comparison. No game bytes or decoded audio are committed.
+
+Measured v1.09 EU asset: `dvdroot_ps4/sound/sprj_c1212.fsb`, stream 0; bank SHA256
+`7b3f701463b12fb235b7eb53a80794ef7e145e4531af061e924d10e2aa163ecb`.
+Configuration `fe7004f0`, mono 48 kHz, 160-byte superframes with four 256-sample
+frames each. The 55 superframes decode to 56,320 PCM samples (FSB nominal length
+55,296). Actual AJM under Rosetta and native ARM emit byte-identical S16 PCM.
+FFmpeg 7.1.1 emits exactly the negation: fitted AJM/FFmpeg gain -1.0, residual RMS
+0.0, maximum direct difference 5,280. Thus the synthesized stream's quarter-scale
+difference does not generalize to this real stream. The polarity disagreement is a
+platform-independent decoder reference question; this result does not establish
+which decoder matches the console. No decoder scaling or sign change was made.
