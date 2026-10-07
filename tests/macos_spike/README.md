@@ -83,3 +83,10 @@ concurrent key initialization, the nine-byte rewrite, executable segment bounds,
 main/host/guest pthread isolation, copied and zeroed static TLS, 8192-byte TLS
 alignment, and low addresses for TCB, DTV, errno, handles, attributes and guest
 stack. This is SDK-only and does not link or build the GPU library.
+
+`tests/macos_spike/test_hle_stack.sh` exercises the actual C++ HLE thread adapter
+with the real C runtime and Mach allocator. It checks low callback stack/TLS
+addresses, native-stack restoration, pooled stack reuse, concurrent workers,
+stop/join and self-detach semantics, and a child process whose callback exception
+must fail loudly. The adapter catches exceptions on the low stack before they
+could unwind across the assembly stack bridge. No GPU library build is needed.

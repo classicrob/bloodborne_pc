@@ -181,6 +181,45 @@ void runtime_thread_attach_main(void) {
     GuestThread *t=runtime_thread_current();
     snprintf(t->name,sizeof(t->name),"main");
 }
+#ifdef __APPLE__
+/* HLE workers retain their native pthread identity, but all code that may call
+ * the guest runs on a low stack. Reclaim only after returning to the native
+ * stack; this also handles workers that detach themselves before returning. */
+#define HLE_STACK_BYTES (8*1024*1024)
+#define HLE_STACK_GUARD 16384
+static pthread_mutex_t hle_stack_lock=PTHREAD_MUTEX_INITIALIZER;
+typedef struct HleStack { unsigned char *base; struct HleStack *next; } HleStack;
+static HleStack *hle_stacks;
+typedef struct HleCall { void (*entry)(void *); void *arg; } HleCall;
+void bb_macos_call_on_stack(void (*entry)(void *),void *arg,void *top);
+__asm__(".text\n.globl _bb_macos_call_on_stack\n_bb_macos_call_on_stack:\n"
+        " push %rbp\n mov %rsp,%rbp\n mov %rdx,%rsp\n and $-16,%rsp\n"
+        " mov %rdi,%rax\n mov %rsi,%rdi\n call *%rax\n"
+        " mov %rbp,%rsp\n pop %rbp\n ret\n");
+static void hle_low_entry(void *arg) {
+    HleCall *call=arg;
+    runtime_thread_attach_host("bb:hle");
+    call->entry(call->arg);
+}
+void runtime_thread_run_host(void (*entry)(void *),void *arg) {
+    pthread_mutex_lock(&hle_stack_lock);
+    HleStack *stack=hle_stacks;
+    if (stack) hle_stacks=stack->next;
+    pthread_mutex_unlock(&hle_stack_lock);
+    if (!stack) {
+        stack=malloc(sizeof(*stack));
+        if (stack) stack->base=runtime_low_map(HLE_STACK_BYTES+HLE_STACK_GUARD,PROT_READ|PROT_WRITE);
+        if (!stack || !stack->base || mprotect(stack->base,HLE_STACK_GUARD,PROT_NONE)) {
+            fputs("STOP: cannot allocate/protect low HLE callback stack\n",stderr); abort();
+        }
+    }
+    HleCall call={entry,arg};
+    bb_macos_call_on_stack(hle_low_entry,&call,stack->base+HLE_STACK_GUARD+HLE_STACK_BYTES);
+    pthread_mutex_lock(&hle_stack_lock);
+    stack->next=hle_stacks; hle_stacks=stack;
+    pthread_mutex_unlock(&hle_stack_lock);
+}
+#endif
 static GuestThread *find_thread(void *handle) {
     GuestThread *found=NULL;
     pthread_mutex_lock(&lock);
