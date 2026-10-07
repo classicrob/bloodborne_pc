@@ -57,7 +57,19 @@ all-or-nothing, with return; specialization reuse across num_records and add_tid
 semantics (group `atomic-semantics`, not a bounds property). Group `wave64`: GCN 64-lane wave
 semantics on 32-wide Apple subgroups (lane id via v_mbcnt, VOPC ballot read as VCC/s_mov_b64/
 s_bcnt1, v_mbcnt over a mask, v_cndmask, v_readlane with constant/SGPR lanes 0..63,
-v_readfirstlane, exec read as a value and s_bcnt1 exec under saveexec).
+v_readfirstlane, exec read as a value and s_bcnt1 exec under saveexec). Group `vertex-fetch`: a
+vertex shader calling a fetch shader (s_swappc_b64; V# via s_load_dwordx4 from a table pointer;
+BUFFER/TBUFFER_LOAD_FORMAT_XYZW idxen) in an indexed draw whose indices run past num_records and
+up to 0xFFFFFF80+, with rasterization discarded. Vertex input is mirrored from
+GraphicsPipeline::GetVertexInputs/ResolveVertexBuffers (dynamic vertex input when available), or
+none when the tree pulls vertices in the shader (`Profile::emulate_vertex_fetch`). Group `srt`: V#
+and a constant read through an extended-user-data pointer. Groups `stage-compile` and
+`dead-access`: fragment/vertex shaders whose only buffer access is s_buffer_load, live or dead,
+plus a compute load whose result is never used (compile-only; an abort is a FAIL).
+
+`--compile-only FILE --stage cs|vs|fs [--ud v0,v1,...] [--fs-export N]` runs one real dumped shader
+through the recompiler and spirv-val, without Vulkan. `--disasm FILE` lists its wave-level
+instructions.
 
 ## Build and run (x86_64 under Rosetta; at most one helper child at a time)
 ```sh

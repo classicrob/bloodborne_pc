@@ -51,6 +51,20 @@ struct Code {
         words.push_back(0x7C000000u | (197u << 17) | (vsrc1 << 9) | src0);
     }
 
+    // EXP: target 12 = pos0; en = component mask; done = last export.
+    void Exp(uint32_t target, uint32_t en, bool done, uint32_t v0, uint32_t v1, uint32_t v2, uint32_t v3,
+             bool vm = false) {
+        words.push_back(0xF8000000u | (vm ? 1u << 12 : 0) | (done ? 1u << 11 : 0) | (target << 4) | en);
+        words.push_back((v3 << 24) | (v2 << 16) | (v1 << 8) | v0);
+    }
+    void SSwappcB64(uint32_t sdst, uint32_t ssrc0) { Sop1(33, sdst, ssrc0); }
+    void SSetpcB64(uint32_t ssrc0) { Sop1(32, 0, ssrc0); }
+    void SLoadDword(uint32_t sdst, uint32_t sbase, uint32_t dword_offset) {
+        words.push_back(0xC0000000u | (0u << 22) | (sdst << 15) | ((sbase >> 1) << 9) | (1u << 8) | dword_offset);
+    }
+    void SLoadDwordx4(uint32_t sdst, uint32_t sbase, uint32_t dword_offset) {
+        words.push_back(0xC0000000u | (2u << 22) | (sdst << 15) | ((sbase >> 1) << 9) | (1u << 8) | dword_offset);
+    }
     // SMRD: sbase is the first SGPR of the V# (multiple of 2; the field drops the LSB).
     void SBufferLoad(uint32_t count, uint32_t sdst, uint32_t sbase, bool imm, uint32_t offset) {
         uint32_t op = 8;
