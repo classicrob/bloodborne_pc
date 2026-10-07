@@ -9,6 +9,7 @@
 #include <mach/mach_vm.h>
 #include <sys/sysctl.h>
 
+#ifndef BB_TLS_REAL_MEMORY
 static pthread_mutex_t alloc_lock=PTHREAD_MUTEX_INITIALIZER;
 static uintptr_t next_low=UINT64_C(0x800000000);
 static int fail_after=-1;
@@ -28,6 +29,7 @@ void *runtime_guest_calloc(size_t n,size_t size) {
     return runtime_low_map(n*size,PROT_READ|PROT_WRITE);
 }
 void runtime_guest_free(void *p) { (void)p; }
+#endif
 void runtime_thread_keys_cleanup(void) {}
 
 static uint32_t offsets[4];
@@ -93,12 +95,14 @@ int main(void) {
     GuestThread *thread=NULL; void *result=NULL;
     assert(!guest_thread_create(&thread,&attr,guest_worker,(void *)0x1234,"low TLS test"));
     assert(!thread_join(thread,&result) && result==(void *)0x1234);
+#ifndef BB_TLS_REAL_MEMORY
     /* Inject failure after the guest record allocation, at the stack allocation. */
     fail_after=1;
     GuestThread *failed=NULL;
     assert(guest_thread_create(&failed,&attr,guest_worker,NULL,"no low stack")==ERR(12));
     assert(failed==NULL);
     fail_after=-1;
+#endif
     assert(!attr_destroy(&attr) && !attr);
     puts("macOS runtime TLS: concurrent key init, loader rewrite, main/host/guest isolation, low TCB/DTV/errno/handles/stack, 8192-byte alignment passed");
     return 0;

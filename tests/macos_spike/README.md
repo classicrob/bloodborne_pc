@@ -72,3 +72,14 @@ gates AVX on CPUID and OS extended-state support. With this spike's hidden bits,
 normal detection should choose older implementations. Do not force global AVX
 flags from these few instruction probes; execution and signal-state preservation
 have not been tested across the full instruction family.
+
+## Runtime integration regression
+
+`tests/macos_spike/test_tls_runtime.sh` tests the actual `runtime_thread.c` and
+`probe.c` TLS rewrite under Rosetta. It runs once with an isolated low allocator
+fixture (including injected stack-allocation failure), then with the actual
+`runtime_memory.c` Mach backend and reusable guest object allocator. Both verify
+concurrent key initialization, the nine-byte rewrite, executable segment bounds,
+main/host/guest pthread isolation, copied and zeroed static TLS, 8192-byte TLS
+alignment, and low addresses for TCB, DTV, errno, handles, attributes and guest
+stack. This is SDK-only and does not link or build the GPU library.
