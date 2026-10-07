@@ -26,6 +26,17 @@ asm(".section .rdata,\"dr\"\n"
     ".global bb_font_ttf_end\n"
     "bb_font_ttf_end:\n"
     ".text\n");
+#elif defined(__APPLE__)
+asm(".section __TEXT,__const\n"
+    ".balign 16\n"
+    ".private_extern _bb_font_ttf\n"
+    ".global _bb_font_ttf\n"
+    "_bb_font_ttf:\n"
+    ".incbin \"" BB_FONT_PATH "\"\n"
+    ".private_extern _bb_font_ttf_end\n"
+    ".global _bb_font_ttf_end\n"
+    "_bb_font_ttf_end:\n"
+    ".text\n");
 #else
 asm(".section .rodata\n"
     ".balign 16\n"
