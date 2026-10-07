@@ -248,8 +248,13 @@ void EmitContext::DefineBufferProperties() {
             }
         }
         for (u32 handle = 0; handle < buffers.size(); ++handle) {
-            if (buffers[handle].buffer_type == BufferType::Guest)
+            const auto& desc = info.buffers[handle];
+            // Discovery retains descriptors whose accesses were eliminated later. A live
+            // dynamic count creates the flat buffer during shader-info collection.
+            if (buffers[handle].buffer_type == BufferType::Guest &&
+                (!(desc.sharp_fetch.load_mask & 4) || info.has_readconst)) {
                 buffers[handle].num_records = BufferNumRecords(handle);
+            }
         }
     }
     if (!profile.needs_buffer_offsets) {
