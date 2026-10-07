@@ -316,15 +316,26 @@ static void watchdog(int sig, siginfo_t *info, void *context) {
         for (mach_msg_type_number_t i=0;i<count;++i) {
             thread_identifier_info_data_t id;
             mach_msg_type_number_t id_count=THREAD_IDENTIFIER_INFO_COUNT;
-            if (thread_info(threads[i],THREAD_IDENTIFIER_INFO,(thread_info_t)&id,&id_count)==KERN_SUCCESS && id.thread_id!=self) {
+            kern_return_t id_result=thread_info(threads[i],THREAD_IDENTIFIER_INFO,(thread_info_t)&id,&id_count);
+            if (id_result==KERN_SUCCESS && id.thread_id!=self) {
                 x86_thread_state64_t state;
                 mach_msg_type_number_t state_count=x86_THREAD_STATE64_COUNT;
                 if (thread_get_state(threads[i],x86_THREAD_STATE64,(thread_state_t)&state,&state_count)==KERN_SUCCESS)
                     dump_registers(state.__rip,state.__rbp,state.__rdi,id.thread_id);
+                else {
+                    const char error[]="STOP: watchdog Darwin thread_get_state failed\n";
+                    ssize_t written_=write(2,error,sizeof(error)-1); (void)written_;
+                }
+            } else if (id_result!=KERN_SUCCESS) {
+                const char error[]="STOP: watchdog Darwin thread_info failed\n";
+                ssize_t written_=write(2,error,sizeof(error)-1); (void)written_;
             }
             mach_port_deallocate(mach_task_self(),threads[i]);
         }
         vm_deallocate(mach_task_self(),(vm_address_t)threads,count*sizeof(*threads));
+    } else {
+        const char error[]="STOP: watchdog Darwin task_threads failed\n";
+        ssize_t written_=write(2,error,sizeof(error)-1); (void)written_;
     }
 #else
     int dir=open("/proc/self/task",O_RDONLY|O_DIRECTORY);

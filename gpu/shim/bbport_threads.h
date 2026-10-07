@@ -13,6 +13,8 @@
 #elif defined(__APPLE__)
 #include "bb_mac_compat.h"
 #include <pthread/qos.h>
+#include <cstdio>
+#include <cstdlib>
 #else
 #include <sched.h>
 #include <sys/resource.h>
@@ -36,11 +38,14 @@ inline void MakeBackground() {
 }
 #elif defined(__APPLE__)
 inline unsigned Available() {
-    return std::max(1u, std::thread::hardware_concurrency());
+    unsigned count = std::thread::hardware_concurrency();
+    if (!count) { std::fprintf(stderr, "STOP: Darwin hardware thread count unavailable\n"); std::abort(); }
+    return count;
 }
 
 inline void MakeBackground() {
-    pthread_set_qos_class_self_np(QOS_CLASS_BACKGROUND, 0);
+    int error = pthread_set_qos_class_self_np(QOS_CLASS_BACKGROUND, 0);
+    if (error) { std::fprintf(stderr, "STOP: Darwin background thread QoS failed (%d)\n", error); std::abort(); }
 }
 #else
 

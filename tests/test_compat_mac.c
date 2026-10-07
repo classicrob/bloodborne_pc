@@ -4,6 +4,7 @@
 #include <errno.h>
 #include <stdio.h>
 #include <string.h>
+#include <stdatomic.h>
 
 static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_rwlock_t rwlock = PTHREAD_RWLOCK_INITIALIZER;
@@ -25,6 +26,27 @@ static void *contended(void *unused) {
     assert(pthread_rwlock_timedwrlock(&rwlock, &end) == ETIMEDOUT);
     assert(compat_thread_id() != 0);
     return NULL;
+}
+static atomic_int cpu_ready, cpu_stop;
+static void *cpu_worker(void *unused) {
+    (void)unused;
+    atomic_store(&cpu_ready, 1);
+    while (!atomic_load(&cpu_stop)) { }
+    return NULL;
+}
+static void test_thread_cpu_clock(void) {
+    pthread_t thread;
+    assert(pthread_create(&thread, NULL, cpu_worker, NULL) == 0);
+    while (!atomic_load(&cpu_ready)) { }
+    int64_t user_before, system_before, user_after, system_after;
+    uint32_t port = pthread_mach_thread_np(thread);
+    assert(compat_thread_cpu_times(port, &user_before, &system_before) == 0);
+    struct timespec delay = {0, 20000000};
+    assert(nanosleep(&delay, NULL) == 0);
+    assert(compat_thread_cpu_times(port, &user_after, &system_after) == 0);
+    assert(user_after + system_after > user_before + system_before);
+    atomic_store(&cpu_stop, 1);
+    assert(pthread_join(thread, NULL) == 0);
 }
 int main(void) {
     pthread_t thread;
@@ -62,6 +84,7 @@ int main(void) {
     int64_t user, kernel;
     assert(compat_cpu_times(0, &user, &kernel) == 0 && user >= 0 && kernel >= 0);
     assert(compat_cpu_times(1, &user, &kernel) == 0 && user >= 0 && kernel >= 0);
+    test_thread_cpu_clock();
     puts("Darwin compatibility tests passed");
     return 0;
 }

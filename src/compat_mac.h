@@ -29,6 +29,7 @@ int compat_clock_nanosleep(clockid_t clock, int flags, const struct timespec *re
                           struct timespec *remaining);
 int compat_random(void *buffer, size_t size);
 int compat_cpu_times(int who, int64_t *user_us, int64_t *kernel_us);
+int compat_thread_cpu_times(uint32_t mach_thread, int64_t *user_us, int64_t *kernel_us);
 uint64_t compat_thread_id(void);
 
 #ifdef __cplusplus

@@ -2,6 +2,7 @@
 #include "compat_mac.h"
 #include <errno.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include <sys/resource.h>
 #include <mach/mach.h>
 
@@ -70,7 +71,8 @@ int compat_random(void *buffer, size_t size) {
 }
 uint64_t compat_thread_id(void) {
     uint64_t id = 0;
-    pthread_threadid_np(NULL, &id);
+    int error = pthread_threadid_np(NULL, &id);
+    if (error || !id) { fprintf(stderr, "STOP: Darwin thread ID query failed (%d)\n", error); abort(); }
     return id;
 }
 int compat_cpu_times(int who, int64_t *user_us, int64_t *kernel_us) {
@@ -81,11 +83,16 @@ int compat_cpu_times(int who, int64_t *user_us, int64_t *kernel_us) {
         *kernel_us = (int64_t)usage.ru_stime.tv_sec * 1000000 + usage.ru_stime.tv_usec;
         return 0;
     }
+    if (who != 1) { errno = EINVAL; return -1; }
+    mach_port_t thread = mach_thread_self();
+    int result = compat_thread_cpu_times(thread, user_us, kernel_us);
+    mach_port_deallocate(mach_task_self(), thread);
+    return result;
+}
+int compat_thread_cpu_times(uint32_t mach_thread, int64_t *user_us, int64_t *kernel_us) {
     thread_basic_info_data_t info;
     mach_msg_type_number_t count = THREAD_BASIC_INFO_COUNT;
-    mach_port_t thread = mach_thread_self();
-    kern_return_t result = thread_info(thread, THREAD_BASIC_INFO, (thread_info_t)&info, &count);
-    mach_port_deallocate(mach_task_self(), thread);
+    kern_return_t result = thread_info(mach_thread, THREAD_BASIC_INFO, (thread_info_t)&info, &count);
     if (result != KERN_SUCCESS) { errno = EIO; return -1; }
     *user_us = (int64_t)info.user_time.seconds * 1000000 + info.user_time.microseconds;
     *kernel_us = (int64_t)info.system_time.seconds * 1000000 + info.system_time.microseconds;

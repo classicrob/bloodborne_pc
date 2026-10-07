@@ -112,6 +112,9 @@ void Liverpool::Process(std::stop_token stoken) {
         BbStats::gpu_thread_clock.store(static_cast<int>(clock));
     }
 #endif
+#ifdef __APPLE__
+    BbStats::gpu_thread_port.store(pthread_mach_thread_np(pthread_self()));
+#endif
     gpu_id = std::this_thread::get_id();
 #if defined(__linux__) || defined(_WIN32) || defined(__APPLE__)
     gpu_tid = static_cast<u32>(gettid());
@@ -1338,6 +1341,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
         if (compat_cpu_times(1, &user_us, &system_us) == 0) {
             BbStats::gpu_user_us.store(static_cast<u64>(user_us), std::memory_order_relaxed);
             BbStats::gpu_sys_us.store(static_cast<u64>(system_us), std::memory_order_relaxed);
+        } else {
+            std::fprintf(stderr, "STOP: Darwin GPU thread CPU accounting failed\n");
+            std::abort();
         }
 #elif !defined(_WIN32) // bbport: per-thread rusage statistics are Linux-only
         if (rusage usage{}; getrusage(RUSAGE_THREAD, &usage) == 0) {

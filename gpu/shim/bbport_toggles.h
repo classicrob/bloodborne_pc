@@ -85,6 +85,9 @@ inline std::atomic<std::uint64_t> images_registered{0};
 inline std::atomic<std::uint64_t> image_upload_bytes{0};
 inline std::atomic<std::uint64_t> buffer_upload_bytes{0};
 inline std::atomic<int> gpu_thread_clock{-1}; ///< clockid_t of the GPU command thread
+#ifdef __APPLE__
+inline std::atomic<std::uint32_t> gpu_thread_port{0}; ///< borrowed pthread Mach thread port
+#endif
 inline std::atomic<std::uint64_t> draws{0}, dispatches{0}, submissions{0};
 /// Frames the GPU command thread has started (display pass), for per-frame diagnostics.
 inline std::atomic<std::uint64_t> gpu_frames{0};

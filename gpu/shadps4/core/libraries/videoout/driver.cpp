@@ -12,6 +12,9 @@
 #endif
 #include "common/assert.h"
 #include "bbport_toggles.h"
+#ifdef __APPLE__
+#include "bb_mac_compat.h"
+#endif
 #include "video_core/renderer_vulkan/vk_frame_capture.h"
 #include "common/debug.h"
 #include "common/thread.h"
@@ -348,7 +351,14 @@ void VideoOutDriver::Flip(const Request& req) {
                   vol = BbStats::gpu_vol_switches.load();
         u64 gpu_ns = 0;
 #ifdef __APPLE__
-        gpu_ns = (user_us + sys_us) * 1000;
+        if (const auto port = BbStats::gpu_thread_port.load()) {
+            int64_t user = 0, system = 0;
+            if (compat_thread_cpu_times(port, &user, &system)) {
+                std::fprintf(stderr, "STOP: Darwin GPU thread CPU clock query failed\n");
+                std::abort();
+            }
+            gpu_ns = static_cast<u64>(user + system) * 1000;
+        }
 #else
         if (const int clock = BbStats::gpu_thread_clock.load(); clock != -1) {
             timespec ts{};
