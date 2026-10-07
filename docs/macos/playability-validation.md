@@ -37,3 +37,32 @@ produced reversed polarity at one-quarter amplitude (within rounding). It was
 therefore not used as an unquestioned oracle; the direct mathematical reference
 matches LibAtrac9. More codec modes and real game streams remain integration
 coverage beyond this synthesized-frame test.
+
+## Saves and case-sensitive guest paths
+
+`tests/test_savedata_macos.sh` exercises the actual save and file implementations:
+create/write/close/reopen, metadata and icon persistence, SaveDataMemory across setup,
+search, read-only mounts (file and metadata writes rejected), error injection for a
+failed metadata write, and recursive deletion with a symlink to an external file.
+`nftw(FTW_DEPTH|FTW_PHYS)` removes the link while preserving its target. Mounted saves
+cannot be deleted. Apple save write/close/delete errors now reach the caller instead
+of reporting success. Linux and Windows error behavior is unchanged.
+
+On this case-insensitive APFS volume, guest lookups now require the exact directory
+entry spelling, matching Linux. Case-only rename works. Creating a second name
+that differs only by case cannot be represented on that volume and aborts with a
+message naming the path; it must never overwrite an existing save accidentally.
+Save mount/delete also reject wrong-case directory names. Mod discovery deliberately
+matches filenames case-insensitively and uses the original game's spelling in the
+merged view; all 13 `test_mods.py` tests pass. The no-mod test resolves the `/var` to
+`/private/var` host alias before comparing paths.
+
+Validation during the system-wide Rosetta translation outage: strict x86_64 syntax
+checks pass; the full save/file test passes as a native ARM build of the same C
+sources. This does not claim a Rosetta execution pass; that run remains pending.
+
+`run.sh` changes to its own directory, then defaults `BB_DATA_DIR` to `.`. Thus
+`out/`, `user/`, and `bbport.ini` live next to `run.sh`. `BB_DATA_DIR` relocates all
+three, while `BB_USER_DIR` and `BB_CONFIG` independently override saves and settings.
+Save paths are `user/savedata/<user>/<title>/<save>/`; metadata sits beside the save
+in `<save>.sce_sys/`, and SaveDataMemory in `<title>.memory/memory.dat`.

@@ -59,6 +59,10 @@ uintptr_t runtime_services_resolve(const char *name);
 void runtime_file_report(void);
 void runtime_file_configure(const char *app0, const char *user);
 int runtime_file_mount(const char *guest, const char *host);
+#ifdef __APPLE__
+int runtime_file_mount_readonly(const char *guest, const char *host);
+int runtime_file_case_check(const char *root, const char *suffix, int creating);
+#endif
 void runtime_file_unmount(const char *guest);
 int runtime_file_translate(const char *guest, char *out, size_t size);
 int64_t runtime_file_open(const char *path, int flags, int mode);

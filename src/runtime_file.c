@@ -48,26 +48,68 @@ _Static_assert(sizeof(GuestStat)==120,"FreeBSD stat layout");
 
 typedef struct { char *names; size_t count, *offsets; unsigned char *types; } Listing;
 typedef struct { int used, host; Listing *dir; size_t position; char path[512]; } File;
-typedef struct { char guest[64]; char host[512]; } Mount;
+typedef struct { char guest[64]; char host[512]; int readonly; } Mount;
 static File files[MAX_FILES];
 static Mount mounts[MAX_MOUNTS];
 static size_t mount_count, opens, reads, writes, missing;
 static uint64_t bytes_read;
 static pthread_mutex_t lock=PTHREAD_MUTEX_INITIALIZER;
 
-int runtime_file_mount(const char *guest,const char *host) {
+static int mount_path(const char *guest,const char *host,int readonly) {
     pthread_mutex_lock(&lock);
     for (size_t i=0;i<mount_count;++i) if (!strcmp(mounts[i].guest,guest)) {
         snprintf(mounts[i].host,sizeof(mounts[i].host),"%s",host);
+        mounts[i].readonly=readonly;
         pthread_mutex_unlock(&lock); return 0;
     }
     if (mount_count==MAX_MOUNTS || strlen(guest)>=64 || strlen(host)>=512) { pthread_mutex_unlock(&lock); return -1; }
     snprintf(mounts[mount_count].guest,64,"%s",guest);
     snprintf(mounts[mount_count].host,512,"%s",host);
+    mounts[mount_count].readonly=readonly;
     ++mount_count;
     pthread_mutex_unlock(&lock);
     return 0;
 }
+int runtime_file_mount(const char *guest,const char *host) { return mount_path(guest,host,0); }
+#ifdef __APPLE__
+int runtime_file_mount_readonly(const char *guest,const char *host) { return mount_path(guest,host,1); }
+/* Match the Linux/PS4 spelling of every component even on case-insensitive
+ * APFS. A distinct-case create cannot be represented there; stop explicitly. */
+int runtime_file_case_check(const char *root,const char *suffix,int creating) {
+    char path[1024];
+    if (snprintf(path,sizeof(path),"%s",root)>=(int)sizeof(path)) return ENAMETOOLONG;
+    while (*suffix) {
+        while (*suffix=='/') ++suffix;
+        if (!*suffix) break;
+        const char *end=strchr(suffix,'/');
+        int final=!end || !end[strspn(end,"/")];
+        size_t length=end ? (size_t)(end-suffix) : strlen(suffix);
+        if (length>NAME_MAX) return ENAMETOOLONG;
+        char component[NAME_MAX+1]; memcpy(component,suffix,length); component[length]=0;
+        DIR *dir=opendir(path);
+        if (!dir) return errno;
+        int found=0;
+        for (struct dirent *entry; (entry=readdir(dir));)
+            if (!strcmp(entry->d_name,component)) { found=1; break; }
+        if (!found) {
+            struct stat st;
+            int alias=!fstatat(dirfd(dir),component,&st,0);
+            closedir(dir);
+            if (creating==1 && final && alias) {
+                fprintf(stderr,"STOP: macOS filesystem cannot create case-distinct path %s/%s on this volume\n",path,component);
+                abort();
+            }
+            return creating && final && (!alias || creating==2) ? 0 : ENOENT;
+        }
+        closedir(dir);
+        size_t used=strlen(path);
+        if (used+length+2>sizeof(path)) return ENAMETOOLONG;
+        path[used++]='/'; memcpy(path+used,component,length+1);
+        suffix=end ? end : suffix+length;
+    }
+    return 0;
+}
+#endif
 void runtime_file_unmount(const char *guest) {
     pthread_mutex_lock(&lock);
     for (size_t i=0;i<mount_count;++i) if (!strcmp(mounts[i].guest,guest)) {
@@ -92,7 +134,7 @@ void runtime_file_configure(const char *app0,const char *user) {
     }
 }
 /* Resolve a guest path to a host path; returns 0 or a host errno. */
-static int translate(const char *guest,char *out,size_t size) {
+static int translate_mode(const char *guest,char *out,size_t size,int creating) {
     if (!guest || !*guest) return ENOENT;
     char buffer[1024];
     if (guest[0]!='/') snprintf(buffer,sizeof(buffer),"/app0/%s",guest);
@@ -109,9 +151,20 @@ static int translate(const char *guest,char *out,size_t size) {
     if (!m) result=ENOENT;
     else if ((size_t)snprintf(out,size,"%s%s",m->host,buffer+best)>=size) result=ENAMETOOLONG;
     pthread_mutex_unlock(&lock);
-    if (result==ENOENT) fprintf(stderr,"Runtime: no mount for guest path %s\n",guest);
+#ifdef __APPLE__
+    if (!result) {
+        /* The configured mount prefix is host-owned; validate only guest components. */
+        size_t prefix=strlen(out)-strlen(buffer+best);
+        char host[1024]; memcpy(host,out,prefix); host[prefix]=0;
+        result=runtime_file_case_check(host,buffer+best,creating);
+    }
+#else
+    (void)creating;
+#endif
+    if (result==ENOENT && !m) fprintf(stderr,"Runtime: no mount for guest path %s\n",guest);
     return result;
 }
+static int translate(const char *guest,char *out,size_t size) { return translate_mode(guest,out,size,0); }
 static int host_flags(int flags) {
     int r;
     switch (flags&3) { case 0: r=O_RDONLY; break; case 1: r=O_WRONLY; break; default: r=O_RDWR; }
@@ -201,6 +254,18 @@ static int audio_trace(void) { static int v=-1; if (v<0) { const char *e=getenv(
 static int game_path(const char *p) {
     if (!p || !*p) return 0;
     if (*p!='/') return 1;
+#ifdef __APPLE__
+    size_t best=0; int readonly=0;
+    pthread_mutex_lock(&lock);
+    for (size_t i=0;i<mount_count;++i) {
+        size_t length=strlen(mounts[i].guest);
+        if (length>best && !strncmp(p,mounts[i].guest,length) && (!p[length] || p[length]=='/')) {
+            best=length; readonly=mounts[i].readonly;
+        }
+    }
+    pthread_mutex_unlock(&lock);
+    if (readonly) return 1;
+#endif
     return (!strncmp(p,"/app0",5) && (!p[5] || p[5]=='/')) ||
            (!strncmp(p,"/hostapp",8) && (!p[8] || p[8]=='/'));
 }
@@ -208,7 +273,7 @@ static int game_path(const char *p) {
 static int64_t do_open(const char *guest,int flags,int mode) {
     if (game_path(guest) && (flags & (3|0x8|0x200|0x400|0x800))) return -EROFS;
     char path[1024];
-    int e=translate(guest,path,sizeof(path));
+    int e=translate_mode(guest,path,sizeof(path),(flags&0x200)!=0);
     if (e) return -e;
 #ifdef _WIN32
     /* Windows cannot open a directory as a CRT descriptor: directories are listings only. */
@@ -402,7 +467,7 @@ static int64_t do_getdents(int fd,char *buffer,uint64_t size,int64_t *basep) {
 static int64_t path_op(const char *guest,int op,int mode) {
     if (game_path(guest)) return -EROFS;
     char path[1024];
-    int e=translate(guest,path,sizeof(path));
+    int e=translate_mode(guest,path,sizeof(path),op==0);
     if (e) return -e;
     int r= op==0 ? mkdir(path,mode ? mode : 0755) : op==1 ? rmdir(path) : unlink(path);
     return r ? -errno : 0;
@@ -411,8 +476,20 @@ static int64_t do_rename(const char *from,const char *to) {
     if (game_path(from) || game_path(to)) return -EROFS;
     char a[1024],b[1024];
     int e=translate(from,a,sizeof(a));
-    if (!e) e=translate(to,b,sizeof(b));
+    if (!e) e=translate_mode(to,b,sizeof(b),2);
     if (e) return -e;
+#ifdef __APPLE__
+    /* A case-only rename of this same inode is representable on APFS. Replacing
+     * a differently spelled, distinct destination would change Linux semantics. */
+    if (translate(to,b,sizeof(b))==ENOENT) {
+        struct stat source,target;
+        if (!lstat(b,&target) && !lstat(a,&source) &&
+            (source.st_dev!=target.st_dev || source.st_ino!=target.st_ino)) {
+            fprintf(stderr,"STOP: macOS filesystem cannot rename to case-distinct path %s on this volume\n",b);
+            abort();
+        }
+    }
+#endif
 #ifdef _WIN32
     /* POSIX rename replaces an existing target; the CRT's fails. */
     return MoveFileExA(a,b,MOVEFILE_REPLACE_EXISTING) ? 0 : -compat_errno_from_win32(GetLastError());
