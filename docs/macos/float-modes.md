@@ -1,16 +1,55 @@
 # GCN2 float modes on Apple
 
 Measured on macOS 27.2 (26B5101f), Apple M4 Max, Rosetta x86_64, the shared
-MoltenVK 1.4.2 (`driverVersion=10402`). This is a research/test unit. It does not
-change the recompiler or authorize continuing past unsupported semantics.
+MoltenVK 1.4.2 (`driverVersion=10402`). This report covers the measured float-mode
+gaps and the production multiply correction. The other mode gaps remain unresolved.
 
-**There is an observable signed-zero bug in the current translation, independent
+**The initial measurement found an observable signed-zero bug, independent
 of the denorm warning.** `NoContraction` multiply becomes an MSL helper using
 `fma(a,b,+0)`, which changes a negative-zero product into positive zero. Keeping
 `SignedZeroInfNanPreserve` enabled or disabling global fast math does not fix it.
-A same-sign-zero FMA addend is a small, tested candidate correction. Removing
+The production correction below uses a same-sign-zero FMA addend. Removing
 `NoContraction` globally is wrong: the test then fuses a separate multiply/add
 and changes its answer.
+
+## Production multiply repair
+
+The Apple profile now enables `repair_mul_signed_zero`. `EmitFPMul32` emits
+`fma(a,b,bitcast_float((bits(a)^bits(b)) & 0x80000000))`, retaining
+`NoContraction`. Actual guest `EmitFPFma32` is unchanged: a guest FMA with an
+explicit positive-zero addend has different zero-sign semantics from multiply.
+The flag defaults off, so Linux/Windows keep their previous emitted operations.
+The Apple shader-binary cache version is bumped to invalidate prior SPIR-V.
+
+Run the production acceptance with a completed shared GPU build:
+
+```sh
+BB_GPU_BUILD=/path/to/completed/out/gpu BB_FLOAT_BENCHMARK=1 \
+    sh tests/macos_float_modes/production.sh
+```
+
+This compiles the actual modified floating-point emitter and a small generator,
+linking the existing GPU library for `EmitContext` and the other production
+emitters; it does not build a second GPU tree. It validates all generated SPIR-V,
+executes the original 50 cases plus 10 overflow/Inf/NaN/FMA-zero cases, and compares
+raw bits (NaNs by classification). The repaired production shader exits **0**;
+its disabled-flag counterpart reproduces the two original zero-sign failures.
+Separate multiply/add still returns zero, fused cancellation returns -2^-46, and
+`fma(-0,1,+0)` still returns positive zero. This acceptance addresses multiply;
+it does not turn the other float-mode research gaps into supported features.
+
+The benchmark uses 65,536 invocations with 128 dependent runtime-operand
+multiplies each (8,388,608 multiplies per dispatch). All 65,536 results match a
+strict CPU multiply chain bit-for-bit. Six sequential runs use baseline/repaired/
+repaired/baseline/baseline/repaired ordering, discard four warmups each, and
+collect 60 GPU timestamp samples per variant. The measured baseline median was
+0.064979 ms (IQR 0.063927–0.065490); repaired median 0.036916 ms
+(IQR 0.036375–0.037333), ratio 0.5681. This is a synthetic workload result, not a
+game FPS claim. SPIR-V contains exactly one XOR and one AND per repaired
+multiply, plus representational bitcasts and one FMA. Raw timing samples are in
+[benchmark-m4-27.2.tsv](../../tests/macos_float_modes/benchmark-m4-27.2.tsv).
+The original strict multiply invokes SPIRV-Cross's `optnone` helper; avoiding
+that helper is a possible reason for the measured improvement, not a separately proven cost attribution.
 
 ## GCN2 contract and the Linux comparison
 
@@ -106,8 +145,8 @@ MoltenVK defaults fast-math configuration to 2, allowing shader controls to
 restrict it; value 0 globally disables it. Both configurations were measured,
 not used as a production fallback. See [MoltenVK 1.4.2 configuration](https://github.com/KhronosGroup/MoltenVK/blob/v1.4.2/Docs/MoltenVK_Configuration_Parameters.md#mvk_config_fast_math_enabled).
 
-`tests/macos_float_modes/run.sh` feeds raw runtime buffer bits into 50 compute
-cases, preventing constant folding, reads raw integer results after explicit
+`tests/macos_float_modes/run.sh` feeds raw runtime buffer bits into the original 50 compute
+cases plus 10 supplemental edge cases, preventing constant folding, reads raw integer results after explicit
 barriers and queue completion, and runs four sequential variants. Unsupported
 DenormPreserve/Flush modes are never requested. This is not a full shader or
 floating-point conformance suite. Exit **2 is expected today**: it reports known
@@ -155,7 +194,7 @@ translation problem, not evidence that the M4 cannot represent negative zero.
 
 ## Correct-or-loud options and cost
 
-1. **Correct strict multiply's zero sign.** A candidate is
+1. **Correct strict multiply's zero sign.** The implemented Apple correction is
    `fma(a,b,bitcast_float((bits(a)^bits(b)) & 0x80000000))`. The addend is a zero
    with the product's sign, so it leaves a nonzero exact product unchanged and
    preserves the intended sign when both terms are zero. This retains one fused
@@ -164,7 +203,8 @@ translation problem, not evidence that the M4 cannot represent negative zero.
    negative underflow, and zero×infinity. All pass. It adds approximately an
    integer XOR and mask per affected multiply; bitcasts are representation
    changes. This is an IR-level cost estimate, not a GPU timing claim. Broader
-   finite/NaN/overflow testing remains required before production use.
+   opcode/mode conformance remains separate from this multiply correction; the
+   production follow-up above also covers finite chains, NaNs and overflow.
 2. **Implement guest modes per opcode.** For the common input/output-flush mode,
    integer exponent/mantissa classification and a signed-zero select can enforce
    flush at the operations that require it. Do not flush loads or pre-GFX9 min/max

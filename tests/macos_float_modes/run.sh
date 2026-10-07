@@ -8,6 +8,8 @@ mkdir -p out/mac-float-modes
 clang -arch x86_64 -std=c11 -O2 -Wall -Wextra -Werror -I"$prefix/include" \
     tests/macos_float_modes/probe.c -L"$prefix/lib" -Wl,-rpath,"$prefix/lib" \
     -lvulkan -o out/mac-float-modes/probe
+codesign --force --sign - out/mac-float-modes/probe
+codesign --verify --strict out/mac-float-modes/probe
 export VK_DRIVER_FILES="$prefix/share/vulkan/icd.d/MoltenVK_icd.json"
 python3 tests/macos_float_modes/variants.py
 result=0

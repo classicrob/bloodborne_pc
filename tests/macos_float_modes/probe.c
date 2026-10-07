@@ -66,9 +66,21 @@ static const Case cases[]={
     {"candidate_fma_negative_denormal",15,0x80000001,0x3f800000,0},
     {"candidate_fma_underflow",15,0x80800000,0x3f000000,0},
     {"candidate_fma_zero_inf",15,0,0x7f800000,0},
+    {"mul_negative_denormal",2,0x80000001,0x3f800000,0},
+    {"mul_negative_finite",2,0xbfc00000,0x40000000,0},
+    {"mul_overflow_positive",2,0x7f7fffff,0x40000000,0},
+    {"mul_overflow_negative",2,0xff7fffff,0x40000000,0},
+    {"mul_negative_inf",2,0x7f800000,0xbf800000,0},
+    {"mul_zero_negative_inf",2,0,0xff800000,0},
+    {"mul_quiet_nan",2,0x7fc12345,0x3f800000,0},
+    {"mul_positive_zeros",2,0,0x3f800000,0},
+    {"mul_double_negative_zero",2,0x80000000,0xbf800000,0},
+    {"fma_negative_zero_positive_addend",3,0x80000000,0x3f800000,0},
 };
 int main(int argc,char **argv) {
-    assert(argc==2); alarm(45); setbuf(stdout,NULL); puts("float modes probe: start");
+    assert(argc==2 || (argc==3 && !strcmp(argv[2],"--benchmark")));
+    const int benchmark=argc==3;
+    alarm(45); setbuf(stdout,NULL); puts("float modes probe: start");
     VkApplicationInfo app={.sType=VK_STRUCTURE_TYPE_APPLICATION_INFO,.pApplicationName="Float modes probe",.apiVersion=VK_API_VERSION_1_3};
     VkInstanceCreateInfo ic={.sType=VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,.pApplicationInfo=&app};
 #ifdef __APPLE__
@@ -91,11 +103,11 @@ int main(int argc,char **argv) {
     VkPhysicalDeviceVulkan12Features f12={.sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
     VkPhysicalDeviceFeatures2 f2={.sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,.pNext=&f12}; vkGetPhysicalDeviceFeatures2(physical,&f2);
     printf("features BDA=%u shaderInt64=%u shaderFloat16=%u shaderFloat64=%u\n",f12.bufferDeviceAddress,f2.features.shaderInt64,f12.shaderFloat16,f2.features.shaderFloat64); assert(f12.bufferDeviceAddress && f2.features.shaderInt64);
-    f12=(VkPhysicalDeviceVulkan12Features){.sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,.bufferDeviceAddress=VK_TRUE};
+    f12=(VkPhysicalDeviceVulkan12Features){.sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,.bufferDeviceAddress=VK_TRUE,.shaderInt8=VK_TRUE};
     VkQueueFamilyProperties families[32]; count=32; vkGetPhysicalDeviceQueueFamilyProperties(physical,&count,families);
     uint32_t family=0; while (family<count && !(families[family].queueFlags&VK_QUEUE_COMPUTE_BIT)) ++family; assert(family<count);
     float priority=1; VkDeviceQueueCreateInfo qi={.sType=VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,.queueFamilyIndex=family,.queueCount=1,.pQueuePriorities=&priority};
-    VkPhysicalDeviceFeatures features={.shaderInt64=VK_TRUE};
+    VkPhysicalDeviceFeatures features={.shaderInt64=VK_TRUE,.shaderInt16=VK_TRUE};
     VkDeviceCreateInfo dc={.sType=VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,.pNext=&f12,.queueCreateInfoCount=1,.pQueueCreateInfos=&qi,
         .pEnabledFeatures=&features};
 #ifdef __APPLE__
@@ -114,7 +126,7 @@ int main(int argc,char **argv) {
     VkComputePipelineCreateInfo pc={.sType=VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,.stage={.sType=VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,.stage=VK_SHADER_STAGE_COMPUTE_BIT,.module=shader,.pName="main"},.layout=layout};
     CHECK(vkCreateComputePipelines(device,VK_NULL_HANDLE,1,&pc,NULL,&pipeline));
 
-    const size_t n=sizeof(cases)/sizeof(*cases), bytes_data=n*8*sizeof(uint32_t);
+    const size_t n=benchmark ? 65536 : sizeof(cases)/sizeof(*cases), bytes_data=n*8*sizeof(uint32_t);
     VkBufferCreateInfo bi={.sType=VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,.size=bytes_data,
         .usage=VK_BUFFER_USAGE_STORAGE_BUFFER_BIT|VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,.sharingMode=VK_SHARING_MODE_EXCLUSIVE};
     VkBuffer buffer; CHECK(vkCreateBuffer(device,&bi,NULL,&buffer));
@@ -128,7 +140,19 @@ int main(int argc,char **argv) {
     VkDeviceMemory memory; CHECK(vkAllocateMemory(device,&mi,NULL,&memory)); CHECK(vkBindBufferMemory(device,buffer,memory,0));
     uint32_t *words; CHECK(vkMapMemory(device,memory,0,req.size,0,(void **)&words));
     memset(words,0,bytes_data);
-    for(size_t i=0;i<n;++i) { words[8*i]=cases[i].op; words[8*i+1]=cases[i].a; words[8*i+2]=cases[i].b; words[8*i+3]=cases[i].c; words[8*i+4]=0xdeadbeef; }
+    for(size_t i=0;i<n;++i) {
+        words[8*i]=benchmark ? 2 : cases[i].op;
+        words[8*i+1]=benchmark ? (0x3f800000u+((i&7)<<19)) | ((i&1)?0x80000000u:0) : cases[i].a;
+        words[8*i+2]=benchmark ? 0x3f800001u | ((i&2)?0x80000000u:0) : cases[i].b;
+        words[8*i+3]=benchmark ? 0 : cases[i].c;
+        words[8*i+4]=0xdeadbeef;
+    }
+    VkQueryPool queries=VK_NULL_HANDLE;
+    if(benchmark) {
+        assert(props.properties.limits.timestampComputeAndGraphics && families[family].timestampValidBits);
+        VkQueryPoolCreateInfo qci={.sType=VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,.queryType=VK_QUERY_TYPE_TIMESTAMP,.queryCount=2};
+        CHECK(vkCreateQueryPool(device,&qci,NULL,&queries));
+    }
     VkBufferDeviceAddressInfo address_info={.sType=VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO,.buffer=buffer};
     uint64_t address=vkGetBufferDeviceAddress(device,&address_info); assert(address);
     VkCommandBufferAllocateInfo cai={.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,.commandPool=commands,.level=VK_COMMAND_BUFFER_LEVEL_PRIMARY,.commandBufferCount=1};
@@ -136,15 +160,40 @@ int main(int argc,char **argv) {
     VkCommandBufferBeginInfo cbi={.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO}; CHECK(vkBeginCommandBuffer(cmd,&cbi));
     VkMemoryBarrier before={.sType=VK_STRUCTURE_TYPE_MEMORY_BARRIER,.srcAccessMask=VK_ACCESS_HOST_WRITE_BIT,.dstAccessMask=VK_ACCESS_SHADER_READ_BIT};
     vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_HOST_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,0,1,&before,0,NULL,0,NULL);
+    if(benchmark) {
+        vkCmdResetQueryPool(cmd,queries,0,2);
+        vkCmdWriteTimestamp(cmd,VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,queries,0);
+    }
     vkCmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_COMPUTE,pipeline);
-    vkCmdPushConstants(cmd,layout,VK_SHADER_STAGE_COMPUTE_BIT,0,8,&address); vkCmdDispatch(cmd,(uint32_t)n,1,1);
+    vkCmdPushConstants(cmd,layout,VK_SHADER_STAGE_COMPUTE_BIT,0,8,&address); vkCmdDispatch(cmd,(uint32_t)n/(benchmark?64:1),1,1);
+    if(benchmark) vkCmdWriteTimestamp(cmd,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,queries,1);
     VkMemoryBarrier after={.sType=VK_STRUCTURE_TYPE_MEMORY_BARRIER,.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT,.dstAccessMask=VK_ACCESS_HOST_READ_BIT};
     vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_HOST_BIT,0,1,&after,0,NULL,0,NULL);
     CHECK(vkEndCommandBuffer(cmd));
     VkSubmitInfo submit={.sType=VK_STRUCTURE_TYPE_SUBMIT_INFO,.commandBufferCount=1,.pCommandBuffers=&cmd};
-    CHECK(vkQueueSubmit(queue,1,&submit,VK_NULL_HANDLE)); CHECK(vkQueueWaitIdle(queue));
+    for(int repetition=0;repetition<(benchmark?24:1);++repetition) {
+        CHECK(vkQueueSubmit(queue,1,&submit,VK_NULL_HANDLE)); CHECK(vkQueueWaitIdle(queue));
+        if(benchmark) {
+            uint64_t ticks[2];
+            CHECK(vkGetQueryPoolResults(device,queries,0,2,sizeof(ticks),ticks,sizeof(uint64_t),VK_QUERY_RESULT_64_BIT|VK_QUERY_RESULT_WAIT_BIT));
+            const unsigned valid=families[family].timestampValidBits;
+            const uint64_t mask=valid==64 ? UINT64_MAX : (UINT64_C(1)<<valid)-1;
+            printf("GPU_SAMPLE %s %d %.6f ms\n",argv[1],repetition,
+                   ((ticks[1]-ticks[0])&mask)*props.properties.limits.timestampPeriod/1e6);
+        }
+    }
     unsigned differences=0;
     for(size_t i=0;i<n;++i) {
+        if(benchmark) {
+            float initial, multiplier;
+            memcpy(&initial,words+8*i+1,4); memcpy(&multiplier,words+8*i+2,4);
+            volatile float product=initial;
+            for(unsigned j=0;j<128;++j) product=product*multiplier;
+            float expected_float=product; uint32_t expected;
+            memcpy(&expected,&expected_float,4);
+            assert(words[8*i+4]==expected);
+            continue;
+        }
         uint32_t actual=words[8*i+4]; assert(actual!=0xdeadbeef);
         printf("%-44s %08x\n",cases[i].name,actual);
         if ((!strcmp(cases[i].name,"mul_positive_zero_negative_one") ||
@@ -157,7 +206,9 @@ int main(int argc,char **argv) {
     }
     vkUnmapMemory(device,memory); vkDestroyBuffer(device,buffer,NULL); vkFreeMemory(device,memory,NULL);
     vkDestroyPipeline(device,pipeline,NULL); vkDestroyPipelineLayout(device,layout,NULL); vkDestroyShaderModule(device,shader,NULL);
+    if(queries) vkDestroyQueryPool(device,queries,NULL);
     vkDestroyCommandPool(device,commands,NULL); vkDestroyDevice(device,NULL); vkDestroyInstance(instance,NULL);
+    if(benchmark) { puts("BENCHMARK: 8,388,608 production multiplies; 65,536 CPU/GPU bitwise results PASS"); return 0; }
     printf("MEASURED: %zu cases; signed-zero/nonfused semantic differences=%u; candidate sign repair passed\n",n,differences);
     return differences ? 2 : 0;
 }
