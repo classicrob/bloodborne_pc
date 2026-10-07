@@ -317,7 +317,12 @@ void Menu() {
     ImGui::EndDisabled(); // upscaler off
 
     ImGui::SeparatorText("Разрешение вывода");
-    static const char* outputs[] = {"1280 x 720", "1920 x 1080", "2560 x 1440", "3840 x 2160"};
+    static const char* outputs[] = {"1280 x 720", "1920 x 1080", "2560 x 1440", "3840 x 2160"
+#ifdef __APPLE__
+        , "3456 x 1944 (MacBook panel fit)"
+#endif
+    };
+    static_assert(sizeof(outputs) / sizeof(outputs[0]) == BbSettings::OutputCount);
     int output = s.output_res;
     if (ImGui::BeginCombo("Разрешение вывода", outputs[output])) {
         for (int i = 0; i < BbSettings::OutputCount; ++i) {
