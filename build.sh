@@ -125,6 +125,9 @@ if [[ ! -f out/libatrac9.a || -n $(find third_party/LibAtrac9/C/src -newer out/l
 fi
 "$CC" "${platform_flags[@]}" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread "${probe_link_flags[@]}" "${includes[@]}" -I. -Isrc src/probe.c "${runtime[@]}" src/vulkan_smoke.c out/libatrac9.a -lm "${gpu[@]}" "${libraries[@]}" -o out/bb-probe
 echo "Built $PWD/out/bb-probe"
+if [[ $(uname -s) == Darwin ]]; then
+    python3 packaging/macos/check-exports.py out/gpu/libbbgpu.dylib out/bb-probe
+fi
 # GPU check for run.sh (live_resolution=auto): links only the Vulkan loader.
 caps_link=()
 if [[ $(uname -s) == Darwin ]]; then
@@ -147,16 +150,33 @@ if [[ ${1:-} == --test ]]; then
         "${CXX:-clang++}" "${platform_flags[@]}" -std=c++23 -O2 -g -Wall -Wextra -Werror \
             -I. tests/test_media_mac.cpp "${media_flags[@]}" "${caps_link[@]}" -o out/media-mac-test
         out/media-mac-test
+        read -r -a surface_flags <<< "$(pkg-config --cflags --libs vulkan sdl3 fmt)"
+        "$CC" "${platform_flags[@]}" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread -Isrc \
+            -c src/macos_ui.c -o out/macos-ui-surface.o
+        "${CXX:-clang++}" "${platform_flags[@]}" -std=c++23 -O2 -g -Wall -Wextra -Werror \
+            -Wno-unused-parameter -Wno-unused-function -pthread \
+            -Isrc -Igpu/shim -Igpu/shadps4 tests/test_macos_surface.cpp gpu/shim/window.cpp \
+            gpu/shadps4/video_core/renderer_vulkan/vk_platform.cpp gpu/shim/common/logging/log.cpp \
+            gpu/shim/common/assert.cpp gpu/shadps4/common/path_util.cpp out/macos-ui-surface.o \
+            "${surface_flags[@]}" "${caps_link[@]}" -o out/macos-surface-test
+        out/macos-surface-test
         sh tests/test_memory_macos.sh
         sh tests/macos_spike/test_tls_runtime.sh
+        sh tests/macos_spike/test_hle_stack.sh
     fi
     "$CC" "${platform_flags[@]}" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread "${includes[@]}" -I. -Isrc tests/test_pad.c "${libraries[@]}" "${caps_link[@]}" -o out/pad-test
     out/pad-test
     "$CC" "${platform_flags[@]}" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread "${includes[@]}" -I. -Isrc tests/test_runtime.c "${runtime[@]}" out/libatrac9.a -lm "${gpu[@]}" "${libraries[@]}" -o out/runtime-test
+    if [[ $(uname -s) == Darwin ]]; then
+        python3 packaging/macos/check-exports.py out/gpu/libbbgpu.dylib out/runtime-test
+    fi
     out/runtime-test
     "$CC" "${platform_flags[@]}" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread -Isrc tests/test_file_mods.c -o out/file-mods-test
     out/file-mods-test
     "$CC" "${platform_flags[@]}" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread "${includes[@]}" -I. -Isrc tests/test_sema.c "${runtime[@]}" out/libatrac9.a -lm "${gpu[@]}" "${libraries[@]}" -o out/sema-test
+    if [[ $(uname -s) == Darwin ]]; then
+        python3 packaging/macos/check-exports.py out/gpu/libbbgpu.dylib out/sema-test
+    fi
     out/sema-test
     "$CC" "${platform_flags[@]}" -std=c11 -D_GNU_SOURCE -O2 -g -Wall -Wextra -Werror -I. -Isrc tests/test_content.c src/runtime_content.c -o out/content-test
     out/content-test

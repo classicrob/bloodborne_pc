@@ -272,3 +272,12 @@ add_executable(fsr4-bench EXCLUDE_FROM_ALL tools/fsr4_bench.cpp
     shadps4/video_core/renderer_vulkan/fsr411/fsr411.cpp)
 target_include_directories(fsr4-bench PRIVATE shadps4/video_core/renderer_vulkan/fsr411)
 target_link_libraries(fsr4-bench PRIVATE ffx-vulkan::fsr4-v07-vulkan ffx-vulkan::fsr4-v07-assets Vulkan::Vulkan)
+
+if (APPLE)
+    find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    foreach(test_target motion-shader-test scene-resolution-test taa-shader-test camera-motion-test)
+        add_custom_command(TARGET ${test_target} POST_BUILD
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../packaging/macos/check-exports.py
+                $<TARGET_FILE:bbgpu> $<TARGET_FILE:${test_target}> VERBATIM)
+    endforeach()
+endif()
