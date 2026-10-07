@@ -18,6 +18,7 @@
 #include "macos_ui.h"
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
+#include <sys/sysctl.h>
 #else
 #include <malloc.h>
 #endif
@@ -740,6 +741,22 @@ static int probe_worker(void *argument) {
 #endif
 int main(int argc, char **argv) {
 #ifdef __APPLE__
+    if (argc==2 && !strcmp(argv[1],"--verify-macos-host")) {
+#if defined(__x86_64__)
+        int translated=0;
+        size_t size=sizeof(translated);
+        if (sysctlbyname("sysctl.proc_translated",&translated,&size,NULL,0)!=0 ||
+            size!=sizeof(translated) || translated!=1) {
+            fputs("macOS bb-probe requires translated x86_64 under Rosetta (sysctl.proc_translated=1)\n",stderr);
+            return 1;
+        }
+        puts("macOS host verified: x86_64, sysctl.proc_translated=1");
+        return 0;
+#else
+        fputs("macOS bb-probe is not x86_64; rebuild for Rosetta guest execution\n",stderr);
+        return 1;
+#endif
+    }
     ProbeArguments args={argc,argv};
     return bb_macos_ui_run(probe_worker,&args);
 #else

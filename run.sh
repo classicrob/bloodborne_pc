@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 cd -- "$(dirname -- "$0")"
-if [[ $(uname -s) == Darwin ]]; then
+if [[ $OSTYPE == darwin* ]]; then
     deps=${BB_DEPS_PREFIX:-$HOME/bbport-deps/x86_64}
     export PATH="$deps/bin:/opt/homebrew/bin:$PATH"
     export PKG_CONFIG_LIBDIR="$deps/lib/pkgconfig:$deps/share/pkgconfig"
@@ -13,6 +13,10 @@ if [[ $(uname -s) == Darwin ]]; then
     }
 fi
 if [[ ${1:-} == --software ]]; then
+    if [[ $OSTYPE == darwin* ]]; then
+        echo 'macOS software Vulkan rendering is not implemented; this port requires MoltenVK.' >&2
+        exit 1
+    fi
     shift
     if [[ -z ${VK_DRIVER_FILES:-} ]]; then
         for candidate in /run/opengl-driver/share/vulkan/icd.d/lvp_icd*.json /usr/share/vulkan/icd.d/lvp_icd*.json; do
@@ -26,7 +30,11 @@ fi
 # next to this script; nothing is built and no nix-shell is needed.
 # BB_DATA_DIR: writable directory for the generated files (out/), saves (user/) and bbport.ini;
 # by default this directory.
-data=${BB_DATA_DIR:-.}
+default_data=.
+if [[ $OSTYPE == darwin* && ${BB_PACKAGED:-0} == 1 ]]; then
+    default_data="$HOME/Library/Application Support/bbport"
+fi
+data=${BB_DATA_DIR:-$default_data}
 out=$data/out
 mkdir -p "$out"
 export BB_CONFIG=${BB_CONFIG:-$data/bbport.ini}
@@ -95,8 +103,17 @@ if [[ -n ${scaled_output:-} ]]; then
         if [[ -n ${BB_PROBE:-} ]]; then caps=$(dirname -- "$BB_PROBE")/bb-gpu-capabilities
         elif [[ -n ${BB_PREBUILT:-} ]]; then caps=bin/bb-gpu-capabilities
         else caps=out/bb-gpu-capabilities; fi
-        live=$("$caps" --live-resolution 2> >(while IFS= read -r line; do
-            [[ $line == *MANGOHUD* ]] || printf '%s\n' "$line"; done >&2)) || live=0
+        if ! live=$("$caps" --live-resolution 2> >(while IFS= read -r line; do
+            [[ $line == *MANGOHUD* ]] || printf '%s\n' "$line"; done >&2))
+        then
+            if [[ $OSTYPE == darwin* ]]; then
+                echo "macOS graphics capability probe failed: $caps" >&2; exit 1
+            fi
+            live=0
+        fi
+        if [[ $OSTYPE == darwin* && $live != 0 && $live != 1 ]]; then
+            echo "macOS graphics capability probe returned invalid result: $live" >&2; exit 1
+        fi
     fi
     [[ $live == 1 ]] || live=0
 fi
@@ -121,6 +138,12 @@ if [[ -n ${BB_PREBUILT:-} ]]; then
 else
     bash build.sh
     probe=out/bb-probe
+fi
+if [[ $OSTYPE == darwin* ]]; then
+    if ! "$probe" --verify-macos-host; then
+        echo "macOS launch rejected: $probe did not verify translated x86_64 execution." >&2
+        exit 1
+    fi
 fi
 probe_args=("$out/boot-linked.bin" --content-profile "$out/content.bin" --patches "$out/patches.bin" --app0 "$game" --user "${BB_USER_DIR:-$data/user}" --timeout "${BB_TIMEOUT:-0}" "$@")
 if [[ -n ${mod_game:-} ]]; then
