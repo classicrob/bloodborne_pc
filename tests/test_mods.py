@@ -144,6 +144,7 @@ class ModTests(unittest.TestCase):
         python.chmod(0o755)
         probe = self.root / 'probe'
         probe.write_text(f'#!{sys.executable}\nimport json,sys,os\nfrom pathlib import Path\n'
+            'if sys.argv[1:] == ["--verify-macos-host"]: sys.exit(0)\n'
             'game=Path(sys.argv[sys.argv.index("--app0")+1])\n'
             'Path(os.environ["BB_DATA_DIR"],"mounted.json").write_text(json.dumps({\n'
             '"path":str(game),"content":(game/"dvdroot_ps4/chr/a.dcx").read_text()}))\n'
