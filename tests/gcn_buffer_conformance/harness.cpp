@@ -51,8 +51,9 @@ constexpr u64 ParamVa = 0x3000000000ull;  // per-lane parameters
 constexpr u64 ResultVa = 0x3800000000ull; // per-lane results
 constexpr u32 Arena = 64 * 1024;          // per-job slot of patterned guest memory
 constexpr u32 BaseInArena = 16 * 1024;    // V# base offset inside its arena (before misalign)
-constexpr u32 ParamSlot = 64 * 32;
-constexpr u32 ResultSlot = 64 * 16;
+constexpr u32 kLanes = 128; // up to two GCN waves per workgroup
+constexpr u32 ParamSlot = kLanes * 32;
+constexpr u32 ResultSlot = kLanes * 16;
 constexpr u32 FlatSlot = 4096;
 constexpr u32 MaxBatch = 256;
 constexpr u32 VgprMarker = 0xDEAD0000u;
@@ -98,7 +99,13 @@ struct Template {
     bool srt = false;      // V# and a constant read through an extended-user-data pointer (s[2:3])
     u32 sdst = 16;         // stage-compile: SDST of the s_buffer_load (0 overlaps user data)
     bool dead = false;     // the access under test is dead (its result is never used)
+    bool wave_divergent = false; // wave: cross-lane ops in divergent flow (loud by design on Apple)
+    bool clip_planes = false;  // vertex: user clip plane 0 enabled (adds the ClipPlanes buffer)
+    bool check_bindings = false; // compile-only: the chosen module's bindings must start at the job's start
+    bool no_buffer_load = false; // stage-compile: export constants only (no s_buffer_load)
     std::vector<u32> fetch;
+    std::array<u32, 3> wg{64, 1, 1}; // compute workgroup shape (power-of-two x)
+    u32 Threads() const { return wg[0] * wg[1] * wg[2]; }
     std::vector<u32> code;
     u64 hash = 0;
 };
@@ -130,7 +137,8 @@ struct Job {
     bool zero_sharp = false;
     u32 sgpr_soff = 0, smem_sgpr = 0;
     s32 vertex_offset = 0; // vertex jobs: drawIndexed vertexOffset (lanes hold index + offset)
-    std::array<Lane, 64> lanes{};
+    u32 start_unified = 0, start_buffer = 0; // Backend::Bindings at which this stage starts
+    std::array<Lane, kLanes> lanes{};
     bool approved_struct_soff = false, approved_swizzle = false;
     bool isa_invalid = false; // violates an ISA programming rule (e.g. element_size < access size)
     bool approved_offen_only = false; // structured, offen without idxen/add_tid: offset never checked
@@ -280,10 +288,12 @@ void AssembleStage(Template& t) {
     Code c;
     c.SMovLiteral(VCC_HI, 0x5eed);
     c.Sop1(3, 124, 8); // s_mov_b32 m0, s8
-    c.SBufferLoad(t.op.ncomp, t.sdst, 4, t.smem == SmemSrc::Imm, t.smem == SmemSrc::Imm ? t.smem_imm : 9);
-    c.SWaitcntAll();
+    if (!t.no_buffer_load) {
+        c.SBufferLoad(t.op.ncomp, t.sdst, 4, t.smem == SmemSrc::Imm, t.smem == SmemSrc::Imm ? t.smem_imm : 9);
+        c.SWaitcntAll();
+    }
     for (u32 i = 0; i < 4; ++i) {
-        if (t.dead) c.VMovLiteral(i, 0x3f800000);
+        if (t.dead || t.no_buffer_load) c.VMovLiteral(i, 0x3f800000);
         else c.VMov(i, t.sdst + (i < t.op.ncomp ? i : 0));
     }
     if (t.fragment) {
@@ -310,7 +320,12 @@ void Assemble(Template& t) {
     }
     Code c;
     c.SMovLiteral(VCC_HI, 0x5eed); // the recompiler expects s_mov_b32 vcc_hi, #imm first
-    c.VLshlrevB32(1, Inline(5), 0);
+    // v15 = local invocation index = x + y * size_x (v0, v1 = local id x, y)
+    u32 log2x = 0;
+    while ((1u << log2x) < t.wg[0]) ++log2x;
+    c.VLshlrevB32(15, Inline(log2x), 1);
+    c.Vop2(37, 15, 15, Vgpr(0)); // v_add_i32 v15, v0, v15
+    c.VLshlrevB32(1, Inline(5), 15);
     Code::BufFields p{.offen = true, .vaddr = 1, .vdata = 2, .srsrc = 4};
     c.Mubuf(BUFFER_LOAD_DWORDX4, p); // v2 active, v3 vindex, v4 voffset, v5 data0
     p.offset = 16;
@@ -357,7 +372,7 @@ void Assemble(Template& t) {
         c.SMovB64(EXEC_LO, t.srt ? 22 : 20);
     }
     if (t.srt) c.VMov(11, 20);
-    c.VLshlrevB32(14, Inline(4), 0);
+    c.VLshlrevB32(14, Inline(4), 15);
     Code::BufFields o{.offen = true, .vaddr = 14, .vdata = 10, .srsrc = 8};
     c.Mubuf(BUFFER_STORE_DWORDX4, o);
     c.SWaitcntAll();
@@ -993,44 +1008,73 @@ void AddAtomicCases() {
 
 // Wave64 lane semantics: the PS4 runs 64-lane waves; Apple subgroups are 32 wide.
 void AddWaveCases() {
-    auto tmpl = [](const char* name, Wave w) {
-        Template t;
-        t.name = name;
-        t.op.kind = GCN_LOAD;
-        t.wave = w;
-        return AddTemplate(t);
-    };
-    const u32 lane = tmpl("wave: v_mbcnt(-1) lane id + VOPC ballot + s_bcnt1", Wave::Lane);
-    const u32 mbcnt = tmpl("wave: v_mbcnt over VCC + s_mov_b64 vcc + v_cndmask", Wave::MbcntMask);
-    const u32 rl = tmpl("wave: v_readlane 37/s13/s12 + v_readfirstlane", Wave::Readlane);
-    const u32 e1 = tmpl("wave: under saveexec: v_readfirstlane, s_bcnt1 exec, masked v_mov", Wave::Exec1);
-    const u32 e2 = tmpl("wave: under saveexec: s_mov_b64 exec, v_mbcnt over exec", Wave::Exec2);
+    auto rotl = [](u64 x, u32 r) { return r ? (x << r) | (x >> (64 - r)) : x; };
     auto value = [](u32 l) { return 0x1000u + l * 0x11u; };
     struct M { const char* name; u64 mask; };
     const M masks[] = {{"all", ~0ull}, {"none", 0}, {"lane63", 1ull << 63}, {"upper32", 0xFFFFFFFF00000000ull},
                        {"lower32", 0xFFFFFFFFull}, {"even", 0x5555555555555555ull}, {"lanes0+37", 1ull | 1ull << 37},
                        {"lane33", 1ull << 33}, {"lanes5+40", 1ull << 5 | 1ull << 40}};
-    for (const M& m : masks) {
-        for (u32 t : {lane, mbcnt}) {
-            Job& j = NewJob("wave64", t, RawV(64), 0);
-            j.label += " ballot=" + std::string(m.name);
-            for (u32 l = 0; l < 64; ++l) SetLane(j, l, value(l), 0, {u32(m.mask >> l & 1), 0, 0, 0});
-        }
-        if (m.mask == 0) continue; // an all-zero exec skips the scope
-        for (u32 t : {e1, e2}) {
-            Job& j = NewJob("wave64", t, RawV(64), 0);
-            j.label += " exec=" + std::string(m.name);
-            for (u32 l = 0; l < 64; ++l) {
-                SetLane(j, l, value(l), 0);
-                j.lanes[l].active = u32(m.mask >> l & 1);
+    const std::array<u32, 3> shapes[] = {{64, 1, 1}, {8, 8, 1}, {16, 4, 1}, {2, 32, 1}, {128, 1, 1}, {32, 4, 1}};
+    for (const auto& wg : shapes) {
+        const std::string shape = " [" + std::to_string(wg[0]) + "x" + std::to_string(wg[1]) + "]";
+        auto tmpl = [&](const char* name, Wave w) {
+            Template t;
+            t.name = std::string(name) + shape;
+            t.op.kind = GCN_LOAD;
+            t.wave = w;
+            t.wg = wg;
+            // cross-lane ops inside an s_and_saveexec scope: divergent, loud by design on Apple
+            t.wave_divergent = w == Wave::Exec1 || w == Wave::Exec2;
+            return AddTemplate(t);
+        };
+        const u32 threads = wg[0] * wg[1] * wg[2];
+        const u32 lane = tmpl("wave: v_mbcnt(-1) lane id + VOPC ballot + s_bcnt1", Wave::Lane);
+        const u32 mbcnt = tmpl("wave: v_mbcnt over VCC + s_mov_b64 vcc + v_cndmask", Wave::MbcntMask);
+        const u32 rl = tmpl("wave: v_readlane 37/s13/s12 + v_readfirstlane", Wave::Readlane);
+        const u32 e1 = tmpl("wave: under saveexec: v_readfirstlane, s_bcnt1 exec, masked v_mov", Wave::Exec1);
+        const u32 e2 = tmpl("wave: under saveexec: s_mov_b64 exec, v_mbcnt over exec", Wave::Exec2);
+        const bool all_masks = wg[0] == 64; // full mask matrix on 64x1, a subset on the other shapes
+        for (const M& m : masks) {
+            if (!all_masks && std::string(m.name) != "all" && std::string(m.name) != "lanes5+40" &&
+                std::string(m.name) != "upper32") {
+                continue;
+            }
+            auto bit = [&](u32 l) { return u32((l < 64 ? m.mask : rotl(m.mask, 7)) >> (l % 64) & 1); };
+            for (u32 t : {lane, mbcnt}) {
+                Job& j = NewJob("wave64", t, RawV(64), 0);
+                j.label += " ballot=" + std::string(m.name);
+                for (u32 l = 0; l < threads; ++l) SetLane(j, l, value(l), 0, {bit(l), 0, 0, 0});
+            }
+            if (m.mask == 0) continue; // an all-zero exec skips the scope
+            for (u32 t : {e1, e2}) {
+                Job& j = NewJob("wave64", t, RawV(64), 0);
+                j.label += " exec=" + std::string(m.name);
+                for (u32 l = 0; l < threads; ++l) {
+                    SetLane(j, l, value(l), 0);
+                    j.lanes[l].active = bit(l);
+                }
             }
         }
+        for (auto [a, b] : {std::pair{0u, 31u}, std::pair{32u, 63u}, std::pair{45u, 1u}, std::pair{63u, 32u}}) {
+            if (!all_masks && a != 45) continue;
+            Job& j = NewJob("wave64", rl, RawV(64), 0, b);
+            j.smem_sgpr = a;
+            j.label += " s13=" + std::to_string(a) + " s12=" + std::to_string(b);
+            for (u32 l = 0; l < threads; ++l) SetLane(j, l, value(l), 0);
+        }
     }
-    for (auto [a, b] : {std::pair{0u, 31u}, std::pair{32u, 63u}, std::pair{45u, 1u}, std::pair{63u, 32u}}) {
-        Job& j = NewJob("wave64", rl, RawV(64), 0, b);
-        j.smem_sgpr = a;
-        j.label += " s13=" + std::to_string(a) + " s12=" + std::to_string(b);
-        for (u32 l = 0; l < 64; ++l) SetLane(j, l, value(l), 0);
+    // add_tid on a non-linear shape: thread_id[5:0] is the wave lane of LocalInvocationIndex
+    {
+        Template t = Base("buffer_load_dword", GCN_LOAD, GcnAsm::BUFFER_LOAD_DWORD, TArgs{.idxen = true, .offen = true});
+        t.name += " [8x8]";
+        t.op.comp_bytes = 4;
+        t.op.ncomp = 1;
+        t.wg = {8, 8, 1};
+        const u32 tt = AddTemplate(t);
+        gcn_vsharp v = StructV(16, 40);
+        v.add_tid = 1;
+        Job& j = NewJob("add-tid", tt, v, 0);
+        for (u32 l = 0; l < 64; ++l) SetLane(j, l, l % 3 == 0 ? 0 : 1, (l % 5) * 4);
     }
 }
 
@@ -1166,6 +1210,32 @@ void AddInternalCases() {
     }
 }
 
+// Specialization reuse across start bindings: the same vertex shader used after fragment
+// shaders with different resource counts must get a module whose bindings start where the
+// pipeline layout puts them (Backend::Bindings start), even when its only binding is special.
+void AddSpecReuseCases() {
+    for (bool only_special : {true, false}) {
+        Template t;
+        t.name = std::string("vs + user clip plane 0, ") +
+                 (only_special ? "no guest buffer (ClipPlanes only)" : "s_buffer_load s[4:7] (control)") + " (compile)";
+        t.compile_only = true;
+        t.vertex = true;
+        t.clip_planes = true;
+        t.no_buffer_load = only_special;
+        t.op.kind = GCN_SLOAD;
+        t.op.ncomp = 4;
+        t.smem = SmemSrc::Imm;
+        t.sdst = 16;
+        t.check_bindings = true;
+        const u32 tt = AddTemplate(t);
+        for (u32 start : {0u, 3u, 0u, 5u}) {
+            Job& j = NewJob("spec-reuse", tt, RawV(64), 0);
+            j.start_unified = j.start_buffer = start;
+            j.label += " start binding " + std::to_string(start);
+        }
+    }
+}
+
 // Shader reuse: StageSpecialization decides whether a compiled module is reused for a new V#.
 // Fields outside the key (num_records, add_tid, base) must be read at run time.
 void AddReuseCases() {
@@ -1286,6 +1356,9 @@ Shader::Profile MakeProfile(const DeviceCaps& c) {
             prof.emulate_robust_buffer_access = !c.rba2;
         }
         // Sol-2's vertex pulling: Apple has no robustBufferAccess2 for fixed-function fetch.
+        if constexpr (requires { prof.emulate_wave64; }) {
+            prof.emulate_wave64 = c.subgroup_size < 64; // Apple: 32-wide subgroups
+        }
         if constexpr (requires { prof.emulate_vertex_fetch; }) {
             prof.emulate_vertex_fetch = !c.rba2;
         }
@@ -1309,7 +1382,8 @@ bool ProfileHasRobustFlag() {
 
 u32 g_fs_export = 9; // MRT0 export format for fragment compiles (9 = ABGR_32; 4 = ABGR_FP16 for compressed exports)
 
-Shader::RuntimeInfo MakeRuntime(bool vertex = false, bool fragment = false, bool indirect = false) {
+Shader::RuntimeInfo MakeRuntime(bool vertex = false, bool fragment = false, bool indirect = false,
+                                std::array<u32, 3> wg = {64, 1, 1}, bool clip_planes = false) {
     Shader::RuntimeInfo rt{};
     if (fragment) {
         rt.Initialize(Shader::HwStage::Fragment, Shader::SwStage::Fragment);
@@ -1326,6 +1400,9 @@ Shader::RuntimeInfo MakeRuntime(bool vertex = false, bool fragment = false, bool
         rt.Initialize(Shader::HwStage::Vertex, Shader::SwStage::Vertex);
         rt.props.num_user_data = 16;
         rt.props.num_allocated_vgprs = 64;
+        if (clip_planes) {
+            rt.hw.vs.user_clip_plane_mask = 1;
+        }
         if (indirect) {
             // DrawIndirectParams: SH offset of the SGPR the CP writes the base vertex into
             // (translate.cpp UdRegFromShOffset: vertex stage user data start at 0x4c).
@@ -1336,7 +1413,7 @@ Shader::RuntimeInfo MakeRuntime(bool vertex = false, bool fragment = false, bool
     rt.Initialize(Shader::HwStage::Compute, Shader::SwStage::Compute);
     rt.props.num_user_data = 16;
     rt.props.num_allocated_vgprs = 64;
-    rt.hw.cs.workgroup_size = {64, 1, 1};
+    rt.hw.cs.workgroup_size = wg;
     rt.hw.cs.tgid_enable = {false, false, false};
     rt.hw.cs.shared_memory_size = 0;
     return rt;
@@ -1365,12 +1442,12 @@ void CompileJob(std::vector<ProgramState>& programs, Shader::Pools& pools, u32 i
     const Shader::ShaderParams params{.user_data = std::span<const u32, 16>(job.ud),
                                       .code = std::span<const u32>(t.code),
                                       .hash = t.hash};
-    auto rt = MakeRuntime(t.vertex, t.fragment, t.indirect);
+    auto rt = MakeRuntime(t.vertex, t.fragment, t.indirect, t.wg, t.clip_planes);
     const auto hw = t.fragment ? Shader::HwStage::Fragment
                                : (t.vertex ? Shader::HwStage::Vertex : Shader::HwStage::Compute);
     const auto sw = t.fragment ? Shader::SwStage::Fragment
                                : (t.vertex ? Shader::SwStage::Vertex : Shader::SwStage::Compute);
-    Shader::Backend::Bindings binding{};
+    Shader::Backend::Bindings binding{.unified = job.start_unified, .buffer = job.start_buffer};
     std::vector<u32> spv;
     u32 perm = 0;
     if (!ps.info) {
@@ -1928,36 +2005,41 @@ gcn_vsharp ActualV(const Job& j) {
 
 std::vector<u32> WaveExpected(const Job& j) {
     const Template& t = g_templates[j.tmpl];
-    std::vector<u32> regs(64 * 4);
-    u64 ballot = 0, exec = 0;
-    for (u32 l = 0; l < 64; ++l) {
-        if (j.lanes[l].data[0] != 0) ballot |= 1ull << l;
-        if (j.lanes[l].active != 0) exec |= 1ull << l;
+    const u32 threads = t.Threads();
+    std::vector<u32> regs(kLanes * 4, ResultFill);
+    for (u32 l = 0; l < threads; ++l) {
         for (u32 i = 0; i < 4; ++i) regs[l * 4 + i] = VgprMarker + i;
     }
-    const u32 blo = u32(ballot), bhi = u32(ballot >> 32);
-    auto value = [&](u32 lane) { return j.lanes[lane & 63].vindex; };
-    for (u32 l = 0; l < 64; ++l) {
+    for (u32 l = 0; l < threads; ++l) {
+        // GCN wave = 64 consecutive invocations; lane = index & 63
+        const u32 w = l / 64, lane = l % 64;
+        u64 ballot = 0, exec = 0;
+        for (u32 k = 0; k < 64 && w * 64 + k < threads; ++k) {
+            if (j.lanes[w * 64 + k].data[0] != 0) ballot |= 1ull << k;
+            if (j.lanes[w * 64 + k].active != 0) exec |= 1ull << k;
+        }
+        const u32 blo = u32(ballot), bhi = u32(ballot >> 32);
+        auto value = [&](u32 sel) { return j.lanes[w * 64 + (sel & 63)].vindex; };
         u32* r = &regs[l * 4];
         switch (t.wave) {
         case Wave::Lane:
-            r[0] = gcn_mbcnt(~0u, gcn_mbcnt(~0u, 0, l, 0), l, 1);
+            r[0] = gcn_mbcnt(~0u, gcn_mbcnt(~0u, 0, lane, 0), lane, 1);
             r[1] = blo; r[2] = bhi; r[3] = gcn_popcount64(ballot);
             break;
         case Wave::MbcntMask:
-            r[0] = gcn_mbcnt(bhi, gcn_mbcnt(blo, 0, l, 0), l, 1);
-            r[1] = blo; r[2] = bhi; r[3] = (ballot >> l) & 1;
+            r[0] = gcn_mbcnt(bhi, gcn_mbcnt(blo, 0, lane, 0), lane, 1);
+            r[1] = blo; r[2] = bhi; r[3] = (ballot >> lane) & 1;
             break;
         case Wave::Readlane: // lane selects are kept in 0..63 by the jobs
             r[0] = value(37); r[1] = value(j.smem_sgpr); r[2] = value(j.sgpr_soff); r[3] = value(0);
             break;
         case Wave::Exec1:
             r[0] = value(gcn_first_lane(exec)); r[1] = gcn_popcount64(exec);
-            if (exec >> l & 1) r[3] = value(l);
+            if (exec >> lane & 1) r[3] = value(lane);
             break;
         case Wave::Exec2:
             r[0] = u32(exec); r[1] = u32(exec >> 32);
-            if (exec >> l & 1) r[2] = gcn_mbcnt(u32(exec >> 32), gcn_mbcnt(u32(exec), 0, l, 0), l, 1);
+            if (exec >> lane & 1) r[2] = gcn_mbcnt(u32(exec >> 32), gcn_mbcnt(u32(exec), 0, lane, 0), lane, 1);
             break;
         case Wave::None:
             break;
@@ -1980,9 +2062,13 @@ std::vector<Outcome> Expected(Gpu& g, const Job& j, std::vector<u8>& work, const
     std::vector<Outcome> outs;
     for (u32 r = 0; r < GCN_NUM_READINGS; ++r) {
         Outcome o;
-        o.regs.assign(64 * 4, 0);
-        for (u32 lane = 0; lane < 64; ++lane) {
+        o.regs.assign(kLanes * 4, 0);
+        for (u32 lane = 0; lane < kLanes; ++lane) {
             for (u32 i = 0; i < 4; ++i) o.regs[lane * 4 + i] = t.vertex ? ResultFill : VgprMarker + i;
+            if (!t.vertex && lane >= t.Threads()) {
+                for (u32 i = 0; i < 4; ++i) o.regs[lane * 4 + i] = ResultFill; // no such invocation
+                continue;
+            }
             const Lane& L = j.lanes[lane];
             const bool smem = t.smem != SmemSrc::None;
             if (!L.active && !smem) continue;
@@ -2028,10 +2114,10 @@ std::vector<Outcome> Expected(Gpu& g, const Job& j, std::vector<u8>& work, const
             }
         }
         if (t.srt) {
-            for (u32 lane = 0; lane < 64; ++lane) o.regs[lane * 4 + 1] = j.vtable[4];
+            for (u32 lane = 0; lane < t.Threads(); ++lane) o.regs[lane * 4 + 1] = j.vtable[4];
         }
         if (t.dead) { // the load's destination is never stored: only the markers come back
-            for (u32 lane = 0; lane < 64; ++lane) {
+            for (u32 lane = 0; lane < t.Threads(); ++lane) {
                 for (u32 i = 0; i < 4; ++i) o.regs[lane * 4 + i] = VgprMarker + i;
             }
         }
@@ -2151,7 +2237,7 @@ JobResult Evaluate(Gpu& g, const Job& j, const Bound& tb, const u8* guest_after,
     const Template& t = g_templates[j.tmpl];
     auto outs = Expected(g, j, work, tb);
     // observed
-    std::vector<u32> regs(results, results + 64 * 4);
+    std::vector<u32> regs(results, results + kLanes * 4);
     // compare region: arena + every outcome's touch ranges
     std::vector<std::pair<u64, u64>> region{{SlotBase(j.slot), SlotBase(j.slot) + Arena}};
     for (const auto& o : outs) for (auto r : o.touches) region.push_back(r);
@@ -2209,12 +2295,12 @@ JobResult Evaluate(Gpu& g, const Job& j, const Bound& tb, const u8* guest_after,
     for (const auto& o : outs) {
         if (o.unknown) continue;
         size_t bad = 0;
-        for (u32 lane = 0; lane < 64; ++lane) {
+        for (u32 lane = 0; lane < kLanes; ++lane) {
             for (u32 i = 0; i < 4; ++i) {
                 if (regs[lane * 4 + i] != o.regs[lane * 4 + i]) { ++bad; break; }
             }
         }
-        if (!mem_matches(o, nullptr)) bad += 64;
+        if (!mem_matches(o, nullptr)) bad += kLanes;
         if (bad < best) { best = bad; lit = &o; }
     }
     if (!lit) {
@@ -2235,7 +2321,7 @@ JobResult Evaluate(Gpu& g, const Job& j, const Bound& tb, const u8* guest_after,
     }
     if (lit) {
         int shown = 0;
-        for (u32 lane = 0; lane < 64 && shown < 10; ++lane) {
+        for (u32 lane = 0; lane < kLanes && shown < 10; ++lane) {
             bool bad = false;
             for (u32 i = 0; i < 4; ++i) bad |= regs[lane * 4 + i] != lit->regs[lane * 4 + i];
             if (!bad) continue;
@@ -2362,7 +2448,7 @@ std::map<u32, JobResult> RunBatch(Gpu& g, const std::vector<u32>& jobs) {
         Job& j = g_jobs[ji];
         // params
         u32* p = reinterpret_cast<u32*>(g.params.data + u64(j.slot) * ParamSlot);
-        for (u32 lane = 0; lane < 64; ++lane) {
+        for (u32 lane = 0; lane < kLanes; ++lane) {
             const Lane& L = j.lanes[lane];
             const u32 w[8] = {L.active, L.vindex, L.voffset, L.data[0], L.data[1], L.data[2], L.data[3], 0};
             std::memcpy(p + lane * 8, w, 32);
@@ -2666,6 +2752,7 @@ int main(int argc, char** argv) {
     AddWaveCases();
     AddVertexCases();
     AddInternalCases();
+    AddSpecReuseCases();
     if (!opt.only.empty()) {
         std::vector<Job> kept;
         for (auto& j : g_jobs) {
@@ -2758,7 +2845,30 @@ int main(int argc, char** argv) {
     for (u32 ji = 0; ji < g_jobs.size(); ++ji) {
         const Job& j = g_jobs[ji];
         if (!g_templates[j.tmpl].compile_only) continue;
-        if (j.status == Status::Ok) {
+        if (j.status == Status::Ok && g_templates[j.tmpl].check_bindings) {
+            // OpDecorate (71) ... Binding (33) N in the module this job would use
+            const auto& spv = g_spirv.at({j.tmpl, j.perm});
+            std::vector<u32> got;
+            for (size_t w = 5; w < spv.size();) {
+                const u32 count = spv[w] >> 16, opcode = spv[w] & 0xFFFF;
+                if (count == 0) break;
+                if (opcode == 71 && count >= 4 && spv[w + 2] == 33) got.push_back(spv[w + 3]);
+                w += count;
+            }
+            std::sort(got.begin(), got.end());
+            std::vector<u32> want;
+            for (u32 b = 0; b < j.binds.size(); ++b) want.push_back(j.start_unified + b);
+            auto list = [](const std::vector<u32>& v) {
+                std::string r;
+                for (u32 x : v) r += (r.empty() ? "" : ",") + std::to_string(x);
+                return "{" + r + "}";
+            };
+            results[ji] = got == want ? JobResult{Verdict::Strict, ""}
+                                      : JobResult{Verdict::Fail, "  module perm " + std::to_string(j.perm) +
+                                                                     " declares bindings " + list(got) +
+                                                                     ", the pipeline layout expects " + list(want) +
+                                                                     " (reused across start bindings)\n"};
+        } else if (j.status == Status::Ok) {
             results[ji] = {Verdict::Strict, ""};
         } else if (j.status == Status::LoudCompile) {
             results[ji] = {Verdict::Fail, "  aborts while compiling a valid shader: " + j.message + "\n"};
@@ -2783,6 +2893,7 @@ int main(int argc, char** argv) {
         case Status::LoudPipeline: {
             // Every Apple binder guard mirrored here is an orchestrator-approved loud check.
             const bool approved = j.approved_struct_soff || j.approved_swizzle || j.isa_invalid || j.approved_offen_only ||
+                                  g_templates[j.tmpl].wave_divergent ||
                                   j.status == Status::LoudBinder;
             r.verdict = LoudRequired(g, j) ? Verdict::LoudRequired
                                            : (approved ? Verdict::LoudApproved : Verdict::LoudUnneeded);
