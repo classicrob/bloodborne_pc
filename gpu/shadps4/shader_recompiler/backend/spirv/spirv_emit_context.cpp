@@ -339,6 +339,11 @@ void EmitContext::DefineInputs() {
         for (const auto& attrib : fetch_shader->attributes) {
             ASSERT(attrib.semantic < IR::NumParams);
             const auto sharp = attrib.GetSharp(info);
+            if (profile.emulate_null_descriptors &&
+                (sharp.base_address == 0 || sharp.GetSize() == 0)) {
+                input_params[attrib.semantic].is_null = true;
+                continue;
+            }
             const Id type{GetAttributeType(*this, sharp.GetNumberFmt())[4]};
             Id id{DefineInput(type, attrib.semantic)};
             if (attrib.GetStepRate() != Gcn::VertexAttribute::InstanceIdType::None) {
@@ -883,6 +888,8 @@ void EmitContext::DefineBuffers() {
 
         // Define aliases depending on the shader usage.
         auto& spv_buffer = buffers.emplace_back(binding.buffer++, desc.buffer_type);
+        spv_buffer.is_null = profile.emulate_null_descriptors && desc.buffer_type == BufferType::Guest &&
+                             (buf_sharp.base_address == 0 || buf_sharp.GetSize() == 0);
         if (True(desc.used_types & IR::Type::U64)) {
             spv_buffer.Alias(PointerType::U64) =
                 DefineBuffer(desc.is_written, is_coherent, 3, desc.buffer_type, U64);

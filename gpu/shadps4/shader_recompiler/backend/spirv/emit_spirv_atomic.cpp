@@ -73,52 +73,64 @@ Id SharedAtomicU64CmpSwap(EmitContext& ctx, Id offset, Id value, Id cmp_value) {
 template <bool is_float = false>
 Id BufferAtomicU32(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address, Id value,
                    Id (Sirit::Module::*atomic_func)(Id, Id, Id, Id, Id)) {
+    const Id original_index = address;
     const auto& buffer = ctx.buffers[handle];
     const Id type = is_float ? ctx.F32[1] : ctx.U32[1];
     if (const Id offset = buffer.Offset(PointerSize::B32); Sirit::ValidId(offset)) {
         address = ctx.OpIAdd(ctx.U32[1], address, offset);
     }
     const auto [id, pointer_type] = buffer.Alias(is_float ? PointerType::F32 : PointerType::U32);
-    const Id ptr = ctx.OpAccessChain(pointer_type, id, ctx.u32_zero_value, address);
     const auto [scope, semantics]{AtomicArgs(ctx)};
-    return (ctx.*atomic_func)(type, ptr, scope, semantics, value);
+    return ctx.BufferRead(handle, is_float ? PointerType::F32 : PointerType::U32, original_index, address, type, [&] {
+        const Id ptr = ctx.OpAccessChain(pointer_type, id, ctx.u32_zero_value, address);
+        return (ctx.*atomic_func)(type, ptr, scope, semantics, value);
+    });
 }
 
 Id BufferAtomicU32IncDec(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address,
                          Id (Sirit::Module::*atomic_func)(Id, Id, Id, Id)) {
+    const Id original_index = address;
     const auto& buffer = ctx.buffers[handle];
     if (const Id offset = buffer.Offset(PointerSize::B32); Sirit::ValidId(offset)) {
         address = ctx.OpIAdd(ctx.U32[1], address, offset);
     }
     const auto [id, pointer_type] = buffer.Alias(PointerType::U32);
-    const Id ptr = ctx.OpAccessChain(pointer_type, id, ctx.u32_zero_value, address);
     const auto [scope, semantics]{AtomicArgs(ctx)};
-    return (ctx.*atomic_func)(ctx.U32[1], ptr, scope, semantics);
+    return ctx.BufferRead(handle, PointerType::U32, original_index, address, ctx.U32[1], [&] {
+        const Id ptr = ctx.OpAccessChain(pointer_type, id, ctx.u32_zero_value, address);
+        return (ctx.*atomic_func)(ctx.U32[1], ptr, scope, semantics);
+    });
 }
 
 Id BufferAtomicU32CmpSwap(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address, Id value,
                           Id cmp_value,
                           Id (Sirit::Module::*atomic_func)(Id, Id, Id, Id, Id, Id, Id)) {
+    const Id original_index = address;
     const auto& buffer = ctx.buffers[handle];
     if (const Id offset = buffer.Offset(PointerSize::B32); Sirit::ValidId(offset)) {
         address = ctx.OpIAdd(ctx.U32[1], address, offset);
     }
     const auto [id, pointer_type] = buffer.Alias(PointerType::U32);
-    const Id ptr = ctx.OpAccessChain(pointer_type, id, ctx.u32_zero_value, address);
     const auto [scope, semantics]{AtomicArgs(ctx)};
-    return (ctx.*atomic_func)(ctx.U32[1], ptr, scope, semantics, semantics, value, cmp_value);
+    return ctx.BufferRead(handle, PointerType::U32, original_index, address, ctx.U32[1], [&] {
+        const Id ptr = ctx.OpAccessChain(pointer_type, id, ctx.u32_zero_value, address);
+        return (ctx.*atomic_func)(ctx.U32[1], ptr, scope, semantics, semantics, value, cmp_value);
+    });
 }
 
 Id BufferAtomicU64(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address, Id value,
                    Id (Sirit::Module::*atomic_func)(Id, Id, Id, Id, Id)) {
+    const Id original_index = address;
     const auto& buffer = ctx.buffers[handle];
     if (const Id offset = buffer.Offset(PointerSize::B64); Sirit::ValidId(offset)) {
         address = ctx.OpIAdd(ctx.U32[1], address, offset);
     }
     const auto [id, pointer_type] = buffer.Alias(PointerType::U64);
-    const Id ptr = ctx.OpAccessChain(pointer_type, id, ctx.u32_zero_value, address);
     const auto [scope, semantics]{AtomicArgs(ctx)};
-    return (ctx.*atomic_func)(ctx.U64, ptr, scope, semantics, value);
+    return ctx.BufferRead(handle, PointerType::U64, original_index, address, ctx.U64, [&] {
+        const Id ptr = ctx.OpAccessChain(pointer_type, id, ctx.u32_zero_value, address);
+        return (ctx.*atomic_func)(ctx.U64, ptr, scope, semantics, value);
+    });
 }
 
 Id ImageAtomicU32(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords, Id value,
