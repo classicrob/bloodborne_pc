@@ -79,3 +79,28 @@ The backend now performs an execute-permission cycle on every executable alias
 of physical pages modified through its backing-write API, retaining the actual
 GPU-restricted protection. Tests cover writes addressed through both executable
 and non-executable aliases followed by immediate execution.
+
+## GPU follow-through
+
+AvPlayer and VideoOutDriver now use class-specific low allocation on Apple.
+VideoOut's inline label array therefore remains below 1 TiB as well. Native
+internal vectors, decoder state, timers, and integer-ID objects stay on the host
+heap. No global C++ allocation override is used. Allocation failure aborts with
+a diagnostic naming low guest-visible GPU allocation.
+
+The callback audit also found host pointers passed to guest code without being
+returned as handles:
+
+| Boundary | Low-pointer implementation |
+| --- | --- |
+| AvPlayer::OpenFile filename | Copy the complete NUL-terminated path into low temporary storage |
+| AvPlayer::ReadOffsetFile FFmpeg AVIO buffer | Copy bytes into low temporary storage, invoke guest read callback, then copy all bytes back, preserving untouched bytes and the exact callback result |
+| AvPlayerState warning payload | Copy the s32 payload into low temporary storage and copy changes back; other implemented event payloads are null |
+| AvPlayer helper thread guest callback stack | Native std::jthread stack was high; assigned to Astra-1 by orchestrator for a low-stack implementation |
+
+`sh tests/test_guest_alloc_macos.sh` tests C++ new/make_unique/delete dispatch,
+64-byte alignment, member addresses, destruction, filename copies, partial read
+buffer mutation with untouched bytes retained, and event payload copy-back using
+the actual low allocator. The changed AvPlayer sources and VideoOutDriver header
+also pass x86_64 syntax checks against the shared dependency headers. Full GPU
+link/runtime verification remains with Sol-1's single build during the disk freeze.

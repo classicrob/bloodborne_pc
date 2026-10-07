@@ -6,6 +6,9 @@
 #include "common/thread.h"
 #include "core/libraries/avplayer/avplayer_error.h"
 #include "core/libraries/avplayer/avplayer_state.h"
+#ifdef __APPLE__
+#include "bbport_guest_alloc.h"
+#endif
 #include "core/libraries/kernel/process.h"
 
 #include <magic_enum/magic_enum.hpp>
@@ -450,7 +453,13 @@ void AvPlayerState::ProcessEvent() {
     }
     switch (event->event) {
     case AvEventType::WarningId: {
+#ifdef __APPLE__
+        BbPort::GuestCopy low_error(&event->payload.error, sizeof(event->payload.error));
+        EmitEvent(AvPlayerEvents::WarningId, low_error.Data());
+        low_error.CopyBack(&event->payload.error);
+#else
         EmitEvent(AvPlayerEvents::WarningId, &event->payload.error);
+#endif
         break;
     }
     case AvEventType::RevertState: {

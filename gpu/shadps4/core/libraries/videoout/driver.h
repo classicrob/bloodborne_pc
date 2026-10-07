@@ -3,6 +3,10 @@
 
 #pragma once
 
+#ifdef __APPLE__
+#include "bbport_guest_alloc.h"
+#endif
+
 #include <deque>
 #include <functional>
 
@@ -77,7 +81,11 @@ struct ServiceThreadParams {
     u64 affinity;
 };
 
-class VideoOutDriver {
+class VideoOutDriver
+#ifdef __APPLE__
+    : public BbPort::GuestAllocated
+#endif
+{
 public:
     VideoOutDriver(u32 width, u32 height);
     ~VideoOutDriver();
@@ -133,5 +141,9 @@ private:
     std::jthread present_thread;
     std::queue<Request> requests;
 };
+
+#ifdef __APPLE__
+static_assert(alignof(VideoOutDriver) <= 64);
+#endif
 
 } // namespace Libraries::VideoOut
