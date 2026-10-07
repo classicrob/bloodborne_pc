@@ -170,8 +170,9 @@ Apple: their INT8/dot-product/compute-derivative shader paths have not been
 validated for this Metal backend, and 4.1.1 additionally needs
 `VK_VALVE_shader_mixed_float_dot_product`. This is not a claim that Apple
 hardware lacks all INT8 operations. The Mac launcher rejects saved FSR4/411
-settings; the renderer also aborts on an FSR 4/4.1.1 selection, naming the
-selected version and the unsupported AMD shader feature set.
+settings; the renderer also aborts on an FSR 4/4.1.1 selection and names the
+selected version. The AMD shader feature requirements above are why these
+versions are disabled for this backend.
 
 The measured M4 Max/MoltenVK capability audit is a snapshot of SDK 1.4.363
 with MoltenVK 1.4.2, not a statement about every future driver:
