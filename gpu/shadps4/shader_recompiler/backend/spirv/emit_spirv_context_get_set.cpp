@@ -89,7 +89,7 @@ Id EmitBufferAddress(EmitContext& ctx, IR::Inst* inst, u32 handle, Id index, Id 
         return ctx.OpIMul(ctx.U32[1], a, ctx.ConstU32(factor));
     };
     if (!flags.index_enable) index = ctx.u32_zero_value;
-    if (sharp.add_tid_enable) {
+    if (sharp.stride != 0 && sharp.add_tid_enable) {
         index = checked_add(index, ctx.OpLoad(ctx.U32[1], ctx.subgroup_local_invocation_id));
     }
     if (!flags.voffset_enable) offset = ctx.u32_zero_value;

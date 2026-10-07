@@ -163,12 +163,13 @@ public:
         // Fallback
         AddLabel(fallback_label);
         const Id fallback_result = fallback();
+        const Id fallback_exit_label = last_label;
         OpBranch(merge_label);
 
         // Merge
         AddLabel(merge_label);
         const Id final_result =
-            OpPhi(U32[1], fallback_result, fallback_label, result, available_label);
+            OpPhi(U32[1], fallback_result, fallback_exit_label, result, available_label);
         return final_result;
     }
 

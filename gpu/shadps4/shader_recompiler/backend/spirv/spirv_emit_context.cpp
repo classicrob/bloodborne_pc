@@ -232,9 +232,19 @@ void EmitContext::DefineBufferProperties() {
     if (profile.emulate_robust_buffer_access) {
         // The prologue dominates every guest access. Query each binding once per invocation.
         for (auto& buffer : buffers) {
+            constexpr std::array shifts{0u, 1u, 2u, 2u, 3u, 3u};
+            u32 source = u32(PointerType::NumAlias);
+            for (u32 alias = 0; alias < buffer.aliases.size(); ++alias) {
+                if (Sirit::ValidId(buffer.aliases[alias].id) &&
+                    (source == u32(PointerType::NumAlias) || shifts[alias] < shifts[source]))
+                    source = alias;
+            }
+            if (source == u32(PointerType::NumAlias)) continue;
+            const Id length = OpArrayLength(U32[1], buffer.aliases[source].id, 0);
             for (u32 alias = 0; alias < buffer.aliases.size(); ++alias) {
                 if (Sirit::ValidId(buffer.aliases[alias].id))
-                    buffer.lengths[alias] = OpArrayLength(U32[1], buffer.aliases[alias].id, 0);
+                    buffer.lengths[alias] = shifts[alias] == shifts[source] ? length
+                        : OpShiftRightLogical(U32[1], length, ConstU32(shifts[alias] - shifts[source]));
             }
         }
         for (u32 handle = 0; handle < buffers.size(); ++handle) {
