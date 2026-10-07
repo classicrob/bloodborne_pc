@@ -357,7 +357,7 @@ void EmitContext::DefineInputs() {
         }
 
         const auto fetch_shader = Gcn::ParseFetchShader(info);
-        if (!fetch_shader) {
+        if (!fetch_shader || profile.emulate_vertex_fetch) {
             break;
         }
         for (const auto& attrib : fetch_shader->attributes) {

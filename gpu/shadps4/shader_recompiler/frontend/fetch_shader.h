@@ -49,18 +49,21 @@ struct VertexAttribute {
     bool operator==(const VertexAttribute& other) const {
         return semantic == other.semantic && dest_vgpr == other.dest_vgpr &&
                num_elements == other.num_elements && sgpr_base == other.sgpr_base &&
-               dword_offset == other.dword_offset && instance_data == other.instance_data;
+               dword_offset == other.dword_offset && instance_data == other.instance_data &&
+               inst_offset == other.inst_offset && data_format == other.data_format &&
+               num_format == other.num_format;
     }
 };
 
 struct FetchShaderData {
     u32 size = 0;
+    u64 code_hash = 0;
     std::vector<VertexAttribute> attributes;
     s8 vertex_offset_sgpr = -1;   ///< SGPR of vertex offset from VADDR
     s8 instance_offset_sgpr = -1; ///< SGPR of instance offset from VADDR
 
     bool operator==(const FetchShaderData& other) const {
-        return attributes == other.attributes && vertex_offset_sgpr == other.vertex_offset_sgpr &&
+        return code_hash == other.code_hash && attributes == other.attributes && vertex_offset_sgpr == other.vertex_offset_sgpr &&
                instance_offset_sgpr == other.instance_offset_sgpr;
     }
 

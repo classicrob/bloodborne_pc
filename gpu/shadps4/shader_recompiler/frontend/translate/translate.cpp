@@ -5,6 +5,7 @@
 #include "common/path_util.h"
 #include "core/emulator_settings.h"
 #include "shader_recompiler/frontend/fetch_shader.h"
+#include "shader_recompiler/frontend/decode.h"
 #include "shader_recompiler/frontend/translate/translate.h"
 #include "shader_recompiler/info.h"
 #include "shader_recompiler/ir/attribute.h"
@@ -112,7 +113,8 @@ void Translator::EmitPrologue(IR::Block* first_block) {
         // v0: vertex ID, always present
         IR::U32 vertex_id = ir.GetAttributeU32(IR::Attribute::VertexId);
         if (base_vertex_sgpr != -1) {
-            if (!fetch_data || fetch_data->vertex_offset_sgpr == -1) {
+            if (profile.emulate_vertex_fetch || !fetch_data ||
+                fetch_data->vertex_offset_sgpr == -1) {
                 vertex_id = ir.ISub(vertex_id, ir.GetAttributeU32(IR::Attribute::BaseVertex));
             } else {
                 ASSERT_MSG(fetch_data->vertex_offset_sgpr == base_vertex_sgpr,
@@ -120,6 +122,11 @@ void Translator::EmitPrologue(IR::Block* first_block) {
             }
         }
         ir.SetVectorReg(dst_vreg++, vertex_id);
+
+        IR::U32 instance_index = ir.GetAttributeU32(IR::Attribute::InstanceId);
+        if (profile.emulate_vertex_fetch && base_instance_sgpr != -1) {
+            instance_index = ir.ISub(instance_index, ir.GetAttributeU32(IR::Attribute::BaseInstance));
+        }
 
         if (info.hw_stage == HwStage::Local) {
             // v1: rel patch ID
@@ -135,7 +142,7 @@ void Translator::EmitPrologue(IR::Block* first_block) {
             if (runtime_info.props.num_input_vgprs > 0) {
                 if (runtime_info.sw.vs.step_rate_0 != 0) {
                     ir.SetVectorReg(dst_vreg++,
-                                    ir.IDiv(ir.GetAttributeU32(IR::Attribute::InstanceId),
+                                    ir.IDiv(instance_index,
                                             ir.Imm32(runtime_info.sw.vs.step_rate_0)));
                 } else {
                     ir.SetVectorReg(dst_vreg++, ir.Imm32(0));
@@ -145,7 +152,7 @@ void Translator::EmitPrologue(IR::Block* first_block) {
             if (runtime_info.props.num_input_vgprs > 1) {
                 if (runtime_info.sw.vs.step_rate_1 != 0) {
                     ir.SetVectorReg(dst_vreg++,
-                                    ir.IDiv(ir.GetAttributeU32(IR::Attribute::InstanceId),
+                                    ir.IDiv(instance_index,
                                             ir.Imm32(runtime_info.sw.vs.step_rate_1)));
                 } else {
                     ir.SetVectorReg(dst_vreg++, ir.Imm32(0));
@@ -155,8 +162,8 @@ void Translator::EmitPrologue(IR::Block* first_block) {
 
         // v3: instance ID, plain
         if (runtime_info.props.num_input_vgprs > 2) {
-            IR::U32 instance_id = ir.GetAttributeU32(IR::Attribute::InstanceId);
-            if (base_instance_sgpr != -1) {
+            IR::U32 instance_id = instance_index;
+            if (base_instance_sgpr != -1 && !profile.emulate_vertex_fetch) {
                 if (!fetch_data || fetch_data->instance_offset_sgpr == -1) {
                     instance_id =
                         ir.ISub(instance_id, ir.GetAttributeU32(IR::Attribute::BaseInstance));
@@ -1138,24 +1145,6 @@ template void Translator::SetDstPk<IR::F32, false>(const InstOperand& operand,
 void Translator::EmitFetch(const GcnInst& inst) {
     const auto code_sgpr_base = inst.src[0].code;
 
-#if 0
-    // Translate fetch shader inline using regular buffer bindings; useful for debugging.
-    const auto* code = GetFetchShaderCode(info, code_sgpr_base);
-    GcnCodeSlice slice(code, code + std::numeric_limits<u32>::max());
-    GcnDecodeContext decoder;
-
-    // Decode and save instructions
-    while (!slice.atEnd()) {
-        const auto sub_inst = decoder.decodeInstruction(slice);
-        if (sub_inst.opcode == Opcode::S_SETPC_B64) {
-            // Assume we're swapping back to the main shader.
-            break;
-        }
-        TranslateInstruction(sub_inst);
-    }
-    return;
-#endif
-
     info.has_fetch_shader = true;
     info.fetch_shader_sgpr_base = code_sgpr_base;
 
@@ -1172,6 +1161,22 @@ void Translator::EmitFetch(const GcnInst& inst) {
         const auto file = IOFile{dump_dir / filename, FileAccessMode::Create};
         const auto* code = GetFetchShaderCode(info, code_sgpr_base);
         file.WriteRaw<u8>(code, fetch_data->size);
+    }
+
+    if (profile.emulate_vertex_fetch) {
+        const auto* code = GetFetchShaderCode(info, code_sgpr_base);
+        GcnCodeSlice slice(code, code + fetch_data->size / sizeof(u32));
+        GcnDecodeContext decoder;
+        while (!slice.atEnd()) {
+            const auto sub_inst = decoder.decodeInstruction(slice);
+            if (sub_inst.opcode == Opcode::S_SETPC_B64) {
+                return;
+            }
+            ASSERT_MSG(sub_inst.opcode != Opcode::S_SWAPPC_B64,
+                       "Vertex fetch shader {:#x}: nested fetch calls are unsupported", info.pgm_hash);
+            TranslateInstruction(sub_inst);
+        }
+        UNREACHABLE_MSG("Vertex fetch shader {:#x}: missing return instruction", info.pgm_hash);
     }
 
     for (const auto& attrib : fetch_data->attributes) {

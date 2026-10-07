@@ -96,13 +96,15 @@ struct StageSpecialization {
     Backend::Bindings start{};
     bool emulate_null_descriptors{};
     bool emulate_robust_buffer_access{};
+    bool emulate_vertex_fetch{};
 
     StageSpecialization() = default;
     StageSpecialization(const Info& info_, RuntimeInfo runtime_info_, const Profile& profile_,
                         Backend::Bindings start_)
         : info{&info_}, runtime_info{runtime_info_}, start{start_},
           emulate_null_descriptors{profile_.emulate_null_descriptors},
-          emulate_robust_buffer_access{profile_.emulate_robust_buffer_access} {
+          emulate_robust_buffer_access{profile_.emulate_robust_buffer_access},
+          emulate_vertex_fetch{profile_.emulate_vertex_fetch} {
         fetch_shader_data = Gcn::ParseFetchShader(info_);
         if (info_.sw_stage == SwStage::Vertex && fetch_shader_data) {
             // Specialize shader on VS input number types to follow spec.
@@ -224,7 +226,8 @@ struct StageSpecialization {
             return false;
         }
 
-        if (emulate_robust_buffer_access != other.emulate_robust_buffer_access ||
+        if (emulate_vertex_fetch != other.emulate_vertex_fetch ||
+            emulate_robust_buffer_access != other.emulate_robust_buffer_access ||
             emulate_null_descriptors != other.emulate_null_descriptors ||
             (emulate_null_descriptors && bitset != other.bitset)) {
             return false;
