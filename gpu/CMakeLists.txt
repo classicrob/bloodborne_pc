@@ -274,8 +274,15 @@ target_include_directories(fsr4-bench PRIVATE shadps4/video_core/renderer_vulkan
 target_link_libraries(fsr4-bench PRIVATE ffx-vulkan::fsr4-v07-vulkan ffx-vulkan::fsr4-v07-assets Vulkan::Vulkan)
 
 if (APPLE)
+    add_executable(null-descriptor-test EXCLUDE_FROM_ALL ../tests/test_null_descriptors.cpp
+        ../tests/test_gpu_runtime_stubs.cpp)
+    target_include_directories(null-descriptor-test PRIVATE shim shadps4 third_party/gcn/include)
+    target_compile_options(null-descriptor-test PRIVATE -UNDEBUG -fPIC)
+    set_source_files_properties(../tests/test_null_descriptors.cpp PROPERTIES
+        COMPILE_OPTIONS "-fvisibility=hidden;-fvisibility-inlines-hidden")
+    target_link_libraries(null-descriptor-test PRIVATE bbgpu)
     find_package(Python3 REQUIRED COMPONENTS Interpreter)
-    foreach(test_target motion-shader-test scene-resolution-test taa-shader-test camera-motion-test)
+    foreach(test_target motion-shader-test scene-resolution-test taa-shader-test camera-motion-test null-descriptor-test)
         add_custom_command(TARGET ${test_target} POST_BUILD
             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../packaging/macos/check-exports.py
                 $<TARGET_FILE:bbgpu> $<TARGET_FILE:${test_target}> VERBATIM)

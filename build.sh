@@ -136,6 +136,8 @@ fi
 "$CC" "${platform_flags[@]}" -std=c11 -O2 -Wall -Wextra -Werror tools/gpu_capabilities.c "${includes[@]}" "${libraries[@]}" "${caps_link[@]}" -o out/bb-gpu-capabilities
 if [[ ${1:-} == --test ]]; then
     if [[ $(uname -s) == Darwin ]]; then
+        ninja -C out/gpu "${ninja_jobs[@]}" null-descriptor-test
+        out/gpu/null-descriptor-test
         "$CC" "${platform_flags[@]}" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread -Isrc \
             tests/test_compat_mac.c src/compat_mac.c -o out/compat-mac-test
         out/compat-mac-test
@@ -163,6 +165,8 @@ if [[ ${1:-} == --test ]]; then
         sh tests/test_memory_macos.sh
         sh tests/macos_spike/test_tls_runtime.sh
         sh tests/macos_spike/test_hle_stack.sh
+        bash tests/test_savedata_macos.sh
+        python3 tests/test_restart_macos.py
     fi
     "$CC" "${platform_flags[@]}" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread "${includes[@]}" -I. -Isrc tests/test_pad.c "${libraries[@]}" "${caps_link[@]}" -o out/pad-test
     out/pad-test
