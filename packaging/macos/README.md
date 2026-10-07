@@ -51,7 +51,9 @@ BB_DEPS_PREFIX="$HOME/bbport-deps/x86_64" bash build.sh --test
 ```
 
 `fetch-python.py` needs Python 3.11 or newer; `setup.sh` supplies native
-Homebrew Python 3.14 for bootstrapping. CMake, Ninja, pkg-config, glslang,
+Homebrew Python 3.14 for bootstrapping. Native Homebrew FFmpeg generates the
+small H.264/AAC fixture for the AvPlayer acceptance test; it is separate from
+the minimal x86_64 FFmpeg libraries loaded by the game. CMake, Ninja, pkg-config, glslang,
 Python and Boost/robin-map headers run or are consumed on the ARM host.
 Libraries loaded by the game are built for x86_64 in one shared dependency
 prefix; an Intel Homebrew installation is not required.
