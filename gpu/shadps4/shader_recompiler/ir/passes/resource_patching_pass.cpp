@@ -630,6 +630,11 @@ void PatchBufferArgs(IR::Inst& inst, Info& info, const Profile& profile) {
     }
 
     IR::IREmitter ir{*inst.GetParent(), IR::Block::InstructionList::s_iterator_to(inst)};
+    if (profile.emulate_null_descriptors && !buffer_res.IsSpecial() &&
+        (buffer.base_address == 0 || buffer.GetSize() == 0)) {
+        inst.SetArg(IR::LoadBufferArgs::Address, ir.Imm32(0u));
+        return;
+    }
     if (profile.emulate_robust_buffer_access && !buffer_res.IsSpecial()) {
         auto flags = inst.Flags<IR::BufferInstInfo>();
         const bool formatted = inst.GetOpcode() == IR::Opcode::LoadBufferFormatF32 ||
@@ -637,7 +642,27 @@ void PatchBufferArgs(IR::Inst& inst, Info& info, const Profile& profile) {
         const auto format = flags.inst_data_fmt != AmdGpu::DataFormat::FormatInvalid
                                 ? AmdGpu::RemapDataFormat(flags.inst_data_fmt.Value())
                                 : buffer.GetDataFmt();
-        const u32 shift = BufferAddressShift(inst, format);
+        const auto soffset = IR::GetBufferSOffsetArg(&inst);
+        ASSERT_MSG(buffer.stride == 0 ||
+                       (soffset.IsImmediate() && soffset.U32() == 0),
+                   "Apple structured-buffer SGPR offset needs a wider binding: shader={:#x} "
+                   "base={:#x} stride={} num_records={} swizzle={} index_stride={} "
+                   "element_size={} flags={:#x} soffset={}",
+                   info.pgm_hash, buffer.base_address, buffer.stride, buffer.num_records,
+                   buffer.swizzle_enable, buffer.GetIndexStride(), buffer.GetElementSize(),
+                   flags.raw, soffset.IsImmediate() ? std::to_string(soffset.U32()) : "dynamic");
+        const bool raw64 = inst.GetOpcode() == IR::Opcode::LoadBufferU64 ||
+                           inst.GetOpcode() == IR::Opcode::StoreBufferU64;
+        const u32 shift = raw64 ? 2 : BufferAddressShift(inst, format);
+        if (raw64) info.buffers[handle.U32()].used_types |= IR::Type::U32;
+        ASSERT_MSG(!buffer.swizzle_enable ||
+                       (buffer.stride % buffer.GetElementSize() == 0 &&
+                        buffer.GetElementSize() >= (formatted ? AmdGpu::NumBitsPerElement(format) / 8
+                                                             : 1u << shift)),
+                   "Apple buffer swizzle has an unsupported element layout: shader={:#x} "
+                   "base={:#x} stride={} num_records={} index_stride={} element_size={} flags={:#x}",
+                   info.pgm_hash, buffer.base_address, buffer.stride, buffer.num_records,
+                   buffer.GetIndexStride(), buffer.GetElementSize(), flags.raw);
         flags.address_shift.Assign(shift);
         flags.access_bytes.Assign(formatted ? AmdGpu::NumBitsPerElement(format) / 8 : 1u << shift);
         flags.typed.Assign(formatted);

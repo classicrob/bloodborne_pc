@@ -185,9 +185,10 @@ public:
         ASSERT(flatbuf_buffer.binding >= 0 && flatbuf_buffer.buffer_type == BufferType::Flatbuf);
         const auto [flatbuf_buffer_id, flatbuf_pointer_type] =
             flatbuf_buffer.aliases[u32(PointerType::U32)];
-        const auto ptr{
-            OpAccessChain(flatbuf_pointer_type, flatbuf_buffer_id, u32_zero_value, flatbuf_offset)};
-        return OpLoad(U32[1], ptr);
+        return BufferRead(flatbuf_index, PointerType::U32, flatbuf_offset, flatbuf_offset, U32[1], [&] {
+            const auto ptr{OpAccessChain(flatbuf_pointer_type, flatbuf_buffer_id, u32_zero_value, flatbuf_offset)};
+            return OpLoad(U32[1], ptr);
+        });
     }
 
     Info& info;

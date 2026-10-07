@@ -543,6 +543,22 @@ Id EmitLoadBufferU32x4(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address)
 }
 
 Id EmitLoadBufferU64(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address) {
+    if (ctx.profile.emulate_robust_buffer_access && ctx.buffer_address_bounds.contains(address.value)) {
+        const Id original = address;
+        const auto& buffer = ctx.buffers[handle];
+        if (const Id offset = buffer.Offset(PointerSize::B32); Sirit::ValidId(offset)) {
+            address = ctx.OpIAdd(ctx.U32[1], address, offset);
+        }
+        const auto [id, pointer_type] = buffer.Alias(PointerType::U32);
+        std::array<Id, 2> values;
+        for (u32 c = 0; c < values.size(); ++c) {
+            const Id index = ctx.OpIAdd(ctx.U32[1], address, ctx.ConstU32(c));
+            values[c] = ctx.BufferRead(handle, PointerType::U32, original, index, ctx.U32[1], [&] {
+                return ctx.OpLoad(ctx.U32[1], ctx.OpAccessChain(pointer_type, id, ctx.u32_zero_value, index));
+            }, c);
+        }
+        return ctx.OpBitcast(ctx.U64, ctx.OpCompositeConstruct(ctx.U32[2], values));
+    }
     const Id original_index = address;
     const auto& spv_buffer = ctx.buffers[handle];
     if (const Id offset = spv_buffer.Offset(PointerSize::B64); Sirit::ValidId(offset)) {
@@ -639,6 +655,23 @@ void EmitStoreBufferU32x4(EmitContext& ctx, IR::Inst* inst, u32 handle, Id addre
 }
 
 void EmitStoreBufferU64(EmitContext& ctx, IR::Inst*, u32 handle, Id address, Id value) {
+    if (ctx.profile.emulate_robust_buffer_access && ctx.buffer_address_bounds.contains(address.value)) {
+        const Id original = address;
+        const auto& buffer = ctx.buffers[handle];
+        if (const Id offset = buffer.Offset(PointerSize::B32); Sirit::ValidId(offset)) {
+            address = ctx.OpIAdd(ctx.U32[1], address, offset);
+        }
+        const auto [id, pointer_type] = buffer.Alias(PointerType::U32);
+        const Id values = ctx.OpBitcast(ctx.U32[2], value);
+        for (u32 c = 0; c < 2; ++c) {
+            const Id index = ctx.OpIAdd(ctx.U32[1], address, ctx.ConstU32(c));
+            const Id component = ctx.OpCompositeExtract(ctx.U32[1], values, c);
+            ctx.BufferWrite(handle, PointerType::U32, original, index, [&] {
+                ctx.OpStore(ctx.OpAccessChain(pointer_type, id, ctx.u32_zero_value, index), component);
+            }, c);
+        }
+        return;
+    }
     const Id original_index = address;
     const auto& spv_buffer = ctx.buffers[handle];
     if (const Id offset = spv_buffer.Offset(PointerSize::B64); Sirit::ValidId(offset)) {
