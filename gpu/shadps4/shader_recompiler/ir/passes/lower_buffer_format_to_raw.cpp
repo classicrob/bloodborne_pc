@@ -240,9 +240,11 @@ static void LowerBufferFormatInst(IR::Block& block, IR::Inst& inst, Info& info, 
             LoadBufferFormat(ir, inst.Arg(0), IR::U32{inst.Arg(1)}, flags, format_info);
         if (profile.emulate_robust_buffer_access) {
             const auto in_range = ir.INotEqual(IR::U32{inst.Arg(1)}, ir.Imm32(UINT32_MAX));
-            const auto zero = ir.CompositeConstruct(ir.Imm32(0.f), ir.Imm32(0.f),
-                                                    ir.Imm32(0.f), ir.Imm32(0.f));
-            inst.ReplaceUsesWithAndRemove(ir.Select(in_range, interpreted, zero));
+            std::array<IR::Value, 4> components;
+            for (u32 c = 0; c < components.size(); ++c)
+                components[c] = ir.Select(in_range, ir.CompositeExtract(interpreted, c), ir.Imm32(0.f));
+            inst.ReplaceUsesWithAndRemove(ir.CompositeConstruct(components[0], components[1],
+                                                               components[2], components[3]));
         } else {
             inst.ReplaceUsesWithAndRemove(interpreted);
         }

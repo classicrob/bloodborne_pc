@@ -643,6 +643,46 @@ void PatchBufferArgs(IR::Inst& inst, Info& info, const Profile& profile) {
                                 ? AmdGpu::RemapDataFormat(flags.inst_data_fmt.Value())
                                 : buffer.GetDataFmt();
         const auto soffset = IR::GetBufferSOffsetArg(&inst);
+        ASSERT_MSG(!buffer.add_tid_enable || buffer.stride == 0 || profile.subgroup_size == 64,
+                   "Apple GCN wave64 add_tid is not implemented for this subgroup: "
+                   "shader={:#x} base={:#x} stride={} num_records={} swizzle={} "
+                   "index_stride={} element_size={} subgroup_size={} flags={:#x}",
+                   info.pgm_hash, buffer.base_address, buffer.stride, buffer.num_records,
+                   buffer.swizzle_enable, buffer.GetIndexStride(), buffer.GetElementSize(),
+                   profile.subgroup_size, flags.raw);
+        if (buffer.GetDataFmt() == AmdGpu::DataFormat::FormatInvalid &&
+            flags.inst_data_fmt == AmdGpu::DataFormat::FormatInvalid) {
+            inst.SetArg(IR::LoadBufferArgs::Address, ir.Imm32(UINT32_MAX));
+            return;
+        }
+        if (buffer.stride != 0 && !flags.index_enable && !buffer.add_tid_enable) {
+            const auto voffset = IR::GetBufferVOffsetArg(&inst);
+            ASSERT_MSG(!flags.voffset_enable || voffset.IsImmediate(),
+                       "Apple structured offen-only dynamic offset needs a wider binding: "
+                       "shader={:#x} base={:#x} stride={} num_records={} swizzle={} "
+                       "index_stride={} element_size={} flags={:#x}",
+                       info.pgm_hash, buffer.base_address, buffer.stride, buffer.num_records,
+                       buffer.swizzle_enable, buffer.GetIndexStride(), buffer.GetElementSize(), flags.raw);
+            u64 span = formatted ? AmdGpu::NumBitsPerElement(format) / 8
+                                 : 1ull << BufferAddressShift(inst, format);
+            switch (inst.GetOpcode()) {
+            case IR::Opcode::LoadBufferU32x2: case IR::Opcode::LoadBufferF32x2:
+            case IR::Opcode::StoreBufferU32x2: case IR::Opcode::StoreBufferF32x2: span = 8; break;
+            case IR::Opcode::LoadBufferU32x3: case IR::Opcode::LoadBufferF32x3:
+            case IR::Opcode::StoreBufferU32x3: case IR::Opcode::StoreBufferF32x3: span = 12; break;
+            case IR::Opcode::LoadBufferU32x4: case IR::Opcode::LoadBufferF32x4:
+            case IR::Opcode::StoreBufferU32x4: case IR::Opcode::StoreBufferF32x4: span = 16; break;
+            default: break;
+            }
+            const u64 offset = u64(flags.inst_offset.Value()) +
+                (flags.voffset_enable ? voffset.U32() : 0u);
+            // Swizzled index0 offsets traverse one element in each index group.
+            const u64 physical_offset = buffer.swizzle_enable
+                ? (offset / buffer.GetElementSize()) * buffer.GetElementSize() * buffer.GetIndexStride() +
+                      offset % buffer.GetElementSize() : offset;
+            auto& required = info.buffers[handle.U32()].required_binding_bytes;
+            required = std::max(required, physical_offset + span);
+        }
         ASSERT_MSG(buffer.stride == 0 ||
                        (soffset.IsImmediate() && soffset.U32() == 0),
                    "Apple structured-buffer SGPR offset needs a wider binding: shader={:#x} "
