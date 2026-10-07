@@ -18,7 +18,8 @@ enum {
     GCN_R_FMT_SEL = 1 << 5,
     GCN_R_MTBUF_BOUND = 1 << 6,
     GCN_R_SHORT_ALIGN = 1 << 7,
-    GCN_NUM_READINGS = 1 << 8,
+    GCN_R_SEL1_FLOAT = 1 << 8,
+    GCN_NUM_READINGS = 1 << 9,
 };
 
 typedef struct {
@@ -87,6 +88,14 @@ int gcn_format_layout(uint32_t dfmt, uint32_t* ncomp, uint32_t* comp_bytes);
  * `data` is the VGPR data (stores/atomics; data[1] is the CMPSWAP compare value). */
 void gcn_execute(const gcn_vsharp* v, const gcn_addr* a, const gcn_op* op, const uint32_t data[4],
                  unsigned reading, gcn_mem* mem, gcn_result* out);
+
+/* Wave64 lane semantics (Sea Islands ISA chapter 12 instruction descriptions). */
+/* V_MBCNT_LO/HI_U32_B32: ThreadMask = (1 << ThreadPosition) - 1;
+ * D = CountOneBits(S0 & ThreadMask[31:0] or [63:32]) + S1. */
+uint32_t gcn_mbcnt(uint32_t s0, uint32_t s1, uint32_t lane, int hi);
+/* V_READFIRSTLANE_B32: Lane# = FindFirst1fromLSB(exec), lane 0 if exec is zero. */
+uint32_t gcn_first_lane(uint64_t exec);
+uint32_t gcn_popcount64(uint64_t x);
 
 #ifdef __cplusplus
 }

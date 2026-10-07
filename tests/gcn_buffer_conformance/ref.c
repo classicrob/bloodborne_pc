@@ -68,11 +68,9 @@ static unit check_unit(const gcn_vsharp* v, const gcn_addr* a, uint32_t delta,
     }
     if (!oob && (r & GCN_R_END_WHOLE)) {
         const uint64_t end = u.addr + touch_bytes;
-        if (v->stride == 0) {
-            oob = end > v->base + v->num_records;
-        } else if (!v->swizzle_en && (a->idxen || v->add_tid)) {
-            oob = end > base + m32(index * v->stride, r) + v->stride;
-        }
+        /* "the end" is the end of the buffer: num_records bytes (raw) or stride * num_records. */
+        const uint64_t size = v->stride == 0 ? v->num_records : (uint64_t)v->stride * v->num_records;
+        oob = end > v->base + size;
     }
     u.in_range = !oob;
     return u;
@@ -262,7 +260,7 @@ void gcn_execute(const gcn_vsharp* v, const gcn_addr* a, const gcn_op* op, const
         for (uint32_t c = 0; c < 4; c++) {
             sel[c] = op->inst_typed ? (uint8_t)(c < k ? 4 + c : 0) : v->dst_sel[c];
         }
-        const uint32_t one = nfmt == GCN_NFMT_FLOAT ? 0x3f800000u : 1u;
+        const uint32_t one = (nfmt == GCN_NFMT_FLOAT || (r & GCN_R_SEL1_FLOAT)) ? 0x3f800000u : 1u;
         for (uint32_t c = 0; c < op->ncomp && c < 4; c++) {
             if (!in_range && !(r & GCN_R_FMT_SEL)) {
                 out->value[c] = 0;
@@ -304,4 +302,23 @@ void gcn_execute(const gcn_vsharp* v, const gcn_addr* a, const gcn_op* op, const
         }
         out->value[i] = (uint32_t)value;
     }
+}
+
+uint32_t gcn_popcount64(uint64_t x) {
+    uint32_t n = 0;
+    for (; x; x &= x - 1) n++;
+    return n;
+}
+
+uint32_t gcn_mbcnt(uint32_t s0, uint32_t s1, uint32_t lane, int hi) {
+    const uint64_t thread_mask = lane >= 64 ? ~0ull : (1ull << lane) - 1;
+    const uint32_t half = hi ? (uint32_t)(thread_mask >> 32) : (uint32_t)thread_mask;
+    return gcn_popcount64(s0 & half) + s1;
+}
+
+uint32_t gcn_first_lane(uint64_t exec) {
+    for (uint32_t lane = 0; lane < 64; lane++) {
+        if (exec & (1ull << lane)) return lane;
+    }
+    return 0;
 }

@@ -48,6 +48,12 @@ cxx=(/usr/bin/clang++ -arch x86_64 -std=gnu++2b -fPIC -fno-omit-frame-pointer
      -I"$third/magic_enum/include" -I"$third/magic_enum/include/magic_enum"
      -I"$src/gpu/third_party/sirit/include" -I"$third/sirit/externals/SPIRV-Headers/include"
      -I"$deps/include/vma" -isystem "$deps/include")
+# Mirror the Apple binder guards that this tree's Rasterizer::BindBuffers has.
+rast="$src/gpu/shadps4/video_core/renderer_vulkan/vk_rasterizer.cpp"
+mirror=()
+grep -q "structured access escapes bound guest buffer" "$rast" && mirror+=(-DBB_MIRROR_REQUIRED_SPAN)
+grep -q "incomplete swizzled buffer index group" "$rast" && mirror+=(-DBB_MIRROR_SWIZZLE_GROUP)
+grep -q "exceeds 32-bit descriptor range" "$rast" && mirror+=(-DBB_MIRROR_U32_RANGE)
 # Production flags for recompiler objects (CMake RelWithDebInfo), our own asserts kept on in the harness.
 prod=(-O2 -DNDEBUG)
 
@@ -73,7 +79,7 @@ if [[ -n $tree ]]; then
 fi
 
 /usr/bin/clang -arch x86_64 -std=c11 -O2 -Wall -Wextra -Werror -c "$here/ref.c" -o "$obj/ref.o"
-"${cxx[@]}" -O1 -g -UNDEBUG -Wall -Wno-unused-parameter -c "$here/harness.cpp" -o "$obj/harness.o"
+"${cxx[@]}" -O1 -g -UNDEBUG -Wall -Wno-unused-parameter ${mirror[@]+"${mirror[@]}"} -c "$here/harness.cpp" -o "$obj/harness.o"
 "${cxx[@]}" -O1 -c "$root/tests/test_gpu_runtime_stubs.cpp" -o "$obj/stubs.o"
 /usr/bin/clang++ -arch x86_64 -Wl,-export_dynamic "$obj/harness.o" "$obj/ref.o" "$obj/stubs.o" "${extra[@]}" \
     "$gpu_build/libbbgpu.dylib" -L"$deps/lib" -lfmt \

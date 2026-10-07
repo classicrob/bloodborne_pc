@@ -72,6 +72,8 @@ u8 CanaryByte(u64 va) { return u8(Hash32(va ^ 0xC0FFEE123ull) % 255 + 1); }
 // ---------------------------------------------------------------------------------------------
 enum class SoffSrc { Inline, Sgpr };
 enum class SmemSrc { None, Imm, Sgpr };
+// Wave64 lane-semantics programs (no buffer access under test).
+enum class Wave { None, Lane, MbcntMask, Readlane, Exec1, Exec2 };
 
 struct Template {
     std::string name;
@@ -85,6 +87,7 @@ struct Template {
     SmemSrc smem = SmemSrc::None;
     u32 smem_imm = 0;      // dwords
     bool combo = false;    // s_buffer_load_dword (imm) + buffer_load_dword on the same V#
+    Wave wave = Wave::None;
     std::vector<u32> code;
     u64 hash = 0;
 };
@@ -96,6 +99,7 @@ struct Lane {
 
 struct BindPlan {
     u32 type = 0; // Shader::BufferType
+    u64 required = 0; // BufferResource::required_binding_bytes, when the tree has it
     std::array<u32, 4> sharp{};
     std::vector<u32> flat;
 };
@@ -112,6 +116,7 @@ struct Job {
     std::array<Lane, 64> lanes{};
     bool approved_struct_soff = false, approved_swizzle = false;
     bool isa_invalid = false; // violates an ISA programming rule (e.g. element_size < access size)
+    bool approved_offen_only = false; // structured, offen without idxen/add_tid: offset never checked
     u32 slot = 0;
     std::array<u32, 16> ud{};
     // compile output
@@ -151,6 +156,64 @@ u64 BoundSize(const gcn_vsharp& v) { // AmdGpu::Buffer::GetSize(): u32 arithmeti
 // ---------------------------------------------------------------------------------------------
 // Shader templates
 
+// v2 = active (exec predicate), v3 = per-lane value, v5 = ballot predicate, v9 = 0; s12/s13 = lane selects.
+void AssembleWave(GcnAsm::Code& c, Wave w) {
+    using namespace GcnAsm;
+    switch (w) {
+    case Wave::Lane: // lane id via mbcnt(-1), ballot via VOPC -> VCC, s_bcnt1 of the ballot
+        c.VMbcnt(false, 10, InlineNeg1, 9);
+        c.VMbcnt(true, 10, InlineNeg1, 10);
+        c.VCmpNeU32(Inline(0), 5);
+        c.VMov(11, VCC_LO);
+        c.VMov(12, VCC_HI);
+        c.SBcnt1B64(16, VCC_LO);
+        c.VMov(13, 16);
+        break;
+    case Wave::MbcntMask: // compaction index: mbcnt over the ballot; s_mov_b64 of VCC; v_cndmask on VCC
+        c.VCmpNeU32(Inline(0), 5);
+        c.VMbcnt(false, 10, VCC_LO, 9);
+        c.VMbcnt(true, 10, VCC_HI, 10);
+        c.SMovB64(16, VCC_LO);
+        c.VMov(11, 16);
+        c.VMov(12, 17);
+        c.VCndmask(13, Inline(0), 2); // v2 == 1 in every lane of these jobs
+        break;
+    case Wave::Readlane: // v_readlane across the 64 lanes; readfirstlane with a full exec
+        c.Sop1(3, 17, Inline(37));
+        c.VReadlane(16, 3, 17);
+        c.VReadlane(18, 3, 13);
+        c.VReadlane(19, 3, 12);
+        c.VReadfirstlane(20, 3);
+        c.VMov(10, 16);
+        c.VMov(11, 18);
+        c.VMov(12, 19);
+        c.VMov(13, 20);
+        break;
+    case Wave::Exec1: // scalar results computed under a partial exec are wave-uniform
+        c.VCmpNeU32(Inline(0), 2);
+        c.SAndSaveexecB64(22, VCC_LO);
+        c.VReadfirstlane(21, 3);
+        c.SBcnt1B64(24, EXEC_LO);
+        c.VMov(13, Vgpr(3));
+        c.SMovB64(EXEC_LO, 22);
+        c.VMov(10, 21);
+        c.VMov(11, 24);
+        break;
+    case Wave::Exec2: // exec as a 64-bit value; mbcnt over exec inside the scope
+        c.VCmpNeU32(Inline(0), 2);
+        c.SAndSaveexecB64(22, VCC_LO);
+        c.SMovB64(26, EXEC_LO);
+        c.VMbcnt(false, 12, 26, 9);
+        c.VMbcnt(true, 12, 27, 12);
+        c.SMovB64(EXEC_LO, 22);
+        c.VMov(10, 26);
+        c.VMov(11, 27);
+        break;
+    case Wave::None:
+        break;
+    }
+}
+
 void Assemble(Template& t) {
     using namespace GcnAsm;
     Code c;
@@ -164,10 +227,13 @@ void Assemble(Template& t) {
     c.SWaitcntAll();
     for (u32 i = 0; i < 4; ++i) c.VMovLiteral(10 + i, VgprMarker + i);
     const bool smem = t.smem != SmemSrc::None;
-    if (smem || t.combo) {
+    if (t.wave != Wave::None) {
+        AssembleWave(c, t.wave);
+    } else if (smem || t.combo) {
         for (u32 i = 0; i < 4; ++i) c.SMovLiteral(16 + i, SgprMarker + i);
     }
-    if (smem) {
+    if (t.wave != Wave::None) {
+    } else if (smem) {
         c.SBufferLoad(t.op.ncomp, 16, 0, t.smem == SmemSrc::Imm, t.smem == SmemSrc::Imm ? t.smem_imm : 13);
         c.SWaitcntAll();
         for (u32 i = 0; i < 4; ++i) c.VMov(10 + i, 16 + i);
@@ -354,6 +420,8 @@ Job& NewJob(const std::string& group, u32 tmpl, const gcn_vsharp& v, u64 base_de
                                 (t.soff == SoffSrc::Sgpr || t.soff_inline != 0);
     j.approved_struct_soff = v.stride != 0 && dyn_or_nonzero;
     j.approved_swizzle = v.swizzle_en && v.index_stride && v.num_records % v.index_stride != 0;
+    j.approved_offen_only = v.stride != 0 && t.offen && !t.idxen && !v.add_tid && t.wave == Wave::None &&
+                            t.smem == SmemSrc::None;
     // §8.1.5: const_element_size "Must be >= maximum element size" and const_stride "must be an
     // integer multiple of const_element_size".
     if (v.swizzle_en && v.element_size) {
@@ -825,6 +893,49 @@ void AddAtomicCases() {
     }
 }
 
+// Wave64 lane semantics: the PS4 runs 64-lane waves; Apple subgroups are 32 wide.
+void AddWaveCases() {
+    auto tmpl = [](const char* name, Wave w) {
+        Template t;
+        t.name = name;
+        t.op.kind = GCN_LOAD;
+        t.wave = w;
+        return AddTemplate(t);
+    };
+    const u32 lane = tmpl("wave: v_mbcnt(-1) lane id + VOPC ballot + s_bcnt1", Wave::Lane);
+    const u32 mbcnt = tmpl("wave: v_mbcnt over VCC + s_mov_b64 vcc + v_cndmask", Wave::MbcntMask);
+    const u32 rl = tmpl("wave: v_readlane 37/s13/s12 + v_readfirstlane", Wave::Readlane);
+    const u32 e1 = tmpl("wave: under saveexec: v_readfirstlane, s_bcnt1 exec, masked v_mov", Wave::Exec1);
+    const u32 e2 = tmpl("wave: under saveexec: s_mov_b64 exec, v_mbcnt over exec", Wave::Exec2);
+    auto value = [](u32 l) { return 0x1000u + l * 0x11u; };
+    struct M { const char* name; u64 mask; };
+    const M masks[] = {{"all", ~0ull}, {"none", 0}, {"lane63", 1ull << 63}, {"upper32", 0xFFFFFFFF00000000ull},
+                       {"lower32", 0xFFFFFFFFull}, {"even", 0x5555555555555555ull}, {"lanes0+37", 1ull | 1ull << 37},
+                       {"lane33", 1ull << 33}, {"lanes5+40", 1ull << 5 | 1ull << 40}};
+    for (const M& m : masks) {
+        for (u32 t : {lane, mbcnt}) {
+            Job& j = NewJob("wave64", t, RawV(64), 0);
+            j.label += " ballot=" + std::string(m.name);
+            for (u32 l = 0; l < 64; ++l) SetLane(j, l, value(l), 0, {u32(m.mask >> l & 1), 0, 0, 0});
+        }
+        if (m.mask == 0) continue; // an all-zero exec skips the scope
+        for (u32 t : {e1, e2}) {
+            Job& j = NewJob("wave64", t, RawV(64), 0);
+            j.label += " exec=" + std::string(m.name);
+            for (u32 l = 0; l < 64; ++l) {
+                SetLane(j, l, value(l), 0);
+                j.lanes[l].active = u32(m.mask >> l & 1);
+            }
+        }
+    }
+    for (auto [a, b] : {std::pair{0u, 31u}, std::pair{32u, 63u}, std::pair{45u, 1u}, std::pair{63u, 32u}}) {
+        Job& j = NewJob("wave64", rl, RawV(64), 0, b);
+        j.smem_sgpr = a;
+        j.label += " s13=" + std::to_string(a) + " s12=" + std::to_string(b);
+        for (u32 l = 0; l < 64; ++l) SetLane(j, l, value(l), 0);
+    }
+}
+
 // Shader reuse: StageSpecialization decides whether a compiled module is reused for a new V#.
 // Fields outside the key (num_records, add_tid, base) must be read at run time.
 void AddReuseCases() {
@@ -849,6 +960,9 @@ struct DeviceCaps {
     u32 api, subgroup_size, storage_align;
     u32 int8, int16, int64, float16, float64, rba, rba2, null_descriptor, buffer_int64_atomics;
     u32 max_shared;
+    u32 min_subgroup, max_subgroup, required_size_stages, size_control, full_subgroups;
+    u32 subgroup_stages, subgroup_ops;
+    u32 explicit_layout; // VK_KHR_workgroup_memory_explicit_layout
 };
 
 vk::UniqueInstance CreateInstance() {
@@ -873,8 +987,10 @@ DeviceCaps QueryCaps() {
     auto instance = CreateInstance();
     auto physical = instance->enumeratePhysicalDevices().value.front();
     auto chain = physical.getFeatures2<vk::PhysicalDeviceFeatures2, vk::PhysicalDeviceVulkan11Features,
-                                       vk::PhysicalDeviceVulkan12Features, vk::PhysicalDeviceRobustness2FeaturesEXT>();
-    auto props = physical.getProperties2<vk::PhysicalDeviceProperties2, vk::PhysicalDeviceSubgroupProperties>();
+                                       vk::PhysicalDeviceVulkan12Features, vk::PhysicalDeviceRobustness2FeaturesEXT,
+                                       vk::PhysicalDeviceVulkan13Features>();
+    auto props = physical.getProperties2<vk::PhysicalDeviceProperties2, vk::PhysicalDeviceSubgroupProperties,
+                                         vk::PhysicalDeviceVulkan13Properties>();
     const auto& f = chain.get<vk::PhysicalDeviceFeatures2>().features;
     const auto& f12 = chain.get<vk::PhysicalDeviceVulkan12Features>();
     const auto& r2 = chain.get<vk::PhysicalDeviceRobustness2FeaturesEXT>();
@@ -893,6 +1009,19 @@ DeviceCaps QueryCaps() {
     c.null_descriptor = r2.nullDescriptor;
     c.buffer_int64_atomics = f12.shaderBufferInt64Atomics;
     c.max_shared = p.limits.maxComputeSharedMemorySize;
+    const auto& p13 = props.get<vk::PhysicalDeviceVulkan13Properties>();
+    const auto& f13 = chain.get<vk::PhysicalDeviceVulkan13Features>();
+    const auto& sg = props.get<vk::PhysicalDeviceSubgroupProperties>();
+    c.min_subgroup = p13.minSubgroupSize;
+    c.max_subgroup = p13.maxSubgroupSize;
+    c.required_size_stages = u32(p13.requiredSubgroupSizeStages);
+    c.size_control = f13.subgroupSizeControl;
+    c.full_subgroups = f13.computeFullSubgroups;
+    c.subgroup_stages = u32(sg.supportedStages);
+    c.subgroup_ops = u32(sg.supportedOperations);
+    for (const auto& e : physical.enumerateDeviceExtensionProperties().value) {
+        if (std::strcmp(e.extensionName, "VK_KHR_workgroup_memory_explicit_layout") == 0) c.explicit_layout = 1;
+    }
     return c;
 }
 
@@ -919,6 +1048,7 @@ Shader::Profile MakeProfile(const DeviceCaps& c) {
     p.supports_buffer_int64_atomics = c.buffer_int64_atomics;
     p.needs_buffer_offsets = c.storage_align > 4;
     p.emulate_null_descriptors = !c.null_descriptor;
+    p.supports_workgroup_explicit_memory_layout = c.explicit_layout;
     // Sol-2's robustness emulation flag, when the tree under test has it: on when the device
     // lacks robustBufferAccess2 (the Apple case).
     [&](auto& prof) {
@@ -1011,6 +1141,12 @@ void CompileJob(std::vector<ProgramState>& programs, Shader::Pools& pools, u32 i
     w.Put(u32(info.buffers.size()));
     for (const auto& desc : info.buffers) {
         w.Put(u32(desc.buffer_type));
+        const u64 required = [](const auto& d) -> u64 {
+            if constexpr (requires { d.required_binding_bytes; }) return d.required_binding_bytes;
+            else return 0;
+        }(desc);
+        w.Put(u32(required));
+        w.Put(u32(required >> 32));
         std::vector<u32> payload;
         if (desc.buffer_type == Shader::BufferType::Guest) {
             const auto sharp = desc.GetSharp(info);
@@ -1087,6 +1223,34 @@ std::string Tail(const std::string& path, size_t max = 1500) {
 }
 
 std::map<std::pair<u32, u32>, std::vector<u32>> g_spirv; // (template, perm) -> SPIR-V
+std::map<std::pair<u32, u32>, std::string> g_spirv_invalid; // spirv-val findings
+
+// Validates every module with spirv-val (a native tool, so it adds no Rosetta process).
+void ValidateModules(const std::string& outdir) {
+    const char* env = std::getenv("BB_SPIRV_VAL");
+    const std::string tool = env ? env : "/opt/homebrew/bin/spirv-val";
+    if (access(tool.c_str(), X_OK) != 0) {
+        std::printf("spirv-val: not found at %s (set BB_SPIRV_VAL); modules NOT validated\n", tool.c_str());
+        return;
+    }
+    const std::string path = outdir + "/validate.spv";
+    for (const auto& [key, spv] : g_spirv) {
+        FILE* f = std::fopen(path.c_str(), "wb");
+        if (!f) continue;
+        std::fwrite(spv.data(), 4, spv.size(), f);
+        std::fclose(f);
+        const std::string cmd = tool + " --target-env vulkan1.3 '" + path + "' 2>&1";
+        std::fflush(nullptr);
+        FILE* p = popen(cmd.c_str(), "r");
+        std::string out;
+        char buf[512];
+        while (p && std::fgets(buf, sizeof(buf), p)) out += buf;
+        const int rc = p ? pclose(p) : -1;
+        if (rc != 0) g_spirv_invalid[key] = out.substr(0, out.find('\n'));
+    }
+    std::remove(path.c_str());
+    std::printf("spirv-val: %zu/%zu modules invalid\n", g_spirv_invalid.size(), g_spirv.size());
+}
 
 void CompileAll(const std::string& outdir) {
     std::vector<u32> replay; // jobs that created a program or permutation
@@ -1128,10 +1292,11 @@ void CompileAll(const std::string& outdir) {
             std::vector<BindPlan> binds;
             bool ok = true;
             for (u32 b = 0; b < *nb && ok; ++b) {
-                auto type = get(), cnt = get();
-                if (!type || !cnt || p + *cnt > w.size()) { ok = false; break; }
+                auto type = get(), req_lo = get(), req_hi = get(), cnt = get();
+                if (!type || !req_lo || !req_hi || !cnt || p + *cnt > w.size()) { ok = false; break; }
                 BindPlan bp;
                 bp.type = *type;
+                bp.required = *req_lo | u64(*req_hi) << 32;
                 if (*type == u32(Shader::BufferType::Guest) && *cnt == 4) {
                     std::copy_n(w.begin() + p, 4, bp.sharp.begin());
                 } else {
@@ -1308,11 +1473,39 @@ struct Bound {
     std::string loud;
 };
 
-Bound BindGuest(Gpu& g, const std::array<u32, 4>& d) {
+Bound BindGuest(Gpu& g, const std::array<u32, 4>& d, u64 required) {
     Bound b;
     const u64 base = d[0] | (u64(d[1] & 0xFF) << 32);
     const u32 stride = (d[1] >> 16) & 0x3FFF;
-    const u32 size = stride == 0 ? d[2] : stride * d[2]; // GetSize(), u32
+    const u32 num_records = d[2];
+    const u32 size = stride == 0 ? num_records : stride * num_records; // GetSize(), u32
+    const bool swizzle = (d[1] >> 31) & 1;
+    const u32 index_stride = 8u << ((d[3] >> 21) & 3);
+    (void)required, (void)swizzle, (void)index_stride;
+    // The Apple guards of the BindBuffers under test (build.sh detects each one in its source).
+    if (base && num_records) {
+#ifdef BB_MIRROR_REQUIRED_SPAN
+        if (size < required) {
+            b.loud = "binder: macOS structured access escapes bound guest buffer: size=" + std::to_string(size) +
+                     ", required_bytes=" + std::to_string(required);
+            return b;
+        }
+#endif
+#ifdef BB_MIRROR_SWIZZLE_GROUP
+        if (swizzle && num_records % index_stride != 0) {
+            b.loud = "binder: macOS incomplete swizzled buffer index group: records=" + std::to_string(num_records) +
+                     ", index_stride=" + std::to_string(index_stride);
+            return b;
+        }
+#endif
+#ifdef BB_MIRROR_U32_RANGE
+        if (stride && u64(stride) * num_records > 0xFFFFFFFFull) {
+            b.loud = "binder: macOS structured buffer exceeds 32-bit descriptor range: stride=" + std::to_string(stride) +
+                     ", records=" + std::to_string(num_records);
+            return b;
+        }
+#endif
+    }
     if (base == 0 || size == 0) {
         b.is_null = true;
         b.info = {.buffer = *g.null_buffer.buffer, .offset = 0, .range = NullBufferSize};
@@ -1360,8 +1553,55 @@ gcn_vsharp ActualV(const Job& j) {
     return v;
 }
 
+std::vector<u32> WaveExpected(const Job& j) {
+    const Template& t = g_templates[j.tmpl];
+    std::vector<u32> regs(64 * 4);
+    u64 ballot = 0, exec = 0;
+    for (u32 l = 0; l < 64; ++l) {
+        if (j.lanes[l].data[0] != 0) ballot |= 1ull << l;
+        if (j.lanes[l].active != 0) exec |= 1ull << l;
+        for (u32 i = 0; i < 4; ++i) regs[l * 4 + i] = VgprMarker + i;
+    }
+    const u32 blo = u32(ballot), bhi = u32(ballot >> 32);
+    auto value = [&](u32 lane) { return j.lanes[lane & 63].vindex; };
+    for (u32 l = 0; l < 64; ++l) {
+        u32* r = &regs[l * 4];
+        switch (t.wave) {
+        case Wave::Lane:
+            r[0] = gcn_mbcnt(~0u, gcn_mbcnt(~0u, 0, l, 0), l, 1);
+            r[1] = blo; r[2] = bhi; r[3] = gcn_popcount64(ballot);
+            break;
+        case Wave::MbcntMask:
+            r[0] = gcn_mbcnt(bhi, gcn_mbcnt(blo, 0, l, 0), l, 1);
+            r[1] = blo; r[2] = bhi; r[3] = (ballot >> l) & 1;
+            break;
+        case Wave::Readlane: // lane selects are kept in 0..63 by the jobs
+            r[0] = value(37); r[1] = value(j.smem_sgpr); r[2] = value(j.sgpr_soff); r[3] = value(0);
+            break;
+        case Wave::Exec1:
+            r[0] = value(gcn_first_lane(exec)); r[1] = gcn_popcount64(exec);
+            if (exec >> l & 1) r[3] = value(l);
+            break;
+        case Wave::Exec2:
+            r[0] = u32(exec); r[1] = u32(exec >> 32);
+            if (exec >> l & 1) r[2] = gcn_mbcnt(u32(exec >> 32), gcn_mbcnt(u32(exec), 0, l, 0), l, 1);
+            break;
+        case Wave::None:
+            break;
+        }
+    }
+    return regs;
+}
+
 std::vector<Outcome> Expected(Gpu& g, const Job& j, std::vector<u8>& work, const Bound& tb) {
     const Template& t = g_templates[j.tmpl];
+    if (t.wave != Wave::None) {
+        Outcome o;
+        o.regs = WaveExpected(j);
+        o.achievable = true;
+        o.reading_list.push_back(0);
+        return {o};
+    }
     const gcn_vsharp v = ActualV(j);
     std::map<std::string, size_t> index;
     std::vector<Outcome> outs;
@@ -1441,6 +1681,7 @@ const char* ReadingName(u32 bit) {
     case GCN_R_FMT_SEL: return "FMT_SEL";
     case GCN_R_MTBUF_BOUND: return "MTBUF_BOUND";
     case GCN_R_SHORT_ALIGN: return "SHORT_ALIGN";
+    case GCN_R_SEL1_FLOAT: return "SEL1_FLOAT";
     }
     return "?";
 }
@@ -1457,12 +1698,13 @@ std::string DescribeReadings(const std::vector<u32>& rs) {
     return s.empty() ? "alternative" : s;
 }
 
-enum class Verdict { Strict, Ambiguous, Fail, LoudRequired, LoudApproved, LoudUnneeded, Crash, HarnessError };
+enum class Verdict { Strict, Ambiguous, Fail, InvalidSpirv, LoudRequired, LoudApproved, LoudUnneeded, Crash, HarnessError };
 const char* VerdictName(Verdict v) {
     switch (v) {
     case Verdict::Strict: return "PASS(strict)";
     case Verdict::Ambiguous: return "PASS(ambiguous)";
     case Verdict::Fail: return "FAIL";
+    case Verdict::InvalidSpirv: return "INVALID-SPIRV";
     case Verdict::LoudRequired: return "LOUD(required)";
     case Verdict::LoudApproved: return "LOUD(approved)";
     case Verdict::LoudUnneeded: return "LOUD(not required)";
@@ -1486,6 +1728,7 @@ struct Options {
     u32 batch = MaxBatch;
     u32 max_detail = 60;
     std::string outdir;
+    std::string dump_spv;
 };
 
 void FillPristine(Gpu& g, const std::vector<u32>& jobs) {
@@ -1577,14 +1820,31 @@ JobResult Evaluate(Gpu& g, const Job& j, const Bound& tb, const u8* guest_after,
         return r;
     }
     r.verdict = Verdict::Fail;
-    // detail against the literal reading (reading 0)
+    // detail against the closest knowable outcome (fewest differing lanes), else the literal one
     const Outcome* lit = nullptr;
+    size_t best = ~size_t(0);
     for (const auto& o : outs) {
-        if (std::find(o.reading_list.begin(), o.reading_list.end(), 0u) != o.reading_list.end()) lit = &o;
+        if (o.unknown) continue;
+        size_t bad = 0;
+        for (u32 lane = 0; lane < 64; ++lane) {
+            for (u32 i = 0; i < 4; ++i) {
+                if (regs[lane * 4 + i] != o.regs[lane * 4 + i]) { ++bad; break; }
+            }
+        }
+        if (!mem_matches(o, nullptr)) bad += 64;
+        if (bad < best) { best = bad; lit = &o; }
+    }
+    if (!lit) {
+        for (const auto& o : outs) {
+            if (std::find(o.reading_list.begin(), o.reading_list.end(), 0u) != o.reading_list.end()) lit = &o;
+        }
     }
     std::string d;
+    if (lit && outs.size() > 1 && !lit->unknown) {
+        d += "  closest reading: " + DescribeReadings(lit->reading_list) + "\n";
+    }
     if (outs.size() > 1) {
-        d += "  " + std::to_string(outs.size()) + " outcomes across readings; none matched. Literal reading shown\n";
+        d += "  " + std::to_string(outs.size()) + " outcomes across readings; none matched\n";
     }
     if (lit && lit->unknown) {
         d += "  literal reading touches guest memory outside the harness image (legal GCN access far past the "
@@ -1652,7 +1912,7 @@ std::map<u32, JobResult> RunBatch(Gpu& g, const std::vector<u32>& jobs) {
         for (u32 b = 0; b < j.binds.size(); ++b) {
             const BindPlan& bp = j.binds[b];
             if (bp.type == u32(Shader::BufferType::Guest)) {
-                Bound bd = BindGuest(g, bp.sharp);
+                Bound bd = BindGuest(g, bp.sharp, bp.required);
                 if (!bd.loud.empty()) {
                     loud = bd.loud;
                     break;
@@ -1761,9 +2021,10 @@ int main(int argc, char** argv) {
         else if (a == "--batch" && i + 1 < argc) opt.batch = std::clamp<u32>(std::atoi(argv[++i]), 1, MaxBatch);
         else if (a == "--max-detail" && i + 1 < argc) opt.max_detail = std::atoi(argv[++i]);
         else if (a == "--out" && i + 1 < argc) opt.outdir = argv[++i];
+        else if (a == "--dump-spv" && i + 1 < argc) opt.dump_spv = argv[++i];
         else {
             std::fprintf(stderr, "usage: %s [--no-rba] [--label NAME] [--only SUBSTRING] [--batch N] "
-                                 "[--max-detail N] --out DIR\n", argv[0]);
+                                 "[--max-detail N] [--dump-spv DIR] --out DIR\n", argv[0]);
             return 2;
         }
     }
@@ -1801,6 +2062,27 @@ int main(int argc, char** argv) {
                 VK_API_VERSION_MAJOR(g_caps.api), VK_API_VERSION_MINOR(g_caps.api), g_caps.subgroup_size,
                 g_caps.storage_align, g_caps.int8, g_caps.int16, g_caps.int64, g_caps.float64, g_caps.rba,
                 g_caps.rba2, g_caps.null_descriptor, g_caps.buffer_int64_atomics);
+    std::printf("subgroups: size %u, control %u (min %u max %u, required-size stages %#x), computeFullSubgroups %u, "
+                "stages %#x, ops %#x, workgroup_memory_explicit_layout %u\n", g_caps.subgroup_size, g_caps.size_control, g_caps.min_subgroup,
+                g_caps.max_subgroup, g_caps.required_size_stages, g_caps.full_subgroups, g_caps.subgroup_stages,
+                g_caps.subgroup_ops, g_caps.explicit_layout);
+    std::printf("binder guards mirrored: required-span %d, swizzle-group %d, u32-range %d\n",
+#ifdef BB_MIRROR_REQUIRED_SPAN
+                1,
+#else
+                0,
+#endif
+#ifdef BB_MIRROR_SWIZZLE_GROUP
+                1,
+#else
+                0,
+#endif
+#ifdef BB_MIRROR_U32_RANGE
+                1
+#else
+                0
+#endif
+    );
     std::printf("profile: emulate_null_descriptors %d, emulate_robust_buffer_access %s, robustBufferAccess %s\n",
                 g_profile.emulate_null_descriptors,
                 ProfileHasRobustFlag() ? (g_caps.rba2 ? "present, off" : "present, ON") : "absent in this tree",
@@ -1811,6 +2093,7 @@ int main(int argc, char** argv) {
     AddStoreCases();
     AddAtomicCases();
     AddReuseCases();
+    AddWaveCases();
     if (!opt.only.empty()) {
         std::vector<Job> kept;
         for (auto& j : g_jobs) {
@@ -1842,6 +2125,19 @@ int main(int argc, char** argv) {
     CompileAll(opt.outdir);
     size_t perms = g_spirv.size();
     std::printf("compiled: %zu modules\n", perms);
+    ValidateModules(opt.outdir);
+    if (!opt.dump_spv.empty()) {
+        for (const auto& [key, spv] : g_spirv) {
+            const std::string f = opt.dump_spv + "/t" + std::to_string(key.first) + "-p" + std::to_string(key.second) + ".spv";
+            if (FILE* fp = std::fopen(f.c_str(), "wb")) {
+                std::fwrite(spv.data(), 4, spv.size(), fp);
+                std::fclose(fp);
+            }
+        }
+        FILE* idx = std::fopen((opt.dump_spv + "/templates.txt").c_str(), "w");
+        for (u32 i = 0; idx && i < g_templates.size(); ++i) std::fprintf(idx, "t%u %s\n", i, g_templates[i].name.c_str());
+        if (idx) std::fclose(idx);
+    }
 
     // Phase 2: run on the device.
     Gpu g;
@@ -1862,6 +2158,14 @@ int main(int argc, char** argv) {
             if (alone.count(ji)) r = alone[ji];
         }
     }
+    // A job whose module fails spirv-val is not a pass, whatever it returned.
+    for (auto& [ji, r] : results) {
+        const Job& j = g_jobs[ji];
+        auto it = g_spirv_invalid.find({j.tmpl, j.perm});
+        if (j.status != Status::Ok || it == g_spirv_invalid.end()) continue;
+        r.detail = "  invalid SPIR-V (" + std::string(VerdictName(r.verdict)) + " on MoltenVK): " + it->second + "\n" + r.detail;
+        r.verdict = Verdict::InvalidSpirv;
+    }
     // Loud classification for jobs that did not run.
     for (u32 ji = 0; ji < g_jobs.size(); ++ji) {
         Job& j = g_jobs[ji];
@@ -1871,8 +2175,9 @@ int main(int argc, char** argv) {
         case Status::LoudCompile:
         case Status::LoudBinder:
         case Status::LoudPipeline: {
-            const bool approved = j.approved_struct_soff || j.approved_swizzle || j.isa_invalid ||
-                                  (j.status == Status::LoudBinder && j.message.find("mapping is incomplete") != std::string::npos);
+            // Every Apple binder guard mirrored here is an orchestrator-approved loud check.
+            const bool approved = j.approved_struct_soff || j.approved_swizzle || j.isa_invalid || j.approved_offen_only ||
+                                  j.status == Status::LoudBinder;
             r.verdict = LoudRequired(g, j) ? Verdict::LoudRequired
                                            : (approved ? Verdict::LoudApproved : Verdict::LoudUnneeded);
             break;
@@ -1913,7 +2218,7 @@ int main(int argc, char** argv) {
         const std::string head = std::string(VerdictName(r.verdict)) + " #" + std::to_string(ji) + " [" + j.group +
                                  "] " + j.label + " (perm " + std::to_string(j.perm) + ")\n";
         if (rep) std::fprintf(rep, "%s%s", head.c_str(), r.detail.c_str());
-        const bool important = r.verdict == Verdict::Fail || r.verdict == Verdict::Crash ||
+        const bool important = r.verdict == Verdict::Fail || r.verdict == Verdict::InvalidSpirv || r.verdict == Verdict::Crash ||
                                r.verdict == Verdict::HarnessError;
         if (important && shown < opt.max_detail) {
             std::printf("%s%s", head.c_str(), r.detail.c_str());
@@ -1922,6 +2227,7 @@ int main(int argc, char** argv) {
     }
     if (rep) std::fclose(rep);
     std::printf("report: %s\n", path.c_str());
-    const bool bad = totals[Verdict::Fail] || totals[Verdict::Crash] || totals[Verdict::HarnessError];
+    const bool bad = totals[Verdict::Fail] || totals[Verdict::InvalidSpirv] || totals[Verdict::Crash] ||
+                     totals[Verdict::HarnessError];
     return bad ? 1 : 0;
 }

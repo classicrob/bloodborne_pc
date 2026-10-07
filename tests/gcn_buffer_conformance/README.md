@@ -24,6 +24,11 @@ with recompiler-emitted bounds checks.
   readings listed in `SPEC.md`. Stores and atomics run one active lane per job. A job that fails
   with memory differences is re-run alone so writes from other jobs cannot be misattributed.
 
+Also: every generated module goes through `spirv-val` (native, `BB_SPIRV_VAL` to override). A job
+whose module is invalid is reported `INVALID-SPIRV` even when MoltenVK happened to return the
+expected values. The Apple binder guards of the tree under test (required span, swizzle group,
+32-bit range) are detected by build.sh and mirrored.
+
 ## Verdicts
 | verdict | meaning |
 |---|---|
@@ -49,12 +54,17 @@ constant 0/1) and TBUFFER (instruction format) all-or-nothing; resource data for
 s_buffer_load and buffer_load); S_BUFFER_LOAD_DWORD/x4 with immediate and SGPR offsets (per-dword
 clamp, `>` for stride != 0, unwritten SDST); atomics add/cmpswap/umax/inc/dec/swap/sub/add_x2,
 all-or-nothing, with return; specialization reuse across num_records and add_tid; INC/DEC wrap
-semantics (group `atomic-semantics`, not a bounds property).
+semantics (group `atomic-semantics`, not a bounds property). Group `wave64`: GCN 64-lane wave
+semantics on 32-wide Apple subgroups (lane id via v_mbcnt, VOPC ballot read as VCC/s_mov_b64/
+s_bcnt1, v_mbcnt over a mask, v_cndmask, v_readlane with constant/SGPR lanes 0..63,
+v_readfirstlane, exec read as a value and s_bcnt1 exec under saveexec).
 
 ## Build and run (x86_64 under Rosetta; at most one helper child at a time)
 ```sh
 GPU=<worktree with the built GPU library, e.g. Sol-1's>
-# recompiler inside the shared dylib (current macos):
+# Prefer the --tree form below for every run, including macos itself: dylib mode is only valid when
+# this checkout's recompiler headers match the dylib's sources exactly (BufferResource layout etc.).
+# recompiler inside the shared dylib:
 BB_GPU_BUILD=$GPU/out/gpu BB_GPU_THIRD_PARTY=$GPU/gpu/third_party tests/gcn_buffer_conformance/build.sh
 # a branch's recompiler at a fixed commit, compiled into the test executable:
 mkdir -p out/gcnconf/trees/C && git archive C gpu/shadps4 gpu/shim gpu/third_party/sirit src/compat_mac.h | tar -x -C out/gcnconf/trees/C
