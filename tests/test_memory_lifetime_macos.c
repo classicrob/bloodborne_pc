@@ -59,8 +59,17 @@ int main(void) {
     void *a=NULL,*b=NULL;
     assert(!direct_map(&a,4*PAGE,3,0,physical,PAGE));
     assert(!direct_map(&b,4*PAGE,3,0,physical,PAGE));
+    uintptr_t region_start,region_end; uint64_t offset;
+    assert(runtime_memory_backing_region((uintptr_t)a+PAGE,&region_start,&region_end,&offset));
+    assert(region_start==(uintptr_t)a && region_end==(uintptr_t)a+4*PAGE && offset==(uint64_t)physical);
+    assert(runtime_memory_backing_region((uintptr_t)b,&region_start,&region_end,&offset));
+    assert(region_start==(uintptr_t)b && offset==(uint64_t)physical);
+    assert(!runtime_memory_backing_region(LOW_MIN,&region_start,&region_end,&offset));
     memset(a,0x5a,4*PAGE); track(a,4*PAGE,0x5a); track(b,4*PAGE,0x5a);
     assert(!direct_release(physical+PAGE,PAGE)); assert(!live()); balanced();
+    assert(!runtime_memory_backing_region((uintptr_t)a+PAGE,&region_start,&region_end,&offset));
+    assert(runtime_memory_backing_region((uintptr_t)b+2*PAGE,&region_start,&region_end,&offset));
+    assert(region_start==(uintptr_t)b+2*PAGE && offset==(uint64_t)physical+2*PAGE);
     assert(((unsigned char *)a)[0]==0x5a && ((unsigned char *)b)[2*PAGE]==0x5a);
     track(a,PAGE,0x5a); track(b,PAGE,0x5a);
     assert(!direct_release(physical,PAGE)); assert(!live());
@@ -74,6 +83,8 @@ int main(void) {
     track(a,4*PAGE,0);
     void *replacement=a;
     assert(!map_flexible(&replacement,4*PAGE,3,MAP_FIXED_FLAG)); assert(!live());
+    assert(runtime_memory_backing_region((uintptr_t)a,&region_start,&region_end,&offset));
+    assert(offset>=POOL_SIZE && region_end-region_start==4*PAGE);
     memset(a,0x6b,4*PAGE); track(a,4*PAGE,0x6b);
     assert(!direct_unmap(a,4*PAGE)); assert(!live());
     assert(!direct_release(physical,4*PAGE));
@@ -93,6 +104,7 @@ int main(void) {
     assert(kernel_mprotect((void *)USER_MIN,PAGE,3)==INVALID);
     assert(begins==before+3); balanced();
     void *reserved=NULL; assert(!reserve_range(&reserved,PAGE,0,PAGE));
+    assert(!runtime_memory_backing_region((uintptr_t)reserved,&region_start,&region_end,&offset));
     before=begins;
     assert(reserve_range(&reserved,PAGE,MAP_FIXED_FLAG,PAGE)==NO_MEMORY);
     assert(begins==before+1); balanced();

@@ -1046,6 +1046,17 @@ int runtime_memory_region(uintptr_t address, uintptr_t *start, uintptr_t *end, i
     read_unlock();
     return found;
 }
+#ifdef __APPLE__
+int runtime_memory_backing_region(uintptr_t address,uintptr_t *start,uintptr_t *end,uint64_t *offset) {
+    if (!start || !end || !offset) return 0;
+    read_lock();
+    size_t i=vma_index(address);
+    int found=i<vma_count && vmas[i].start<=address && vmas[i].kind!=KIND_RESERVED;
+    if (found) { *start=vmas[i].start; *end=vmas[i].end; *offset=vmas[i].phys; }
+    read_unlock();
+    return found;
+}
+#endif
 /* GPU page tracking: restrict host access, never beyond the guest's own protection. */
 void runtime_memory_gpu_protect(uintptr_t address, uint64_t size, int read, int write) {
     read_lock();
