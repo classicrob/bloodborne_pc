@@ -89,7 +89,8 @@ stack. This is SDK-only and does not link or build the GPU library.
 `tests/macos_spike/test_hle_stack.sh` exercises the actual C++ HLE thread adapter
 with the real C runtime and Mach allocator. It checks low callback stack/TLS
 addresses, native-stack restoration, pooled stack reuse, concurrent workers,
-stop/join and self-detach semantics, and a child process whose callback exception
+stop/join and self-stop semantics, concurrent/repeated join completion, destruction
+ordering, and a child process whose callback exception
 must fail loudly. The adapter catches exceptions on the low stack before they
 could unwind across the assembly stack bridge. No GPU library build is needed.
 

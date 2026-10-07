@@ -1,5 +1,6 @@
 #include "core/libraries/kernel/threads.h"
 #include <cassert>
+#include <atomic>
 #include <cstdint>
 #include <stdexcept>
 #include <sys/mman.h>
@@ -24,6 +25,7 @@ static void check_stack(void *) {
     assert(reinterpret_cast<uintptr_t>(runtime_errno())<(UINT64_C(1)<<40));
 }
 int main() {
+    alarm(30);
     rlimit lim{0,0}; assert(!setrlimit(RLIMIT_CORE,&lim));
     const unsigned char op[]{0x65,0x48,0x8b,0x04,0x25,0,0,0,0,0xc3};
     auto code=static_cast<unsigned char *>(runtime_low_map(4096,PROT_READ|PROT_WRITE));
@@ -74,6 +76,51 @@ int main() {
     });
     start.store(true);
     while(!done.load()) std::this_thread::yield();
+    self.Join();
     assert(!self.Joinable());
-    std::puts("macOS HLE stacks: real low allocator/TLS, reuse, 3 workers, stop/join, self-detach, loud exception passed");
+    for (unsigned trial=0; trial<64; ++trial) {
+        Libraries::Kernel::Thread target;
+        std::atomic<unsigned> joining{},joined{};
+        std::atomic<bool> release{},returned{};
+        target.Run([&](std::stop_token stop) {
+            while(!release.load()) std::this_thread::yield();
+            target.Stop();
+            assert(stop.stop_requested());
+            target.Join();
+            returned.store(true);
+        });
+        auto joiner=[&] {
+            joining.fetch_add(1);
+            target.Join();
+            assert(returned.load());
+            joined.fetch_add(1);
+        };
+        std::thread first(joiner),second(joiner);
+        while(joining.load()!=2) std::this_thread::yield();
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        assert(joined.load()==0);
+        target.RequestStop();
+        release.store(true);
+        first.join();second.join();
+        target.Join();target.Stop();
+        assert(joined.load()==2 && !target.Joinable());
+        target.Run([](std::stop_token) {});
+        target.Join();
+    }
+    std::atomic<bool> destructor_ready{},callback_destroyed{};
+    {
+        Libraries::Kernel::Thread owned;
+        owned.Run([&](std::stop_token stop) {
+            struct Guard {
+                std::atomic<bool>& done;
+                ~Guard() { done.store(true); }
+            } guard{callback_destroyed};
+            destructor_ready.store(true);
+            while(!stop.stop_requested()) std::this_thread::yield();
+        });
+        while(!destructor_ready.load()) std::this_thread::yield();
+    }
+    assert(callback_destroyed.load());
+    alarm(0);
+    std::puts("macOS HLE stacks: real low allocator/TLS, reuse, 3 workers, stop/join, self-stop, concurrent/repeated joins, destruction order, loud exception passed");
 }
