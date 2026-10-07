@@ -63,8 +63,8 @@ bool initialized = false;
 std::atomic<bool> menu_open{false};
 bool l3_down = false, r3_down = false;
 bool dirty = false; // settings changed while open: saved on close
-// The game's text dialog (SetTextEntry), guarded by imgui_mutex.
-bool text_entry_active = false;
+// Visibility is queried without imgui_mutex; the dialog strings remain protected by it.
+std::atomic<bool> text_entry_active{false};
 std::string text_entry_prompt, text_entry_text;
 float base_scale = 1.0f;
 
