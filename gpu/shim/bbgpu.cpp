@@ -21,6 +21,9 @@
 #include <vector>
 #include <SDL3/SDL.h>
 #include "../bbgpu.h"
+#ifdef __APPLE__
+#include "../../src/macos_ui.h"
+#endif
 #include "common/elf_info.h"
 #include "common/logging/log.h"
 #include "common/rdtsc.h"
@@ -171,17 +174,64 @@ s32 PS4_SYSV_ABI sceKernelUsleep(u32 microseconds) {
 } // namespace Libraries::Kernel
 
 namespace {
+#ifndef __APPLE__
 // SDL video must be driven from one thread: the window lives on its own host thread.
 std::thread g_window_thread;
 std::mutex g_window_mutex;
 std::condition_variable g_window_cv;
 bool g_window_ready;
+#else
+struct WindowRequest {
+    const char* title;
+    s32 width, height;
+    int result{};
+};
+
+void PollMacWindow(void* argument) {
+    auto* window = static_cast<Frontend::WindowSDL*>(argument);
+    if (!window->PollEvents()) {
+        ASSERT_MSG(bb_macos_ui_set_poll(nullptr, nullptr) == 0,
+                   "macOS event polling could not be stopped on the process main thread");
+        LOG_INFO(Frontend, "Window closed by user");
+        std::fflush(stdout);
+        // The presenter still owns the surface; keep it alive until process termination.
+        std::_Exit(0);
+    }
+}
+
+void CreateMacWindow(void* argument) {
+    auto& request = *static_cast<WindowRequest*>(argument);
+    auto* window = new Frontend::WindowSDL(request.width, request.height, request.title);
+    request.result = bb_macos_ui_set_poll(PollMacWindow, window);
+    if (request.result) {
+        delete window;
+        return;
+    }
+    g_window = window;
+}
+#endif
 } // namespace
 
 u32 BbDisplayRefreshHz() {
     static const u32 hz = [] {
-        const SDL_DisplayMode* mode = SDL_GetCurrentDisplayMode(SDL_GetPrimaryDisplay());
-        const u32 rate = mode && mode->refresh_rate > 0 ? u32(mode->refresh_rate + 0.5f) : 60;
+        u32 rate = 60;
+        const auto query = [](void* argument) {
+            const SDL_DisplayMode* mode = SDL_GetCurrentDisplayMode(SDL_GetPrimaryDisplay());
+            if (mode && mode->refresh_rate > 0) {
+                *static_cast<u32*>(argument) = u32(mode->refresh_rate + 0.5f);
+            }
+#ifdef __APPLE__
+            else {
+                UNREACHABLE_MSG("macOS display refresh query failed: {}", SDL_GetError());
+            }
+#endif
+        };
+#ifdef __APPLE__
+        const int result = bb_macos_ui_call(query, &rate);
+        ASSERT_MSG(result == 0, "macOS display main-thread dispatch failed: {}", result);
+#else
+        query(&rate);
+#endif
         std::printf("GPU: vblank follows the display refresh rate, %u Hz\n", rate);
         return std::max<u32>(rate, 60);
     }();
@@ -221,6 +271,15 @@ extern "C" int bbgpu_init(const BbGpuConfig* config) {
     Core::Emulator::FillElfInfo(*config);
     const std::string title = config->title ? config->title : "Bloodborne";
     const s32 width = config->width, height = config->height;
+#ifdef __APPLE__
+    WindowRequest request{title.c_str(), width, height};
+    const int result = bb_macos_ui_call(CreateMacWindow, &request);
+    if (result || request.result) {
+        LOG_ERROR(Frontend, "Cannot create window on main thread: {}",
+                  result ? result : request.result);
+        return -1;
+    }
+#else
     g_window_thread = std::thread([title, width, height] {
         Common::SetCurrentThreadName("bb:window");
         auto* window = new Frontend::WindowSDL(width, height, title.c_str());
@@ -242,6 +301,7 @@ extern "C" int bbgpu_init(const BbGpuConfig* config) {
         std::unique_lock lock{g_window_mutex};
         g_window_cv.wait(lock, [] { return g_window_ready; });
     }
+#endif
     Core::Loader::SymbolsResolver resolver;
     // GnmDriver creates the presenter that the VideoOut present thread uses.
     Libraries::GnmDriver::RegisterLib(&resolver);
