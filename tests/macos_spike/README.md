@@ -92,3 +92,15 @@ addresses, native-stack restoration, pooled stack reuse, concurrent workers,
 stop/join and self-detach semantics, and a child process whose callback exception
 must fail loudly. The adapter catches exceptions on the low stack before they
 could unwind across the assembly stack bridge. No GPU library build is needed.
+
+## macOS 27.2 revalidation
+
+After the host updated from macOS 27.0 to 27.2 (build 26B5101f), rerunning
+`sh tests/macos_spike/run.sh` on 2026-10-07 reproduced all 25 probe outcomes.
+[The new capture](results-macos27.2.txt) collapses consecutive identical 1-GiB
+reservation results using the same format as [the 27.0 capture](results.txt).
+The differences are the OS version, concurrent-thread print order and ASLR
+addresses. Keys 258–261, 4096-byte pages, the protected 63–448 GiB interval,
+SIGBUS/code 2/write-error 6, and instruction behavior are unchanged. Exit 1
+still represents the same five unsupported probes: three executable shm-view
+cases and the two SSE4a instructions. This SDK-only spike does not test MoltenVK.
