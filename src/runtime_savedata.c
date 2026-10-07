@@ -65,7 +65,7 @@ _Static_assert(sizeof(SearchCond)==64 && sizeof(SearchResult)==56,"dir name sear
 static pthread_mutex_t lock=PTHREAD_MUTEX_INITIALIZER;
 static int initialized;
 static char title_id[16]="UNKNOWN";
-static struct { int used; char host[700], meta[700]; } slots[SLOTS];
+static struct { int used, readonly; char host[700], meta[700]; } slots[SLOTS];
 static char memory_path[720];
 static uint64_t memory_size;
 static size_t mounts_done, memory_writes;
@@ -120,10 +120,14 @@ static int valid_name(const char *name, size_t max) {
     for (size_t i=0;i<n;++i) if (name[i]=='/' || name[i]=='\\' || (name[i]=='.' && (i==0 || name[i-1]=='.'))) return 0;
     return 1;
 }
-static void write_param(const char *meta, const Param *p) {
+static int write_param(const char *meta, const Param *p) {
     char path[700]; snprintf(path,sizeof(path),"%s/param.bin",meta);
     FILE *f=fopen(path,"wb");
-    if (f) { Param copy=*p; copy.mtime=time(NULL); fwrite(&copy,sizeof(copy),1,f); fclose(f); }
+    if (!f) return -1;
+    Param copy=*p; copy.mtime=time(NULL);
+    int failed=fwrite(&copy,sizeof(copy),1,f)!=1;
+    if (fclose(f)) failed=1;
+    return failed ? -1 : 0;
 }
 static int read_param(const char *meta, Param *p) {
     char path[700]; snprintf(path,sizeof(path),"%s/param.bin",meta);
@@ -141,7 +145,15 @@ static void remove_tree(const char *path) { compat_remove_tree(path); }
 static int remove_entry(const char *path, const struct stat *st, int flag, struct FTW *ftw) {
     (void)st; (void)flag; (void)ftw; return remove(path);
 }
+#ifdef __APPLE__
+static int remove_tree(const char *path) {
+    struct stat st;
+    if (lstat(path,&st)) return errno==ENOENT ? 0 : -1;
+    return nftw(path,remove_entry,16,FTW_DEPTH|FTW_PHYS);
+}
+#else
 static void remove_tree(const char *path) { nftw(path,remove_entry,16,FTW_DEPTH|FTW_PHYS); }
+#endif
 #endif
 
 static ABI int32_t save_initialize(const void *param) { (void)param; initialized=1; return 0; }
@@ -159,6 +171,14 @@ static int32_t mount(int32_t user, const char *title, const DirName *dir, uint32
     snprintf(meta,sizeof(meta),"%s/%s.sce_sys",base,dir->data);
     struct stat st;
     int exists=!stat(host,&st) && S_ISDIR(st.st_mode);
+#ifdef __APPLE__
+    int spelling=runtime_file_case_check(base,dir->data,0);
+    if (spelling && exists) {
+        if (mode & (MODE_CREATE|MODE_CREATE2))
+            runtime_file_case_check(base,dir->data,1);
+        return ERR_NOT_FOUND;
+    }
+#endif
     if ((mode & MODE_CREATE) && exists) return ERR_EXISTS;
     if (!(mode & (MODE_CREATE|MODE_CREATE2)) && !exists) return ERR_NOT_FOUND;
     pthread_mutex_lock(&lock);
@@ -169,8 +189,16 @@ static int32_t mount(int32_t user, const char *title, const DirName *dir, uint32
     }
     if (slot<0) { pthread_mutex_unlock(&lock); return ERR_MOUNT_FULL; }
     if (!exists && (make_dirs(host) || make_dirs(meta))) { pthread_mutex_unlock(&lock); return ERR_INTERNAL; }
-    if (!exists) { Param empty={0}; write_param(meta,&empty); }
+    if (!exists) {
+        Param empty={0};
+#ifdef __APPLE__
+        if (write_param(meta,&empty)) { pthread_mutex_unlock(&lock); return ERR_INTERNAL; }
+#else
+        write_param(meta,&empty);
+#endif
+    }
     slots[slot].used=1;
+    slots[slot].readonly=(mode & MODE_RDONLY)!=0;
     snprintf(slots[slot].host,sizeof(slots[slot].host),"%s",host);
     snprintf(slots[slot].meta,sizeof(slots[slot].meta),"%s",meta);
     memset(result,0,sizeof(*result));
@@ -178,7 +206,13 @@ static int32_t mount(int32_t user, const char *title, const DirName *dir, uint32
     snprintf(point,sizeof(point),"/savedata%d",slot&15);
     memcpy(result->point.data,point,strlen(point)+1);
     result->status=exists ? 0 : 1; /* CREATED */
+#ifdef __APPLE__
+    int failed=(mode & MODE_RDONLY) ? runtime_file_mount_readonly(result->point.data,host)
+                                     : runtime_file_mount(result->point.data,host);
+    if (failed) { slots[slot].used=0; pthread_mutex_unlock(&lock); return ERR_INTERNAL; }
+#else
     runtime_file_mount(result->point.data,host);
+#endif
     ++mounts_done;
     pthread_mutex_unlock(&lock);
     printf("Runtime: save data '%s' mounted at %s (%s%s)\n",dir->data,result->point.data,
@@ -212,6 +246,9 @@ static ABI int32_t save_set_param(const MountPoint *point, uint32_t type, const 
     pthread_mutex_lock(&lock);
     int slot=slot_of(point);
     if (slot<0) { pthread_mutex_unlock(&lock); return ERR_NOT_MOUNTED; }
+#ifdef __APPLE__
+    if (slots[slot].readonly) { pthread_mutex_unlock(&lock); return ERR_BAD_MOUNTED; }
+#endif
     Param p; read_param(slots[slot].meta,&p);
     switch (type) {
     case 0: if (size<sizeof(Param)) goto bad; memcpy(&p,buffer,sizeof(p)); break;     /* ALL */
@@ -221,9 +258,15 @@ static ABI int32_t save_set_param(const MountPoint *point, uint32_t type, const 
     case 4: if (size<4) goto bad; memcpy(&p.user_param,buffer,4); break;
     default: goto bad;
     }
+#ifdef __APPLE__
+    int failed=write_param(slots[slot].meta,&p);
+    pthread_mutex_unlock(&lock);
+    return failed ? ERR_INTERNAL : 0;
+#else
     write_param(slots[slot].meta,&p);
     pthread_mutex_unlock(&lock);
     return 0;
+#endif
 bad:
     pthread_mutex_unlock(&lock);
     return ERR_PARAMETER;
@@ -235,10 +278,17 @@ static ABI int32_t save_icon(const MountPoint *point, const Icon *icon) {
     int slot=slot_of(point);
     int32_t r=ERR_NOT_MOUNTED;
     if (slot>=0) {
+#ifdef __APPLE__
+        if (slots[slot].readonly) { pthread_mutex_unlock(&lock); return ERR_BAD_MOUNTED; }
+#endif
         char path[700]; snprintf(path,sizeof(path),"%s/icon0.png",slots[slot].meta);
         FILE *f=fopen(path,"wb");
         r=f && fwrite(icon->buffer,1,icon->data_size,f)==icon->data_size ? 0 : ERR_INTERNAL;
+#ifdef __APPLE__
+        if (f && fclose(f)) r=ERR_INTERNAL;
+#else
         if (f) fclose(f);
+#endif
     }
     pthread_mutex_unlock(&lock);
     return r;
@@ -252,8 +302,21 @@ static ABI int32_t save_delete(const Delete *d) {
     snprintf(meta,sizeof(meta),"%s/%s.sce_sys",base,d->dir->data);
     struct stat st;
     if (stat(host,&st)) return ERR_NOT_FOUND;
+#ifdef __APPLE__
+    if (runtime_file_case_check(base,d->dir->data,0)) return ERR_NOT_FOUND;
+#endif
+#ifdef __APPLE__
+    pthread_mutex_lock(&lock);
+    for (int i=0;i<SLOTS;++i) if (slots[i].used && !strcmp(slots[i].host,host)) {
+        pthread_mutex_unlock(&lock); return ERR_BAD_MOUNTED;
+    }
+    int failed=remove_tree(host) || remove_tree(meta);
+    pthread_mutex_unlock(&lock);
+    if (failed) return ERR_INTERNAL;
+#else
     remove_tree(host);
     remove_tree(meta);
+#endif
     printf("Runtime: save data '%s' deleted\n",d->dir->data);
     return 0;
 }
@@ -321,9 +384,17 @@ static ABI int32_t memory_setup(int32_t user, uint64_t size, const Param *param)
         if ((uint64_t)ftell(f)<size && ftruncate(fileno(f),(off_t)size)) goto done;
         memory_size=size; r=0;
     done:
+#ifdef __APPLE__
+        if (fclose(f)) r=ERR_INTERNAL;
+#else
         fclose(f);
+#endif
     }
+#ifdef __APPLE__
+    if (!r && param && write_param(dir,param)) r=ERR_INTERNAL;
+#else
     if (!r && param) write_param(dir,param);
+#endif
     pthread_mutex_unlock(&lock);
     if (!r) printf("Runtime: save data memory ready (%llu bytes)\n",(unsigned long long)size);
     return r;
@@ -338,7 +409,11 @@ static int32_t memory_io(void *buffer, uint64_t size, int64_t offset, int write)
     int32_t r=ERR_INTERNAL;
     if (f && !fseek(f,offset,SEEK_SET) &&
         (write ? fwrite(buffer,1,size,f) : fread(buffer,1,size,f))==size) r=0;
+#ifdef __APPLE__
+    if (f && fclose(f)) r=ERR_INTERNAL;
+#else
     if (f) fclose(f);
+#endif
     if (!r && write) ++memory_writes;
     pthread_mutex_unlock(&lock);
     return r;
