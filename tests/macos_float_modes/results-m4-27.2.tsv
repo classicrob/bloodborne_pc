@@ -1,0 +1,57 @@
+Measured 2026-10-07 on macOS 27.2 (26B5101f), Rosetta x86_64, Apple M4 Max.
+MoltenVK 1.4.2 (driverVersion 10402). Raw uint32 result bits; not full conformance.
+All four runs exit 2: strict variants have two zero-sign differences;
+allow-contraction has one unwanted-fusion difference. Candidate repair assertions pass.
+Capabilities and interpretation: docs/macos/float-modes.md.
+
+case	default	strict	preserve	allow-contraction
+add_smallest_subnormals	00000000	00000000	00000000	00000000
+add_subnormals_to_normal	00000000	00000000	00000000	00000000
+subnormal_input_mul_to_normal	00000000	00000000	00000000	00000000
+normal_mul_produces_subnormal	00000000	00000000	00000000	00000000
+negative_normal_mul_underflows	80000000	80000000	80000000	80000000
+sub_normal_minus_subnormal	00800000	00800000	00800000	00800000
+fma_subnormal_input	00000000	00000000	00000000	00000000
+fma_subnormal_output	00000000	00000000	00000000	00000000
+fma_cancellation	a8800000	a8800000	a8800000	a8800000
+mul_positive_zero_negative_one	00000000	00000000	00000000	80000000
+mul_negative_zero_positive_one	00000000	00000000	00000000	80000000
+add_negative_zeros	80000000	80000000	80000000	80000000
+add_opposite_zeros	00000000	00000000	00000000	00000000
+fma_negative_zero	80000000	80000000	80000000	80000000
+min_negative_positive_zero	00000000	00000000	00000000	00000000
+min_positive_negative_zero	80000000	80000000	80000000	80000000
+max_negative_positive_zero	00000000	00000000	00000000	00000000
+max_positive_negative_zero	80000000	80000000	80000000	80000000
+min_subnormal_normal	00000001	00000001	00000001	00000001
+max_negative_subnormal_negative_normal	80000001	80000001	80000001	80000001
+int_from_subnormal	00000000	00000000	00000000	00000000
+int_from_negative_subnormal	00000000	00000000	00000000	00000000
+int_from_1point9	00000001	00000001	00000001	00000001
+float_from_int_rounding	4b800002	4b800002	4b800002	4b800002
+half_subnormal_pack	00000001	00000001	00000001	00000001
+half_negative_zero_pack	00008000	00008000	00008000	00008000
+half_pack_rounding_positive	00003c02	00003c02	00003c02	00003c02
+half_pack_rounding_negative	0000bc02	0000bc02	0000bc02	0000bc02
+half_subnormal_unpack	33800000	33800000	33800000	33800000
+half_negative_zero_unpack	80000000	80000000	80000000	80000000
+compare_subnormal_zero	00000001	00000001	00000001	00000001
+compare_negative_subnormal_zero	00000001	00000001	00000001	00000001
+divide_by_negative_zero	ff800000	ff800000	ff800000	ff800000
+min_nan_number	3f800000	3f800000	3f800000	3f800000
+max_number_nan	3f800000	3f800000	3f800000	3f800000
+mul_zero_inf	7fc00000	7fc00000	7fc00000	7fc00000
+add_inf_negative_inf	7fc00000	7fc00000	7fc00000	7fc00000
+negate_negative_zero	00000000	00000000	00000000	00000000
+negate_subnormal	80000001	80000001	80000001	80000001
+candidate_mul_positive_zero_negative_one	80000000	80000000	80000000	80000000
+candidate_mul_negative_zero_positive_one	80000000	80000000	80000000	80000000
+candidate_mul_negative_denormal	80000000	80000000	80000000	80000000
+candidate_mul_underflow	80000000	80000000	80000000	80000000
+candidate_mul_zero_inf	7fc00000	7fc00000	7fc00000	7fc00000
+nonfused_mul_add_cancellation	00000000	00000000	00000000	a8800000
+candidate_fma_positive_zero_negative_one	80000000	80000000	80000000	80000000
+candidate_fma_negative_zero_positive_one	80000000	80000000	80000000	80000000
+candidate_fma_negative_denormal	80000000	80000000	80000000	80000000
+candidate_fma_underflow	80000000	80000000	80000000	80000000
+candidate_fma_zero_inf	7fc00000	7fc00000	7fc00000	7fc00000

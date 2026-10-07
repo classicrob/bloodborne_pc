@@ -1,0 +1,45 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+layout(local_size_x=1) in;
+layout(buffer_reference, std430, buffer_reference_align=4) buffer Words { uint v[]; };
+layout(push_constant) uniform Parameters { uint64_t address; } pc;
+void main() {
+    Words p=Words(pc.address);
+    uint i=gl_GlobalInvocationID.x*8;
+    uint op=p.v[i];
+    precise float a=uintBitsToFloat(p.v[i+1]);
+    precise float b=uintBitsToFloat(p.v[i+2]);
+    precise float c=uintBitsToFloat(p.v[i+3]);
+    precise float r;
+    uint bits;
+    switch(op) {
+    case 0: r=a+b; bits=floatBitsToUint(r); break;
+    case 1: r=a-b; bits=floatBitsToUint(r); break;
+    case 2: r=a*b; bits=floatBitsToUint(r); break;
+    case 3: r=fma(a,b,c); bits=floatBitsToUint(r); break;
+    case 4: r=min(a,b); bits=floatBitsToUint(r); break;
+    case 5: r=max(a,b); bits=floatBitsToUint(r); break;
+    case 6: bits=uint(int(a)); break;
+    case 7: r=float(int(p.v[i+1])); bits=floatBitsToUint(r); break;
+    case 8: bits=packHalf2x16(vec2(a,b)); break;
+    case 9: r=unpackHalf2x16(p.v[i+1]).x; bits=floatBitsToUint(r); break;
+    case 10: bits=(a==b ? 1u : 0u)|(a<b ? 2u : 0u)|(a>b ? 4u : 0u); break;
+    case 11: r=a/b; bits=floatBitsToUint(r); break;
+    case 12: r=-a; bits=floatBitsToUint(r); break;
+    case 13:
+        r=a*b;
+        bits=floatBitsToUint(r);
+        // Research candidate: recover the product sign when the result is zero.
+        bits=(bits&0x7fffffffu)==0u ? ((p.v[i+1]^p.v[i+2])&0x80000000u) : bits;
+        break;
+    case 14: r=a*b+c; bits=floatBitsToUint(r); break;
+    case 15:
+        // Research candidate: a same-sign zero addend preserves multiply's zero.
+        r=fma(a,b,uintBitsToFloat((p.v[i+1]^p.v[i+2])&0x80000000u));
+        bits=floatBitsToUint(r);
+        break;
+    default: bits=0xdeaddeadu;
+    }
+    p.v[i+4]=bits;
+}
