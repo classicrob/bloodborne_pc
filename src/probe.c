@@ -15,6 +15,7 @@
 #else
 #include <sys/mman.h>
 #ifdef __APPLE__
+#include "macos_ui.h"
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
 #else
@@ -43,7 +44,14 @@ static int entered_game;
 static int gpu_enabled;
 int vulkan_smoke(void);
 
-static __attribute__((noreturn)) void fail(const char *message) { fprintf(stderr, "ERROR: %s\n", message); exit(1); }
+static __attribute__((noreturn)) void fail(const char *message) {
+    fprintf(stderr, "ERROR: %s\n", message);
+#ifdef __APPLE__
+    bb_macos_ui_exit(1);
+#else
+    exit(1);
+#endif
+}
 static uint64_t read64(FILE *f) {
     unsigned char b[8];
     if (fread(b, 1, 8, f) != 8) fail("truncated boot file");
@@ -435,7 +443,7 @@ void runtime_restart(void) {
 #endif
 }
 
-int main(int argc, char **argv) {
+static int probe_main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
 #ifdef __APPLE__
     runtime_memory_reserve();
@@ -509,7 +517,7 @@ int main(int argc, char **argv) {
     sigemptyset(&sa.sa_mask);
     sigaction(SIGSEGV, &sa, NULL); sigaction(SIGILL, &sa, NULL); sigaction(SIGBUS, &sa, NULL);
     Dl_info self_info;
-    if (dladdr((void *)main,&self_info)) exe_base=(uintptr_t)self_info.dli_fbase;
+    if (dladdr((void *)probe_main,&self_info)) exe_base=(uintptr_t)self_info.dli_fbase;
     struct sigaction dump = {0}; dump.sa_sigaction = thread_dump; dump.sa_flags = SA_SIGINFO|SA_RESTART;
     sigemptyset(&dump.sa_mask); sigaction(SIGUSR2, &dump, NULL);
     struct sigaction alarm_action = {0}; alarm_action.sa_sigaction = watchdog; alarm_action.sa_flags = SA_SIGINFO;
@@ -708,4 +716,20 @@ int main(int argc, char **argv) {
     enter_on_stack(image+entry,&params,(void *)guest_exit,stack+MAIN_STACK-64);
 #endif
     fail("entry unexpectedly returned");
+}
+
+#ifdef __APPLE__
+typedef struct { int argc; char **argv; } ProbeArguments;
+static int probe_worker(void *argument) {
+    ProbeArguments *args=argument;
+    return probe_main(args->argc,args->argv);
+}
+#endif
+int main(int argc, char **argv) {
+#ifdef __APPLE__
+    ProbeArguments args={argc,argv};
+    return bb_macos_ui_run(probe_worker,&args);
+#else
+    return probe_main(argc,argv);
+#endif
 }
