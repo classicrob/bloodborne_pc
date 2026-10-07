@@ -10,6 +10,9 @@
 #include <mutex>
 #include <optional>
 #include <stop_token>
+#ifdef __APPLE__
+#include <string>
+#endif
 #include <string_view>
 #include <utility>
 
@@ -198,6 +201,9 @@ private:
     Frame PrepareVideoFrame(GuestBuffer buffer, const AVFrame& frame);
 
     AvPlayerStateCallback& m_state;
+#ifdef __APPLE__
+    std::string m_source_path;
+#endif
 
     struct Stream {
         size_t ffmpeg_index = 0;

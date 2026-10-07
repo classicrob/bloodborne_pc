@@ -9,6 +9,9 @@
 #include "core/libraries/avplayer/avplayer_source.h"
 #include "core/libraries/videodec/video_utils.h"
 #include "core/memory.h"
+#ifdef __APPLE__
+#include "bbport_media_checks.h"
+#endif
 
 #include <magic_enum/magic_enum.hpp>
 
@@ -54,6 +57,9 @@ AvPlayerSource::~AvPlayerSource() {
 }
 
 bool AvPlayerSource::Init(const AvPlayerInitData& init_data, std::string_view path) {
+#ifdef __APPLE__
+    m_source_path = path;
+#endif
     m_memory_replacement = init_data.memory_replacement;
     m_max_num_video_framebuffers =
         std::min(std::max(2, init_data.num_output_video_framebuffers), 16);
@@ -77,7 +83,11 @@ bool AvPlayerSource::Init(const AvPlayerInitData& init_data, std::string_view pa
             return false;
         }
         attach_custom_io();
-        if (AVPLAYER_IS_ERROR(avformat_open_input(&context, nullptr, nullptr, nullptr))) {
+        const int open_result = avformat_open_input(&context, nullptr, nullptr, nullptr);
+#ifdef __APPLE__
+        BbMedia::RequireDemuxResult(m_source_path, open_result);
+#endif
+        if (AVPLAYER_IS_ERROR(open_result)) {
             return false;
         }
     } else {
@@ -89,7 +99,11 @@ bool AvPlayerSource::Init(const AvPlayerInitData& init_data, std::string_view pa
             return false;
         }
         LOG_INFO(Lib_AvPlayer, "Opening {} from host path {}", path, host);
-        if (AVPLAYER_IS_ERROR(avformat_open_input(&context, host, nullptr, nullptr))) {
+        const int open_result = avformat_open_input(&context, host, nullptr, nullptr);
+#ifdef __APPLE__
+        BbMedia::RequireDemuxResult(m_source_path, open_result);
+#endif
+        if (AVPLAYER_IS_ERROR(open_result)) {
             return false;
         }
     }
@@ -99,9 +113,25 @@ bool AvPlayerSource::Init(const AvPlayerInitData& init_data, std::string_view pa
 }
 
 bool AvPlayerSource::FindStreams() {
-    if (avformat_find_stream_info(m_avformat_context.get(), nullptr) >= 0) {
+    const int stream_result = avformat_find_stream_info(m_avformat_context.get(), nullptr);
+#ifdef __APPLE__
+    BbMedia::RequireDemuxResult(m_source_path, stream_result);
+#endif
+    if (stream_result >= 0) {
         m_streams.reserve(m_avformat_context->nb_streams);
         for (u32 idx = 0; idx < m_avformat_context->nb_streams; ++idx) {
+#ifdef __APPLE__
+            const auto* parameters = m_avformat_context->streams[idx]->codecpar;
+            if (parameters->codec_type == AVMEDIA_TYPE_VIDEO ||
+                parameters->codec_type == AVMEDIA_TYPE_AUDIO) {
+                BbMedia::RequireDecoder(m_source_path, parameters->codec_id);
+                if (!IsStreamSupported(m_avformat_context->streams[idx])) {
+                    std::fprintf(stderr, "macOS AvPlayer: stream codec '%s' is unsupported for '%s'\n",
+                                 avcodec_get_name(parameters->codec_id), m_source_path.c_str());
+                    std::abort();
+                }
+            }
+#endif
             if (!IsStreamSupported(m_avformat_context->streams[idx])) {
                 continue;
             }
@@ -244,6 +274,9 @@ bool AvPlayerSource::Start() {
         avformat_seek_file(m_avformat_context.get(), m_video_stream_index.value(), 0, 0,
                            stream->duration, 0);
         const auto decoder = avcodec_find_decoder(stream->codecpar->codec_id);
+#ifdef __APPLE__
+        BbMedia::RequireDecoder(m_source_path, stream->codecpar->codec_id);
+#endif
         if (decoder == nullptr) {
             return false;
         }
@@ -272,6 +305,9 @@ bool AvPlayerSource::Start() {
         avformat_seek_file(m_avformat_context.get(), m_audio_stream_index.value(), 0, 0,
                            stream->duration, 0);
         const auto decoder = avcodec_find_decoder(stream->codecpar->codec_id);
+#ifdef __APPLE__
+        BbMedia::RequireDecoder(m_source_path, stream->codecpar->codec_id);
+#endif
         if (decoder == nullptr) {
             return false;
         }

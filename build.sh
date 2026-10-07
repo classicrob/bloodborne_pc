@@ -143,6 +143,10 @@ if [[ ${1:-} == --test ]]; then
             "${includes[@]}" -I. -Isrc tests/test_fault_mac.c "${compat[@]}" \
             -Wl,-dead_strip -o out/fault-mac-test
         out/fault-mac-test
+        read -r -a media_flags <<< "$(pkg-config --cflags --libs libavformat libavcodec libavutil)"
+        "${CXX:-clang++}" "${platform_flags[@]}" -std=c++23 -O2 -g -Wall -Wextra -Werror \
+            -I. tests/test_media_mac.cpp "${media_flags[@]}" "${caps_link[@]}" -o out/media-mac-test
+        out/media-mac-test
     fi
     "$CC" "${platform_flags[@]}" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread "${includes[@]}" -I. -Isrc tests/test_pad.c "${libraries[@]}" "${caps_link[@]}" -o out/pad-test
     out/pad-test
