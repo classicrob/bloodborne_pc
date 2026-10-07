@@ -19,7 +19,7 @@ static VkPipelineLayout layout;
 static PFN_vkGetMemoryHostPointerPropertiesEXT host_properties;
 static VkPhysicalDeviceMemoryProperties memory_properties;
 static VkDeviceSize import_alignment;
-typedef struct { VkBuffer buffer; VkDeviceMemory memory; VkDeviceAddress address; VkDeviceSize size; } Imported;
+typedef struct { VkBuffer buffer; VkDeviceMemory memory; VkDeviceAddress address; VkDeviceSize size; uintptr_t host, mirror; } Imported;
 static volatile sig_atomic_t faults;
 static uintptr_t protected_start;
 static size_t protected_size;
@@ -33,7 +33,7 @@ static void write_fault(int sig,siginfo_t *info,void *context) {
 }
 static Imported import(void *pointer,VkDeviceSize size,const char *name) {
     struct timespec started,finished; clock_gettime(CLOCK_MONOTONIC,&started);
-    Imported out={.size=size};
+    Imported out={.size=size,.host=(uintptr_t)pointer};
     VkMemoryHostPointerPropertiesEXT hp={.sType=VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
     VkResult r=host_properties(device,VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,pointer,&hp);
     printf("import %s pointer=%p bytes=%llu query=%d types=%x\n",name,pointer,(unsigned long long)size,r,hp.memoryTypeBits);
@@ -71,10 +71,26 @@ static Imported import(void *pointer,VkDeviceSize size,const char *name) {
     printf("BDA=%#llx import_ms=%.3f maxrss_MiB=%.1f\n",(unsigned long long)out.address,ms,usage.ru_maxrss/1048576.0); assert(out.address);
     return out;
 }
-static void destroy(Imported *in) {
-    CHECK(vkDeviceWaitIdle(device)); vkDestroyBuffer(device,in->buffer,NULL); vkFreeMemory(device,in->memory,NULL); *in=(Imported){0};
+static Imported import_rw_alias(void *pointer,VkDeviceSize size,const char *name) {
+    mach_vm_address_t alias=0;
+    vm_prot_t current=0,maximum=0;
+    kern_return_t kr=mach_vm_remap(mach_task_self(),&alias,size,0,VM_FLAGS_ANYWHERE,
+        mach_task_self(),(mach_vm_address_t)pointer,FALSE,&current,&maximum,VM_INHERIT_NONE);
+    printf("RW mirror source=%p alias=%#llx remap=%d current=%x maximum=%x\n",pointer,alias,kr,current,maximum);
+    assert(kr==KERN_SUCCESS);
+    assert(mach_vm_protect(mach_task_self(),alias,size,FALSE,VM_PROT_READ|VM_PROT_WRITE)==KERN_SUCCESS);
+    Imported in=import((void *)alias,size,name); assert(in.memory); in.mirror=alias; in.host=(uintptr_t)pointer;
+    return in;
 }
-static void dispatch(const Imported *in,uint32_t index,uint32_t addend) {
+static void destroy_now(Imported *in) {
+    vkDestroyBuffer(device,in->buffer,NULL); vkFreeMemory(device,in->memory,NULL);
+    if(in->mirror) assert(mach_vm_deallocate(mach_task_self(),in->mirror,in->size)==KERN_SUCCESS);
+    *in=(Imported){0};
+}
+static void destroy(Imported *in) {
+    CHECK(vkDeviceWaitIdle(device)); destroy_now(in);
+}
+static VkCommandBuffer submit_dispatch(const Imported *in,uint32_t index,uint32_t addend) {
     VkCommandBufferAllocateInfo ai={.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,.commandPool=commands,
         .level=VK_COMMAND_BUFFER_LEVEL_PRIMARY,.commandBufferCount=1};
     VkCommandBuffer cmd; CHECK(vkAllocateCommandBuffers(device,&ai,&cmd));
@@ -89,8 +105,32 @@ static void dispatch(const Imported *in,uint32_t index,uint32_t addend) {
     vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_HOST_BIT,0,1,&after,0,NULL,0,NULL);
     CHECK(vkEndCommandBuffer(cmd));
     VkSubmitInfo submit={.sType=VK_STRUCTURE_TYPE_SUBMIT_INFO,.commandBufferCount=1,.pCommandBuffers=&cmd};
-    CHECK(vkQueueSubmit(queue,1,&submit,VK_NULL_HANDLE)); CHECK(vkQueueWaitIdle(queue));
-    vkFreeCommandBuffers(device,commands,1,&cmd);
+    CHECK(vkQueueSubmit(queue,1,&submit,VK_NULL_HANDLE));
+    return cmd;
+}
+static void dispatch(const Imported *in,uint32_t index,uint32_t addend) {
+    VkCommandBuffer cmd=submit_dispatch(in,index,addend);
+    CHECK(vkQueueWaitIdle(queue)); vkFreeCommandBuffers(device,commands,1,&cmd);
+}
+static Imported *tracked[2];
+static unsigned lifetime_active,lifetime_retired,lifetime_finished;
+static void gpu_begin(void) {
+    assert(!exclusive_depth && !lifetime_active); lifetime_active=1;
+    CHECK(vkDeviceWaitIdle(device));
+}
+static void gpu_retire(uintptr_t address,uint64_t size) {
+    assert(exclusive_depth && lifetime_active);
+    for (unsigned i=0;i<2;++i) {
+        Imported *in=tracked[i];
+        if (!in || !in->memory || in->host>=address+size || address>=in->host+in->size) continue;
+        /* The queued shader has finished and the OLD backing is still alive. */
+        assert(*(volatile uint32_t *)in->host==731);
+        destroy_now(in); ++lifetime_retired;
+    }
+}
+static void gpu_end(void) {
+    assert(!exclusive_depth && !pending_count && lifetime_active);
+    assert(lifetime_retired==2); lifetime_active=0; ++lifetime_finished;
 }
 int main(int argc,char **argv) {
     assert(argc==2); setbuf(stdout,NULL); puts("external host probe: start");
@@ -162,7 +202,8 @@ int main(int argc,char **argv) {
     void *joined=(void *)(USER_MIN+UINT64_C(0x10000000));
     assert(!direct_map(&joined,PAGE,3,MAP_FIXED_FLAG,phys,PAGE));
     void *second=(unsigned char *)joined+PAGE; assert(!direct_map(&second,PAGE,3,MAP_FIXED_FLAG,phys+2*PAGE,PAGE));
-    Imported fragmented=import(joined,2*PAGE,"noncontiguous-physical-pages"); assert(fragmented.memory);
+    assert(!mprotect(joined,2*PAGE,PROT_READ));
+    Imported fragmented=import_rw_alias(joined,2*PAGE,"noncontiguous-physical-pages-RO-with-RW-mirror"); assert(fragmented.memory);
     back[1]=400; back[2*PAGE/4+1]=500;
     dispatch(&fragmented,0,56); dispatch(&fragmented,PAGE/4,67);
     assert(back[0]==456 && back[2*PAGE/4]==567); puts("PASS import spans distinct Mach remaps"); destroy(&fragmented);
@@ -174,6 +215,54 @@ int main(int argc,char **argv) {
     Imported fresh=import(a,4*PAGE,"fresh-backing-after-release"); assert(fresh.memory);
     dispatch(&fresh,0,78); assert(back[0]==78); destroy(&fresh); assert(!direct_release(phys,4*PAGE));
     puts("PASS destroy-import -> release/zero -> remap/reimport -> BDA execution");
+    /* Cold Mach backing: no CPU read/write may materialize a page before GPU. */
+    assert(!direct_allocate(0,POOL_SIZE,12*PAGE,PAGE,0,&phys));
+    a=NULL; b=NULL;
+    assert(!direct_map(&a,12*PAGE,3,0,phys,PAGE));
+    assert(!direct_map(&b,12*PAGE,3,0,phys,PAGE));
+    assert(!mprotect(a,12*PAGE,PROT_READ));
+    Imported cold_left=import_rw_alias(a,4*PAGE,"cold-left64KiB-RW-mirror");
+    Imported cold_right=import_rw_alias((char *)a+8*PAGE,4*PAGE,"cold-right64KiB-RW-mirror");
+    Imported cold_whole=import_rw_alias(a,12*PAGE,"cold-encompassing192KiB-RW-mirror");
+    assert(cold_left.memory && cold_right.memory && cold_whole.memory);
+    dispatch(&cold_left,1,111);
+    dispatch(&cold_right,0,222);
+    dispatch(&cold_whole,4*PAGE/4,333);
+    printf("cold words: %u %u %u aliases %u %u %u\n",((volatile uint32_t *)a)[1],((volatile uint32_t *)a)[8*PAGE/4],((volatile uint32_t *)a)[4*PAGE/4],((volatile uint32_t *)b)[1],((volatile uint32_t *)b)[8*PAGE/4],((volatile uint32_t *)b)[4*PAGE/4]);
+    assert(((volatile uint32_t *)a)[1]==111 && ((volatile uint32_t *)b)[1]==111);
+    assert(((volatile uint32_t *)a)[8*PAGE/4]==222 && ((volatile uint32_t *)b)[8*PAGE/4]==222);
+    assert(((volatile uint32_t *)a)[4*PAGE/4]==333 && ((volatile uint32_t *)b)[4*PAGE/4]==333);
+    /* Access the same written location through the overlapping whole import. */
+    dispatch(&cold_whole,0,444);
+    assert(((volatile uint32_t *)b)[0]==555);
+    protected_start=(uintptr_t)a; protected_size=12*PAGE;
+    ((volatile uint32_t *)a)[2]=900; assert(faults==1); faults=0;
+    assert(((volatile uint32_t *)b)[2]==900);
+    destroy(&cold_left); destroy(&cold_right); destroy(&cold_whole);
+    assert(!direct_release(phys,12*PAGE));
+    puts("PASS cold zero Mach backing + overlapping64/192KiB imports + RO GPU writes in every alias");
+    /* Exercise backend-triggered import retirement with work still submitted. */
+    assert(!direct_allocate(0,POOL_SIZE,4*PAGE,PAGE,0,&phys));
+    a=NULL; b=NULL;
+    assert(!direct_map(&a,4*PAGE,3,0,phys,PAGE));
+    assert(!direct_map(&b,4*PAGE,3,0,phys,PAGE));
+    assert(!mprotect(a,4*PAGE,PROT_READ)); assert(!mprotect(b,4*PAGE,PROT_READ));
+    one=import_rw_alias(a,4*PAGE,"lifetime-alias-one");
+    two=import_rw_alias(b,4*PAGE,"lifetime-alias-two");
+    assert(one.memory && two.memory); tracked[0]=&one; tracked[1]=&two;
+    VkCommandBuffer outstanding=submit_dispatch(&one,0,731);
+    runtime_memory_set_gpu_lifetime_hooks(gpu_begin,gpu_retire,gpu_end);
+    assert(!direct_release(phys,4*PAGE));
+    runtime_memory_set_gpu_lifetime_hooks(NULL,NULL,NULL);
+    assert(lifetime_finished==1 && !one.memory && !two.memory);
+    vkFreeCommandBuffers(device,commands,1,&outstanding);
+    assert(!direct_allocate(phys,phys+4*PAGE,4*PAGE,PAGE,0,&reused));
+    a=NULL; assert(!direct_map(&a,4*PAGE,3,0,reused,PAGE));
+    for(unsigned i=0;i<4*PAGE/4;++i) assert(!((uint32_t *)a)[i]);
+    fresh=import(a,4*PAGE,"lifetime-fresh-backing"); assert(fresh.memory);
+    dispatch(&fresh,0,123); assert(((uint32_t *)a)[0]==123);
+    destroy(&fresh); assert(!direct_release(reused,4*PAGE));
+    puts("PASS queued shader -> backend begin/wait -> all alias imports retire -> release/zero/reimport");
     const unsigned sizes[]={1,16,256,4096,8192};
     for (unsigned si=0;si<sizeof(sizes)/sizeof(*sizes);++si) {
         unsigned mib=sizes[si];
