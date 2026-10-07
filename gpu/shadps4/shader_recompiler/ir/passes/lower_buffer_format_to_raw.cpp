@@ -237,7 +237,14 @@ static void LowerBufferFormatInst(IR::Block& block, IR::Inst& inst, Info& info, 
     if (IsBufferFormatLoad(inst)) {
         const auto interpreted =
             LoadBufferFormat(ir, inst.Arg(0), IR::U32{inst.Arg(1)}, flags, format_info);
-        inst.ReplaceUsesWithAndRemove(interpreted);
+        if (profile.emulate_robust_buffer_access) {
+            const auto in_range = ir.INotEqual(IR::U32{inst.Arg(1)}, ir.Imm32(UINT32_MAX));
+            const auto zero = ir.CompositeConstruct(ir.Imm32(0.f), ir.Imm32(0.f),
+                                                    ir.Imm32(0.f), ir.Imm32(0.f));
+            inst.ReplaceUsesWithAndRemove(ir.Select(in_range, interpreted, zero));
+        } else {
+            inst.ReplaceUsesWithAndRemove(interpreted);
+        }
     } else if (IsBufferFormatStore(inst)) {
         StoreBufferFormat(ir, inst.Arg(0), IR::U32{inst.Arg(1)}, inst.Arg(2), flags, format_info);
         inst.Invalidate();

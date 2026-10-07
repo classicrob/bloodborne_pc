@@ -619,7 +619,7 @@ IR::U32 CalculateBufferAddress(IR::IREmitter& ir, const IR::Inst& inst, const In
     return buffer_offset;
 }
 
-void PatchBufferArgs(IR::Inst& inst, Info& info) {
+void PatchBufferArgs(IR::Inst& inst, Info& info, const Profile& profile) {
     const auto handle = inst.Arg(0);
     const auto buffer_res = info.buffers[handle.U32()];
     const auto buffer = buffer_res.GetSharp(info);
@@ -630,8 +630,24 @@ void PatchBufferArgs(IR::Inst& inst, Info& info) {
     }
 
     IR::IREmitter ir{*inst.GetParent(), IR::Block::InstructionList::s_iterator_to(inst)};
-    inst.SetArg(IR::LoadBufferArgs::Address,
-                CalculateBufferAddress(ir, inst, info, buffer, buffer.stride));
+    if (profile.emulate_robust_buffer_access && !buffer_res.IsSpecial()) {
+        auto flags = inst.Flags<IR::BufferInstInfo>();
+        const bool formatted = inst.GetOpcode() == IR::Opcode::LoadBufferFormatF32 ||
+                               inst.GetOpcode() == IR::Opcode::StoreBufferFormatF32;
+        const auto format = flags.inst_data_fmt != AmdGpu::DataFormat::FormatInvalid
+                                ? AmdGpu::RemapDataFormat(flags.inst_data_fmt.Value())
+                                : buffer.GetDataFmt();
+        const u32 shift = BufferAddressShift(inst, format);
+        flags.address_shift.Assign(shift);
+        flags.access_bytes.Assign(formatted ? AmdGpu::NumBitsPerElement(format) / 8 : 1u << shift);
+        flags.typed.Assign(formatted);
+        inst.SetArg(IR::LoadBufferArgs::Address,
+                    ir.BufferAddress(IR::U32{handle}, IR::GetBufferIndexArg(&inst),
+                                     IR::GetBufferVOffsetArg(&inst), IR::GetBufferSOffsetArg(&inst), flags));
+    } else {
+        inst.SetArg(IR::LoadBufferArgs::Address,
+                    CalculateBufferAddress(ir, inst, info, buffer, buffer.stride));
+    }
 }
 
 IR::Value FixCubeCoords(IR::IREmitter& ir, const AmdGpu::Image& image, const IR::Value& x,
@@ -955,7 +971,7 @@ void ResourcePatchingPass(Shader::Info& info, const ResourceDiscoveryList& resou
     for (const auto& usage : resources) {
         IR::Inst& inst = *usage.user;
         if (IsBufferInstruction(inst)) {
-            PatchBufferArgs(inst, info);
+            PatchBufferArgs(inst, info, profile);
         } else if (IsImageInstruction(inst)) {
             PatchImageArgs(inst, info);
         } else if (IsDataRingInstruction(inst)) {

@@ -56,6 +56,8 @@ struct Profile {
     bool supports_shader_stencil_export{};
     bool emulate_null_descriptors{};
 
+    bool emulate_robust_buffer_access{};
+
     bool operator==(const Profile&) const = default;
 };
 

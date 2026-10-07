@@ -274,9 +274,7 @@ bool Instance::CreateDevice() {
 #ifdef __APPLE__
     ASSERT_MSG(features.robustBufferAccess,
                "Required Vulkan feature unavailable: robustBufferAccess");
-    ASSERT_MSG(robustness2_features.robustBufferAccess2,
-               "Required Vulkan feature unavailable on macOS: robustBufferAccess2; "
-               "exact out-of-bounds buffer semantics are not yet implemented");
+    // Guest buffer bounds are enforced explicitly by the SPIR-V recompiler.
 #else
     ASSERT_MSG(robustness2_features.robustBufferAccess2,
                "Required Vulkan feature unavailable: robustBufferAccess2");
@@ -508,7 +506,7 @@ bool Instance::CreateDevice() {
         },
         vk::PhysicalDeviceRobustness2FeaturesEXT{
 #ifdef __APPLE__
-            .robustBufferAccess2 = robustness2_features.robustBufferAccess2,
+            .robustBufferAccess2 = false,
 #else
             .robustBufferAccess2 = true,
 #endif

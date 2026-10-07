@@ -143,6 +143,12 @@ void Visit(Info& info, const IR::Inst& inst) {
     case IR::Opcode::Memtime:
         info.uses_shader_clock = true;
         break;
+    case IR::Opcode::BufferAddress:
+        info.uses_lane_id |= info.buffers[inst.Arg(0).U32()].GetSharp(info).add_tid_enable;
+        if (!(info.buffers[inst.Arg(0).U32()].sharp_fetch.load_mask & 4)) {
+            break;
+        }
+        [[fallthrough]];
     case IR::Opcode::ReadConst:
         if (!info.has_readconst) {
             info.buffers.push_back({
@@ -151,7 +157,7 @@ void Visit(Info& info, const IR::Inst& inst) {
             });
             info.has_readconst = true;
         }
-        if (inst.Flags<u32>() == 0) {
+        if (inst.GetOpcode() == IR::Opcode::ReadConst && inst.Flags<u32>() == 0) {
             info.readconst_types |= Info::ReadConstType::Immediate;
             info.readconst_types |= Info::ReadConstType::Dynamic;
             info.uses_dma = true;

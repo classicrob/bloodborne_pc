@@ -34,6 +34,11 @@ Id Module::OpAccessChain(Id result_type, Id base, std::span<const Id> indexes) {
     return *code << OpId{spv::Op::OpAccessChain, result_type} << base << indexes << EndOp{};
 }
 
+Id Module::OpArrayLength(Id result_type, Id structure, std::uint32_t member) {
+    code->Reserve(5);
+    return *code << OpId{spv::Op::OpArrayLength, result_type} << structure << member << EndOp{};
+}
+
 Id Module::OpVectorExtractDynamic(Id result_type, Id vector, Id index) {
     code->Reserve(5);
     return *code << OpId{spv::Op::OpVectorExtractDynamic, result_type} << vector << index

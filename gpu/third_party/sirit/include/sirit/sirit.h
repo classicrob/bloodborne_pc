@@ -370,6 +370,8 @@ public:
     /// Create a pointer into a composite object that can be used with OpLoad and OpStore.
     Id OpAccessChain(Id result_type, Id base, std::span<const Id> indexes = {});
 
+    Id OpArrayLength(Id result_type, Id structure, std::uint32_t member);
+
     /// Create a pointer into a composite object that can be used with OpLoad and OpStore.
     template <typename... Ts>
     requires(...&& std::is_convertible_v<Ts, Id>) Id

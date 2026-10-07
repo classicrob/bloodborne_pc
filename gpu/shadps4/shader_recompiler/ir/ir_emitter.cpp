@@ -424,6 +424,11 @@ U32 IREmitter::ReadConst(const Value& base, const U32& offset) {
     return Inst<U32>(Opcode::ReadConst, base, offset);
 }
 
+U32 IREmitter::BufferAddress(const U32& handle, const U32& index, const U32& offset,
+                            const U32& soffset, BufferInstInfo info) {
+    return Inst<U32>(Opcode::BufferAddress, Flags{info}, handle, index, offset, soffset);
+}
+
 U32 IREmitter::ReadConstBuffer(const Value& handle, const U32& index, BufferInstInfo info) {
     return Inst<U32>(Opcode::ReadConstBuffer, Flags{info}, handle, index);
 }

@@ -69,6 +69,78 @@ Id EmitReadConst(EmitContext& ctx, IR::Inst* inst, Id addr, Id offset) {
     }
 }
 
+Id EmitBufferAddress(EmitContext& ctx, IR::Inst* inst, u32 handle, Id index, Id offset, Id soffset) {
+    const auto flags = inst->Flags<IR::BufferInstInfo>();
+    const auto& desc = ctx.info.buffers[handle];
+    const auto sharp = desc.GetSharp(ctx.info);
+    Id valid = ctx.true_value;
+    auto checked_add = [&](Id a, Id b) {
+        const Id sum = ctx.OpIAdd(ctx.U32[1], a, b);
+        valid = ctx.OpLogicalAnd(ctx.U1[1], valid, ctx.OpUGreaterThanEqual(ctx.U1[1], sum, a));
+        return sum;
+    };
+    auto checked_mul = [&](Id a, u32 factor) {
+        if (factor == 0) return ctx.u32_zero_value;
+        valid = ctx.OpLogicalAnd(ctx.U1[1], valid,
+            ctx.OpULessThanEqual(ctx.U1[1], a, ctx.ConstU32(UINT32_MAX / factor)));
+        return ctx.OpIMul(ctx.U32[1], a, ctx.ConstU32(factor));
+    };
+    if (!flags.index_enable) index = ctx.u32_zero_value;
+    if (sharp.add_tid_enable) {
+        index = checked_add(index, ctx.OpLoad(ctx.U32[1], ctx.subgroup_local_invocation_id));
+    }
+    if (!flags.voffset_enable) offset = ctx.u32_zero_value;
+    offset = checked_add(offset, ctx.ConstU32(u32(flags.inst_offset.Value())));
+    Id address;
+    if (sharp.swizzle_enable) {
+        const u32 index_stride = sharp.GetIndexStride();
+        const u32 element = sharp.GetElementSize();
+        const Id index_msb = ctx.OpUDiv(ctx.U32[1], index, ctx.ConstU32(index_stride));
+        const Id index_lsb = ctx.OpUMod(ctx.U32[1], index, ctx.ConstU32(index_stride));
+        const Id offset_msb = ctx.OpUDiv(ctx.U32[1], offset, ctx.ConstU32(element));
+        const Id offset_lsb = ctx.OpUMod(ctx.U32[1], offset, ctx.ConstU32(element));
+        const Id msb = checked_mul(checked_add(checked_mul(index_msb, sharp.stride),
+                                              checked_mul(offset_msb, element)), index_stride);
+        address = checked_add(msb, checked_add(checked_mul(index_lsb, element), offset_lsb));
+    } else {
+        address = checked_add(checked_mul(index, sharp.stride), offset);
+    }
+    // GCN applies the SGPR offset to the base, after the swizzle calculation.
+    address = checked_add(address, soffset);
+    const Id records = desc.sharp_fetch.load_mask & 4
+        ? ctx.EmitFlatbufferLoad(ctx.ConstU32(u32(desc.sharp_fetch.offsets[2])))
+        : ctx.ConstU32(desc.sharp_fetch.immediates[2]);
+    const bool formatted = flags.typed.Value();
+    const u32 bytes = flags.access_bytes.Value();
+    std::array<Id, 4> predicates;
+    for (u32 c = 0; c < predicates.size(); ++c) {
+        const u32 delta = (formatted ? 0u : c * 4) + bytes - 1;
+        Id predicate = valid;
+        if (sharp.stride == 0) {
+            const Id end = ctx.OpIAdd(ctx.U32[1], address, ctx.ConstU32(delta));
+            predicate = ctx.OpLogicalAnd(ctx.U1[1], predicate,
+                ctx.OpUGreaterThanEqual(ctx.U1[1], end, address));
+            predicate = ctx.OpLogicalAnd(ctx.U1[1], predicate,
+                ctx.OpULessThan(ctx.U1[1], end, records));
+        } else {
+            predicate = ctx.OpLogicalAnd(ctx.U1[1], predicate,
+                ctx.OpULessThan(ctx.U1[1], index, records));
+            if (flags.index_enable || sharp.add_tid_enable) {
+                const Id end = ctx.OpIAdd(ctx.U32[1], offset, ctx.ConstU32(delta));
+                predicate = ctx.OpLogicalAnd(ctx.U1[1], predicate,
+                    ctx.OpUGreaterThanEqual(ctx.U1[1], end, offset));
+                predicate = ctx.OpLogicalAnd(ctx.U1[1], predicate,
+                    ctx.OpULessThan(ctx.U1[1], end, ctx.ConstU32(u32(sharp.stride))));
+            }
+        }
+        predicates[c] = predicate;
+    }
+    const Id aligned = ctx.OpShiftRightLogical(ctx.U32[1], address, ctx.ConstU32(u32(flags.address_shift.Value())));
+    const Id result = ctx.OpSelect(ctx.U32[1], predicates[0], aligned, ctx.ConstU32(UINT32_MAX));
+    ctx.buffer_address_bounds.emplace(result.value, EmitContext::BufferAddressBounds{predicates, bytes, formatted});
+    return result;
+}
+
 Id EmitReadConstBuffer(EmitContext& ctx, u32 handle, Id index) {
     const Id original_index = index;
     const auto& buffer = ctx.buffers[handle];
