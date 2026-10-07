@@ -1,10 +1,15 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-// Saved FSR 4 choices must be safe before the first rendered frame on older GPUs.
+// Validate saved choices and the platform policy before the first rendered frame.
 #include <cassert>
 #include <cstdio>
 #include <cstdlib>
 #include <initializer_list>
 #include <unistd.h>
+#ifdef __APPLE__
+#include <csignal>
+#include <sys/resource.h>
+#include <sys/wait.h>
+#endif
 #include "bbport_settings.h"
 
 int main() {
@@ -39,6 +44,29 @@ int main() {
                 s.fsr4_problem = nullptr;
                 Load();
                 assert(s.upscaler == requested);
+#ifdef __APPLE__
+                if (requested == UpscalerFsr4 || requested == UpscalerFsr411) {
+                    std::fflush(nullptr);
+                    const pid_t child = fork();
+                    assert(child >= 0);
+                    if (child == 0) {
+                        const struct rlimit limit{0, 0};
+                        setrlimit(RLIMIT_CORE, &limit);
+                        ConfigureUpscalerSupport(fsr4, fsr411);
+                        _exit(99);
+                    }
+                    int status = 0;
+                    assert(waitpid(child, &status, 0) == child);
+                    assert(WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT);
+                    continue;
+                }
+                ConfigureUpscalerSupport(fsr4, fsr411);
+                assert(s.upscaler == requested);
+                assert(!s.fsr4_supported && !s.fsr411_supported);
+                assert(!s.fsr4_problem.load());
+                assert(s.preset == Performance && s.output_res == 2);
+                assert(s.startup_upscaler == requested);
+#else
                 ConfigureUpscalerSupport(fsr4, fsr411);
                 const bool unsupported = (requested == UpscalerFsr4 && !fsr4) ||
                     (requested == UpscalerFsr411 && !(fsr4 && fsr411));
@@ -51,6 +79,7 @@ int main() {
                 assert(s.startup_upscaler == requested);
                 ConfigureUpscalerSupport(fsr4, fsr411);
                 assert(s.upscaler == (unsupported ? UpscalerFsr3 : requested));
+#endif
             }
         }
     }
@@ -78,5 +107,9 @@ int main() {
     assert(!FixedRenderSession() && !ResolutionNeedsRestart());
     unsetenv("BB_RENDER_RES");
     std::remove(path);
+#ifdef __APPLE__
+    std::puts("Upscaler support: saved choices and explicit FSR 4/4.1.1 rejection PASS");
+#else
     std::puts("Upscaler support: saved choices and FSR 3.1 fallback PASS");
+#endif
 }
