@@ -27,9 +27,12 @@
 #include "shader_recompiler/recompiler.h"
 #include "shader_recompiler/runtime_info.h"
 #include "shader_recompiler/specialization.h"
+#include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_common.h"
 
 #include "gcn_asm.h"
+#include "shader_recompiler/frontend/decode.h"
+#include <magic_enum/magic_enum.hpp>
 #include "ref.h"
 
 VULKAN_HPP_DEFAULT_DISPATCH_LOADER_DYNAMIC_STORAGE
@@ -88,6 +91,13 @@ struct Template {
     u32 smem_imm = 0;      // dwords
     bool combo = false;    // s_buffer_load_dword (imm) + buffer_load_dword on the same V#
     Wave wave = Wave::None;
+    bool vertex = false;   // vertex shader + fetch shader (s_swappc_b64), indexed draw
+    bool fragment = false; // fragment stage (compile-only)
+    bool compile_only = false; // translate + EmitSPIRV + spirv-val only; an abort is a FAIL
+    bool srt = false;      // V# and a constant read through an extended-user-data pointer (s[2:3])
+    u32 sdst = 16;         // stage-compile: SDST of the s_buffer_load (0 overlaps user data)
+    bool dead = false;     // the access under test is dead (its result is never used)
+    std::vector<u32> fetch;
     std::vector<u32> code;
     u64 hash = 0;
 };
@@ -95,6 +105,11 @@ struct Template {
 struct Lane {
     u32 active = 0, vindex = 0, voffset = 0;
     u32 data[4]{};
+};
+
+struct VertexAttr {
+    u32 semantic = 0, format = 0; // vk::Format from LiverpoolToVK::SurfaceFormat
+    std::array<u32, 4> sharp{};
 };
 
 struct BindPlan {
@@ -125,6 +140,8 @@ struct Job {
     u32 perm = 0;
     std::vector<BindPlan> binds;
     std::array<u32, 16> ud_regs{};
+    std::vector<VertexAttr> vattrs; // fixed-function vertex inputs of the permutation
+    std::array<u32, 8> vtable{};    // vertex/srt jobs: table at s[2:3] (V# in dwords 0..3, constant in 4)
 };
 
 std::vector<Template> g_templates;
@@ -214,8 +231,76 @@ void AssembleWave(GcnAsm::Code& c, Wave w) {
     }
 }
 
+// Vertex shader: s_swappc_b64 into the fetch shader (V# via s_load_dwordx4 from the table at
+// s[2:3], buffer/tbuffer_load_format_xyzw v[4:7], v0 idxen), then stores v[4:7] to the result
+// slot (vertex index & 63) and exports a position. Rasterization is discarded.
+void AssembleVertex(Template& t) {
+    using namespace GcnAsm;
+    Code c;
+    c.SMovLiteral(VCC_HI, 0x5eed);
+    c.SSwappcB64(0, 0);
+    c.Vop2(27, 9, 0, Inline(63)); // v_and_b32 v9, 63, v0
+    c.VLshlrevB32(8, Inline(4), 9);
+    c.Mubuf(BUFFER_STORE_DWORDX4, Code::BufFields{.offen = true, .vaddr = 8, .vdata = 4, .srsrc = 8});
+    c.SWaitcntAll();
+    c.VMov(10, Inline(0));
+    c.VMovLiteral(11, 0x3f800000);
+    c.Exp(12, 0xF, true, 10, 10, 10, 11);
+    c.SEndpgm();
+    Code f;
+    f.SLoadDwordx4(4, 2, 0);
+    f.SWaitcntAll();
+    const Code::BufFields fl{.idxen = true, .vaddr = 0, .vdata = 4, .srsrc = 4};
+    if (t.mtbuf) {
+        f.Mtbuf(TBUFFER_LOAD_FORMAT_XYZW, t.op.inst_dfmt, t.op.inst_nfmt, fl);
+    } else {
+        f.Mubuf(BUFFER_LOAD_FORMAT_XYZW, fl);
+    }
+    f.SWaitcntAll();
+    f.SSetpcB64(0);
+    t.code = std::move(c.words);
+    t.fetch = std::move(f.words);
+    u64 h = 0xcbf29ce484222325ull;
+    for (u32 w : t.code) h = (h ^ w) * 0x100000001b3ull;
+    for (u32 w : t.fetch) h = (h ^ w) * 0x100000001b3ull;
+    t.hash = h;
+}
+
+// Graphics stages whose only buffer access is s_buffer_load (V# in s[4:7]), compile-only. The
+// fragment shader mirrors the shape of a real game shader that broke the Apple bounds path.
+void AssembleStage(Template& t) {
+    using namespace GcnAsm;
+    Code c;
+    c.SMovLiteral(VCC_HI, 0x5eed);
+    c.Sop1(3, 124, 8); // s_mov_b32 m0, s8
+    c.SBufferLoad(t.op.ncomp, t.sdst, 4, t.smem == SmemSrc::Imm, t.smem == SmemSrc::Imm ? t.smem_imm : 9);
+    c.SWaitcntAll();
+    for (u32 i = 0; i < 4; ++i) {
+        if (t.dead) c.VMovLiteral(i, 0x3f800000);
+        else c.VMov(i, t.sdst + (i < t.op.ncomp ? i : 0));
+    }
+    if (t.fragment) {
+        c.Exp(0, 0xF, true, 0, 1, 2, 3, true); // mrt0
+    } else {
+        c.Exp(12, 0xF, true, 0, 1, 2, 3); // pos0
+    }
+    c.SEndpgm();
+    t.code = std::move(c.words);
+    u64 h = 0xcbf29ce484222325ull ^ (t.fragment ? 1 : 2);
+    for (u32 w : t.code) h = (h ^ w) * 0x100000001b3ull;
+    t.hash = h;
+}
+
 void Assemble(Template& t) {
     using namespace GcnAsm;
+    if (t.vertex && !t.compile_only) {
+        AssembleVertex(t);
+        return;
+    }
+    if (t.compile_only) {
+        AssembleStage(t);
+        return;
+    }
     Code c;
     c.SMovLiteral(VCC_HI, 0x5eed); // the recompiler expects s_mov_b32 vcc_hi, #imm first
     c.VLshlrevB32(1, Inline(5), 0);
@@ -242,12 +327,17 @@ void Assemble(Template& t) {
             c.SBufferLoad(1, 16, 0, true, t.smem_imm);
             c.SWaitcntAll();
         }
+        if (t.srt) {
+            c.SLoadDwordx4(16, 2, 0); // V# from the table at s[2:3]
+            c.SLoadDword(20, 2, 4);   // a constant from the same table
+            c.SWaitcntAll();
+        }
         c.VCmpNeU32(Inline(0), 2);
-        c.SAndSaveexecB64(20, VCC_LO);
+        c.SAndSaveexecB64(t.srt ? 22 : 20, VCC_LO);
         Code::BufFields f{.offset = t.inst_offset, .offen = t.offen, .idxen = t.idxen, .glc = t.glc};
         f.vaddr = t.idxen ? 3 : (t.offen ? 4 : 3);
-        f.vdata = t.op.kind == GCN_LOAD ? 10 : 5;
-        f.srsrc = 0;
+        f.vdata = t.op.kind == GCN_LOAD ? (t.dead ? 20 : 10) : 5;
+        f.srsrc = t.srt ? 16 : 0;
         f.soffset = t.soff == SoffSrc::Sgpr ? 12 : Inline(t.soff_inline);
         if (t.mtbuf) {
             c.Mtbuf(t.opcode, t.op.inst_dfmt, t.op.inst_nfmt, f);
@@ -257,8 +347,9 @@ void Assemble(Template& t) {
         c.SWaitcntAll();
         if (t.op.kind == GCN_ATOMIC && t.glc) c.VMov(10, Vgpr(5));
         if (t.combo) c.VMov(11, 16);
-        c.SMovB64(EXEC_LO, 20);
+        c.SMovB64(EXEC_LO, t.srt ? 22 : 20);
     }
+    if (t.srt) c.VMov(11, 20);
     c.VLshlrevB32(14, Inline(4), 0);
     Code::BufFields o{.offen = true, .vaddr = 14, .vdata = 10, .srsrc = 8};
     c.Mubuf(BUFFER_STORE_DWORDX4, o);
@@ -936,6 +1027,112 @@ void AddWaveCases() {
     }
 }
 
+// Vertex fetch: indexed draws whose indices run past num_records. GCN fetch shaders are
+// BUFFER/TBUFFER_LOAD_FORMAT idxen loads, so out-of-range vertices read 0 (§8.1.5.3).
+void AddVertexCases() {
+    auto tmpl = [](const char* name, bool mtbuf, u32 dfmt, u32 nfmt) {
+        Template t;
+        t.name = name;
+        t.vertex = true;
+        t.mtbuf = mtbuf;
+        t.idxen = true;
+        t.offen = false;
+        t.op.kind = GCN_LOAD;
+        t.op.typed = 1;
+        t.op.inst_typed = mtbuf;
+        t.op.inst_dfmt = dfmt;
+        t.op.inst_nfmt = nfmt;
+        t.op.ncomp = 4;
+        return AddTemplate(t);
+    };
+    const u32 fmt = tmpl("vertex: fetch buffer_load_format_xyzw v0 idxen", false, 0, 0);
+    const u32 tb = tmpl("vertex: fetch tbuffer_load_format_xyzw dfmt:14 nfmt:4", true, GCN_DFMT_32_32_32_32, GCN_NFMT_UINT);
+    gcn_vsharp a = StructV(16, 5, GCN_DFMT_32_32_32_32, GCN_NFMT_UINT);
+    gcn_vsharp b = StructV(8, 3, GCN_DFMT_32_32, GCN_NFMT_FLOAT);
+    b.dst_sel[2] = 0; b.dst_sel[3] = 1;
+    gcn_vsharp c = StructV(4, 6, GCN_DFMT_8_8_8_8, GCN_NFMT_UINT);
+    gcn_vsharp d = StructV(12, 4, GCN_DFMT_32_32_32, GCN_NFMT_UINT);
+    d.dst_sel[3] = 1;
+    gcn_vsharp e = StructV(16, 0, GCN_DFMT_32_32_32_32, GCN_NFMT_UINT);
+    gcn_vsharp f = StructV(20, 3, GCN_DFMT_32_32_32_32, GCN_NFMT_UINT); // stride > element
+    struct VC { u32 t; gcn_vsharp v; u64 mis; };
+    for (const VC& vc : {VC{fmt, a, 0}, VC{fmt, a, 4}, VC{fmt, b, 0}, VC{fmt, c, 0}, VC{fmt, d, 0}, VC{fmt, e, 0},
+                         VC{fmt, f, 0}, VC{tb, a, 0}, VC{tb, StructV(16, 5), 0}}) {
+        Job& j = NewJob("vertex-fetch", vc.t, vc.v, vc.mis);
+        // slot = index & 63: small indices 0..nr+3, then huge indices on slots 40..43
+        for (u32 i = 0; i < vc.v.num_records + 4 && i < 40; ++i) SetLane(j, i, i, 0);
+        const u32 big[] = {0x10000000u, 0x7FFFFFC0u, 0xFFFFFF80u, 0x40000000u};
+        for (u32 k = 0; k < 4; ++k) SetLane(j, 40 + k, big[k] | (40 + k), 0);
+    }
+}
+
+// Internal buffer reads the bounds path relies on: V#s and constants from extended user data
+// (s_load through a pointer in s[2:3], read back from the flattened user-data buffer), and graphics
+// stages whose only buffer access is s_buffer_load (no other resource that creates the flatbuf).
+void AddInternalCases() {
+    using namespace GcnAsm;
+    auto srt = [](const char* name, u32 opcode, bool idxen) {
+        Template t = Base(std::string("srt: ") + name, GCN_LOAD, opcode, TArgs{.idxen = idxen, .offen = true});
+        t.op.comp_bytes = 4;
+        t.op.ncomp = 1;
+        t.srt = true;
+        return AddTemplate(t);
+    };
+    const u32 raw = srt("s_load_dwordx4 V# + s_load_dword const + buffer_load_dword", BUFFER_LOAD_DWORD, false);
+    const u32 st = srt("s_load_dwordx4 V# + s_load_dword const + buffer_load_dword", BUFFER_LOAD_DWORD, true);
+    for (u32 nr : {8u, 64u}) {
+        Job& j = NewJob("srt", raw, RawV(nr), 0);
+        const auto offs = Uniq(RawProbe(nr));
+        for (u32 i = 0; i < offs.size(); ++i) SetLane(j, i, 0, offs[i]);
+    }
+    for (u32 nr : {4u, 1u}) {
+        Job& j = NewJob("srt", st, StructV(16, nr), 0);
+        u32 lane = 0;
+        for (u32 i : {0u, nr - 1, nr, 0x10000001u}) for (u32 o : {0u, 12u, 16u}) SetLane(j, lane++, i, o);
+    }
+    auto stage = [](bool fragment, u32 count, u32 sdst, SmemSrc src, u32 imm, bool dead = false) {
+        Template t;
+        t.name = std::string(dead ? "dead " : "") + (fragment ? "fs" : "vs") + ": s_buffer_load_dword" +
+                 (count > 1 ? "x" + std::to_string(count) : "") + " s[" + std::to_string(sdst) + "], s[4:7]" +
+                 (src == SmemSrc::Imm ? " imm:" + std::to_string(imm) : " soff:s9") + " only (compile)";
+        t.compile_only = true;
+        t.fragment = fragment;
+        t.vertex = !fragment;
+        t.op.kind = GCN_SLOAD;
+        t.op.ncomp = count;
+        t.smem = src;
+        t.smem_imm = imm;
+        t.sdst = sdst;
+        t.dead = dead;
+        return AddTemplate(t);
+    };
+    for (bool fragment : {true, false}) {
+        for (auto [count, sdst, src, imm] : {std::tuple{4u, 0u, SmemSrc::Imm, 0u}, std::tuple{4u, 16u, SmemSrc::Imm, 0u},
+                                             std::tuple{1u, 0u, SmemSrc::Imm, 3u}, std::tuple{4u, 16u, SmemSrc::Sgpr, 0u}}) {
+            const u32 t = stage(fragment, count, sdst, src, imm);
+            for (const gcn_vsharp& v : {RawV(64), StructV(16, 4), RawV(0)}) NewJob("stage-compile", t, v, 0);
+        }
+        // the descriptor stays declared but every access to it is dead
+        for (u32 sdst : {0u, 16u}) {
+            const u32 t = stage(fragment, 4, sdst, SmemSrc::Imm, 0, true);
+            for (const gcn_vsharp& v : {RawV(64), StructV(16, 4)}) NewJob("dead-access", t, v, 0);
+        }
+    }
+    // compute: the buffer under test is loaded into a register that is never stored
+    for (bool idxen : {false, true}) {
+        Template t = Base("dead: buffer_load_dword into v20 (unused)", GCN_LOAD, BUFFER_LOAD_DWORD,
+                          TArgs{.idxen = idxen, .offen = true});
+        t.op.comp_bytes = 4;
+        t.op.ncomp = 1;
+        t.dead = true;
+        const u32 tt = AddTemplate(t);
+        for (const gcn_vsharp& v : {RawV(64), StructV(16, 4)}) {
+            Job& j = NewJob("dead-access", tt, v, 0);
+            for (u32 lane = 0; lane < 8; ++lane) SetLane(j, lane, lane, lane * 4);
+        }
+    }
+}
+
 // Shader reuse: StageSpecialization decides whether a compiled module is reused for a new V#.
 // Fields outside the key (num_records, add_tid, base) must be read at run time.
 void AddReuseCases() {
@@ -1055,8 +1252,19 @@ Shader::Profile MakeProfile(const DeviceCaps& c) {
         if constexpr (requires { prof.emulate_robust_buffer_access; }) {
             prof.emulate_robust_buffer_access = !c.rba2;
         }
+        // Sol-2's vertex pulling: Apple has no robustBufferAccess2 for fixed-function fetch.
+        if constexpr (requires { prof.emulate_vertex_fetch; }) {
+            prof.emulate_vertex_fetch = !c.rba2;
+        }
     }(p);
     return p;
+}
+
+bool VertexPulling() {
+    return [](auto& prof) {
+        if constexpr (requires { prof.emulate_vertex_fetch; }) return bool(prof.emulate_vertex_fetch);
+        else return false;
+    }(g_profile);
 }
 
 bool ProfileHasRobustFlag() {
@@ -1066,8 +1274,27 @@ bool ProfileHasRobustFlag() {
     }(g_profile);
 }
 
-Shader::RuntimeInfo MakeRuntime() {
+u32 g_fs_export = 9; // MRT0 export format for fragment compiles (9 = ABGR_32; 4 = ABGR_FP16 for compressed exports)
+
+Shader::RuntimeInfo MakeRuntime(bool vertex = false, bool fragment = false) {
     Shader::RuntimeInfo rt{};
+    if (fragment) {
+        rt.Initialize(Shader::HwStage::Fragment, Shader::SwStage::Fragment);
+        rt.props.num_user_data = 16;
+        rt.props.num_allocated_vgprs = 64;
+        rt.hw.fs.en_flags.persp_center_ena = 1;
+        rt.hw.fs.addr_flags.persp_center_ena = 1;
+        rt.hw.fs.num_inputs = 1;
+        rt.hw.fs.inputs[0].param_index = 0;
+        rt.hw.fs.color_buffers[0].export_format = AmdGpu::ShaderExportFormat(g_fs_export);
+        return rt;
+    }
+    if (vertex) {
+        rt.Initialize(Shader::HwStage::Vertex, Shader::SwStage::Vertex);
+        rt.props.num_user_data = 16;
+        rt.props.num_allocated_vgprs = 64;
+        return rt;
+    }
     rt.Initialize(Shader::HwStage::Compute, Shader::SwStage::Compute);
     rt.props.num_user_data = 16;
     rt.props.num_allocated_vgprs = 64;
@@ -1100,12 +1327,16 @@ void CompileJob(std::vector<ProgramState>& programs, Shader::Pools& pools, u32 i
     const Shader::ShaderParams params{.user_data = std::span<const u32, 16>(job.ud),
                                       .code = std::span<const u32>(t.code),
                                       .hash = t.hash};
-    auto rt = MakeRuntime();
+    auto rt = MakeRuntime(t.vertex, t.fragment);
+    const auto hw = t.fragment ? Shader::HwStage::Fragment
+                               : (t.vertex ? Shader::HwStage::Vertex : Shader::HwStage::Compute);
+    const auto sw = t.fragment ? Shader::SwStage::Fragment
+                               : (t.vertex ? Shader::SwStage::Vertex : Shader::SwStage::Compute);
     Shader::Backend::Bindings binding{};
     std::vector<u32> spv;
     u32 perm = 0;
     if (!ps.info) {
-        ps.info = std::make_unique<Shader::Info>(Shader::HwStage::Compute, Shader::SwStage::Compute, params);
+        ps.info = std::make_unique<Shader::Info>(hw, sw, params);
         const auto start = binding;
         const auto program = Shader::TranslateProgram(t.code, pools, *ps.info, rt, g_profile);
         spv = Shader::Backend::SPIRV::EmitSPIRV(g_profile, rt, program, binding);
@@ -1121,7 +1352,7 @@ void CompileJob(std::vector<ProgramState>& programs, Shader::Pools& pools, u32 i
             perm = u32(std::distance(ps.specs.begin(), it));
         } else {
             perm = u32(ps.specs.size());
-            Shader::Info new_info(Shader::HwStage::Compute, Shader::SwStage::Compute, params);
+            Shader::Info new_info(hw, sw, params);
             const auto program = Shader::TranslateProgram(t.code, pools, new_info, rt, g_profile);
             spv = Shader::Backend::SPIRV::EmitSPIRV(g_profile, rt, program, binding);
             ps.specs.push_back(std::move(spec));
@@ -1167,6 +1398,19 @@ void CompileJob(std::vector<ProgramState>& programs, Shader::Pools& pools, u32 i
     Shader::Backend::Bindings ud_binding{};
     info.PushUd(ud_binding, push);
     for (u32 i = 0; i < 16; ++i) w.Put(push.ud_regs[i]);
+    // Vertex inputs the graphics pipeline would declare (GraphicsPipeline::GetVertexInputs).
+    const auto& fetch = ps.specs[perm].fetch_shader_data;
+    const u32 nattr = (t.vertex && fetch) ? u32(fetch->attributes.size()) : 0;
+    w.Put(nattr);
+    for (u32 a = 0; a < nattr; ++a) {
+        const auto& attrib = fetch->attributes[a];
+        const auto sharp = attrib.GetSharp(info);
+        w.Put(u32(attrib.semantic));
+        w.Put(u32(Vulkan::LiverpoolToVK::SurfaceFormat(sharp.GetDataFmt(), sharp.GetNumberFmt())));
+        u32 dw[4];
+        std::memcpy(dw, &sharp, 16);
+        for (u32 x : dw) w.Put(x);
+    }
     const u8* p = reinterpret_cast<const u8*>(w.buf.data());
     size_t left = w.buf.size() * 4;
     while (left) {
@@ -1312,6 +1556,18 @@ void CompileAll(const std::string& outdir) {
             job.binds = std::move(binds);
             std::copy_n(w.begin() + p, 16, job.ud_regs.begin());
             p += 16;
+            if (p >= w.size()) break;
+            const u32 nattr = w[p++];
+            if (p + nattr * 6 > w.size()) break;
+            job.vattrs.clear();
+            for (u32 a = 0; a < nattr; ++a) {
+                VertexAttr va;
+                va.semantic = w[p];
+                va.format = w[p + 1];
+                std::copy_n(w.begin() + p + 2, 4, va.sharp.begin());
+                job.vattrs.push_back(va);
+                p += 6;
+            }
             job.status = *other ? Status::HarnessError : Status::Ok;
             if (*other) job.message = "shader uses images/samplers";
             if (!spv.empty()) {
@@ -1359,14 +1615,17 @@ struct Gpu {
     u64 align = 16;
     vk::UniqueCommandPool pool;
     vk::UniqueDescriptorPool dpool;
-    Mem guest, params, results, flat, null_buffer;
+    Mem guest, params, results, flat, null_buffer, index;
+    bool dynamic_vertex_input = false; // VK_EXT_vertex_input_dynamic_state, as the renderer uses it
     std::vector<u8> pristine; // initial guest image of the current batch
 };
 
-Mem MakeBuffer(Gpu& g, u64 size) {
+Mem MakeBuffer(Gpu& g, u64 size,
+               vk::BufferUsageFlags usage = vk::BufferUsageFlagBits::eStorageBuffer |
+                                            vk::BufferUsageFlagBits::eVertexBuffer) {
     Mem m;
     m.size = size;
-    m.buffer = g.device->createBufferUnique({.size = size, .usage = vk::BufferUsageFlagBits::eStorageBuffer}).value;
+    m.buffer = g.device->createBufferUnique({.size = size, .usage = usage}).value;
     const auto req = g.device->getBufferMemoryRequirements(*m.buffer);
     const auto props = g.physical.getMemoryProperties();
     const auto want = vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent;
@@ -1395,7 +1654,13 @@ void InitGpu(Gpu& g, bool rba) {
     std::vector<const char*> exts;
     for (const auto& e : g.physical.enumerateDeviceExtensionProperties().value) {
         if (std::strcmp(e.extensionName, "VK_KHR_portability_subset") == 0) exts.push_back("VK_KHR_portability_subset");
+        if (std::strcmp(e.extensionName, VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME) == 0) {
+            exts.push_back(VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME);
+            g.dynamic_vertex_input = true;
+        }
     }
+    vk::PhysicalDeviceVertexInputDynamicStateFeaturesEXT dyn_vertex{.vertexInputDynamicState = true};
+    if (g.dynamic_vertex_input) chain.get<vk::PhysicalDeviceVulkan13Features>().pNext = &dyn_vertex;
     const float priority = 1.0f;
     const vk::DeviceQueueCreateInfo queue_info{.queueFamilyIndex = g.family, .queueCount = 1, .pQueuePriorities = &priority};
     auto device = g.physical.createDeviceUnique({.pNext = &chain.get<vk::PhysicalDeviceFeatures2>(),
@@ -1420,6 +1685,7 @@ void InitGpu(Gpu& g, bool rba) {
     g.results = MakeBuffer(g, u64(MaxBatch) * ResultSlot);
     g.flat = MakeBuffer(g, u64(MaxBatch) * FlatSlot);
     g.null_buffer = MakeBuffer(g, NullBufferSize);
+    g.index = MakeBuffer(g, u64(MaxBatch) * 64 * 4, vk::BufferUsageFlagBits::eIndexBuffer);
     std::memset(g.null_buffer.data, 0, NullBufferSize);
 }
 
@@ -1457,6 +1723,74 @@ Pipe& GetPipe(Gpu& g, u32 tmpl, u32 perm, u32 nbind) {
     auto pipe = g.device->createComputePipelineUnique(
         {}, {.stage = {.stage = vk::ShaderStageFlagBits::eCompute, .module = *p.module, .pName = "main"},
              .layout = *p.playout});
+    p.result = pipe.result;
+    if (pipe.result == vk::Result::eSuccess) p.pipeline = std::move(pipe.value);
+    return p;
+}
+
+// Vertex-shader-only graphics pipeline with rasterizer discard. Fixed-function vertex input
+// mirrors GraphicsPipeline::GetVertexInputs (location = binding = semantic, offset 0, stride =
+// V# stride), dynamic when VK_EXT_vertex_input_dynamic_state is available, as in the renderer;
+// none when the tree pulls vertices in the shader (Profile::emulate_vertex_fetch).
+std::map<std::string, Pipe> g_gfx_pipes;
+
+Pipe& GetGfxPipe(Gpu& g, const Job& j, u32 nbind, bool pulling) {
+    std::string key = std::to_string(j.tmpl) + "/" + std::to_string(j.perm);
+    if (!pulling && !g.dynamic_vertex_input) {
+        for (const auto& a : j.vattrs) {
+            key += "/" + std::to_string(a.semantic) + ":" + std::to_string(a.format) + ":" +
+                   std::to_string((a.sharp[1] >> 16) & 0x3FFF);
+        }
+    }
+    auto [it, fresh] = g_gfx_pipes.try_emplace(key);
+    Pipe& p = it->second;
+    if (!fresh) return p;
+    const auto& spv = g_spirv.at({j.tmpl, j.perm});
+    auto module = g.device->createShaderModuleUnique({.codeSize = spv.size() * 4, .pCode = spv.data()});
+    if (module.result != vk::Result::eSuccess) {
+        p.result = module.result;
+        return p;
+    }
+    p.module = std::move(module.value);
+    std::vector<vk::DescriptorSetLayoutBinding> b;
+    for (u32 i = 0; i < nbind; ++i) {
+        b.push_back({.binding = i, .descriptorType = vk::DescriptorType::eStorageBuffer, .descriptorCount = 1,
+                     .stageFlags = vk::ShaderStageFlagBits::eVertex});
+    }
+    p.layout = g.device->createDescriptorSetLayoutUnique({.bindingCount = nbind, .pBindings = b.data()}).value;
+    const vk::PushConstantRange push{.stageFlags = vk::ShaderStageFlagBits::eVertex, .offset = 0,
+                                     .size = sizeof(Shader::PushData)};
+    const vk::DescriptorSetLayout l = *p.layout;
+    p.playout = g.device->createPipelineLayoutUnique({.setLayoutCount = 1, .pSetLayouts = &l,
+                                                      .pushConstantRangeCount = 1, .pPushConstantRanges = &push}).value;
+    std::vector<vk::VertexInputBindingDescription> vb;
+    std::vector<vk::VertexInputAttributeDescription> va;
+    std::vector<vk::DynamicState> dyn;
+    if (!pulling) {
+        if (g.dynamic_vertex_input) {
+            dyn.push_back(vk::DynamicState::eVertexInputEXT);
+        } else {
+            for (const auto& a : j.vattrs) {
+                vb.push_back({.binding = a.semantic, .stride = (a.sharp[1] >> 16) & 0x3FFF,
+                              .inputRate = vk::VertexInputRate::eVertex});
+                va.push_back({.location = a.semantic, .binding = a.semantic, .format = vk::Format(a.format), .offset = 0});
+            }
+            dyn.push_back(vk::DynamicState::eVertexInputBindingStride);
+        }
+    }
+    const vk::PipelineVertexInputStateCreateInfo vi{.vertexBindingDescriptionCount = u32(vb.size()),
+                                                    .pVertexBindingDescriptions = vb.data(),
+                                                    .vertexAttributeDescriptionCount = u32(va.size()),
+                                                    .pVertexAttributeDescriptions = va.data()};
+    const vk::PipelineInputAssemblyStateCreateInfo ia{.topology = vk::PrimitiveTopology::ePointList};
+    const vk::PipelineRasterizationStateCreateInfo rs{.rasterizerDiscardEnable = true, .lineWidth = 1.0f};
+    const vk::PipelineDynamicStateCreateInfo ds{.dynamicStateCount = u32(dyn.size()), .pDynamicStates = dyn.data()};
+    const vk::PipelineRenderingCreateInfo rendering{};
+    const vk::PipelineShaderStageCreateInfo stage{.stage = vk::ShaderStageFlagBits::eVertex, .module = *p.module,
+                                                  .pName = "main"};
+    auto pipe = g.device->createGraphicsPipelineUnique(
+        {}, {.pNext = &rendering, .stageCount = 1, .pStages = &stage, .pVertexInputState = &vi,
+             .pInputAssemblyState = &ia, .pRasterizationState = &rs, .pDynamicState = &ds, .layout = *p.playout});
     p.result = pipe.result;
     if (pipe.result == vk::Result::eSuccess) p.pipeline = std::move(pipe.value);
     return p;
@@ -1609,7 +1943,7 @@ std::vector<Outcome> Expected(Gpu& g, const Job& j, std::vector<u8>& work, const
         Outcome o;
         o.regs.assign(64 * 4, 0);
         for (u32 lane = 0; lane < 64; ++lane) {
-            for (u32 i = 0; i < 4; ++i) o.regs[lane * 4 + i] = VgprMarker + i;
+            for (u32 i = 0; i < 4; ++i) o.regs[lane * 4 + i] = t.vertex ? ResultFill : VgprMarker + i;
             const Lane& L = j.lanes[lane];
             const bool smem = t.smem != SmemSrc::None;
             if (!L.active && !smem) continue;
@@ -1652,6 +1986,14 @@ std::vector<Outcome> Expected(Gpu& g, const Job& j, std::vector<u8>& work, const
                         work[k] = g.pristine[k];
                     }
                 }
+            }
+        }
+        if (t.srt) {
+            for (u32 lane = 0; lane < 64; ++lane) o.regs[lane * 4 + 1] = j.vtable[4];
+        }
+        if (t.dead) { // the load's destination is never stored: only the markers come back
+            for (u32 lane = 0; lane < 64; ++lane) {
+                for (u32 i = 0; i < 4; ++i) o.regs[lane * 4 + i] = VgprMarker + i;
             }
         }
         // achievable inside the bound Vulkan range?
@@ -1729,6 +2071,8 @@ struct Options {
     u32 max_detail = 60;
     std::string outdir;
     std::string dump_spv;
+    std::string compile_only, stage = "cs";
+    std::array<u32, 16> ud{};
 };
 
 void FillPristine(Gpu& g, const std::vector<u32>& jobs) {
@@ -1879,6 +2223,81 @@ JobResult Evaluate(Gpu& g, const Job& j, const Bound& tb, const u8* guest_after,
     return r;
 }
 
+// Records the indexed draw of a vertex job, binding vertex buffers the way
+// Rasterizer::ResolveVertexBuffers/EmitVertexBuffers do (fixed-function) or none (pulling).
+bool RecordDraw(Gpu& g, vk::CommandBuffer cmd, Job& j, const std::vector<vk::DescriptorBufferInfo>& infos,
+                const Shader::PushData& push, std::map<u32, Bound>& tbound) {
+    const u32 ji = u32(&j - g_jobs.data());
+    const bool pulling = VertexPulling();
+    Pipe& pipe = GetGfxPipe(g, j, u32(j.binds.size()), pulling);
+    if (pipe.result != vk::Result::eSuccess) {
+        j.status = Status::LoudPipeline;
+        j.message = "graphics pipeline creation failed: " + vk::to_string(pipe.result);
+        return false;
+    }
+    const vk::DescriptorSetLayout l = *pipe.layout;
+    auto set = g.device->allocateDescriptorSets({.descriptorPool = *g.dpool, .descriptorSetCount = 1,
+                                                 .pSetLayouts = &l}).value.front();
+    std::vector<vk::WriteDescriptorSet> writes;
+    for (u32 b = 0; b < infos.size(); ++b) {
+        writes.push_back({.dstSet = set, .dstBinding = b, .descriptorCount = 1,
+                          .descriptorType = vk::DescriptorType::eStorageBuffer, .pBufferInfo = &infos[b]});
+    }
+    g.device->updateDescriptorSets(writes, {});
+    std::vector<vk::Buffer> bufs;
+    std::vector<vk::DeviceSize> offsets, sizes, strides;
+    std::vector<vk::VertexInputBindingDescription2EXT> bind2;
+    std::vector<vk::VertexInputAttributeDescription2EXT> attr2;
+    if (!pulling) {
+        for (const auto& a : j.vattrs) {
+            const u64 base = a.sharp[0] | (u64(a.sharp[1] & 0xFF) << 32);
+            const u32 stride = (a.sharp[1] >> 16) & 0x3FFF;
+            const u32 size = stride == 0 ? a.sharp[2] : stride * a.sharp[2];
+            if (base != 0 && size > 0) {
+                if (base < GuestVa || base + size > GuestVa + g.guest.size) {
+                    j.status = Status::HarnessError;
+                    j.message = "vertex buffer outside the harness guest image";
+                    return false;
+                }
+                bufs.push_back(*g.guest.buffer);
+                offsets.push_back(base - GuestVa);
+                sizes.push_back(size);
+                if (!tbound.count(ji)) tbound[ji] = Bound{.lo = base, .hi = base + size};
+            } else {
+                bufs.push_back(*g.null_buffer.buffer);
+                offsets.push_back(0);
+                sizes.push_back(0);
+                if (!tbound.count(ji)) tbound[ji] = Bound{.is_null = true};
+            }
+            strides.push_back(stride);
+            bind2.push_back({.binding = a.semantic, .stride = stride, .inputRate = vk::VertexInputRate::eVertex,
+                             .divisor = 1});
+            attr2.push_back({.location = a.semantic, .binding = a.semantic, .format = vk::Format(a.format), .offset = 0});
+        }
+    }
+    u32* idx = reinterpret_cast<u32*>(g.index.data + u64(j.slot) * 256);
+    u32 count = 0;
+    for (u32 lane = 0; lane < 64; ++lane) {
+        if (j.lanes[lane].active) idx[count++] = j.lanes[lane].vindex;
+    }
+    cmd.beginRendering({.renderArea = {.extent = {1, 1}}, .layerCount = 1});
+    cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *pipe.pipeline);
+    cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *pipe.playout, 0, set, {});
+    cmd.pushConstants(*pipe.playout, vk::ShaderStageFlagBits::eVertex, 0, sizeof(push), &push);
+    if (!pulling && !bufs.empty()) {
+        if (g.dynamic_vertex_input) {
+            cmd.setVertexInputEXT(bind2, attr2);
+            cmd.bindVertexBuffers(0, u32(bufs.size()), bufs.data(), offsets.data());
+        } else {
+            cmd.bindVertexBuffers2(0, u32(bufs.size()), bufs.data(), offsets.data(), sizes.data(), strides.data());
+        }
+    }
+    cmd.bindIndexBuffer(*g.index.buffer, u64(j.slot) * 256, vk::IndexType::eUint32);
+    cmd.drawIndexed(count, 1, 0, 0, 0);
+    cmd.endRendering();
+    return true;
+}
+
 // Run one batch of jobs; returns per-job results (jobs that cannot run get loud/error verdicts).
 std::map<u32, JobResult> RunBatch(Gpu& g, const std::vector<u32>& jobs) {
     std::map<u32, JobResult> out;
@@ -1902,7 +2321,7 @@ std::map<u32, JobResult> RunBatch(Gpu& g, const std::vector<u32>& jobs) {
             const u32 w[8] = {L.active, L.vindex, L.voffset, L.data[0], L.data[1], L.data[2], L.data[3], 0};
             std::memcpy(p + lane * 8, w, 32);
         }
-        if (j.status != Status::Ok) continue;
+        if (j.status != Status::Ok || g_templates[j.tmpl].compile_only) continue;
         // bind
         std::vector<vk::DescriptorBufferInfo> infos;
         Shader::PushData push{};
@@ -1919,10 +2338,18 @@ std::map<u32, JobResult> RunBatch(Gpu& g, const std::vector<u32>& jobs) {
                 }
                 push.AddOffset(b, bd.adjust);
                 infos.push_back(bd.info);
-                // the buffer under test is user data s[0:3]
-                if (bp.sharp == std::array<u32, 4>{j.ud[0], j.ud[1], j.ud[2], j.ud[3]} && !tbound.count(ji)) {
+                // the buffer under test: user data s[0:3], or the fetched V# for vertex jobs
+                const auto& tt = g_templates[j.tmpl];
+                const std::array<u32, 4> under_test =
+                    (tt.vertex || tt.srt) ? std::array<u32, 4>{j.vtable[0], j.vtable[1], j.vtable[2], j.vtable[3]}
+                                          : std::array<u32, 4>{j.ud[0], j.ud[1], j.ud[2], j.ud[3]};
+                if (bp.sharp == under_test && !tbound.count(ji)) {
                     tbound[ji] = bd;
                 }
+            } else if (bp.type == u32(Shader::BufferType::ClipPlanes)) {
+                // BindBuffers: user clip planes are disabled here, so the null resource is bound.
+                push.AddOffset(b, 0);
+                infos.push_back({.buffer = *g.null_buffer.buffer, .offset = 0, .range = NullBufferSize});
             } else if (bp.type == u32(Shader::BufferType::Flatbuf)) {
                 const u64 off = u64(j.slot) * FlatSlot + flat_used;
                 const u64 bytes = bp.flat.size() * 4;
@@ -1940,6 +2367,10 @@ std::map<u32, JobResult> RunBatch(Gpu& g, const std::vector<u32>& jobs) {
         if (!loud.empty()) {
             j.status = Status::LoudBinder;
             j.message = loud;
+            continue;
+        }
+        if (g_templates[j.tmpl].vertex) {
+            if (RecordDraw(g, cmd, j, infos, push, tbound)) ran.push_back(ji);
             continue;
         }
         Pipe& pipe = GetPipe(g, j.tmpl, j.perm, u32(j.binds.size()));
@@ -1965,7 +2396,7 @@ std::map<u32, JobResult> RunBatch(Gpu& g, const std::vector<u32>& jobs) {
     }
     const vk::MemoryBarrier barrier{.srcAccessMask = vk::AccessFlagBits::eShaderWrite,
                                     .dstAccessMask = vk::AccessFlagBits::eHostRead};
-    cmd.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader, vk::PipelineStageFlagBits::eHost, {}, barrier, {}, {});
+    cmd.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands, vk::PipelineStageFlagBits::eHost, {}, barrier, {}, {});
     assert(cmd.end() == vk::Result::eSuccess);
     const vk::SubmitInfo submit{.commandBufferCount = 1, .pCommandBuffers = &cmd};
     assert(g.queue.submit(submit) == vk::Result::eSuccess);
@@ -2011,7 +2442,55 @@ bool LoudRequired(Gpu& g, Job& j) {
 
 } // namespace
 
+// --disasm FILE: decode a GCN binary with the production decoder and flag wave-level operations
+// (results depend on the 64-lane wave; see the wave64 group).
+int Disasm(const char* path) {
+    FILE* f = std::fopen(path, "rb");
+    if (!f) { std::perror(path); return 2; }
+    std::vector<u32> code;
+    u32 w;
+    while (std::fread(&w, 4, 1, f) == 1) code.push_back(w);
+    std::fclose(f);
+    Shader::Gcn::GcnCodeSlice slice(code.data(), code.data() + code.size());
+    Shader::Gcn::GcnDecodeContext decoder;
+    std::map<std::string, u32> wave_ops;
+    u32 n = 0, pc = 0;
+    auto reads = [](const Shader::Gcn::GcnInst& in, Shader::Gcn::OperandField fld) {
+        for (u32 i = 0; i < in.src_count; ++i) if (in.src[i].field == fld) return true;
+        return false;
+    };
+    while (!slice.atEnd()) {
+        const auto inst = decoder.decodeInstruction(slice);
+        const std::string name{magic_enum::enum_name(inst.opcode)};
+        using OF = Shader::Gcn::OperandField;
+        std::string why;
+        if (name.find("READLANE") != std::string::npos || name.find("READFIRSTLANE") != std::string::npos ||
+            name.find("WRITELANE") != std::string::npos || name.find("MBCNT") != std::string::npos ||
+            name.find("SWIZZLE") != std::string::npos || name.find("_B64") != std::string::npos ||
+            name.find("SAVEEXEC") != std::string::npos || name.find("BCNT") != std::string::npos ||
+            name.find("FF1") != std::string::npos || name.find("FLBIT") != std::string::npos) {
+            why = name;
+        }
+        if (reads(inst, OF::ExecHi) || reads(inst, OF::VccHi)) why += " reads exec_hi/vcc_hi";
+        if (name.rfind("V_", 0) == 0 && (reads(inst, OF::VccLo) || reads(inst, OF::ExecLo)) &&
+            name.find("CNDMASK") == std::string::npos && name.find("ADDC") == std::string::npos &&
+            name.find("SUBB") == std::string::npos) {
+            why += " vector reads vcc/exec as a value";
+        }
+        if (!why.empty()) {
+            ++wave_ops[name];
+            std::printf("%5x: %s%s\n", pc * 4, name.c_str(), why == name ? "" : (" (" + why + ")").c_str());
+        }
+        pc += inst.length / 4;
+        ++n;
+    }
+    std::printf("%u instructions; wave-relevant opcode counts:\n", n);
+    for (auto& [k, c] : wave_ops) std::printf("  %-28s %u\n", k.c_str(), c);
+    return 0;
+}
+
 int main(int argc, char** argv) {
+    if (argc == 3 && std::string(argv[1]) == "--disasm") return Disasm(argv[2]);
     Options opt;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -2022,6 +2501,19 @@ int main(int argc, char** argv) {
         else if (a == "--max-detail" && i + 1 < argc) opt.max_detail = std::atoi(argv[++i]);
         else if (a == "--out" && i + 1 < argc) opt.outdir = argv[++i];
         else if (a == "--dump-spv" && i + 1 < argc) opt.dump_spv = argv[++i];
+        else if (a == "--compile-only" && i + 1 < argc) opt.compile_only = argv[++i];
+        else if (a == "--stage" && i + 1 < argc) opt.stage = argv[++i];
+        else if (a == "--fs-export" && i + 1 < argc) g_fs_export = u32(std::atoi(argv[++i]));
+        else if (a == "--ud" && i + 1 < argc) {
+            std::string list = argv[++i];
+            u32 k = 0;
+            for (size_t pos = 0; pos <= list.size() && k < 16;) {
+                size_t e = list.find(',', pos);
+                if (e == std::string::npos) e = list.size();
+                opt.ud[k++] = u32(std::strtoul(list.substr(pos, e - pos).c_str(), nullptr, 0));
+                pos = e + 1;
+            }
+        }
         else {
             std::fprintf(stderr, "usage: %s [--no-rba] [--label NAME] [--only SUBSTRING] [--batch N] "
                                  "[--max-detail N] [--dump-spv DIR] --out DIR\n", argv[0]);
@@ -2083,17 +2575,51 @@ int main(int argc, char** argv) {
                 0
 #endif
     );
+    std::printf("vertex fetch: %s\n", VertexPulling() ? "pulled in the shader (Profile::emulate_vertex_fetch)"
+                                                      : "fixed-function vertex input (mirrored)");
     std::printf("profile: emulate_null_descriptors %d, emulate_robust_buffer_access %s, robustBufferAccess %s\n",
                 g_profile.emulate_null_descriptors,
                 ProfileHasRobustFlag() ? (g_caps.rba2 ? "present, off" : "present, ON") : "absent in this tree",
                 opt.rba ? "enabled (production)" : "DISABLED (--no-rba)");
 
+    if (!opt.compile_only.empty()) {
+        // A real game shader through the production recompiler: compile + spirv-val only.
+        FILE* f = std::fopen(opt.compile_only.c_str(), "rb");
+        if (!f) { std::perror(opt.compile_only.c_str()); return 2; }
+        Template t;
+        t.name = "compile-only " + opt.compile_only + " (" + opt.stage + ")";
+        u32 w;
+        while (std::fread(&w, 4, 1, f) == 1) t.code.push_back(w);
+        std::fclose(f);
+        t.fragment = opt.stage == "fs";
+        t.vertex = opt.stage == "vs";
+        t.hash = 0x9e3779b97f4a7c15ull ^ t.code.size();
+        for (u32 x : t.code) t.hash = (t.hash ^ x) * 0x100000001b3ull;
+        g_templates.push_back(t);
+        Job j;
+        j.group = "compile-only";
+        j.label = t.name;
+        j.ud = opt.ud;
+        g_jobs.push_back(j);
+        CompileAll(opt.outdir);
+        ValidateModules(opt.outdir);
+        const Job& r = g_jobs[0];
+        const bool invalid = g_spirv_invalid.count({0, r.perm});
+        std::printf("%s: %s%s\n%s", t.name.c_str(),
+                    r.status == Status::Ok ? "compiled" : (r.status == Status::LoudCompile ? "LOUD ABORT" : "CRASH"),
+                    r.status == Status::Ok ? (invalid ? ", INVALID SPIR-V" : ", SPIR-V valid") : "",
+                    r.status == Status::Ok ? (invalid ? (g_spirv_invalid[{0, r.perm}] + "\n").c_str() : "")
+                                           : (r.message + "\n").c_str());
+        return r.status == Status::Ok && !invalid ? 0 : 1;
+    }
     // Cases
     AddLoadCases();
     AddStoreCases();
     AddAtomicCases();
     AddReuseCases();
     AddWaveCases();
+    AddVertexCases();
+    AddInternalCases();
     if (!opt.only.empty()) {
         std::vector<Job> kept;
         for (auto& j : g_jobs) {
@@ -2118,6 +2644,30 @@ int main(int argc, char** argv) {
         }
         j.ud[12] = j.sgpr_soff;
         j.ud[13] = j.smem_sgpr;
+        if (g_templates[j.tmpl].compile_only) {
+            j.ud = {};
+            for (u32 k = 0; k < 4; ++k) j.ud[4 + k] = t[k];
+            j.ud[8] = 0x1234;
+            j.ud[9] = 16;
+        } else if (g_templates[j.tmpl].srt) {
+            std::copy_n(t.begin(), 4, j.vtable.begin());
+            j.vtable[4] = 0x5A17C0DEu ^ i;
+            const u64 table = reinterpret_cast<u64>(j.vtable.data());
+            for (u32 k = 0; k < 4; ++k) j.ud[k] = 0;
+            j.ud[2] = u32(table);
+            j.ud[3] = u32(table >> 32);
+        } else if (g_templates[j.tmpl].vertex) {
+            // s[0:1] fetch shader address, s[2:3] V# table address, s[4:7] scratch, s[8:11] results
+            std::copy_n(t.begin(), 4, j.vtable.begin());
+            const u64 fetch = reinterpret_cast<u64>(g_templates[j.tmpl].fetch.data());
+            const u64 table = reinterpret_cast<u64>(j.vtable.data());
+            j.ud = {};
+            j.ud[0] = u32(fetch);
+            j.ud[1] = u32(fetch >> 32);
+            j.ud[2] = u32(table);
+            j.ud[3] = u32(table >> 32);
+            for (u32 k = 0; k < 4; ++k) j.ud[8 + k] = o[k];
+        }
     }
     std::printf("cases: %zu jobs over %zu shader templates\n", g_jobs.size(), g_templates.size());
 
@@ -2156,6 +2706,16 @@ int main(int argc, char** argv) {
             if (r.verdict != Verdict::Fail || (kind != GCN_STORE && kind != GCN_ATOMIC)) continue;
             auto alone = RunBatch(g, {ji});
             if (alone.count(ji)) r = alone[ji];
+        }
+    }
+    // Compile-only jobs: a valid shader must compile; an abort blocks the game.
+    for (u32 ji = 0; ji < g_jobs.size(); ++ji) {
+        const Job& j = g_jobs[ji];
+        if (!g_templates[j.tmpl].compile_only) continue;
+        if (j.status == Status::Ok) {
+            results[ji] = {Verdict::Strict, ""};
+        } else if (j.status == Status::LoudCompile) {
+            results[ji] = {Verdict::Fail, "  aborts while compiling a valid shader: " + j.message + "\n"};
         }
     }
     // A job whose module fails spirv-val is not a pass, whatever it returned.
