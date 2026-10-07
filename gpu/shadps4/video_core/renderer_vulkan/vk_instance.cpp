@@ -253,6 +253,13 @@ bool Instance::CreateDevice() {
     };
 
     // Required
+#ifdef __APPLE__
+    // Portability devices must enable the subset extension when they advertise it.
+    if (std::ranges::find(available_extensions, "VK_KHR_portability_subset") !=
+        available_extensions.end()) {
+        add_extension("VK_KHR_portability_subset");
+    }
+#endif
     ASSERT_MSG(add_extension(VK_KHR_SWAPCHAIN_EXTENSION_NAME),
                "Required Vulkan extension unavailable: {}", VK_KHR_SWAPCHAIN_EXTENSION_NAME);
     ASSERT_MSG(add_extension(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME),
@@ -264,8 +271,18 @@ bool Instance::CreateDevice() {
                "Required Vulkan extension unavailable: {}", VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);
 
     const auto robustness2_features = feature_chain.get<vk::PhysicalDeviceRobustness2FeaturesEXT>();
+#ifdef __APPLE__
+    ASSERT_MSG(features.robustBufferAccess,
+               "Required Vulkan feature unavailable: robustBufferAccess");
+    if (!robustness2_features.robustBufferAccess2) {
+        LOG_WARNING(Render_Vulkan,
+                    "robustBufferAccess2 unavailable; using robustBufferAccess. "
+                    "Out-of-bounds buffer reads may not return zero.");
+    }
+#else
     ASSERT_MSG(robustness2_features.robustBufferAccess2,
                "Required Vulkan feature unavailable: robustBufferAccess2");
+#endif
     ASSERT_MSG(robustness2_features.robustImageAccess2,
                "Required Vulkan feature unavailable: robustImageAccess2");
     ASSERT_MSG(robustness2_features.nullDescriptor,
@@ -488,7 +505,11 @@ bool Instance::CreateDevice() {
             .depthClipEnable = true,
         },
         vk::PhysicalDeviceRobustness2FeaturesEXT{
+#ifdef __APPLE__
+            .robustBufferAccess2 = robustness2_features.robustBufferAccess2,
+#else
             .robustBufferAccess2 = true,
+#endif
             .robustImageAccess2 = true,
             .nullDescriptor = true,
         },

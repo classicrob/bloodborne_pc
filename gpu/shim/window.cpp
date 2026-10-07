@@ -1,7 +1,10 @@
-// bbport: SDL3 window for the Vulkan swapchain (X11 or Wayland).
+// bbport: SDL3 window for the Vulkan swapchain.
 #include <cstdlib>
 #include <cstring>
 #include <SDL3/SDL.h>
+#ifdef __APPLE__
+#include <SDL3/SDL_metal.h>
+#endif
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "sdl_window.h"
@@ -21,7 +24,11 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, const char* title) : width{width_}
     SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_WIDTH_NUMBER, width_);
     SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_HEIGHT_NUMBER, height_);
     SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_RESIZABLE_BOOLEAN, true);
+#ifdef __APPLE__
+    SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_METAL_BOOLEAN, true);
+#else
     SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_VULKAN_BOOLEAN, true);
+#endif
     const char* fullscreen = std::getenv("BB_FULLSCREEN");
     SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_FULLSCREEN_BOOLEAN, fullscreen && fullscreen[0] == '1');
     base_title = title;
@@ -30,6 +37,17 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, const char* title) : width{width_}
     ASSERT_MSG(window, "Failed to create window: {}", SDL_GetError());
 
     const char* driver = SDL_GetCurrentVideoDriver();
+#ifdef __APPLE__
+    if (driver && !std::strcmp(driver, "cocoa")) {
+        metal_view = SDL_Metal_CreateView(window);
+        ASSERT_MSG(metal_view, "Failed to create Metal view: {}", SDL_GetError());
+        window_info.type = WindowSystemType::Metal;
+        window_info.render_surface = SDL_Metal_GetLayer(metal_view);
+        ASSERT_MSG(window_info.render_surface, "Failed to get Metal layer: {}", SDL_GetError());
+    } else {
+        UNREACHABLE_MSG("Unsupported SDL video driver {}", driver ? driver : "(none)");
+    }
+#else
     const SDL_PropertiesID wp = SDL_GetWindowProperties(window);
 #ifdef _WIN32
     if (driver && !std::strcmp(driver, "windows")) {
@@ -48,6 +66,7 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, const char* title) : width{width_}
     } else {
         UNREACHABLE_MSG("Unsupported SDL video driver {}", driver ? driver : "(none)");
     }
+#endif
     int w = 0, h = 0;
     SDL_GetWindowSizeInPixels(window, &w, &h);
     width = w;
@@ -56,6 +75,9 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, const char* title) : width{width_}
 }
 
 WindowSDL::~WindowSDL() {
+#ifdef __APPLE__
+    SDL_Metal_DestroyView(metal_view);
+#endif
     SDL_DestroyWindow(window);
 }
 

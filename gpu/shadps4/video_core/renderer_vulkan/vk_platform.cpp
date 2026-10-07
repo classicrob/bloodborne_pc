@@ -14,6 +14,8 @@
 #endif
 
 #include <vector>
+#include <cstdlib>
+#include <filesystem>
 #include <fmt/ranges.h>
 
 #include "common/assert.h"
@@ -168,6 +170,10 @@ std::vector<const char*> GetInstanceExtensions(Frontend::WindowSystemType window
     std::vector<const char*> extensions;
     extensions.reserve(7);
 
+#ifdef __APPLE__
+    extensions.push_back(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
+#endif
+
     switch (window_type) {
     case Frontend::WindowSystemType::Headless:
         break;
@@ -259,15 +265,26 @@ vk::UniqueInstance CreateInstance(Frontend::WindowSystemType window_type, bool e
     LOG_INFO(Render_Vulkan, "Creating vulkan instance");
 
 #if defined(__APPLE__)
-    // Initialize the environment with the path to the included ICD, so that the loader will
-    // find it.
-    static const auto icd_path = [] {
-        char path[PATH_MAX];
-        u32 length = PATH_MAX;
-        _NSGetExecutablePath(path, &length);
-        return std::filesystem::path(path).parent_path();
-    }();
-    setenv("VK_DRIVER_FILES", icd_path.c_str(), true);
+    // Respect explicit ICD selection; otherwise prefer a bundled ICD if one exists.
+    if (!std::getenv("VK_DRIVER_FILES") && !std::getenv("VK_ICD_FILENAMES")) {
+        u32 length = 1024;
+        std::vector<char> path(length);
+        if (_NSGetExecutablePath(path.data(), &length) != 0) {
+            path.resize(length);
+        }
+        if (_NSGetExecutablePath(path.data(), &length) == 0) {
+            const auto executable_dir = std::filesystem::path(path.data()).parent_path();
+            for (const auto& icd_path : {
+                     executable_dir / "MoltenVK_icd.json",
+                     executable_dir / "../Resources/vulkan/icd.d/MoltenVK_icd.json"}) {
+                std::error_code error;
+                if (std::filesystem::is_regular_file(icd_path, error)) {
+                    setenv("VK_DRIVER_FILES", icd_path.c_str(), false);
+                    break;
+                }
+            }
+        }
+    }
 #endif
 
     static vk::detail::DynamicLoader dl;
@@ -399,8 +416,18 @@ vk::UniqueInstance CreateInstance(Frontend::WindowSystemType window_type, bool e
         },
     };
 
+    vk::InstanceCreateFlags instance_flags{};
+#ifdef __APPLE__
+    if (std::ranges::any_of(extensions, [](const char* extension) {
+            return std::strcmp(extension, VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME) == 0;
+        })) {
+        instance_flags |= vk::InstanceCreateFlagBits::eEnumeratePortabilityKHR;
+    }
+#endif
+
     vk::StructureChain<vk::InstanceCreateInfo, vk::LayerSettingsCreateInfoEXT> instance_ci_chain = {
         vk::InstanceCreateInfo{
+            .flags = instance_flags,
             .pApplicationInfo = &application_info,
             .enabledLayerCount = static_cast<u32>(layers.size()),
             .ppEnabledLayerNames = layers.data(),
