@@ -196,8 +196,10 @@ static LONG CALLBACK vectored_fault(EXCEPTION_POINTERS *info) {
     return EXCEPTION_CONTINUE_SEARCH;
 }
 static LONG WINAPI unhandled_fault(EXCEPTION_POINTERS *info) { return fatal_exception(info); }
-/* Guest code reads its TCB with `mov rax, gs:[0]` (link_*.py rewrote fs:[0]); on Windows
- * the displacement becomes the TEB TLS slot that holds the guest TCB (runtime_thread.c). */
+#endif
+#if defined(_WIN32) || defined(__APPLE__)
+/* Guest code reads its TCB with `mov rax, gs:[0]` (link_*.py rewrote fs:[0]).
+ * The displacement selects a Windows TEB TLS slot or macOS pthread TSD key. */
 uint32_t runtime_thread_tcb_offset(void);
 static uint64_t patch_tcb_loads(const Segment *segments, uint64_t count) {
     static const unsigned char load[]={0x65,0x48,0x8b,0x04,0x25,0,0,0,0};
@@ -668,8 +670,8 @@ static int probe_main(int argc, char **argv) {
         memcpy(image + relocs[i].target, &value, 8);
     }
     if (patch_file) apply_patches(patch_file, segments, ns, relocs, nr);
-#ifdef _WIN32
-    printf("Guest TCB loads redirected to the TEB TLS slot: %" PRIu64 "\n", patch_tcb_loads(segments, ns));
+#if defined(_WIN32) || defined(__APPLE__)
+    printf("Guest TCB loads redirected to the host TLS slot: %" PRIu64 "\n", patch_tcb_loads(segments, ns));
 #endif
     protect(traps, round_host_page((import_count + 1) * 32), 5);
     protect(image, round_host_page(size), 0);

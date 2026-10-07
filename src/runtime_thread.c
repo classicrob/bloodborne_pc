@@ -4,7 +4,9 @@
  * keeps FS. Priorities/affinity are recorded, not enforced by a PS4 scheduler.
  * Windows: GS is the TEB and cannot be moved. The guest TCB lives in a TLS slot of the TEB
  * instead, and the loader rewrites the load to `mov rax, gs:[0x1480+8*slot]` (TlsSlots),
- * the same 9-byte instruction with another displacement. */
+ * the same 9-byte instruction with another displacement.
+ * macOS: GS points to pthread TSD; a once-created key holds the guest TCB
+ * and the same load uses displacement 8*key. Never change the host GS base. */
 #define _GNU_SOURCE
 #include "runtime.h"
 #include <stdio.h>
@@ -20,7 +22,9 @@
 #else
 #include <sys/syscall.h>
 #include <sys/mman.h>
+#ifndef __APPLE__
 #include <asm/prctl.h>
+#endif
 #endif
 #define ERR(n) ((int32_t)(UINT32_C(0x80020000)|(n)))
 #define ATTR_MAGIC UINT32_C(0x41545452)
@@ -40,6 +44,10 @@ typedef struct GuestThread {
     /* Guest-visible TCB is allocated separately; this is the ScePthread handle. */
     uint64_t *tcb;
     unsigned char *tls_block;
+#ifdef __APPLE__
+    uint64_t dtv[3];
+    int32_t guest_errno;
+#endif
     pthread_t host;
     GuestEntry entry;
     void *argument, *result;
@@ -58,7 +66,9 @@ static pthread_mutex_t lock=PTHREAD_MUTEX_INITIALIZER;
 static ThreadAttr *attributes;
 static GuestThread *threads;
 static _Thread_local GuestThread *current;
+#ifndef __APPLE__
 static _Thread_local int32_t guest_errno;
+#endif
 static const unsigned char *tls_template;
 static uint64_t tls_filesz, tls_memsz, tls_align=16;
 static size_t created, joined_count, exited;
@@ -82,6 +92,32 @@ static void set_gs(void *base) {
     if (!TlsSetValue(tls_slot,base)) { fprintf(stderr,"STOP: TlsSetValue failed (%lu)\n",GetLastError()); exit(21); }
 }
 #define tls_block_alloc(size) _aligned_malloc(size,64)
+#elif defined(__APPLE__)
+static pthread_key_t tcb_key;
+static pthread_once_t tcb_key_once=PTHREAD_ONCE_INIT;
+static void create_tcb_key(void) {
+    int e=pthread_key_create(&tcb_key,NULL);
+    if (e || (uint64_t)tcb_key>INT32_MAX/sizeof(void *)) {
+        fprintf(stderr,"STOP: cannot allocate pthread TCB key (%d)\n",e); exit(21);
+    }
+}
+uint32_t runtime_thread_tcb_offset(void) {
+    int e=pthread_once(&tcb_key_once,create_tcb_key);
+    if (e) { fprintf(stderr,"STOP: pthread_once for TCB key failed (%d)\n",e); exit(21); }
+    return (uint32_t)(sizeof(void *)*tcb_key);
+}
+static void set_gs(void *base) {
+    runtime_thread_tcb_offset();
+    int e=pthread_setspecific(tcb_key,base);
+    if (e) { fprintf(stderr,"STOP: pthread_setspecific for TCB failed (%d)\n",e); exit(21); }
+}
+static void *tls_block_alloc(size_t size) {
+    size_t alignment=tls_align<64 ? 64 : tls_align;
+    if ((alignment&(alignment-1)) || size>SIZE_MAX-(alignment-1)) return NULL;
+    void *p=runtime_low_map(size+alignment-1,PROT_READ|PROT_WRITE);
+    if (!p) return NULL;
+    return (void *)(((uintptr_t)p+alignment-1)&~(uintptr_t)(alignment-1));
+}
 #else
 static void set_gs(void *base) {
     if (syscall(SYS_arch_prctl,ARCH_SET_GS,(unsigned long)base)) { perror("STOP: arch_prctl(ARCH_SET_GS)"); exit(21); }
@@ -90,6 +126,12 @@ static void set_gs(void *base) {
 #endif
 /* Build TCB/static TLS for the calling host thread and point GS at it. */
 static void attach(GuestThread *t) {
+#ifdef __APPLE__
+    if ((tls_align&(tls_align-1)) || tls_memsz>SIZE_MAX-tls_align ||
+        tls_offset()>SIZE_MAX-319 || tls_filesz>tls_memsz) {
+        fputs("STOP: invalid guest TLS size/alignment\n",stderr); exit(21);
+    }
+#endif
     uint64_t offset=tls_offset();
     size_t total=offset+256;
     unsigned char *block=tls_block_alloc((total+63)&~(size_t)63);
@@ -97,7 +139,11 @@ static void attach(GuestThread *t) {
     memset(block,0,total);
     if (tls_filesz) memcpy(block,tls_template,tls_filesz);
     uint64_t *tcb=(uint64_t *)(block+offset);
+#ifdef __APPLE__
+    uint64_t *dtv=t->dtv;
+#else
     static uint64_t dtv[3];
+#endif
     tcb[0]=(uint64_t)(uintptr_t)tcb;         /* tcb_self */
     tcb[1]=(uint64_t)(uintptr_t)dtv;         /* tcb_dtv (static module only) */
     tcb[2]=(uint64_t)(uintptr_t)t;           /* tcb_thread */
@@ -106,7 +152,7 @@ static void attach(GuestThread *t) {
     current=t;
 }
 static GuestThread *new_thread(void) {
-    GuestThread *t=calloc(1,sizeof(*t));
+    GuestThread *t=runtime_guest_calloc(1,sizeof(*t));
     if (!t) return NULL;
     t->attr=(ThreadAttr){.magic=ATTR_MAGIC,.policy=1,.prio=DEFAULT_PRIO,.stack=DEFAULT_STACK,.affinity=0x7f};
     return t;
@@ -152,12 +198,18 @@ static ThreadAttr *find_attr(ThreadAttr **slot) {
 }
 
 static ABI void *thread_self(void) { return runtime_thread_current(); }
-static ABI int32_t *guest_error(void) { return &guest_errno; }
-int32_t *runtime_errno(void) { return &guest_errno; }
+int32_t *runtime_errno(void) {
+#ifdef __APPLE__
+    return &runtime_thread_current()->guest_errno;
+#else
+    return &guest_errno;
+#endif
+}
+static ABI int32_t *guest_error(void) { return runtime_errno(); }
 
 static ABI int32_t attr_init(ThreadAttr **out) {
     if (!out) return ERR(22);
-    ThreadAttr *a=calloc(1,sizeof(*a));
+    ThreadAttr *a=runtime_guest_calloc(1,sizeof(*a));
     if (!a) return ERR(12);
     *a=(ThreadAttr){.magic=ATTR_MAGIC,.policy=1,.prio=DEFAULT_PRIO,.inherit=4,.stack=DEFAULT_STACK,.guard=4096,.affinity=0x7f};
     pthread_mutex_lock(&lock); a->next=attributes; attributes=a; pthread_mutex_unlock(&lock);
@@ -171,7 +223,7 @@ static ABI int32_t attr_destroy(ThreadAttr **slot) {
     while (*link!=a) link=&(*link)->next;
     *link=a->next; a->magic=0;
     pthread_mutex_unlock(&lock);
-    free(a); *slot=NULL; return 0;
+    runtime_guest_free(a); *slot=NULL; return 0;
 }
 static ABI int32_t attr_get(void *thread,ThreadAttr **out) {
     ThreadAttr *a=find_attr(out);
@@ -243,7 +295,11 @@ static ABI int32_t attr_set_guard(ThreadAttr **slot,uint64_t size) {
 static void set_host_name(const char *name) {
     char host[16]={0};
     memcpy(host,name,strnlen(name,sizeof(host)-1));
+#ifdef __APPLE__
+    pthread_setname_np(host);
+#else
     pthread_setname_np(pthread_self(),host);
+#endif
 }
 #ifdef _WIN32
 #define exit_setjmp(t) bb_setjmp((t)->exit_jump)
@@ -274,6 +330,11 @@ static int32_t create(GuestThread **out,ThreadAttr **attr_slot,GuestEntry entry,
     pthread_attr_init(&host);
     uint64_t stack=t->attr.stack<MIN_STACK ? MIN_STACK : t->attr.stack;
     /* Stacks below 1 TiB as on PS4; guest code may pack stack addresses. */
+#ifdef __APPLE__
+    if (stack>SIZE_MAX-STACK_MARGIN) {
+        pthread_attr_destroy(&host); runtime_guest_free(t); return ERR(22);
+    }
+#endif
     size_t stack_bytes=(size_t)stack+STACK_MARGIN;
 #ifdef _WIN32
     /* Windows places the stack itself (low: no high-entropy ASLR) and commits all of it:
@@ -281,8 +342,17 @@ static int32_t create(GuestThread **out,ThreadAttr **attr_slot,GuestEntry entry,
     pthread_attr_setstacksize(&host,stack_bytes);
 #else
     void *stack_memory=runtime_low_map(stack_bytes,PROT_READ|PROT_WRITE);
+#ifdef __APPLE__
+    int stack_error=stack_memory ? pthread_attr_setstack(&host,stack_memory,stack_bytes) : ENOMEM;
+    if (stack_error) {
+        fprintf(stderr,"Cannot create macOS guest thread: low stack allocation/setup failed (%d)\n",stack_error);
+        pthread_attr_destroy(&host); runtime_guest_free(t);
+        return ERR(stack_error==ENOMEM ? 12 : 22);
+    }
+#else
     if (stack_memory) pthread_attr_setstack(&host,stack_memory,stack_bytes);
     else pthread_attr_setstacksize(&host,stack_bytes);
+#endif
 #endif
     publish(t);
     /* Publish the handle before the thread can run and inspect itself. */
