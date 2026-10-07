@@ -39,7 +39,8 @@ class RestartResolutionTests(unittest.TestCase):
             python.chmod(0o755)
             probe = data / 'probe'
             probe.write_text(f'#!{sys.executable}\n' +
-                'import json, os\n'
+                'import json, os, sys\n'
+                'if sys.argv[1:]==["--verify-macos-host"]: sys.exit(0)\n'
                 'from pathlib import Path\n'
                 'config=Path(os.environ["BB_CONFIG"])\n'
                 'stage=int(os.environ.get("BB_TEST_STAGE", "0"))\n'
