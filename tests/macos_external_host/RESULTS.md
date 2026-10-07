@@ -19,6 +19,8 @@ library rebuild. `glslangValidator` runs natively from Homebrew.
 | Two simultaneous imports of the same physical payload through different aliases | Both work, writes visible through both aliases |
 | Noncontiguous backing | Two adjacent 16-KiB guest maps from physical offsets 0 and 32 KiB import as one 32-KiB range; GPU writes reach the correct separated backing pages |
 | Guest alias protected RO | GPU writes still work, including when that alias is the imported pointer; CPU write faults and handler restores RW/resumes |
+| Already-RO cold view / overlapping imports | Dedicated RW Mach alias per import works: 64-KiB left/right and encompassing 192-KiB imports simultaneously, cross-import shader reads/writes coherent; original guest remains RO and still faults on CPU writes |
+| Backend-triggered retirement | Outstanding shader submission is waited in begin; both alias imports and their RW mirrors are destroyed while old bytes remain readable; end observes flushed notifications, then fresh-zero reimport works |
 | Release/zero/reuse | After waiting and destroying imports, actual direct release removes aliases and replaces backing; reallocation reads zero, reimport has working BDA |
 
 The compute test reads a CPU-written word through a buffer-reference device address
@@ -58,3 +60,29 @@ copies onto the same physical storage. Importing the guest view also requires
 retirement before its virtual address is removed even if some backing alias survives.
 The chosen production renderer implementation and its lifetime protocol belong to
 Sol-3; this probe changes no arena implementation.
+
+## Import-time protection qualification
+
+Importing a guest view that is already read-only produced zero instead of the GPU
+writes in the cold 192-KiB overlapping-import test. Pre-touching the entire backing
+through a writable CPU alias did not fix it. Importing while writable and changing
+the guest view to read-only afterward did work. This narrows the earlier RO result:
+it tested protection changes after import, not import of an already-RO view.
+
+The tested production-compatible path gives each import a dedicated writable Mach
+alias. `mach_vm_remap(copy=FALSE, VM_FLAGS_ANYWHERE, VM_INHERIT_NONE)` of an already-RO
+guest range returned current protection `1`, maximum `7`; protecting **only the
+new alias** RW succeeded. Vulkan imports that alias. Guest CPU permissions never
+change during setup, so concurrent CPU writes cannot escape tracking. No prefault
+or data copy is needed. The import stays indexed by its original guest-view range.
+After GPU retirement, destroy the Vulkan buffer and memory before deallocating the
+Mach alias. The backend hooks invalidate every affected original view before a
+mapping or physical backing change.
+
+This passes cold zero backing, three simultaneous overlapping imports, a shader
+reading another import's shader output, and a single alias spanning two guest VMAs
+with noncontiguous physical offsets. A subsequent CPU write still delivers the
+expected protection fault. The queued-work lifetime test now uses these writable
+mirrors too. Alias setup adds one Mach remap/protect per retained import and a
+virtual alias; it adds no per-draw copies. Full renderer pause/retirement integration
+remains a separate test from this standalone callback fixture.

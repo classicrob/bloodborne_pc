@@ -10,6 +10,7 @@
  * encode 40-bit addresses, so host-default 0x7f... addresses would not fit. */
 #define _GNU_SOURCE
 #include "runtime.h"
+#include "runtime_memory.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -100,6 +101,39 @@ static uint64_t flex_bitmap[FLEX_SPAN/PAGE/64];
 /* GPU hooks (bbgpu): notified outside the lock, in order, after each operation. */
 typedef void (*GpuRange)(uintptr_t address, uint64_t size);
 static GpuRange hook_map, hook_unmap, hook_invalidate;
+#ifdef __APPLE__
+static void (*lifetime_begin_hook)(void), (*lifetime_end_hook)(void);
+static GpuRange lifetime_retire_hook;
+static __thread unsigned lifetime_depth;
+void runtime_memory_set_gpu_lifetime_hooks(void (*begin)(void),GpuRange retire,void (*end)(void)) {
+    if ((begin || retire || end) && !(begin && retire && end)) {
+        fputs("STOP: imported GPU memory requires begin/retire/end lifetime hooks together\n",stderr); abort();
+    }
+    if (lifetime_depth || exclusive_depth) {
+        fputs("STOP: cannot replace GPU lifetime hooks during a memory mutation\n",stderr); abort();
+    }
+    lifetime_begin_hook=begin; lifetime_retire_hook=retire; lifetime_end_hook=end;
+}
+static void mutation_begin(void) {
+    if (!lifetime_depth++) {
+        if (exclusive_depth) { fputs("STOP: GPU lifetime begin under VMA lock\n",stderr); abort(); }
+        if (lifetime_begin_hook) lifetime_begin_hook();
+    }
+}
+static void mutation_end(void) {
+    if (!lifetime_depth || exclusive_depth) { fputs("STOP: invalid GPU lifetime end\n",stderr); abort(); }
+    if (!--lifetime_depth && lifetime_end_hook) lifetime_end_hook();
+}
+static void retire_range(uintptr_t address,uint64_t size) {
+    if (!lifetime_retire_hook) return;
+    if (!lifetime_depth || !exclusive_depth) { fputs("STOP: GPU retirement outside memory mutation\n",stderr); abort(); }
+    lifetime_retire_hook(address,size);
+}
+#else
+static void mutation_begin(void) {}
+static void mutation_end(void) {}
+static void retire_range(uintptr_t address,uint64_t size) { (void)address; (void)size; }
+#endif
 enum { HOOK_MAP, HOOK_UNMAP, HOOK_INVALIDATE };
 typedef struct { int kind; uintptr_t address; uint64_t size; } PendingHook;
 static PendingHook pending[64]; static size_t pending_count;
@@ -454,6 +488,14 @@ static int32_t place(void **inout, uint64_t size, int prot, int flags, uint64_t 
         address=find_free(address,size,alignment);
         if (!address) return NO_MEMORY;
     }
+#ifdef __APPLE__
+    for (size_t i=vma_index(address); i<vma_count && vmas[i].start<address+size; ++i) {
+        if (vmas[i].kind==KIND_RESERVED) continue;
+        uintptr_t lo=vmas[i].start>address ? vmas[i].start : address;
+        uintptr_t hi=vmas[i].end<address+size ? vmas[i].end : address+size;
+        retire_range(lo,hi-lo);
+    }
+#endif
     if (host_map(address,size,host_prot(prot),kind==KIND_RESERVED,phys)) return NO_MEMORY;
     void *mapped=(void *)address;
     drop_range(address,address+size);
@@ -520,10 +562,12 @@ static int32_t map_direct_locked(void **out, uint64_t size, int prot, int flags,
     return result;
 }
 static ABI int32_t direct_map(void **out, uint64_t size, int prot, int flags, int64_t physical, uint64_t alignment) {
+    mutation_begin();
     write_lock();
     int32_t result=map_direct_locked(out,size,prot,flags,physical,alignment);
     write_unlock();
     flush_hooks();
+    mutation_end();
     if (!result) printf("Runtime: mapped direct memory %p, size=%" PRIu64 ", prot=0x%x\n", *out, size, prot);
     return result;
 }
@@ -537,6 +581,7 @@ static int32_t unmap_locked(uintptr_t start, uint64_t size) {
     for (size_t i=vma_index(start); i<vma_count && vmas[i].start<end; ++i)
         if (vmas[i].kind!=KIND_RESERVED) {
             uintptr_t a=vmas[i].start>start ? vmas[i].start : start, b=vmas[i].end<end ? vmas[i].end : end;
+            retire_range(a,b-a);
             queue_hook(HOOK_UNMAP,a,b-a);
         }
     for (size_t i=vma_index(start); i<vma_count && vmas[i].start<end; ++i) {
@@ -547,6 +592,15 @@ static int32_t unmap_locked(uintptr_t start, uint64_t size) {
     return 0;
 }
 static ABI int32_t direct_unmap(void *address, uint64_t size) {
+#ifdef __APPLE__
+    mutation_begin();
+    write_lock();
+    int32_t result=unmap_locked((uintptr_t)address,size);
+    write_unlock();
+    flush_hooks();
+    mutation_end();
+    return result;
+#else
     /* The GPU forgets the range before it disappears (as shadPS4's early GPU unmap). */
     if (hook_unmap && !((uintptr_t)address%PAGE) && size) hook_unmap((uintptr_t)address,align_up(size,PAGE));
     write_lock();
@@ -555,12 +609,14 @@ static ABI int32_t direct_unmap(void *address, uint64_t size) {
     pending_count=before; /* already notified above */
     write_unlock();
     return result;
+#endif
 }
 static ABI int32_t direct_release(uint64_t start, uint64_t size) {
     if (start % PAGE || size % PAGE) return INVALID;
     if (!size) return 0;
+    mutation_begin();
     write_lock();
-    if (!direct_range_allocated(start,size)) { write_unlock(); return INVALID; }
+    if (!direct_range_allocated(start,size)) { write_unlock(); mutation_end(); return INVALID; }
     /* Mappings of released physical pages disappear with them. */
     for (size_t i=0; i<vma_count;) {
         Vma v=vmas[i];
@@ -587,6 +643,7 @@ static ABI int32_t direct_release(uint64_t start, uint64_t size) {
     host_discard(start,size); /* zero on reuse */
     write_unlock();
     flush_hooks();
+    mutation_end();
     return 0;
 }
 static int32_t map_flexible_locked(void **inout, uint64_t size, int prot, int flags) {
@@ -599,10 +656,12 @@ static int32_t map_flexible_locked(void **inout, uint64_t size, int prot, int fl
     return result;
 }
 static ABI int32_t map_flexible(void **inout, uint64_t size, int prot, int flags) {
+    mutation_begin();
     write_lock();
     int32_t result=map_flexible_locked(inout,size,prot,flags);
     write_unlock();
     flush_hooks();
+    mutation_end();
     if (!result) printf("Runtime: mapped flexible memory %p, size=%" PRIu64 ", prot=0x%x\n", *inout, size, prot);
     else fprintf(stderr,"Runtime: flexible map of %" PRIu64 " bytes failed (0x%x), in use=%" PRIu64 "\n",
                  size, (unsigned)result, flexible_bytes);
@@ -615,12 +674,17 @@ static ABI int32_t release_flexible(void *address, uint64_t size) { return direc
 static ABI int32_t reserve_range(void **inout, uint64_t size, int flags, uint64_t alignment) {
     if (!alignment) alignment=PAGE;
     if (!inout || !size || size%PAGE || !valid_alignment(alignment)) return INVALID;
+    mutation_begin();
     write_lock();
     if ((flags & MAP_FIXED_FLAG) && overlaps((uintptr_t)*inout,(uintptr_t)*inout+size,0)) {
-        write_unlock(); return NO_MEMORY;
+        write_unlock(); mutation_end(); return NO_MEMORY;
     }
     int32_t result=place(inout,size,0,flags,alignment,KIND_RESERVED,0,0);
     write_unlock();
+#ifdef __APPLE__
+    flush_hooks();
+#endif
+    mutation_end();
     if (!result) printf("Runtime: reserved virtual range %p, size=%" PRIu64 "\n", *inout, size);
     return result;
 }
@@ -628,6 +692,7 @@ static int32_t protect_locked(uintptr_t start, uint64_t size, int prot, int type
     uintptr_t end=start+align_up(size,PAGE);
     start&=~(uintptr_t)(PAGE-1);
     if ((prot & ~0x37) || !covered(start,end,0)) return INVALID;
+    if (!(host_prot(prot)&PROT_READ)) retire_range(start,end-start);
     if (host_protect(start,end-start,host_prot(prot))) return INVALID;
     int error; size_t i=carve(start,end,&error);
     if (error) return NO_MEMORY;
@@ -637,10 +702,12 @@ static int32_t protect_locked(uintptr_t start, uint64_t size, int prot, int type
     return 0;
 }
 static ABI int32_t kernel_mprotect(const void *address, uint64_t size, int prot) {
+    mutation_begin();
     write_lock();
     int32_t result=protect_locked((uintptr_t)address,size,prot,-1);
     write_unlock();
     flush_hooks();
+    mutation_end();
     return result;
 }
 static ABI int32_t query_protection(void *address, void **start, void **end, uint32_t *prot) {
@@ -690,6 +757,7 @@ static ABI int32_t direct_memory_type(uint64_t phys, int *type, void **start, vo
 static ABI int32_t batch_map2(BatchEntry *entries, int count, int *processed, int flags) {
     if (!entries || count<0) return INVALID;
     int32_t result=0; int done=0;
+    mutation_begin();
     write_lock();
     for (; done<count; ++done) {
         BatchEntry *e=&entries[done];
@@ -705,6 +773,7 @@ static ABI int32_t batch_map2(BatchEntry *entries, int count, int *processed, in
     }
     write_unlock();
     flush_hooks();
+    mutation_end();
     if (processed) *processed=done;
     return result;
 }
