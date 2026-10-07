@@ -2107,6 +2107,12 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
                 prepared ? prepared->buffer_sharps[buffer_index] : desc.GetSharp(stage);
 #ifdef __APPLE__
             if (vsharp.base_address && vsharp.num_records) {
+                ASSERT_MSG(vsharp.GetSize() >= desc.required_binding_bytes,
+                    "macOS structured access escapes bound guest buffer: base={:#x}, stride={}, "
+                    "records={}, swizzle={}, index_stride={}, element_size={}, required_bytes={}, shader={:#x}",
+                    vsharp.base_address, vsharp.GetStride(), vsharp.num_records,
+                    vsharp.swizzle_enable, vsharp.GetIndexStride(), vsharp.GetElementSize(),
+                    desc.required_binding_bytes, stage.pgm_hash);
                 ASSERT_MSG(!vsharp.swizzle_enable || vsharp.num_records % vsharp.GetIndexStride() == 0,
                     "macOS incomplete swizzled buffer index group: base={:#x}, stride={}, records={}, "
                     "swizzle={}, index_stride={}, element_size={}, shader={:#x}",
