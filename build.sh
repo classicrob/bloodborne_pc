@@ -11,20 +11,16 @@ default_lto=ON
 case $(uname -s) in
 Darwin)
     # Guest code executes natively, so all linked libraries must contain x86_64.
-    deps=${BB_DEPS_PREFIX:-/usr/local}
+    deps=${BB_DEPS_PREFIX:-$HOME/bbport-deps/x86_64}
     export PATH="$deps/bin:/opt/homebrew/bin:$PATH"
     export PKG_CONFIG_LIBDIR="$deps/lib/pkgconfig:$deps/share/pkgconfig"
     export PKG_CONFIG_PATH="$PKG_CONFIG_LIBDIR"
-    if [[ -z ${VK_DRIVER_FILES:-} && -z ${VK_ICD_FILENAMES:-} &&
-          -f $deps/share/vulkan/icd.d/MoltenVK_icd.json ]]; then
-        export VK_DRIVER_FILES="$deps/share/vulkan/icd.d/MoltenVK_icd.json"
-    fi
+    export VK_DRIVER_FILES="$deps/share/vulkan/icd.d/MoltenVK_icd.json"
+    [[ -f $VK_DRIVER_FILES ]] || {
+        echo "Missing macOS MoltenVK ICD: $VK_DRIVER_FILES (run packaging/macos/build-deps.sh)." >&2
+        exit 1
+    }
     export CMAKE_PREFIX_PATH="$deps"
-    if [[ -n ${VULKAN_SDK:-} ]]; then
-        export PATH="$VULKAN_SDK/bin:$PATH"
-        export PKG_CONFIG_PATH="$VULKAN_SDK/lib/pkgconfig:$PKG_CONFIG_PATH"
-        export CMAKE_PREFIX_PATH="$VULKAN_SDK:$CMAKE_PREFIX_PATH"
-    fi
     platform_flags=(-arch x86_64)
     probe_link_flags=(-Wl,-no_pie)
     compat=(src/compat_mac.c src/macos_ui.c)
@@ -92,6 +88,9 @@ if [[ -z $pgo ]]; then
     elif [[ -n $(find pgo -name '*.gcda' -print -quit 2>/dev/null) ]]; then pgo=use; else pgo=off; fi
 fi
 mkdir -p pgo
+if [[ $(uname -s) == Darwin && $pgo != off ]]; then
+    echo 'macOS PGO is not implemented; BB_PGO must be off.' >&2; exit 1
+fi
 # Submodules (git clone --recursive, or: git submodule update --init) and this port's changes
 # to FSR-Vulkan (gpu/patches/fsr-vulkan), applied to its working tree once.
 if [[ ! -f gpu/third_party/fsr-vulkan/CMakeLists.txt || ! -f gpu/third_party/imgui/imgui.h ]]; then
@@ -115,7 +114,6 @@ gpu=(-Lout/gpu -lbbgpu -Wl,-rpath,'$ORIGIN/gpu' -Wl,-rpath,"$PWD/out/gpu" -rdyna
 if [[ $(uname -s) == Darwin ]]; then
     gpu=(-Lout/gpu -lbbgpu -Wl,-rpath,@loader_path/gpu -Wl,-rpath,@loader_path
          -Wl,-rpath,"$deps/lib" -Wl,-export_dynamic)
-    if [[ -n ${VULKAN_SDK:-} ]]; then gpu+=(-Wl,-rpath,"$VULKAN_SDK/lib"); fi
 fi
 runtime=(src/runtime*.c "${compat[@]}")
 # Third-party decoders: compiled once, without this project's -Werror policy.
@@ -131,7 +129,6 @@ echo "Built $PWD/out/bb-probe"
 caps_link=()
 if [[ $(uname -s) == Darwin ]]; then
     caps_link=(-Wl,-rpath,@loader_path -Wl,-rpath,"$deps/lib")
-    if [[ -n ${VULKAN_SDK:-} ]]; then caps_link+=(-Wl,-rpath,"$VULKAN_SDK/lib"); fi
 fi
 "$CC" "${platform_flags[@]}" -std=c11 -O2 -Wall -Wextra -Werror tools/gpu_capabilities.c "${includes[@]}" "${libraries[@]}" "${caps_link[@]}" -o out/bb-gpu-capabilities
 if [[ ${1:-} == --test ]]; then

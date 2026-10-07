@@ -2,22 +2,15 @@
 set -euo pipefail
 cd -- "$(dirname -- "$0")"
 if [[ $(uname -s) == Darwin ]]; then
-    deps=${BB_DEPS_PREFIX:-/usr/local}
+    deps=${BB_DEPS_PREFIX:-$HOME/bbport-deps/x86_64}
     export PATH="$deps/bin:/opt/homebrew/bin:$PATH"
     export PKG_CONFIG_LIBDIR="$deps/lib/pkgconfig:$deps/share/pkgconfig"
     export PKG_CONFIG_PATH="$PKG_CONFIG_LIBDIR"
-    if [[ -n ${VULKAN_SDK:-} ]]; then
-        export PATH="$VULKAN_SDK/bin:$PATH"
-        export PKG_CONFIG_PATH="$VULKAN_SDK/lib/pkgconfig:$PKG_CONFIG_PATH"
-    fi
-    if [[ -z ${VK_DRIVER_FILES:-} && -z ${VK_ICD_FILENAMES:-} ]]; then
-        for prefix in "${VULKAN_SDK:-$deps}" "$deps"; do
-            if [[ -f $prefix/share/vulkan/icd.d/MoltenVK_icd.json ]]; then
-                export VK_DRIVER_FILES=$prefix/share/vulkan/icd.d/MoltenVK_icd.json
-                break
-            fi
-        done
-    fi
+    export VK_DRIVER_FILES="$deps/share/vulkan/icd.d/MoltenVK_icd.json"
+    [[ -f $VK_DRIVER_FILES ]] || {
+        echo "Missing macOS MoltenVK ICD: $VK_DRIVER_FILES (run packaging/macos/build-deps.sh)." >&2
+        exit 1
+    }
 fi
 if [[ ${1:-} == --software ]]; then
     shift
