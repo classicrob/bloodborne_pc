@@ -702,10 +702,17 @@ bool PipelineCache::RefreshGraphicsStages(PipelineSelection& sel) {
     switch (regs.stage_enable.raw) {
     case AmdGpu::ShaderStageEnable::VgtStages::EsGs:
         if (!instance.IsGeometryStageSupported()) {
+#ifdef __APPLE__
+            UNREACHABLE_MSG("macOS geometry shader emulation is not implemented: VGT stage mask {:#x}",
+                            static_cast<u32>(regs.stage_enable.raw));
+#endif
             LOG_WARNING(Render_Vulkan, "Geometry shader stage unsupported, skipping");
             return false;
         }
         if (regs.vgt_gs_mode.onchip || regs.vgt_strmout_config.raw) {
+#ifdef __APPLE__
+            UNREACHABLE_MSG("macOS on-chip geometry shaders or stream-out are not implemented");
+#endif
             LOG_WARNING(Render_Vulkan, "Geometry shader features unsupported, skipping");
             return false;
         }
@@ -718,6 +725,9 @@ bool PipelineCache::RefreshGraphicsStages(PipelineSelection& sel) {
         break;
     case AmdGpu::ShaderStageEnable::VgtStages::LsHs:
         if (!instance.IsTessellationSupported()) {
+#ifdef __APPLE__
+            UNREACHABLE_MSG("macOS device cannot execute required tessellation shaders");
+#endif
             return false;
         }
         if (!bind_stage(HwStage::Hull, SwStage::TessellationControl)) {
@@ -732,13 +742,23 @@ bool PipelineCache::RefreshGraphicsStages(PipelineSelection& sel) {
         break;
     case AmdGpu::ShaderStageEnable::VgtStages::LsHsEsGs:
         if (!instance.IsTessellationSupported()) {
+#ifdef __APPLE__
+            UNREACHABLE_MSG("macOS device cannot execute required tessellation shaders");
+#endif
             return false;
         }
         if (!instance.IsGeometryStageSupported()) {
+#ifdef __APPLE__
+            UNREACHABLE_MSG("macOS geometry shader emulation is not implemented: VGT stage mask {:#x}",
+                            static_cast<u32>(regs.stage_enable.raw));
+#endif
             LOG_WARNING(Render_Vulkan, "Geometry shader stage unsupported, skipping");
             return false;
         }
         if (regs.vgt_gs_mode.onchip || regs.vgt_strmout_config.raw) {
+#ifdef __APPLE__
+            UNREACHABLE_MSG("macOS on-chip geometry shaders or stream-out are not implemented");
+#endif
             LOG_WARNING(Render_Vulkan, "Geometry shader features unsupported, skipping");
             return false;
         }
