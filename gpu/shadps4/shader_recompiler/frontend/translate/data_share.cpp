@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "shader_recompiler/frontend/translate/translate.h"
+#include "shader_recompiler/profile.h"
 #include "shader_recompiler/ir/reg.h"
 #include "shader_recompiler/runtime_info.h"
 
@@ -99,6 +100,15 @@ void Translator::EmitDataShare(const GcnInst& inst) {
 
 void Translator::V_READFIRSTLANE_B32(const GcnInst& inst) {
     const IR::U32 value{GetSrc(inst.src[0])};
+    if (profile.emulate_wave64 && info.hw_stage == HwStage::Compute) {
+        // Lane# = FindFirst1fromLSB(exec), lane 0 if exec is zero. The instruction ignores the
+        // exec mask, so it may sit outside the exec scope's block, where every invocation runs:
+        // name the lane from exec explicitly (lower_wave64_pass makes it wave-wide).
+        const IR::U64 exec = ir.Ballot(ir.GetExec());
+        const IR::U32 lane{ir.Select(ir.IEqual(exec, ir.Imm64(u64{0})), ir.Imm32(0u), ir.BallotFindLsb(exec))};
+        SetDst(inst.dst[0], ir.ReadLane(value, lane));
+        return;
+    }
     SetDst(inst.dst[0], ir.ReadFirstLane(value));
 }
 

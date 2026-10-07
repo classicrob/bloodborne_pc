@@ -565,7 +565,9 @@ void EmitContext::DefineInputs() {
             local_invocation_id =
                 DefineVariable(U32[3], spv::BuiltIn::LocalInvocationId, spv::StorageClass::Input);
         }
-        if (info.loads.Get(IR::Attribute::LocalInvocationIndex)) {
+        // Apple wave64: add_tid's thread_id[5:0] is LocalInvocationIndex & 63 (EmitBufferAddress).
+        if (info.loads.Get(IR::Attribute::LocalInvocationIndex) ||
+            (profile.emulate_wave64 && info.uses_lane_id)) {
             local_invocation_index = DefineVariable(U32[1], spv::BuiltIn::LocalInvocationIndex,
                                                     spv::StorageClass::Input);
         }

@@ -90,7 +90,14 @@ Id EmitBufferAddress(EmitContext& ctx, IR::Inst* inst, u32 handle, Id index, Id 
     };
     if (!flags.index_enable) index = ctx.u32_zero_value;
     if (sharp.stride != 0 && sharp.add_tid_enable) {
-        index = checked_add(index, ctx.OpLoad(ctx.U32[1], ctx.subgroup_local_invocation_id));
+        // GCN thread_id[5:0] is the lane in the 64-wide wave. On Apple (32-wide subgroups,
+        // emulate_wave64) that is LocalInvocationIndex & 63; add_tid exists only in compute.
+        const Id thread_id =
+            ctx.profile.emulate_wave64
+                ? ctx.OpBitwiseAnd(ctx.U32[1], ctx.OpLoad(ctx.U32[1], ctx.local_invocation_index),
+                                   ctx.ConstU32(63u))
+                : ctx.OpLoad(ctx.U32[1], ctx.subgroup_local_invocation_id);
+        index = checked_add(index, thread_id);
     }
     if (!flags.voffset_enable) offset = ctx.u32_zero_value;
     offset = checked_add(offset, ctx.ConstU32(u32(flags.inst_offset.Value())));
