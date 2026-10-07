@@ -20,6 +20,18 @@
 extern "C" {
 #endif
 
+typedef struct {
+    pthread_mutex_t mutex;
+    pthread_cond_t event;
+    unsigned count, arrived, active;
+    uint64_t generation;
+} pthread_barrier_t;
+typedef struct { int pshared; } pthread_barrierattr_t;
+#define PTHREAD_BARRIER_SERIAL_THREAD (-1)
+int compat_barrier_init(pthread_barrier_t *barrier, const pthread_barrierattr_t *attr, unsigned count);
+int compat_barrier_wait(pthread_barrier_t *barrier);
+int compat_barrier_destroy(pthread_barrier_t *barrier);
+
 int compat_mutex_timedlock(pthread_mutex_t *mutex, const struct timespec *deadline);
 int compat_rwlock_timedrdlock(pthread_rwlock_t *lock, const struct timespec *deadline);
 int compat_rwlock_timedwrlock(pthread_rwlock_t *lock, const struct timespec *deadline);
@@ -36,6 +48,9 @@ uint64_t compat_thread_id(void);
 }
 #endif
 
+#define pthread_barrier_init compat_barrier_init
+#define pthread_barrier_wait compat_barrier_wait
+#define pthread_barrier_destroy compat_barrier_destroy
 #define pthread_mutex_timedlock compat_mutex_timedlock
 #define pthread_rwlock_timedrdlock compat_rwlock_timedrdlock
 #define pthread_rwlock_timedwrlock compat_rwlock_timedwrlock
