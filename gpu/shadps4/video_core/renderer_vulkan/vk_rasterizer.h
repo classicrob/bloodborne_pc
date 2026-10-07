@@ -31,6 +31,7 @@ namespace Vulkan {
 
 class GraphicsPipeline;
 class Runtime;
+class NullResources;
 
 class Rasterizer {
 public:
@@ -318,6 +319,7 @@ private:
     Runtime& runtime;
     VideoCore::PageManager page_manager;
     VideoCore::BufferCache buffer_cache;
+    std::unique_ptr<NullResources> null_resources;
     VideoCore::TextureCache texture_cache;
     AmdGpu::Liverpool* liverpool;
     Core::MemoryManager* memory;

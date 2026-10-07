@@ -16,6 +16,7 @@
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/renderer_vulkan/vk_null_resources.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/renderer_vulkan/vk_gpu_profiler.h"
@@ -48,6 +49,10 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
       pipeline_cache{instance, scheduler, liverpool, buffer_cache.GetSparsePageShift()},
       host_markers_enabled{EmulatorSettings.IsVkHostMarkersEnabled()},
       guest_markers_enabled{EmulatorSettings.IsVkGuestMarkersEnabled()} {
+    if (instance.EmulatesNullDescriptors()) {
+        null_resources = std::make_unique<NullResources>(instance.GetPhysicalDevice(),
+                                                        instance.GetDevice());
+    }
     // Before the rasterizer is bound: Liverpool enqueues buffers only once it sees it.
     draw_prep = std::make_unique<DrawPreparation>(pipeline_cache);
     scene_targets = std::make_unique<SceneTargets>(instance, scheduler, runtime, texture_cache);
@@ -1479,6 +1484,9 @@ bool Rasterizer::TexturesBindableOnHelper(const Shader::Info& stage,
         if (tsharp.Address() == 0 || data_fmt == AmdGpu::DataFormat::FormatInvalid ||
             !memory->IsValidGpuMapping(tsharp.Address(), 0) ||
             !IsKnownFormat(data_fmt, num_fmt)) {
+            if (null_resources) {
+                return false; // Placeholder initialization is recorded by the draw thread.
+            }
             continue; // null descriptor
         }
         const auto& entry =
@@ -1819,10 +1827,11 @@ void Rasterizer::ResolveVertexBuffers(const GraphicsPipeline* pipeline,
             host_offsets.push_back(host_buffer_info->offset + buffer.base_address -
                                    host_buffer_info->base_address);
         } else {
-            host_buffers.emplace_back(VK_NULL_HANDLE);
+            host_buffers.emplace_back(null_resources ? null_resources->Buffer() : VK_NULL_HANDLE);
             host_offsets.push_back(0);
         }
-        host_sizes.push_back(buffer.GetSize());
+        host_sizes.push_back(null_resources && (buffer.base_address == 0 || buffer.GetSize() == 0)
+                                 ? 0 : buffer.GetSize());
         host_strides.push_back(buffer.GetStride());
     }
 
@@ -2060,7 +2069,8 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
                 // Permutations compiled without enabled planes never read the buffer, so the
                 // declared binding is satisfied with a null descriptor instead of a copy.
                 if (Regs().clipper_control.user_clip_plane_enable == 0) {
-                    buffer_infos.emplace_back(VK_NULL_HANDLE, 0, VK_WHOLE_SIZE);
+                    buffer_infos.emplace_back(null_resources ? null_resources->Buffer() : VK_NULL_HANDLE,
+                                              0, null_resources ? NullResources::BufferSize : VK_WHOLE_SIZE);
                 } else {
                     auto& vk_buffer = buffer_cache.GetStreamBuffer();
                     std::array<float, AmdGpu::NUM_CLIP_PLANES * 4> planes{};
@@ -2118,9 +2128,16 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
                                      memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize()));
             }
             if (vsharp.base_address == 0 || vsharp.GetSize() == 0) {
-                buffer_infos.emplace_back(VK_NULL_HANDLE, 0, VK_WHOLE_SIZE);
+                push_data.AddOffset(binding.buffer, 0);
+                buffer_infos.emplace_back(null_resources ? null_resources->Buffer() : VK_NULL_HANDLE,
+                                          0, null_resources ? NullResources::BufferSize : VK_WHOLE_SIZE);
             } else {
                 const u64 size = memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize());
+#ifdef __APPLE__
+                ASSERT_MSG(memory->IsValidGpuMapping(vsharp.base_address, 0) && size == vsharp.GetSize(),
+                           "macOS non-null buffer mapping is incomplete: address={:#x}, size={}, mapped={}",
+                           vsharp.base_address, vsharp.GetSize(), size);
+#endif
                 if (size != vsharp.GetSize()) {
                     LOG_ERROR(Render, "Clamped size from {} to {} for stage {:#x}",
                               vsharp.GetSize(), size, stage.pgm_hash);
@@ -2243,15 +2260,44 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
         const auto data_fmt = tsharp.GetDataFmt();
         const auto num_fmt = tsharp.GetNumberFmt();
         if (tsharp.Address() == 0 || data_fmt == AmdGpu::DataFormat::FormatInvalid) {
-            image_bindings.emplace_back(VideoCore::ImageId{}, &image_desc_storage.emplace_back());
-            image_binding_entries.push_back(nullptr);
-            binding_proxy_ok.push_back(false);
-            image_descriptor_array_sizes.push_back(1);
+            if (null_resources) {
+                auto& desc = image_desc_storage.emplace_back();
+                desc.type = image_desc.is_written ? VideoCore::TextureCache::BindingType::Storage
+                                                 : VideoCore::TextureCache::BindingType::Texture;
+                desc.view_info.type = tsharp.GetViewType(image_desc.is_array);
+                const auto number_class = AmdGpu::GetNumberClass(tsharp.GetNumberFmt());
+                desc.view_info.format = number_class == AmdGpu::NumberClass::Sint
+                                            ? vk::Format::eR32G32B32A32Sint
+                                            : number_class == AmdGpu::NumberClass::Uint
+                                                  ? vk::Format::eR32G32B32A32Uint
+                                                  : image_desc.is_depth && !image_desc.is_written
+                                                        ? vk::Format::eD32Sfloat
+                                                        : vk::Format::eR32G32B32A32Sfloat;
+                desc.info.num_samples = tsharp.NumSamples();
+                const u32 count = image_desc.NumBindings(stage);
+                for (u32 i = 0; i < count; ++i) {
+                    image_bindings.emplace_back(VideoCore::ImageId{}, &desc);
+                    image_binding_entries.push_back(nullptr);
+                    binding_proxy_ok.push_back(false);
+                }
+                image_descriptor_array_sizes.push_back(count);
+                set_ok = false;
+            } else {
+                image_bindings.emplace_back(VideoCore::ImageId{}, &image_desc_storage.emplace_back());
+                image_binding_entries.push_back(nullptr);
+                binding_proxy_ok.push_back(false);
+                image_descriptor_array_sizes.push_back(1);
+            }
             continue;
         }
 
         if (!memory->IsValidGpuMapping(tsharp.Address(), 0) ||
             !IsKnownFormat(data_fmt, num_fmt)) {
+#ifdef __APPLE__
+            UNREACHABLE_MSG("macOS non-null texture mapping/format invalid: address={:#x}, "
+                            "data_format={}, num_format={}", tsharp.Address(),
+                            static_cast<u32>(data_fmt), static_cast<u32>(num_fmt));
+#endif
             LOG_WARNING(Render_Vulkan,
                         "Rejecting invalid T# address={:#x}, pitch={}, width={}, "
                         "data_format={}, num_format={}",
@@ -2362,7 +2408,27 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
         const auto& desc = *desc_ptr;
         bool is_storage = desc.type == VideoCore::TextureCache::BindingType::Storage;
         if (!image_id) {
-            image_infos.emplace_back(VK_NULL_HANDLE, VK_NULL_HANDLE, vk::ImageLayout::eGeneral);
+            vk::ImageView view{};
+            if (null_resources) {
+                vk::ImageViewType type;
+                switch (desc.view_info.type) {
+                case AmdGpu::ImageType::Color1D: type = vk::ImageViewType::e1D; break;
+                case AmdGpu::ImageType::Color1DArray: type = vk::ImageViewType::e1DArray; break;
+                case AmdGpu::ImageType::Color2D:
+                case AmdGpu::ImageType::Color2DMsaa: type = vk::ImageViewType::e2D; break;
+                case AmdGpu::ImageType::Color2DArray: type = vk::ImageViewType::e2DArray; break;
+                case AmdGpu::ImageType::Color3D: type = vk::ImageViewType::e3D; break;
+                default: UNREACHABLE_MSG("macOS null texture view type is unsupported: {}",
+                                        static_cast<u32>(desc.view_info.type));
+                }
+                view = null_resources->ImageView(type, desc.view_info.format,
+                    static_cast<vk::SampleCountFlagBits>(desc.info.num_samples), is_storage,
+                    [this](auto&& initialize) {
+                        scheduler.EndRendering();
+                        scheduler.Record(std::forward<decltype(initialize)>(initialize));
+                    });
+            }
+            image_infos.emplace_back(VK_NULL_HANDLE, view, vk::ImageLayout::eGeneral);
         } else {
             if (auto& old_image = texture_cache.GetImage(image_id);
                 old_image.binding.needs_rebind) {
@@ -2586,6 +2652,7 @@ bool Rasterizer::BindTexturesFromSet(const Shader::Info& stage, const PreparedSt
     for (u32 i = 0; i < count; ++i) {
         const auto& entry = set.entries[i];
         if (!entry.id) {
+            ASSERT_MSG(!null_resources, "macOS cached texture set retained a null descriptor");
             image_infos.emplace_back(VK_NULL_HANDLE, VK_NULL_HANDLE, vk::ImageLayout::eGeneral);
             continue;
         }
