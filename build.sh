@@ -164,6 +164,8 @@ if [[ ${1:-} == --test ]]; then
             "${surface_flags[@]}" "${caps_link[@]}" -o out/macos-surface-test
         out/macos-surface-test
         sh tests/test_memory_macos.sh
+        sh tests/test_memory_lifetime_macos.sh
+        sh tests/test_avplayer_lifecycle_macos.sh
         sh tests/macos_spike/test_tls_runtime.sh
         sh tests/macos_spike/test_hle_stack.sh
         bash tests/test_savedata_macos.sh

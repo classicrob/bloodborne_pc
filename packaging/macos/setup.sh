@@ -17,7 +17,7 @@ export PATH="$host_brew/bin:$PATH"
 export BB_DEPS_PREFIX=${BB_DEPS_PREFIX:-$HOME/bbport-deps/x86_64}
 python_prefix=${BB_PYTHON_PREFIX:-$HOME/bbport-deps/python-arm64}
 missing=()
-for formula in cmake ninja pkg-config glslang boost robin-map python@3.14; do
+for formula in cmake ninja pkg-config glslang boost robin-map python@3.14 ffmpeg; do
     if ! "$host_brew/bin/brew" list --versions "$formula" >/dev/null 2>&1; then
         missing+=("$formula")
     fi
