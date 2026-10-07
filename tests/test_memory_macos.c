@@ -151,11 +151,15 @@ int main(void) {
     assert(((int (*)(void))code)()==42);
     byte=17;
     assert(runtime_memory_write_backing((uintptr_t)code+1,&byte,1));
-    assert(!protect(code,PAGE,3));
-    assert(!protect(code,PAGE,5));
     assert(((int (*)(void))code)()==17);
+    void *data_alias=NULL;
+    assert(!map(&data_alias,PAGE,3,0,physical,PAGE));
+    byte=23;
+    assert(runtime_memory_write_backing((uintptr_t)data_alias+1,&byte,1));
+    assert(((int (*)(void))code)()==23);
+    assert(protection(code)==(VM_PROT_READ|VM_PROT_EXECUTE));
     assert(!release(physical,PAGE));
-    puts("PASS: executable shared views and Rosetta translation invalidation by protection cycle");
+    puts("PASS: executable shared views and automatic Rosetta translation invalidation across aliases");
     runtime_memory_report();
     return 0;
 }

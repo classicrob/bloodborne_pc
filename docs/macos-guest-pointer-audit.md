@@ -75,5 +75,7 @@ bounds, reservation holes, flexible offsets, and executable views. Modifying
 already-translated instructions through the private backing alias requires an
 RW-to-RX guest-view protection cycle to invalidate Rosetta's translation; the
 ordinary instruction-cache builtin and reapplying RX alone did not suffice.
-The GPU backing-write API is for data transfers; automatic invalidation of
-translated code after such writes is not implemented.
+The backend now performs an execute-permission cycle on every executable alias
+of physical pages modified through its backing-write API, retaining the actual
+GPU-restricted protection. Tests cover writes addressed through both executable
+and non-executable aliases followed by immediate execution.

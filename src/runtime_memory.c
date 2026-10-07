@@ -290,7 +290,9 @@ static int pool(void) {
 static int host_unmap(uintptr_t address, uint64_t size) {
     if (address<USER_MIN || address>=USER_MAX || size>USER_MAX-address) return -1;
     /* Keep the reservation so host allocations cannot occupy guest holes. */
-    return mmap((void *)address,size,PROT_NONE,MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED,-1,0)==MAP_FAILED ? -1 : 0;
+    if (mmap((void *)address,size,PROT_NONE,MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED,-1,0)==MAP_FAILED)
+        mac_fail("restoring guest reservation",address,size,errno);
+    return 0;
 }
 static int host_map(uintptr_t address, uint64_t size, int prot, int reserved, uint64_t phys) {
     runtime_memory_reserve();
@@ -300,7 +302,7 @@ static int host_map(uintptr_t address, uint64_t size, int prot, int reserved, ui
     vm_prot_t current, maximum;
     kern_return_t error=mach_vm_remap(mach_task_self(),&target,size,0,VM_FLAGS_FIXED|VM_FLAGS_OVERWRITE,
         mach_task_self(),(mach_vm_address_t)(backing_base+phys),FALSE,&current,&maximum,VM_INHERIT_NONE);
-    if (error!=KERN_SUCCESS) return -1;
+    if (error!=KERN_SUCCESS) mac_fail("mapping shared guest memory",address,size,error);
     if (mprotect((void *)address,size,prot)) {
         /* Losing a replaced mapping would leave the table inconsistent. */
         mac_fail("protecting shared guest view",address,size,errno);
@@ -873,6 +875,41 @@ void runtime_memory_set_gpu_hooks(GpuRange map, GpuRange unmap, GpuRange invalid
     write_unlock();
     flush_hooks();
 }
+#ifdef __APPLE__
+static void sync_executable_aliases(uint64_t phys, uint64_t size) {
+    for (size_t i=0;i<vma_count;++i) {
+        const Vma *v=&vmas[i];
+        if (v->kind==KIND_RESERVED || !(v->prot & 4) || v->phys>=phys+size ||
+            phys>=v->phys+v->end-v->start) continue;
+        uint64_t lo=v->phys>phys ? v->phys : phys;
+        uint64_t hi=v->phys+v->end-v->start<phys+size ? v->phys+v->end-v->start : phys+size;
+        uintptr_t at=(v->start+lo-v->phys)&~(uintptr_t)(PAGE-1);
+        uintptr_t end=align_up(v->start+hi-v->phys,PAGE);
+        while (at<end) {
+            mach_vm_address_t address=at;
+            mach_vm_size_t bytes=0;
+            vm_region_basic_info_data_64_t info;
+            mach_msg_type_number_t count=VM_REGION_BASIC_INFO_COUNT_64;
+            mach_port_t object=MACH_PORT_NULL;
+            kern_return_t error=mach_vm_region(mach_task_self(),&address,&bytes,VM_REGION_BASIC_INFO_64,
+                (vm_region_info_t)&info,&count,&object);
+            if (object!=MACH_PORT_NULL) mach_port_deallocate(mach_task_self(),object);
+            if (error!=KERN_SUCCESS || address>at || address+bytes<=at)
+                mac_fail("querying executable alias",at,end-at,error);
+            uintptr_t next=address+bytes<end ? address+bytes : end;
+            /* Rosetta does not observe writes through a different alias. An
+             * execute-permission cycle invalidates translated instructions;
+             * restore the actual GPU-restricted protection, not guest policy. */
+            if (info.protection & VM_PROT_EXECUTE) {
+                if (mprotect((void *)at,next-at,info.protection & ~VM_PROT_EXECUTE) ||
+                    mprotect((void *)at,next-at,info.protection))
+                    mac_fail("invalidating translated guest code",at,next-at,errno);
+            }
+            at=next;
+        }
+    }
+}
+#endif
 /* Writes through the backing view; 0 when part of the range has no backing. */
 int runtime_memory_write_backing(uintptr_t address, const void *data, uint64_t size) {
     read_lock();
@@ -882,6 +919,9 @@ int runtime_memory_write_backing(uintptr_t address, const void *data, uint64_t s
         if (i==vma_count || vmas[i].start>at || vmas[i].kind==KIND_RESERVED) { ok=0; break; }
         uint64_t n=(vmas[i].end<end ? vmas[i].end : end)-at;
         memcpy(backing_base+vmas[i].phys+(at-vmas[i].start),(const unsigned char *)data+(at-address),n);
+#ifdef __APPLE__
+        sync_executable_aliases(vmas[i].phys+(at-vmas[i].start),n);
+#endif
         at+=n;
     }
     read_unlock();
