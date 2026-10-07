@@ -12,6 +12,8 @@ import threading
 
 import bbport_launcher_win as shared
 
+OUTPUTS = [*shared.OUTPUTS, ('3456x1944', ('3456 × 1944 (MacBook panel fit)',))]
+
 PORT = Path(__file__).resolve().parent.parent
 PACKAGED = os.environ.get('BB_PACKAGED') == '1'
 DATA = Path(os.environ.get('BB_DATA_DIR',
@@ -68,7 +70,7 @@ class Launcher:
         self.choice(frame, 'upscaler', 'Upscaler', self.ini,
                     [entry for entry in shared.UPSCALERS if entry[0] in ('fsr3', 'taa', 'off')])
         self.choice(frame, 'preset', 'Preset', self.ini, shared.PRESETS)
-        self.choice(frame, 'output_res', 'Output resolution', self.ini, shared.OUTPUTS)
+        self.choice(frame, 'output_res', 'Output resolution', self.ini, OUTPUTS)
         self.choice(frame, 'language', 'Game language', self.settings, shared.LANGUAGES)
         self.field(frame, 'player_name', 'Player name', self.settings)
         self.fullscreen = tk.BooleanVar(value=self.settings['fullscreen'])

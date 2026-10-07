@@ -16,6 +16,13 @@ THIS PROJECT IS NOT RELATED TO SHADPS4. ALL QUESTIONS RELATED TO THIS PROJECT SH
 > [deadinside28](https://github.com/deadinside28/bloodborne_pc); the Windows port is by
 > [Supermedo](https://github.com/Supermedo).
 
+> ### Experimental macOS port
+> Apple Silicon + Rosetta 2 contributor builds and a native launcher are under
+> development. Real GPU-path/title-screen milestones are still pending; the
+> Linux playability status below does not apply to macOS. Requirements, one-time
+> setup, your own dump, current feature gaps and commands:
+> [packaging/macos/README.md](packaging/macos/README.md).
+
 bbport runs the original PlayStation 4 executable of *Bloodborne* (CUSA03173, game version
 1.09) directly on an x86-64 Linux PC. It is not a general emulator. The game's own x86-64 code
 executes natively; a small runtime written for this one game replaces the PS4 system libraries;

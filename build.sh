@@ -136,8 +136,9 @@ fi
 "$CC" "${platform_flags[@]}" -std=c11 -O2 -Wall -Wextra -Werror tools/gpu_capabilities.c "${includes[@]}" "${libraries[@]}" "${caps_link[@]}" -o out/bb-gpu-capabilities
 if [[ ${1:-} == --test ]]; then
     if [[ $(uname -s) == Darwin ]]; then
-        ninja -C out/gpu "${ninja_jobs[@]}" null-descriptor-test
+        ninja -C out/gpu "${ninja_jobs[@]}" null-descriptor-test upscaler-support-test
         out/gpu/null-descriptor-test
+        out/gpu/upscaler-support-test
         "$CC" "${platform_flags[@]}" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread -Isrc \
             tests/test_compat_mac.c src/compat_mac.c -o out/compat-mac-test
         out/compat-mac-test
