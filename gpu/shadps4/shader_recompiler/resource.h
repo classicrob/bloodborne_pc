@@ -83,6 +83,8 @@ struct BufferResource {
     bool is_formatted{};
     SharpFetchPostOp post_op{};
     u32 post_op_dw1_mask{};
+    // Structured accesses without index bounds may need bytes past the descriptor size.
+    u64 required_binding_bytes{};
 
     bool IsSpecial() const noexcept {
         return buffer_type != BufferType::Guest;

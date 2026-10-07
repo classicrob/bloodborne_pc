@@ -2105,6 +2105,26 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
         } else {
             const auto vsharp =
                 prepared ? prepared->buffer_sharps[buffer_index] : desc.GetSharp(stage);
+#ifdef __APPLE__
+            if (vsharp.base_address && vsharp.num_records) {
+                ASSERT_MSG(vsharp.GetSize() >= desc.required_binding_bytes,
+                    "macOS structured access escapes bound guest buffer: base={:#x}, stride={}, "
+                    "records={}, swizzle={}, index_stride={}, element_size={}, required_bytes={}, shader={:#x}",
+                    vsharp.base_address, vsharp.GetStride(), vsharp.num_records,
+                    vsharp.swizzle_enable, vsharp.GetIndexStride(), vsharp.GetElementSize(),
+                    desc.required_binding_bytes, stage.pgm_hash);
+                ASSERT_MSG(!vsharp.swizzle_enable || vsharp.num_records % vsharp.GetIndexStride() == 0,
+                    "macOS incomplete swizzled buffer index group: base={:#x}, stride={}, records={}, "
+                    "swizzle={}, index_stride={}, element_size={}, shader={:#x}",
+                    vsharp.base_address, vsharp.GetStride(), vsharp.num_records,
+                    vsharp.swizzle_enable, vsharp.GetIndexStride(), vsharp.GetElementSize(), stage.pgm_hash);
+                ASSERT_MSG(!vsharp.stride || u64(vsharp.stride) * vsharp.num_records <= UINT32_MAX,
+                    "macOS structured buffer exceeds 32-bit descriptor range: base={:#x}, stride={}, "
+                    "records={}, swizzle={}, index_stride={}, element_size={}, shader={:#x}",
+                    vsharp.base_address, vsharp.GetStride(), vsharp.num_records,
+                    vsharp.swizzle_enable, vsharp.GetIndexStride(), vsharp.GetElementSize(), stage.pgm_hash);
+            }
+#endif
             if (vsharp.GetSize() == 864 && gbuffer_draw &&
                 memory->IsValidGpuMapping(vsharp.base_address, 0)) {
                 camera_motion->OnConstants(reinterpret_cast<const float*>(vsharp.base_address));
