@@ -21,6 +21,16 @@ extern "C" {
  */
 void runtime_memory_set_gpu_lifetime_hooks(void (*begin)(void),
     void (*retire)(uintptr_t address,uint64_t size),void (*end)(void));
+
+/* Exact backing identity for import creation, not a per-draw query. Returns 1
+ * for a committed VMA, 0 for a gap/reservation/untracked low allocation. offset
+ * is the unified backing-pool byte offset at *start (direct and flexible occupy
+ * disjoint intervals). Aliases have overlapping offset intervals. The caller
+ * must participate in the lifetime protocol while using the snapshot: release
+ * may replace the physical object at an identical offset after retiring imports.
+ */
+int runtime_memory_backing_region(uintptr_t address,uintptr_t *start,
+    uintptr_t *end,uint64_t *offset);
 #endif
 #ifdef __cplusplus
 }
