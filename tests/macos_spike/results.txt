@@ -9,14 +9,14 @@ TLS thread=0x23450000 key=258 disp=2064 got=0x23450000 expected=0x23450000
 TLS thread=0x23450000 key=259 disp=2072 got=0x23450001 expected=0x23450001
 TLS thread=0x23450000 key=260 disp=2080 got=0x23450002 expected=0x23450002
 TLS thread=0x23450000 key=261 disp=2088 got=0x23450003 expected=0x23450003
-TLS thread=0x23450100 key=258 disp=2064 got=0x23450100 expected=0x23450100
-TLS thread=0x23450100 key=259 disp=2072 got=0x23450101 expected=0x23450101
-TLS thread=0x23450100 key=260 disp=2080 got=0x23450102 expected=0x23450102
-TLS thread=0x23450100 key=261 disp=2088 got=0x23450103 expected=0x23450103
 TLS thread=0x23450200 key=258 disp=2064 got=0x23450200 expected=0x23450200
 TLS thread=0x23450200 key=259 disp=2072 got=0x23450201 expected=0x23450201
 TLS thread=0x23450200 key=260 disp=2080 got=0x23450202 expected=0x23450202
 TLS thread=0x23450200 key=261 disp=2088 got=0x23450203 expected=0x23450203
+TLS thread=0x23450100 key=258 disp=2064 got=0x23450100 expected=0x23450100
+TLS thread=0x23450100 key=259 disp=2072 got=0x23450101 expected=0x23450101
+TLS thread=0x23450100 key=260 disp=2080 got=0x23450102 expected=0x23450102
+TLS thread=0x23450100 key=261 disp=2088 got=0x23450103 expected=0x23450103
 9-byte GS load and per-thread isolation passed
 RESULT tls: PASS (exit 0)
 
@@ -62,9 +62,9 @@ RESULT aliases: PASS (exit 0)
 
 === protection ===
 reserved [0x7000000000, 0x10000000000): 576 GiB PROT_NONE
-protect 4096: signal=10 (Bus error: 10) code=2 RIP=0x1041b85b0 expected=0x1041b85b0 address=0x7000001000 resumed=42
+protect 4096: signal=10 (Bus error: 10) code=2 RIP=0x10037e5b0 expected=0x10037e5b0 address=0x7000001000 resumed=42
 Darwin __es.__err=0x6 write-bit=1
-protect 16384: signal=10 (Bus error: 10) code=2 RIP=0x1041b85b0 expected=0x1041b85b0 address=0x7000004000 resumed=42
+protect 16384: signal=10 (Bus error: 10) code=2 RIP=0x10037e5b0 expected=0x10037e5b0 address=0x7000004000 resumed=42
 Darwin __es.__err=0x6 write-bit=1
 RESULT protection: PASS (exit 0)
 
@@ -84,21 +84,21 @@ RESULT exec_shared_rwx: SIGNAL 10 (Bus error: 10)
 
 === exec_shared_rx ===
 reserved [0x7000000000, 0x10000000000): 576 GiB PROT_NONE
-FAIL tests/macos_spike/spike.c:143: mprotect(p,65536,PROT_READ|PROT_EXEC)==0 (errno=13 Permission denied)
+FAIL tests/macos_spike/spike.c:144: mprotect(p,65536,PROT_READ|PROT_EXEC)==0 (errno=13 Permission denied)
 RESULT exec_shared_rx: FAIL (exit 1)
 
 === exec_alias ===
 reserved [0x7000000000, 0x10000000000): 576 GiB PROT_NONE
-FAIL tests/macos_spike/spike.c:143: mprotect(p,65536,PROT_READ|PROT_EXEC)==0 (errno=13 Permission denied)
+FAIL tests/macos_spike/spike.c:144: mprotect(p,65536,PROT_READ|PROT_EXEC)==0 (errno=13 Permission denied)
 RESULT exec_alias: FAIL (exit 1)
 
 === allocations ===
-malloc(16)=0x7fa34d905a70 below 1 TiB=no
-malloc(256)=0x7fa34d905ac0 below 1 TiB=no
-malloc(4096)=0x7fa34e808600 below 1 TiB=no
-malloc(16384)=0x7fa34e809600 below 1 TiB=no
-malloc(1048576)=0x7fa350008000 below 1 TiB=no
-malloc(16777216)=0x7fa34f000000 below 1 TiB=no
+malloc(16)=0x7fc590f06630 below 1 TiB=no
+malloc(256)=0x7fc590f06690 below 1 TiB=no
+malloc(4096)=0x7fc591008c00 below 1 TiB=no
+malloc(16384)=0x7fc591009c00 below 1 TiB=no
+malloc(1048576)=0x7fc598008000 below 1 TiB=no
+malloc(16777216)=0x7fc593000000 below 1 TiB=no
 mmap hint=0x7000000000 below 1 TiB=yes
 explicit low mmap=0x7000000000 writable=42
 RESULT allocations: PASS (exit 0)
@@ -112,11 +112,18 @@ RESULT cpuid: PASS (exit 0)
 === avx ===
 RESULT avx: PASS (exit 0)
 
+=== avx_fault_state ===
+All 16 YMM registers retain 256 bits across SIGBUS/mprotect/retry despite vzeroall in handler
+RESULT avx_fault_state: PASS (exit 0)
+
 === f16c ===
 RESULT f16c: PASS (exit 0)
 
 === bmi1 ===
 RESULT bmi1: PASS (exit 0)
+
+=== bmi1_bextr ===
+RESULT bmi1_bextr: PASS (exit 0)
 
 === sse41 ===
 RESULT sse41: PASS (exit 0)
