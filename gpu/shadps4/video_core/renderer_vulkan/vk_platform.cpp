@@ -25,9 +25,6 @@
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 
-#ifdef __APPLE__
-#include <mach-o/dyld.h>
-#endif
 
 namespace Vulkan {
 
@@ -160,7 +157,11 @@ static auto GetLayerExtensions(std::vector<const char*>&& extensions,
 std::vector<const char*> GetInstanceExtensions(Frontend::WindowSystemType window_type,
                                                bool enable_debug_utils) {
     const auto [properties_result, properties] = vk::enumerateInstanceExtensionProperties();
-    if (properties_result != vk::Result::eSuccess || properties.empty()) {
+    if (properties_result != vk::Result::eSuccess
+#ifndef __APPLE__
+        || properties.empty()
+#endif
+    ) {
         LOG_ERROR(Render_Vulkan, "Failed to query extension properties: {}",
                   vk::to_string(properties_result));
         return {};
@@ -229,7 +230,11 @@ std::vector<const char*> GetInstanceExtensions(Frontend::WindowSystemType window
 
 std::vector<const char*> GetInstanceLayers(bool enable_validation, bool enable_crash_diagnostic) {
     const auto [properties_result, properties] = vk::enumerateInstanceLayerProperties();
-    if (properties_result != vk::Result::eSuccess || properties.empty()) {
+    if (properties_result != vk::Result::eSuccess
+#ifndef __APPLE__
+        || properties.empty()
+#endif
+    ) {
         LOG_ERROR(Render_Vulkan, "Failed to query layer properties: {}",
                   vk::to_string(properties_result));
         return {};
@@ -251,6 +256,9 @@ std::vector<const char*> GetInstanceLayers(bool enable_validation, bool enable_c
             return std::strcmp(layer, prop.layerName) == 0;
         });
         if (it == properties.end()) {
+#ifdef __APPLE__
+            UNREACHABLE_MSG("Requested Vulkan layer {} is not available", layer);
+#endif
             LOG_ERROR(Render_Vulkan, "Requested layer {} is not available", layer);
             return true;
         }
@@ -265,26 +273,10 @@ vk::UniqueInstance CreateInstance(Frontend::WindowSystemType window_type, bool e
     LOG_INFO(Render_Vulkan, "Creating vulkan instance");
 
 #if defined(__APPLE__)
-    // Respect explicit ICD selection; otherwise prefer a bundled ICD if one exists.
-    if (!std::getenv("VK_DRIVER_FILES") && !std::getenv("VK_ICD_FILENAMES")) {
-        u32 length = 1024;
-        std::vector<char> path(length);
-        if (_NSGetExecutablePath(path.data(), &length) != 0) {
-            path.resize(length);
-        }
-        if (_NSGetExecutablePath(path.data(), &length) == 0) {
-            const auto executable_dir = std::filesystem::path(path.data()).parent_path();
-            for (const auto& icd_path : {
-                     executable_dir / "MoltenVK_icd.json",
-                     executable_dir / "../Resources/vulkan/icd.d/MoltenVK_icd.json"}) {
-                std::error_code error;
-                if (std::filesystem::is_regular_file(icd_path, error)) {
-                    setenv("VK_DRIVER_FILES", icd_path.c_str(), false);
-                    break;
-                }
-            }
-        }
-    }
+    const char* icd = std::getenv("VK_DRIVER_FILES");
+    ASSERT_MSG(icd && *icd && std::filesystem::is_regular_file(icd),
+               "macOS requires VK_DRIVER_FILES pointing to the MoltenVK ICD manifest; "
+               "run through build.sh/run.sh with BB_DEPS_PREFIX configured");
 #endif
 
     static vk::detail::DynamicLoader dl;
