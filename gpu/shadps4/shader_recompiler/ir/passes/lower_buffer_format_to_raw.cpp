@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "shader_recompiler/info.h"
+#include "shader_recompiler/profile.h"
 #include "shader_recompiler/ir/basic_block.h"
 #include "shader_recompiler/ir/ir_emitter.h"
 #include "shader_recompiler/ir/program.h"
@@ -189,11 +190,21 @@ static void StoreBufferFormat(IR::IREmitter& ir, const IR::Value handle, const I
     }
 }
 
-static void LowerBufferFormatInst(IR::Block& block, IR::Inst& inst, Info& info) {
+static void LowerBufferFormatInst(IR::Block& block, IR::Inst& inst, Info& info, const Profile& profile) {
     IR::IREmitter ir{block, IR::Block::InstructionList::s_iterator_to(inst)};
     const auto flags = inst.Flags<IR::BufferInstInfo>();
     const auto desc{info.buffers[inst.Arg(0).U32()]};
     const auto buffer{desc.GetSharp(info)};
+    if (profile.emulate_null_descriptors && !desc.IsSpecial() &&
+        (buffer.base_address == 0 || buffer.GetSize() == 0)) {
+        if (IsBufferFormatLoad(inst)) {
+            inst.ReplaceUsesWithAndRemove(
+                ir.CompositeConstruct(ir.Imm32(0.f), ir.Imm32(0.f), ir.Imm32(0.f), ir.Imm32(0.f)));
+        } else {
+            inst.Invalidate();
+        }
+        return;
+    }
 
     const auto is_inst_typed = flags.inst_data_fmt != AmdGpu::DataFormat::FormatInvalid;
     const auto data_format =
@@ -233,12 +244,12 @@ static void LowerBufferFormatInst(IR::Block& block, IR::Inst& inst, Info& info) 
     }
 }
 
-void LowerBufferFormatToRaw(IR::Program& program) {
+void LowerBufferFormatToRaw(IR::Program& program, const Profile& profile) {
     auto& info = program.info;
     for (IR::Block* const block : program.blocks) {
         for (IR::Inst& inst : block->Instructions()) {
             if (IsBufferFormatLoad(inst) || IsBufferFormatStore(inst)) {
-                LowerBufferFormatInst(*block, inst, info);
+                LowerBufferFormatInst(*block, inst, info, profile);
             }
         }
     }

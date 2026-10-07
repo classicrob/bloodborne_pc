@@ -349,6 +349,7 @@ public:
     struct BufferDefinition {
         u32 binding;
         BufferType buffer_type;
+        bool is_null = false;
         std::array<Id, u32(PointerSize::NumClass)> offsets;
         std::array<BufferSpv, u32(PointerType::NumAlias)> aliases;
 
@@ -362,6 +363,15 @@ public:
             return self.offsets[u32(size)];
         }
     };
+
+    Id BufferRead(u32 handle, PointerType, Id, Id, Id type, auto&& read, u32 = 0) {
+        if (buffers[handle].is_null) return ConstantNull(type);
+        return read();
+    }
+
+    void BufferWrite(u32 handle, PointerType, Id, Id, auto&& write, u32 = 0) {
+        if (!buffers[handle].is_null) write();
+    }
 
     Bindings& binding;
     boost::container::small_vector<Id, 16> buf_type_ids;
@@ -389,6 +399,7 @@ public:
         bool is_integer{};
         bool is_loaded{};
         bool is_array{};
+        bool is_null{};
     };
     Id input_attr_array;
     Id output_attr_array;

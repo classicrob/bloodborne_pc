@@ -14,6 +14,7 @@
 namespace Shader {
 
 struct VsAttribSpecialization {
+    bool is_null{};
     u32 divisor{};
     AmdGpu::NumberClass num_class{};
     AmdGpu::CompMapping dst_select{};
@@ -90,16 +91,21 @@ struct StageSpecialization {
     boost::container::small_vector<FMaskSpecialization, 8> fmasks;
     boost::container::small_vector<SamplerSpecialization, 16> samplers;
     Backend::Bindings start{};
+    bool emulate_null_descriptors{};
 
     StageSpecialization() = default;
     StageSpecialization(const Info& info_, RuntimeInfo runtime_info_, const Profile& profile_,
                         Backend::Bindings start_)
-        : info{&info_}, runtime_info{runtime_info_}, start{start_} {
+        : info{&info_}, runtime_info{runtime_info_}, start{start_},
+          emulate_null_descriptors{profile_.emulate_null_descriptors} {
         fetch_shader_data = Gcn::ParseFetchShader(info_);
         if (info_.sw_stage == SwStage::Vertex && fetch_shader_data) {
             // Specialize shader on VS input number types to follow spec.
             ForEachSharp(vs_attribs, fetch_shader_data->attributes,
                          [this](auto& spec, const auto& desc, AmdGpu::Buffer sharp) {
+                             spec.is_null = emulate_null_descriptors &&
+                                            (sharp.base_address == 0 || sharp.GetSize() == 0);
+                             if (spec.is_null) return;
                              using InstanceIdType = Shader::Gcn::VertexAttribute::InstanceIdType;
                              if (const auto step_rate = desc.GetStepRate();
                                  step_rate != InstanceIdType::None) {
@@ -168,7 +174,7 @@ struct StageSpecialization {
         for (const auto& desc : desc_list) {
             auto& spec = spec_list.emplace_back();
             const auto sharp = desc.GetSharp(*info);
-            if (!sharp) {
+            if (!sharp && !emulate_null_descriptors) {
                 continue;
             }
             func(spec, desc, sharp);
@@ -179,6 +185,19 @@ struct StageSpecialization {
         for (const auto& desc : desc_list) {
             auto& spec = spec_list.emplace_back();
             const auto sharp = desc.GetSharp(*info);
+            if (emulate_null_descriptors) {
+                if constexpr (std::is_same_v<std::remove_cvref_t<decltype(sharp)>, AmdGpu::Buffer>) {
+                    if (sharp.base_address == 0 || sharp.GetSize() == 0) {
+                        binding++;
+                        continue;
+                    }
+                } else if constexpr (std::is_same_v<std::remove_cvref_t<decltype(sharp)>, AmdGpu::Image>) {
+                    if (sharp.Address() == 0 || sharp.GetDataFmt() == AmdGpu::DataFormat::FormatInvalid) {
+                        binding++;
+                        continue;
+                    }
+                }
+            }
             if (!sharp) {
                 binding++;
                 continue;
@@ -194,6 +213,11 @@ struct StageSpecialization {
 
     bool operator==(const StageSpecialization& other) const {
         if (!Valid()) {
+            return false;
+        }
+
+        if (emulate_null_descriptors != other.emulate_null_descriptors ||
+            (emulate_null_descriptors && bitset != other.bitset)) {
             return false;
         }
 
