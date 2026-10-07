@@ -72,6 +72,14 @@ public:
         return allocator;
     }
 
+    bool EmulatesNullDescriptors() const {
+#ifdef __APPLE__
+        return emulate_null_descriptors;
+#else
+        return false;
+#endif
+    }
+
     /// Returns a list of the available physical devices
     std::span<const vk::PhysicalDevice> GetPhysicalDevices() const {
         return physical_devices;
@@ -498,6 +506,7 @@ public:
     [[nodiscard]] bool IsFormatSupported(vk::Format format, vk::FormatFeatureFlags2 flags) const;
 
 private:
+    bool emulate_null_descriptors{};
     Instance(const Frontend::WindowSystemInfo&, s32, bool, bool);
     /// Creates the logical device opportunistically enabling extensions
     bool CreateDevice();

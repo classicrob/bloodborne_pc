@@ -285,8 +285,12 @@ bool Instance::CreateDevice() {
 #endif
     ASSERT_MSG(robustness2_features.robustImageAccess2,
                "Required Vulkan feature unavailable: robustImageAccess2");
+#ifndef __APPLE__
     ASSERT_MSG(robustness2_features.nullDescriptor,
                "Required Vulkan feature unavailable: nullDescriptor");
+#else
+    emulate_null_descriptors = !robustness2_features.nullDescriptor;
+#endif
 
     // Optional
     maintenance_5 = add_extension(VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
@@ -511,7 +515,7 @@ bool Instance::CreateDevice() {
             .robustBufferAccess2 = true,
 #endif
             .robustImageAccess2 = true,
-            .nullDescriptor = true,
+            .nullDescriptor = robustness2_features.nullDescriptor,
         },
         vk::PhysicalDeviceVertexInputDynamicStateFeaturesEXT{
             .vertexInputDynamicState = true,
