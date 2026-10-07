@@ -4,6 +4,7 @@
 #include <SDL3/SDL.h>
 #ifdef __APPLE__
 #include <SDL3/SDL_metal.h>
+#include <pthread.h>
 #endif
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -13,6 +14,9 @@
 namespace Frontend {
 
 WindowSDL::WindowSDL(s32 width_, s32 height_, const char* title) : width{width_}, height{height_} {
+#ifdef __APPLE__
+    ASSERT_MSG(pthread_main_np(), "SDL video must be initialized on the process main thread");
+#endif
     // Gamepads are sampled by runtime_pad.c; their events are pumped here with the window's.
     if (!SDL_InitSubSystem(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) {
         UNREACHABLE_MSG("Failed to initialize SDL video: {}", SDL_GetError());
@@ -76,6 +80,7 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, const char* title) : width{width_}
 
 WindowSDL::~WindowSDL() {
 #ifdef __APPLE__
+    ASSERT_MSG(pthread_main_np(), "Metal view must be destroyed on the process main thread");
     SDL_Metal_DestroyView(metal_view);
 #endif
     SDL_DestroyWindow(window);
@@ -103,6 +108,9 @@ void WindowSDL::UpdateTextTitle() {
 }
 
 bool WindowSDL::PollEvents() {
+#ifdef __APPLE__
+    ASSERT_MSG(pthread_main_np(), "SDL events must be pumped on the process main thread");
+#endif
     {
         std::scoped_lock lock{text_mutex};
         if (text_requested) { // SDL text input must be toggled from the window thread
