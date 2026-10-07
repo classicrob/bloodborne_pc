@@ -1,6 +1,9 @@
 # bbport GPU library: shadPS4 video core + shader recompiler + Gnm/VideoOut
 # drivers, adapted to the native_probe runtime through shims in shim/.
 cmake_minimum_required(VERSION 3.24)
+if (APPLE AND NOT DEFINED CMAKE_OSX_ARCHITECTURES)
+    set(CMAKE_OSX_ARCHITECTURES x86_64 CACHE STRING "bbport guest execution architecture")
+endif()
 project(bbgpu LANGUAGES C CXX)
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -63,7 +66,7 @@ endif()
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(XXHASH REQUIRED IMPORTED_TARGET libxxhash)
 pkg_check_modules(SDL3 REQUIRED IMPORTED_TARGET sdl3)
-if (NOT WIN32)
+if (NOT WIN32 AND NOT APPLE)
     pkg_check_modules(X11 REQUIRED IMPORTED_TARGET x11)
 endif()
 find_package(miniz QUIET)
@@ -169,7 +172,14 @@ target_include_directories(bbgpu PRIVATE shim shadps4 ${SHADER_INCLUDE} third_pa
 target_compile_definitions(bbgpu PRIVATE BOOST_ASIO_STANDALONE NDEBUG)
 target_compile_options(bbgpu PRIVATE -Wno-deprecated-declarations -Wno-missing-field-initializers)
 # Runtime symbols (runtime_memory_*, runtime_process_*) resolve against bb-probe.
-if (NOT WIN32)
+if (APPLE)
+    target_link_options(bbgpu PRIVATE -Wl,-undefined,dynamic_lookup)
+    target_sources(bbgpu INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/../src/macos_ui.c)
+    target_link_options(bbgpu INTERFACE -Wl,-export_dynamic)
+    set_target_properties(bbgpu PROPERTIES INSTALL_NAME_DIR "@rpath"
+        BUILD_WITH_INSTALL_NAME_DIR ON BUILD_RPATH "@loader_path"
+        INSTALL_RPATH "@loader_path")
+elseif (NOT WIN32)
     target_link_options(bbgpu PRIVATE -Wl,--allow-shlib-undefined)
 endif()
 target_link_libraries(bbgpu PRIVATE ffx-vulkan::portable ffx-vulkan::fsr4-v07-vulkan)
@@ -182,7 +192,7 @@ if (WIN32)
     target_compile_options(bbgpu PRIVATE -include ${CMAKE_CURRENT_SOURCE_DIR}/shim/bb_win_compat.h)
     target_include_directories(bbgpu PRIVATE third_party/xbyak)
     target_link_libraries(bbgpu PUBLIC Vulkan::Vulkan ws2_32 bcrypt ntdll synchronization winmm)
-else()
+elseif (NOT APPLE)
     target_link_libraries(bbgpu PUBLIC PkgConfig::X11)
 endif()
 
