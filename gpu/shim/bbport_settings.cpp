@@ -132,6 +132,18 @@ void Load() {
 
 void ConfigureUpscalerSupport(bool fsr4, bool fsr411) {
     auto& v = Get();
+#ifdef __APPLE__
+    (void)fsr4;
+    (void)fsr411;
+    v.fsr4_supported = false;
+    v.fsr411_supported = false;
+    const int requested = v.upscaler;
+    if (requested == UpscalerFsr4 || requested == UpscalerFsr411) {
+        std::fprintf(stderr, "macOS does not support the selected %s upscaler shaders\n",
+                     UpscalerName(requested));
+        std::abort();
+    }
+#else
     v.fsr4_supported = fsr4;
     v.fsr411_supported = fsr4 && fsr411;
     const int requested = v.upscaler;
@@ -142,6 +154,7 @@ void ConfigureUpscalerSupport(bool fsr4, bool fsr411) {
                     UpscalerName(requested));
         v.upscaler = UpscalerFsr3;
     }
+#endif
 }
 
 bool FixedRenderSession() {
