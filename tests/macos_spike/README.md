@@ -34,6 +34,8 @@ Apple M4 Max, Darwin 27.0.0, Apple Clang 21.0.0. `sysctl.proc_translated=1`,
 | Low mmap | Hint and fixed low mappings work | Below-1-TiB allocations are possible |
 | SSE4.1, SSE4.2, AES, POPCNT | CPUID advertises; representative instructions execute and results match | Basic ISA probes pass |
 | AVX (256-bit), F16C, BMI1, LZCNT | CPUID hides; representative instructions execute and results match | CPUID alone understates these observed capabilities; not an exhaustive ISA test |
+| AVX signal state | All 16 YMM registers preserve full 256 bits across SIGBUS despite `vzeroall` in handler | Tested fault/retry preserves vector state |
+| BMI1 BEXTR | Extracted value and zero flag match | Instruction present in real eboot allocation code works |
 | SSE4a EXTRQ and INSERTQ | CPUID absent, both tested immediate forms SIGILL | Guest use requires a patch/emulation path |
 
 The shared-code alias probe fails while adding execute permission, so it says
@@ -70,8 +72,8 @@ game needs it must be answered by a real executable scan or a SIGILL trace.
 [FFmpeg's x86 CPU detection](https://github.com/FFmpeg/FFmpeg/blob/master/libavutil/x86/cpu.c)
 gates AVX on CPUID and OS extended-state support. With this spike's hidden bits,
 normal detection should choose older implementations. Do not force global AVX
-flags from these few instruction probes; execution and signal-state preservation
-have not been tested across the full instruction family.
+flags from these few instruction probes; execution has not been tested across the full instruction family. The targeted
+SIGBUS test preserves all sixteen full YMM registers.
 
 ## Runtime integration regression
 

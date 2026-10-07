@@ -101,7 +101,7 @@ static void aliases(void) {
     CHECK(*(volatile uint64_t *)(896*GIB)==42);
     puts("16 KiB and 4 KiB mprotect; 4 KiB shared offset mapping passed"); close(fd);
 }
-static volatile sig_atomic_t seen_signal, seen_code, fault_count;
+static volatile sig_atomic_t seen_signal, seen_code, fault_count, clobber_vectors;
 static volatile uintptr_t seen_rip, seen_address, seen_err;
 static void *fault_page;
 static size_t fault_size;
@@ -110,6 +110,7 @@ static void fault_handler(int sig, siginfo_t *info, void *context) {
     seen_signal=sig; seen_code=info->si_code; seen_err=uc->uc_mcontext->__es.__err;
     seen_rip=uc->uc_mcontext->__ss.__rip; seen_address=(uintptr_t)info->si_addr;
     if (++fault_count>1 || mprotect(fault_page,fault_size,PROT_READ|PROT_WRITE)) _exit(91);
+    if (clobber_vectors) __asm__ volatile("vzeroall" ::: "xmm0","xmm1","xmm2","xmm3","xmm4","xmm5","xmm6","xmm7","xmm8","xmm9","xmm10","xmm11","xmm12","xmm13","xmm14","xmm15");
 }
 static void install_handler(void) {
     struct sigaction sa={0}; sa.sa_sigaction=fault_handler; sa.sa_flags=SA_SIGINFO;
@@ -223,6 +224,59 @@ static void mach_thread_state(void) {
     state_done=1; pthread_cond_signal(&state_cond); pthread_mutex_unlock(&state_lock);
     CHECK(pthread_join(worker,NULL)==0); CHECK(kr==KERN_SUCCESS);
 }
+extern void avx_fault_store(void *,void *,const void *);
+extern const unsigned char avx_fault_instruction[];
+__asm__(".text\n.globl _avx_fault_store\n_avx_fault_store:\n"
+        " vmovdqu (%rdx),%ymm0\n"
+        " vmovdqu (%rdx),%ymm1\n"
+        " vmovdqu (%rdx),%ymm2\n"
+        " vmovdqu (%rdx),%ymm3\n"
+        " vmovdqu (%rdx),%ymm4\n"
+        " vmovdqu (%rdx),%ymm5\n"
+        " vmovdqu (%rdx),%ymm6\n"
+        " vmovdqu (%rdx),%ymm7\n"
+        " vmovdqu (%rdx),%ymm8\n"
+        " vmovdqu (%rdx),%ymm9\n"
+        " vmovdqu (%rdx),%ymm10\n"
+        " vmovdqu (%rdx),%ymm11\n"
+        " vmovdqu (%rdx),%ymm12\n"
+        " vmovdqu (%rdx),%ymm13\n"
+        " vmovdqu (%rdx),%ymm14\n"
+        " vmovdqu (%rdx),%ymm15\n"
+        ".globl _avx_fault_instruction\n_avx_fault_instruction:\n movb $42,(%rdi)\n"
+        " vmovdqu %ymm0,0(%rsi)\n"
+        " vmovdqu %ymm1,32(%rsi)\n"
+        " vmovdqu %ymm2,64(%rsi)\n"
+        " vmovdqu %ymm3,96(%rsi)\n"
+        " vmovdqu %ymm4,128(%rsi)\n"
+        " vmovdqu %ymm5,160(%rsi)\n"
+        " vmovdqu %ymm6,192(%rsi)\n"
+        " vmovdqu %ymm7,224(%rsi)\n"
+        " vmovdqu %ymm8,256(%rsi)\n"
+        " vmovdqu %ymm9,288(%rsi)\n"
+        " vmovdqu %ymm10,320(%rsi)\n"
+        " vmovdqu %ymm11,352(%rsi)\n"
+        " vmovdqu %ymm12,384(%rsi)\n"
+        " vmovdqu %ymm13,416(%rsi)\n"
+        " vmovdqu %ymm14,448(%rsi)\n"
+        " vmovdqu %ymm15,480(%rsi)\n"
+        " vzeroupper\n ret\n");
+static void avx_fault_state(void) {
+    install_handler();
+    fault_size=4096; fault_page=map_at(0,4096,PROT_READ); clobber_vectors=1;
+    uint32_t pattern[8]={0x12345678,0xabcdef01,0x31415926,0,0x80000000,0x98765432,0xffffffff,0x10203040};
+    uint32_t out[16][8]; memset(out,0,sizeof(out));
+    avx_fault_store(fault_page,out,pattern);
+    CHECK(fault_count==1 && seen_rip==(uintptr_t)avx_fault_instruction);
+    for(unsigned i=0;i<16;i++) CHECK(!memcmp(out[i],pattern,sizeof(pattern)));
+    puts("All 16 YMM registers retain 256 bits across SIGBUS/mprotect/retry despite vzeroall in handler");
+}
+static void bmi1_bextr(void) {
+    uint64_t in=0x123456789abcdef0,control=0x0808,out;
+    unsigned char z;
+    __asm__ volatile("bextr %3,%2,%0; setz %1":"=r"(out),"=qm"(z):"r"(in),"r"(control):"cc");
+    CHECK(out==0xde && z==0);
+}
 static int run(const char *name,void (*fn)(void)) {
     printf("\n=== %s ===\n",name); fflush(NULL);
     pid_t pid=fork(); CHECK(pid>=0);
@@ -241,6 +295,6 @@ int main(int argc,char **argv) {
     int failed=0;
 #define RUN(f) failed+=run(#f,f)
     RUN(tls); RUN(reservation_survey); RUN(mach_ranges); RUN(mach_thread_state); RUN(aliases); RUN(protection); RUN(exec_rwx); RUN(exec_rx); RUN(exec_shared_rwx); RUN(exec_shared_rx); RUN(exec_alias); RUN(allocations); RUN(cpuid);
-    RUN(avx); RUN(f16c); RUN(bmi1); RUN(sse41); RUN(sse42); RUN(aes); RUN(popcnt); RUN(lzcnt); RUN(sse4a_extrq); RUN(sse4a_insertq);
+    RUN(avx); RUN(avx_fault_state); RUN(f16c); RUN(bmi1); RUN(bmi1_bextr); RUN(sse41); RUN(sse42); RUN(aes); RUN(popcnt); RUN(lzcnt); RUN(sse4a_extrq); RUN(sse4a_insertq);
     printf("\n%d probes failed\n",failed); return failed ? 1 : 0;
 }
