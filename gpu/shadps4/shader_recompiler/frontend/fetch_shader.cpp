@@ -4,6 +4,7 @@
 #include <cstring>
 #include <unordered_map>
 #include <vector>
+#include <xxhash.h>
 #include "bbport_toggles.h"
 #include "common/assert.h"
 #include "shader_recompiler/frontend/decode.h"
@@ -126,6 +127,8 @@ std::optional<FetchShaderData> ParseFetchShader(const Shader::Info& info) {
             }
         }
     }
+
+    data.code_hash = XXH3_64bits(code, data.size);
 
     if (cache.size() >= 4096) {
         cache.clear();

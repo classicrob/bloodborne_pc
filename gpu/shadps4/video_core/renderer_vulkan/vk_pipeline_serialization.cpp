@@ -12,9 +12,9 @@
 
 namespace Serialization {
 /* You should increment versions below once corresponding serialization scheme is changed. */
-static constexpr u32 ShaderBinaryVersion = 9u; // Explicit guest buffer bounds and scalar clamp semantics.
-static constexpr u32 ShaderMetaVersion = 7u; // bbport: ImageResource::needs_native
-static constexpr u32 PipelineKeyVersion = 7u; // MUBUF format validity and add-thread-ID specialization.
+static constexpr u32 ShaderBinaryVersion = 10u; // Explicit guest buffer bounds and scalar clamp semantics.
+static constexpr u32 ShaderMetaVersion = 8u; // bbport: ImageResource::needs_native
+static constexpr u32 PipelineKeyVersion = 8u; // MUBUF format validity and add-thread-ID specialization.
 } // namespace Serialization
 
 namespace Vulkan {
@@ -415,9 +415,10 @@ bool Info::Deserialize(Serialization::Archive& ar) {
 
 void Gcn::FetchShaderData::Serialize(Serialization::Archive& ar) const {
     Serialization::Writer fetch{ar};
-    ar.Grow(6 + attributes.size() * sizeof(VertexAttribute));
+    ar.Grow(14 + attributes.size() * sizeof(VertexAttribute));
 
     fetch.Write(size);
+    fetch.Write(code_hash);
     fetch.Write(vertex_offset_sgpr);
     fetch.Write(instance_offset_sgpr);
     fetch.Write(attributes);
@@ -427,6 +428,7 @@ bool Gcn::FetchShaderData::Deserialize(Serialization::Archive& ar) {
     Serialization::Reader fetch{ar};
 
     fetch.Read(size);
+    fetch.Read(code_hash);
     fetch.Read(vertex_offset_sgpr);
     fetch.Read(instance_offset_sgpr);
     fetch.Read(attributes);
@@ -465,6 +467,7 @@ void StageSpecialization::Serialize(Serialization::Archive& ar) const {
     spec.Write(bitset.to_string());
     spec.Write(emulate_null_descriptors);
     spec.Write(emulate_robust_buffer_access);
+    spec.Write(emulate_vertex_fetch);
 
     if (fetch_shader_data) {
         spec.Write(sizeof(*fetch_shader_data));
@@ -491,6 +494,7 @@ bool StageSpecialization::Deserialize(Serialization::Archive& ar) {
     bitset = std::bitset<MaxStageResources>(bits);
     spec.Read(emulate_null_descriptors);
     spec.Read(emulate_robust_buffer_access);
+    spec.Read(emulate_vertex_fetch);
 
     u64 fetch_data_size{};
     spec.Read(fetch_data_size);
