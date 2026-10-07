@@ -4,6 +4,8 @@
  * Windows: a pagefile-backed section plays the memfd's part, and the PS4 user range is
  * reserved as one placeholder that views of the section replace (VirtualAlloc2/MapViewOfFile3,
  * as shadPS4 does); see the "host mappings" section below.
+ * macOS: shared Mach views of anonymous backing memory replace reserved arena
+ * pages; released backing ranges are replaced with fresh zero-filled objects.
  * Guest addresses are placed below 1 TiB (PS4 user range): GPU descriptors
  * encode 40-bit addresses, so host-default 0x7f... addresses would not fit. */
 #define _GNU_SOURCE
@@ -16,6 +18,10 @@
 #include <pthread.h>
 #include <time.h>
 #include <errno.h>
+#ifdef __APPLE__
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
+#endif
 #ifdef _WIN32
 #include <windows.h>
 #else
@@ -38,7 +44,15 @@ static uint64_t pool_size_bytes(void) {
 #define POOL_SIZE pool_size_bytes()
 #define FLEXIBLE_SIZE (UINT64_C(448) * 1024 * 1024)
 #define PAGE UINT64_C(16384)
+#define LOW_MIN UINT64_C(0x0800000000)
+#ifdef __APPLE__
+/* Rosetta reserves [63 GiB,448 GiB) as an immutable guard. */
+#define LOW_MAX UINT64_C(0x0fc0000000)
+#define USER_MIN UINT64_C(0x7000000000)
+#else
 #define USER_MIN UINT64_C(0x1000000000)
+#define LOW_MAX USER_MIN
+#endif
 #define USER_MAX UINT64_C(0xfc00000000)
 #define LIMIT 4096
 #define INVALID ((int32_t)UINT32_C(0x80020016))
@@ -77,7 +91,7 @@ static void read_lock(void) { if (!exclusive_depth) pthread_rwlock_rdlock(&lock)
 static void read_unlock(void) { if (!exclusive_depth) pthread_rwlock_unlock(&lock); }
 static Block blocks[LIMIT];
 static Vma *vmas; static size_t vma_count, vma_capacity;
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__APPLE__)
 static int pool_fd=-1;
 #endif
 static unsigned char *backing_base; /* second view of the pool: host writes bypass guest/GPU page protection */
@@ -241,6 +255,66 @@ static int pool(void) {
     backing_base=MapViewOfFile3(section,GetCurrentProcess(),NULL,0,bytes,0,PAGE_READWRITE,NULL,0);
     return backing_base ? 0 : -1;
 }
+#elif defined(__APPLE__)
+/* Anonymous Mach objects permit executable shared views under Rosetta; POSIX
+ * shm objects can be mapped RWX but fault when their contents are executed. */
+static pthread_once_t reserve_once=PTHREAD_ONCE_INIT;
+static void mac_fail(const char *what, uintptr_t address, uint64_t size, int error) {
+    fprintf(stderr,"STOP: %s at %p (+0x%" PRIx64 "), error %d\n",what,(void *)address,size,error);
+    exit(21);
+}
+static void reserve_arena(uintptr_t start, uint64_t size) {
+    mach_vm_address_t address=start;
+    kern_return_t error=mach_vm_allocate(mach_task_self(),&address,size,VM_FLAGS_FIXED);
+    if (error!=KERN_SUCCESS) mac_fail("reserving low address arena",start,size,error);
+    error=mach_vm_protect(mach_task_self(),address,size,FALSE,VM_PROT_NONE);
+    if (error!=KERN_SUCCESS) mac_fail("protecting low address arena",start,size,error);
+}
+static void reserve_arenas(void) {
+    long page=sysconf(_SC_PAGESIZE);
+    if (page<=0 || PAGE%(uint64_t)page) mac_fail("unsupported host page size",0,PAGE,(int)page);
+    /* Fixed Mach allocation refuses overlaps; never overwrite an existing host
+     * mapping just to obtain the arena. Only our reserved pages use MAP_FIXED. */
+    reserve_arena(LOW_MIN,LOW_MAX-LOW_MIN);
+    reserve_arena(USER_MIN,USER_MAX-USER_MIN);
+}
+void runtime_memory_reserve(void) { pthread_once(&reserve_once,reserve_arenas); }
+static int pool(void) {
+    if (backing_base) return 0;
+    runtime_memory_reserve();
+    void *view=mmap(NULL,POOL_SIZE+FLEX_SPAN,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
+    if (view==MAP_FAILED) return -1;
+    backing_base=view;
+    return 0;
+}
+static int host_unmap(uintptr_t address, uint64_t size) {
+    if (address<USER_MIN || address>=USER_MAX || size>USER_MAX-address) return -1;
+    /* Keep the reservation so host allocations cannot occupy guest holes. */
+    return mmap((void *)address,size,PROT_NONE,MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED,-1,0)==MAP_FAILED ? -1 : 0;
+}
+static int host_map(uintptr_t address, uint64_t size, int prot, int reserved, uint64_t phys) {
+    runtime_memory_reserve();
+    if (address<USER_MIN || address>=USER_MAX || size>USER_MAX-address) return -1;
+    if (reserved) return host_unmap(address,size);
+    mach_vm_address_t target=address;
+    vm_prot_t current, maximum;
+    kern_return_t error=mach_vm_remap(mach_task_self(),&target,size,0,VM_FLAGS_FIXED|VM_FLAGS_OVERWRITE,
+        mach_task_self(),(mach_vm_address_t)(backing_base+phys),FALSE,&current,&maximum,VM_INHERIT_NONE);
+    if (error!=KERN_SUCCESS) return -1;
+    if (mprotect((void *)address,size,prot)) {
+        /* Losing a replaced mapping would leave the table inconsistent. */
+        mac_fail("protecting shared guest view",address,size,errno);
+    }
+    return 0;
+}
+static int host_protect(uintptr_t address, uint64_t size, int prot) { return mprotect((void *)address,size,prot); }
+static void host_discard(uint64_t phys, uint64_t size) {
+    /* All guest aliases of these pages have been removed. Replacing the host
+     * backing pages releases physical storage and guarantees zero on reuse,
+     * without touching gigabytes of previously uncommitted pages. */
+    if (mmap(backing_base+phys,size,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED,-1,0)==MAP_FAILED)
+        mac_fail("discarding guest backing pages",(uintptr_t)(backing_base+phys),size,errno);
+}
 #else
 /* Direct memory occupies [0,POOL_SIZE) of the memfd, flexible memory [POOL_SIZE,+FLEX_SPAN). */
 static int pool(void) {
@@ -324,7 +398,7 @@ static int split_at(uintptr_t a) {
     if (i==vma_count || vmas[i].start>=a) return 0;
     Vma right=vmas[i];
     right.start=a;
-    if (right.kind==KIND_DIRECT) right.phys+=a-vmas[i].start;
+    if (right.kind!=KIND_RESERVED) right.phys+=a-vmas[i].start;
     vmas[i].end=a;
     return vma_insert(i+1,right);
 }
@@ -348,8 +422,9 @@ static int overlaps(uintptr_t start, uintptr_t end, int ignore_reserved) {
 }
 /* First-fit search in the PS4 user range, starting from the hint. */
 static uintptr_t find_free(uintptr_t hint, uint64_t size, uint64_t alignment) {
+    if (hint>=USER_MAX || size>USER_MAX-USER_MIN) return 0;
     uintptr_t at=align_up(hint<USER_MIN ? USER_MIN : hint, alignment);
-    for (size_t i=vma_index(at); at+size<=USER_MAX; ++i) {
+    for (size_t i=vma_index(at); at<=USER_MAX && size<=USER_MAX-at; ++i) {
         if (i==vma_count || vmas[i].start>=at+size) return at;
         at=align_up(vmas[i].end,alignment);
     }
@@ -436,6 +511,7 @@ static int32_t map_direct_locked(void **out, uint64_t size, int prot, int flags,
     if (!alignment) alignment=PAGE;
     if (!out || physical < 0 || (uint64_t)physical % PAGE || !size || size % PAGE || !valid_alignment(alignment) ||
         (prot & ~0x37)) return INVALID;
+    if (size>POOL_SIZE || (uint64_t)physical>POOL_SIZE-size) return INVALID;
     if (!direct_range_allocated((uint64_t)physical,size)) return INVALID;
     int32_t result=place(out,size,prot,flags,alignment,KIND_DIRECT,block_type((uint64_t)physical),(uint64_t)physical);
     if (!result) ++maps;
@@ -654,22 +730,33 @@ uintptr_t runtime_memory_resolve(const char *name) {
 }
 /* Host-owned memory the guest can see (image, stacks, trampolines) lives in
  * [LOW_MIN, USER_MIN): PS4 code packs pointers into 40-bit fields. */
-#define LOW_MIN UINT64_C(0x0800000000)
 static uintptr_t low_next=LOW_MIN;
 void *runtime_low_map(size_t size, int prot) {
+    if (!size || size>LOW_MAX-LOW_MIN-PAGE) return NULL;
     size=align_up(size,PAGE);
+#ifdef __APPLE__
+    runtime_memory_reserve();
+#endif
     write_lock();
 #ifdef _WIN32
     void *p=NULL;
-    while (!p && low_next+size<=USER_MIN) {
+    while (!p && low_next<=LOW_MAX && size<=LOW_MAX-low_next) {
         p=VirtualAlloc((void *)low_next,size,MEM_RESERVE|MEM_COMMIT,win_prot(prot));
         low_next+=size+UINT64_C(65536); /* unmapped gap catches overruns; allocation granularity */
     }
     write_unlock();
     return p;
+#elif defined(__APPLE__)
+    void *p=MAP_FAILED;
+    if (low_next<=LOW_MAX && size<=LOW_MAX-low_next) {
+        p=mmap((void *)low_next,size,prot,MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED,-1,0);
+        if (p!=MAP_FAILED) low_next+=size+PAGE;
+    }
+    write_unlock();
+    return p==MAP_FAILED ? NULL : p;
 #else
     void *p=MAP_FAILED;
-    while (low_next+size<=USER_MIN) {
+    while (low_next<=LOW_MAX && size<=LOW_MAX-low_next) {
         p=mmap((void *)low_next,size,prot,MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED_NOREPLACE,-1,0);
         low_next+=size+PAGE; /* unmapped gap catches overruns */
         if (p!=MAP_FAILED) break;
@@ -678,6 +765,65 @@ void *runtime_low_map(size_t size, int prot) {
     return p==MAP_FAILED ? NULL : p;
 #endif
 }
+#ifdef __APPLE__
+/* Small opaque handles share low chunks. Free blocks are split and coalesced,
+ * so repeated synchronization-object creation cannot exhaust the low arena. */
+typedef struct GuestAllocation {
+    size_t size;
+    struct GuestAllocation *next;
+    int free;
+} GuestAllocation;
+#define GUEST_ALIGNMENT ((size_t)64)
+#define GUEST_HEADER ((sizeof(GuestAllocation)+GUEST_ALIGNMENT-1)&~(GUEST_ALIGNMENT-1))
+#define GUEST_CHUNK ((size_t)1024*1024)
+static pthread_mutex_t guest_heap_lock=PTHREAD_MUTEX_INITIALIZER;
+static GuestAllocation *guest_heap;
+void *runtime_guest_malloc(size_t size) {
+    if (!size) size=1;
+    if (size>SIZE_MAX-GUEST_HEADER-GUEST_ALIGNMENT-PAGE) return NULL;
+    size=(size+GUEST_ALIGNMENT-1)&~(GUEST_ALIGNMENT-1);
+    pthread_mutex_lock(&guest_heap_lock);
+    GuestAllocation *block=guest_heap, *last=NULL;
+    while (block && (!block->free || block->size<size)) { last=block; block=block->next; }
+    if (!block) {
+        size_t bytes=size+GUEST_HEADER;
+        if (bytes<GUEST_CHUNK) bytes=GUEST_CHUNK;
+        bytes=align_up(bytes,PAGE);
+        block=runtime_low_map(bytes,PROT_READ|PROT_WRITE);
+        if (!block) { pthread_mutex_unlock(&guest_heap_lock); return NULL; }
+        *block=(GuestAllocation){.size=bytes-GUEST_HEADER,.free=1};
+        if (last) last->next=block; else guest_heap=block;
+    }
+    if (block->size>=size+GUEST_HEADER+GUEST_ALIGNMENT) {
+        GuestAllocation *rest=(GuestAllocation *)((unsigned char *)block+GUEST_HEADER+size);
+        *rest=(GuestAllocation){.size=block->size-size-GUEST_HEADER,.next=block->next,.free=1};
+        block->next=rest; block->size=size;
+    }
+    block->free=0;
+    pthread_mutex_unlock(&guest_heap_lock);
+    return (unsigned char *)block+GUEST_HEADER;
+}
+void *runtime_guest_calloc(size_t count, size_t size) {
+    if (size && count>SIZE_MAX/size) return NULL;
+    size_t bytes=count*size;
+    void *result=runtime_guest_malloc(bytes);
+    if (result) memset(result,0,bytes);
+    return result;
+}
+void runtime_guest_free(void *pointer) {
+    if (!pointer) return;
+    GuestAllocation *block=(GuestAllocation *)((unsigned char *)pointer-GUEST_HEADER);
+    pthread_mutex_lock(&guest_heap_lock);
+    block->free=1;
+    for (GuestAllocation *at=guest_heap; at && at->next;) {
+        GuestAllocation *next=at->next;
+        if (at->free && next->free && (unsigned char *)at+GUEST_HEADER+at->size==(unsigned char *)next) {
+            at->size+=GUEST_HEADER+next->size; at->next=next->next;
+        } else at=next;
+    }
+    pthread_mutex_unlock(&guest_heap_lock);
+}
+#endif
 /* ---- GPU library interface (gpu/shim/bbgpu.cpp) ---- */
 /* Optimizations switched off at run time (diagnostics): the number in the file named by
  * BB_TOGGLE_FILE, re-read every 250 ms. Bits: 1 region cache, 2 fetch shader cache,
@@ -819,4 +965,3 @@ void runtime_memory_report(void) {
     printf("Runtime: flexible maps=%zu, in use=%" PRIu64 ", protects=%zu, queries=%zu, regions=%zu\n",
            flexible_maps, flexible_bytes, protects, queries, vma_count);
 }
-

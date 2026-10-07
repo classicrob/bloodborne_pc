@@ -36,3 +36,44 @@ The guest packs pointers into 40 bits. Host heap and host TLS addresses on macOS
 | runtime_resolve and runtime_*_resolve / GPU exports | Function addresses in guest imports | Main executable/dylib code: validate placement before handing imports to guest |
 
 Planned API in runtime.h: runtime_guest_malloc(size), runtime_guest_calloc(count,size), runtime_guest_free(ptr). macOS uses a reusable low-address allocator backed by runtime_low_map; other platforms use their unchanged libc allocation routines. TLS blocks can use runtime_low_map directly for page alignment and process-lifetime allocation. No blanket malloc macro substitution.
+
+## GPU-library exports
+
+The compiled library export groups are GnmDriver, VideoOut, AvPlayer, and Kernel Equeue.
+
+| Source / allocation | Guest exposure | Action |
+| --- | --- | --- |
+| avplayer/avplayer.cpp sceAvPlayerInit/InitEx: new AvPlayer | Pointer handle returned directly | Low allocation required; Sol-3 notified |
+| videoout/video_out.cpp: make_unique<VideoOutDriver> | main_port.buffer_labels.data() returned to guest and written into GNM wait packets | Low allocation required for driver or label storage; Sol-3 notified |
+| avplayer GuestBuffer / texture and audio frame buffers | Guest memory-replacement callbacks allocate output storage | Guest-owned, already low |
+| avplayer state/source/streamer, FFmpeg AVIO buffer | Host-only decoder internals | Keep host allocations |
+| kernel/equeue.cpp: new EqueueInternal, event timers | Integer equeue ID from NextEqueueHandle | Keep host allocations |
+| gnmdriver Liverpool/Presenter and renderer objects | Host-only; command buffers/read pointers are guest-provided | Keep host allocations |
+
+## Verified backend design
+
+Rosetta on the test host has an immutable guard at 63–448 GiB (Astra-1 spike).
+Host-owned guest objects use the reserved 32–63 GiB arena; guest direct/flexible
+mappings use 448–1008 GiB. Mach fixed allocations first claim these arenas without
+overwriting existing mappings. Anonymous replacements retain ownership of holes.
+
+POSIX shm supports coherent data aliases but executable aliases fault under
+Rosetta. The backend instead uses `mach_vm_remap(copy=FALSE)` from anonymous
+backing storage, which supports shared data and executable views. Physical
+release first removes all guest aliases, then replaces the released backing
+subrange with fresh anonymous pages. This guarantees zero reuse and releases
+physical storage without memset-committing unused pool pages.
+
+`runtime_guest_malloc/calloc/free` uses reusable, 64-byte-aligned blocks from
+low mappings. Freed neighboring blocks coalesce. Dynamic module TLS uses this
+allocator; direct low mappings remain available for page-aligned TLS and stacks.
+
+Run `sh tests/test_memory_macos.sh` for SDK-only x86_64/Rosetta regression checks.
+They cover concurrent low allocation/reuse, aliases, protected backing writes,
+partial release and zero reuse, remapping across split backing objects, arena
+bounds, reservation holes, flexible offsets, and executable views. Modifying
+already-translated instructions through the private backing alias requires an
+RW-to-RX guest-view protection cycle to invalidate Rosetta's translation; the
+ordinary instruction-cache builtin and reapplying RX alone did not suffice.
+The GPU backing-write API is for data transfers; automatic invalidation of
+translated code after such writes is not implemented.
