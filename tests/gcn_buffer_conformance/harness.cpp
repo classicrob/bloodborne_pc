@@ -92,6 +92,7 @@ struct Template {
     bool combo = false;    // s_buffer_load_dword (imm) + buffer_load_dword on the same V#
     Wave wave = Wave::None;
     bool vertex = false;   // vertex shader + fetch shader (s_swappc_b64), indexed draw
+    bool indirect = false; // vertex: indirect draw; the fetch shader adds the base vertex from s13
     bool fragment = false; // fragment stage (compile-only)
     bool compile_only = false; // translate + EmitSPIRV + spirv-val only; an abort is a FAIL
     bool srt = false;      // V# and a constant read through an extended-user-data pointer (s[2:3])
@@ -232,6 +233,8 @@ void AssembleWave(GcnAsm::Code& c, Wave w) {
     }
 }
 
+constexpr u32 IndirectBaseSgpr = 13;
+
 // Vertex shader: s_swappc_b64 into the fetch shader (V# via s_load_dwordx4 from the table at
 // s[2:3], buffer/tbuffer_load_format_xyzw v[4:7], v0 idxen), then stores v[4:7] to the result
 // slot (vertex index & 63) and exports a position. Rasterization is discarded.
@@ -249,6 +252,9 @@ void AssembleVertex(Template& t) {
     c.Exp(12, 0xF, true, 10, 10, 10, 11);
     c.SEndpgm();
     Code f;
+    if (t.indirect) {
+        f.Vop2(37, 0, 0, IndirectBaseSgpr); // v_add_i32 v0, s13, v0: base vertex written by the CP
+    }
     f.SLoadDwordx4(4, 2, 0);
     f.SWaitcntAll();
     const Code::BufFields fl{.idxen = true, .vaddr = 0, .vdata = 4, .srsrc = 4};
@@ -1065,6 +1071,24 @@ void AddVertexCases() {
         const u32 big[] = {0x10000000u, 0x7FFFFFC0u, 0xFFFFFF80u, 0x40000000u};
         for (u32 k = 0; k < 4; ++k) SetLane(j, 40 + k, big[k] | (40 + k), 0);
     }
+    // indirect draws: the CP passes the base vertex in s13 and the fetch shader adds it to v0
+    {
+        Template ti = g_templates[fmt];
+        ti.name = "vertex: indirect, fetch v_add_i32 v0, s13, v0 + buffer_load_format_xyzw";
+        ti.indirect = true;
+        ti.code.clear();
+        ti.fetch.clear();
+        const u32 ind = AddTemplate(ti);
+        for (s32 off : {0, 64, 0x0FFFFFC0}) {
+            for (const gcn_vsharp& v : {a, d}) {
+                Job& j = NewJob("vertex-fetch", ind, v, 0);
+                j.vertex_offset = off;
+                j.label += " indirect vertexOffset=" + Hex(u32(off));
+                for (u32 i = 0; i < v.num_records + 4; ++i) SetLane(j, i, u32(off) + i, 0);
+                SetLane(j, 40, u32(off) + 0x10000000u + 40, 0);
+            }
+        }
+    }
     // direct draws with a base vertex: the fetch index is index + vertexOffset
     for (s32 off : {64, 0x0FFFFFC0}) {
         Job& j = NewJob("vertex-fetch", fmt, a, 0);
@@ -1285,7 +1309,7 @@ bool ProfileHasRobustFlag() {
 
 u32 g_fs_export = 9; // MRT0 export format for fragment compiles (9 = ABGR_32; 4 = ABGR_FP16 for compressed exports)
 
-Shader::RuntimeInfo MakeRuntime(bool vertex = false, bool fragment = false) {
+Shader::RuntimeInfo MakeRuntime(bool vertex = false, bool fragment = false, bool indirect = false) {
     Shader::RuntimeInfo rt{};
     if (fragment) {
         rt.Initialize(Shader::HwStage::Fragment, Shader::SwStage::Fragment);
@@ -1302,6 +1326,11 @@ Shader::RuntimeInfo MakeRuntime(bool vertex = false, bool fragment = false) {
         rt.Initialize(Shader::HwStage::Vertex, Shader::SwStage::Vertex);
         rt.props.num_user_data = 16;
         rt.props.num_allocated_vgprs = 64;
+        if (indirect) {
+            // DrawIndirectParams: SH offset of the SGPR the CP writes the base vertex into
+            // (translate.cpp UdRegFromShOffset: vertex stage user data start at 0x4c).
+            rt.sw.vs.vertex_sgpr_offset = 0x4c + IndirectBaseSgpr;
+        }
         return rt;
     }
     rt.Initialize(Shader::HwStage::Compute, Shader::SwStage::Compute);
@@ -1336,7 +1365,7 @@ void CompileJob(std::vector<ProgramState>& programs, Shader::Pools& pools, u32 i
     const Shader::ShaderParams params{.user_data = std::span<const u32, 16>(job.ud),
                                       .code = std::span<const u32>(t.code),
                                       .hash = t.hash};
-    auto rt = MakeRuntime(t.vertex, t.fragment);
+    auto rt = MakeRuntime(t.vertex, t.fragment, t.indirect);
     const auto hw = t.fragment ? Shader::HwStage::Fragment
                                : (t.vertex ? Shader::HwStage::Vertex : Shader::HwStage::Compute);
     const auto sw = t.fragment ? Shader::SwStage::Fragment
@@ -1624,7 +1653,7 @@ struct Gpu {
     u64 align = 16;
     vk::UniqueCommandPool pool;
     vk::UniqueDescriptorPool dpool;
-    Mem guest, params, results, flat, null_buffer, index;
+    Mem guest, params, results, flat, null_buffer, index, indirect;
     bool dynamic_vertex_input = false; // VK_EXT_vertex_input_dynamic_state, as the renderer uses it
     std::vector<u8> pristine; // initial guest image of the current batch
 };
@@ -1695,6 +1724,7 @@ void InitGpu(Gpu& g, bool rba) {
     g.flat = MakeBuffer(g, u64(MaxBatch) * FlatSlot);
     g.null_buffer = MakeBuffer(g, NullBufferSize);
     g.index = MakeBuffer(g, u64(MaxBatch) * 64 * 4, vk::BufferUsageFlagBits::eIndexBuffer);
+    g.indirect = MakeBuffer(g, u64(MaxBatch) * 32, vk::BufferUsageFlagBits::eIndirectBuffer);
     std::memset(g.null_buffer.data, 0, NullBufferSize);
 }
 
@@ -2302,7 +2332,14 @@ bool RecordDraw(Gpu& g, vk::CommandBuffer cmd, Job& j, const std::vector<vk::Des
         }
     }
     cmd.bindIndexBuffer(*g.index.buffer, u64(j.slot) * 256, vk::IndexType::eUint32);
-    cmd.drawIndexed(count, 1, 0, j.vertex_offset, 0);
+    if (g_templates[j.tmpl].indirect) {
+        const vk::DrawIndexedIndirectCommand args{.indexCount = count, .instanceCount = 1, .firstIndex = 0,
+                                                  .vertexOffset = j.vertex_offset, .firstInstance = 0};
+        std::memcpy(g.indirect.data + u64(j.slot) * 32, &args, sizeof(args));
+        cmd.drawIndexedIndirect(*g.indirect.buffer, u64(j.slot) * 32, 1, sizeof(args));
+    } else {
+        cmd.drawIndexed(count, 1, 0, j.vertex_offset, 0);
+    }
     cmd.endRendering();
     return true;
 }
