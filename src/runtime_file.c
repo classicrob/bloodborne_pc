@@ -179,9 +179,15 @@ static void convert_stat(const HostStat *s,GuestStat *g) {
 #else
     g->mode=(uint16_t)s->st_mode;
     g->blocks=s->st_blocks; g->blksize=(uint32_t)s->st_blksize;
+#ifdef __APPLE__
+    g->atime=(GuestTimespec){s->st_atimespec.tv_sec,s->st_atimespec.tv_nsec};
+    g->mtime=(GuestTimespec){s->st_mtimespec.tv_sec,s->st_mtimespec.tv_nsec};
+    g->ctime=(GuestTimespec){s->st_ctimespec.tv_sec,s->st_ctimespec.tv_nsec};
+#else
     g->atime=(GuestTimespec){s->st_atim.tv_sec,s->st_atim.tv_nsec};
     g->mtime=(GuestTimespec){s->st_mtim.tv_sec,s->st_mtim.tv_nsec};
     g->ctime=(GuestTimespec){s->st_ctim.tv_sec,s->st_ctim.tv_nsec};
+#endif
 #endif
     g->birthtime=g->ctime;
 }

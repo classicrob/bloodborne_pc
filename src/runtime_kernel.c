@@ -197,9 +197,9 @@ typedef struct { GuestTimeval utime, stime; int64_t rest[14]; } GuestRusage;
 static ABI int32_t guest_getrusage(int who,GuestRusage *out) {
     if (!out || (who!=0 && who!=1)) return fail_posix(EINVAL);
     memset(out,0,sizeof(*out));
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__APPLE__)
     int64_t user=0,kernel=0;
-    compat_cpu_times(who,&user,&kernel);
+    if (compat_cpu_times(who,&user,&kernel)) return fail_posix(errno);
     out->utime=(GuestTimeval){user/1000000,user%1000000};
     out->stime=(GuestTimeval){kernel/1000000,kernel%1000000};
 #else
@@ -215,7 +215,7 @@ static ABI int32_t guest_sysctl(const int32_t *name,uint32_t namelen,void *old,u
     if (!name || namelen<2 || new_value) return fail_posix(EINVAL);
     if (name[0]==1 && name[1]==37) { /* kern.arandom */
         if (!old || !oldlen) return fail_posix(EINVAL);
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__APPLE__)
         if (compat_random(old,(size_t)*oldlen)) return fail_posix(EIO);
 #else
         if (getrandom(old,(size_t)*oldlen,0)<0) return fail_posix(errno);
