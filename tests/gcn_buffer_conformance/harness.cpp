@@ -58,7 +58,8 @@ constexpr u32 ParamSlot = kLanes * 32;
 constexpr u32 ResultSlot = kLanes * 16;
 constexpr u32 FlatSlot = 4096;
 constexpr u32 MaxBatch = 256;
-constexpr u32 LdsSlot = 64 * 1024; // spilled guest LDS (BufferType::SharedMemory) per job
+constexpr u32 LdsSlot = 128 * 1024; // spilled guest LDS (BufferType::SharedMemory) per job
+constexpr u8 LdsCanary = 0xCD;      // past the bound spill range
 constexpr u32 VgprMarker = 0xDEAD0000u;
 constexpr u32 SgprMarker = 0x5EED0000u;
 constexpr u32 ResultFill = 0x0BAD0BADu;
@@ -124,6 +125,8 @@ struct Template {
     bool lds_only = false;           // Wave::Lds without the VOPC ballot (no wave-level operation)
     bool lds_contend = false;        // Wave::Lds: LDS address from voffset (several lanes per halfword)
     u32 lds_bytes = 0;               // guest LDS size when not Threads()*lds_bits/8 (e.g. above the host limit)
+    u32 lds_cross = 0;               // 1: ds_write_b32 then two ds_read_u16; 2: ds_write_b16 then ds_read_b32
+    u32 workgroups = 1;              // compute dispatch width (spilled LDS: one region per workgroup)
     u32 pushud_mask = 0;             // pushud: user-data SGPRs the stage reads (s[0:3] = its V#)
     u32 Threads() const { return wg[0] * wg[1] * wg[2]; }
     std::vector<u32> code;
@@ -291,8 +294,28 @@ void AssembleWave(GcnAsm::Code& c, Wave w) {
 }
 
 // Guest LDS of one width (each lane writes and reads its own slot) next to a VOPC ballot.
-void AssembleLds(GcnAsm::Code& c, u32 bits, bool lds_only, bool addr_from_voffset) {
+void AssembleLds(GcnAsm::Code& c, u32 bits, bool lds_only, bool addr_from_voffset, u32 cross) {
     using namespace GcnAsm;
+    if (cross == 1) { // dword per lane, read back as its two halfwords
+        c.VLshlrevB32(16, Inline(2), 15);
+        c.Ds(13, 16, 3, 0);
+        c.SWaitcntAll();
+        c.SBarrier();
+        c.Ds(60, 16, 0, 10);
+        c.Ds(60, 16, 0, 11, 2);
+        c.SWaitcntAll();
+        return;
+    }
+    if (cross == 2) { // halfword per lane, read back as the dword of the lane pair
+        c.VLshlrevB32(16, Inline(1), 15);
+        c.Ds(31, 16, 3, 0);
+        c.SWaitcntAll();
+        c.SBarrier();
+        c.Vop2(27, 17, 16, 196); // v_and_b32 v17, -4, v16
+        c.Ds(54, 17, 0, 10);
+        c.SWaitcntAll();
+        return;
+    }
     const u32 shift = bits == 64 ? 3 : (bits == 32 ? 2 : (bits == 16 ? 1 : 0));
     if (addr_from_voffset) c.VMov(16, Vgpr(4));
     else c.VLshlrevB32(16, Inline(shift), 15);
@@ -540,7 +563,7 @@ void Assemble(Template& t) {
     for (u32 i = 0; i < 4; ++i) c.VMovLiteral(10 + i, VgprMarker + i);
     const bool smem = t.smem != SmemSrc::None;
     if (t.wave == Wave::Lds) {
-        AssembleLds(c, t.lds_bits, t.lds_only, t.lds_contend);
+        AssembleLds(c, t.lds_bits, t.lds_only, t.lds_contend, t.lds_cross);
     } else if (t.wave != Wave::None) {
         AssembleWave(c, t.wave);
     } else if (smem || t.combo) {
@@ -1393,6 +1416,30 @@ void AddWaveCases() {
                       {"lds: spilled (48 KiB > host LDS), 16-bit own slot", 16, false, max_lds + 16 * 1024},
                       {"lds: spilled (48 KiB > host LDS), 16-bit same-halfword contention", 16, true, max_lds + 16 * 1024},
                       {"lds: spilled (48 KiB > host LDS), 32-bit own slot", 32, false, max_lds + 16 * 1024}};
+    // Cross-width aliasing (SharedMemorySimplifyPass turns the 16-bit side into dword accesses, so
+    // below the size limit LDS stays in workgroup memory) and spilled
+    // LDS over two workgroups; spilled jobs also check the storage image byte for byte.
+    struct LX { const char* name; u32 bits, cross, bytes, wgs; };
+    const LX lxs[] = {{"lds: cross-width 32-bit write, two 16-bit reads", 32, 1, 0, 1},
+                      {"lds: cross-width 16-bit writes, 32-bit read", 16, 2, 0, 1},
+                      {"lds: spilled, cross-width 32-bit write, two 16-bit reads, 2 workgroups", 32, 1, max_lds + 8 * 1024, 2},
+                      {"lds: spilled, cross-width 16-bit writes, 32-bit read, 2 workgroups", 16, 2, max_lds + 8 * 1024, 2},
+                      {"lds: spilled, 32-bit own slot, 2 workgroups", 32, 0, max_lds + 8 * 1024, 2},
+                      {"lds: spilled, 16-bit own slot, 2 workgroups", 16, 0, max_lds + 8 * 1024, 2}};
+    for (const LX& lx : lxs) {
+        Template t;
+        t.name = lx.name;
+        t.op.kind = GCN_LOAD;
+        t.wave = Wave::Lds;
+        t.lds_bits = lx.bits;
+        t.lds_only = true;
+        t.lds_cross = lx.cross;
+        t.lds_bytes = lx.bytes ? lx.bytes : (lx.cross ? 64 * 4 : 0);
+        t.workgroups = lx.wgs;
+        const u32 tt = AddTemplate(t);
+        Job& j = NewJob("lds", tt, RawV(64), 0);
+        for (u32 l = 0; l < 64; ++l) SetLane(j, l, 0x51000u + l * 0x10101u, 0xABC00u + l);
+    }
     for (const LC& lc : lcs) {
         Template t;
         t.name = lc.name;
@@ -2664,6 +2711,15 @@ std::vector<u32> WaveExpected(const Job& j) {
         }
         case Wave::Lds: {
             const Lane& L = j.lanes[l];
+            if (t.lds_cross == 1) {
+                r[0] = L.vindex & 0xFFFF;
+                r[1] = L.vindex >> 16;
+                break;
+            }
+            if (t.lds_cross == 2) {
+                r[0] = (j.lanes[l & ~1u].vindex & 0xFFFF) | (j.lanes[l | 1u].vindex & 0xFFFF) << 16;
+                break;
+            }
             r[0] = t.lds_bits == 8 ? (L.vindex & 0xFF) : (t.lds_bits == 16 ? (L.vindex & 0xFFFF) : L.vindex);
             if (t.lds_bits == 64) r[1] = L.voffset;
             if (!t.lds_only) {
@@ -3285,6 +3341,41 @@ JobResult EvaluatePushUd(Gpu& g, const Job& j) {
                                " stored user-data dwords wrong\n" + d};
 }
 
+// Spilled LDS: the storage buffer must hold each lane's write at its exact byte address in each
+// workgroup's region (WorkgroupIndex * size), zeros elsewhere, canaries past the bound range.
+std::string CheckSpillImage(Gpu& g, const Job& j) {
+    const Template& t = g_templates[j.tmpl];
+    bool spilled = false;
+    for (const auto& b : j.binds) spilled |= b.type == u32(Shader::BufferType::SharedMemory);
+    if (!spilled || t.lds_contend) return "";
+    const u32 size = t.lds_bytes ? t.lds_bytes : t.Threads() * t.lds_bits / 8;
+    std::vector<u8> want(LdsSlot, LdsCanary);
+    std::fill_n(want.begin(), size * t.workgroups, u8(0));
+    const u32 width = t.lds_cross == 1 ? 4 : (t.lds_cross == 2 ? 2 : t.lds_bits / 8);
+    for (u32 w = 0; w < t.workgroups; ++w) {
+        for (u32 l = 0; l < 64; ++l) {
+            const Lane& L = j.lanes[l];
+            if (!L.active) continue;
+            const u64 v = L.vindex | (width == 8 ? u64(L.voffset) << 32 : 0);
+            for (u32 b = 0; b < width; ++b) want[w * size + l * width + b] = u8(v >> (8 * b));
+        }
+    }
+    const u8* got = g.lds.data + u64(j.slot) * LdsSlot;
+    u32 bad = 0;
+    std::string d;
+    for (u32 k = 0; k < LdsSlot; ++k) {
+        if (got[k] == want[k]) continue;
+        if (bad++ < 8) {
+            char b[160];
+            std::snprintf(b, sizeof(b), "    spill buffer +%#x (workgroup %u +%#x): got %#04x want %#04x%s\n", k, k / size,
+                          k % size, got[k], want[k], k >= size * t.workgroups ? " (canary)" : "");
+            d += b;
+        }
+    }
+    if (!bad) return "";
+    return "  " + std::to_string(bad) + " spill-buffer bytes wrong\n" + d;
+}
+
 // Same-halfword LDS contention: lanes 3g, 3g+1 read the same value, one of the two written; lane
 // 3g+2 reads its own halfword.
 JobResult EvaluateLdsContend(const Job& j, const u32* res) {
@@ -3370,9 +3461,10 @@ std::map<u32, JobResult> RunBatch(Gpu& g, const std::vector<u32>& jobs) {
             } else if (bp.type == u32(Shader::BufferType::SharedMemory)) {
                 // BindBuffers: zeroed SharedMemSize * NumWorkgroups (one workgroup here), no offset.
                 const auto& lt = g_templates[j.tmpl];
-                const u32 bytes = lt.lds_bytes ? lt.lds_bytes : lt.Threads() * lt.lds_bits / 8;
+                const u32 bytes = (lt.lds_bytes ? lt.lds_bytes : lt.Threads() * lt.lds_bits / 8) * lt.workgroups;
                 assert(bytes <= LdsSlot);
                 std::memset(g.lds.data + u64(j.slot) * LdsSlot, 0, bytes);
+                std::memset(g.lds.data + u64(j.slot) * LdsSlot + bytes, LdsCanary, LdsSlot - bytes);
                 infos.push_back({.buffer = *g.lds.buffer, .offset = u64(j.slot) * LdsSlot, .range = bytes});
             } else {
                 out[ji] = {Verdict::HarnessError, "  unsupported buffer type " + std::to_string(bp.type) + "\n"};
@@ -3403,7 +3495,7 @@ std::map<u32, JobResult> RunBatch(Gpu& g, const std::vector<u32>& jobs) {
         cmd.bindPipeline(vk::PipelineBindPoint::eCompute, *pipe.pipeline);
         BindStorageBuffers(g, cmd, vk::PipelineBindPoint::eCompute, pipe, infos);
         cmd.pushConstants(*pipe.playout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
-        cmd.dispatch(1, 1, 1);
+        cmd.dispatch(g_templates[j.tmpl].workgroups, 1, 1);
         ran.push_back(ji);
     }
     const vk::MemoryBarrier barrier{.srcAccessMask = vk::AccessFlagBits::eShaderWrite,
@@ -3435,6 +3527,13 @@ std::map<u32, JobResult> RunBatch(Gpu& g, const std::vector<u32>& jobs) {
         const u32* res = reinterpret_cast<const u32*>(g.results.data + u64(j.slot) * ResultSlot);
         if (g_templates[j.tmpl].lds_contend) {
             out[ji] = EvaluateLdsContend(j, res);
+            continue;
+        }
+        if (g_templates[j.tmpl].wave == Wave::Lds) {
+            JobResult r = Evaluate(g, j, tb, g.guest.data, res, work, null_dirty && tb.is_null);
+            const std::string img = CheckSpillImage(g, j);
+            if (!img.empty()) r = {Verdict::Fail, (r.verdict == Verdict::Fail ? r.detail : std::string()) + img};
+            out[ji] = r;
             continue;
         }
         // the null buffer is shared: attribute a dirty null buffer only to jobs with a null V#
