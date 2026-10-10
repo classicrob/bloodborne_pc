@@ -58,6 +58,7 @@ constexpr u32 ParamSlot = kLanes * 32;
 constexpr u32 ResultSlot = kLanes * 16;
 constexpr u32 FlatSlot = 4096;
 constexpr u32 MaxBatch = 256;
+constexpr u32 LdsSlot = 64 * 1024; // spilled guest LDS (BufferType::SharedMemory) per job
 constexpr u32 VgprMarker = 0xDEAD0000u;
 constexpr u32 SgprMarker = 0x5EED0000u;
 constexpr u32 ResultFill = 0x0BAD0BADu;
@@ -121,6 +122,8 @@ struct Template {
     std::array<u32, 3> wg{64, 1, 1}; // compute workgroup shape (power-of-two x)
     u32 lds_bits = 0;                // Wave::Lds: guest LDS access width (16, 32, 64)
     bool lds_only = false;           // Wave::Lds without the VOPC ballot (no wave-level operation)
+    bool lds_contend = false;        // Wave::Lds: LDS address from voffset (several lanes per halfword)
+    u32 lds_bytes = 0;               // guest LDS size when not Threads()*lds_bits/8 (e.g. above the host limit)
     u32 pushud_mask = 0;             // pushud: user-data SGPRs the stage reads (s[0:3] = its V#)
     u32 Threads() const { return wg[0] * wg[1] * wg[2]; }
     std::vector<u32> code;
@@ -288,14 +291,15 @@ void AssembleWave(GcnAsm::Code& c, Wave w) {
 }
 
 // Guest LDS of one width (each lane writes and reads its own slot) next to a VOPC ballot.
-void AssembleLds(GcnAsm::Code& c, u32 bits, bool lds_only) {
+void AssembleLds(GcnAsm::Code& c, u32 bits, bool lds_only, bool addr_from_voffset) {
     using namespace GcnAsm;
-    const u32 shift = bits == 64 ? 3 : (bits == 32 ? 2 : 1);
-    c.VLshlrevB32(16, Inline(shift), 15);
-    c.Ds(bits == 64 ? 77 : (bits == 32 ? 13 : 31), 16, 3, 0); // ds_write v16, v3 (v[3:4] for b64)
+    const u32 shift = bits == 64 ? 3 : (bits == 32 ? 2 : (bits == 16 ? 1 : 0));
+    if (addr_from_voffset) c.VMov(16, Vgpr(4));
+    else c.VLshlrevB32(16, Inline(shift), 15);
+    c.Ds(bits == 64 ? 77 : (bits == 32 ? 13 : (bits == 16 ? 31 : 30)), 16, 3, 0); // ds_write v16, v3 (v[3:4] for b64)
     c.SWaitcntAll();
     c.SBarrier();
-    c.Ds(bits == 64 ? 118 : (bits == 32 ? 54 : 60), 16, 0, 10); // ds_read -> v10 (v[10:11] for b64)
+    c.Ds(bits == 64 ? 118 : (bits == 32 ? 54 : (bits == 16 ? 60 : 58)), 16, 0, 10); // ds_read -> v10 (v[10:11] for b64)
     c.SWaitcntAll();
     if (lds_only) return;
     c.VCmpNeU32(Inline(0), 5);
@@ -536,7 +540,7 @@ void Assemble(Template& t) {
     for (u32 i = 0; i < 4; ++i) c.VMovLiteral(10 + i, VgprMarker + i);
     const bool smem = t.smem != SmemSrc::None;
     if (t.wave == Wave::Lds) {
-        AssembleLds(c, t.lds_bits, t.lds_only);
+        AssembleLds(c, t.lds_bits, t.lds_only, t.lds_contend);
     } else if (t.wave != Wave::None) {
         AssembleWave(c, t.wave);
     } else if (smem || t.combo) {
@@ -1368,7 +1372,7 @@ void AddWaveCases() {
     }
     // The same guest LDS accesses with no wave-level operation: independent of the wave64
     // emulation (runs on every tree). Each lane writes and reads back its own slot.
-    for (u32 bits : {16u, 32u, 64u}) {
+    for (u32 bits : {8u, 16u, 32u, 64u}) {
         Template t;
         t.name = "lds: guest LDS " + std::to_string(bits) + "-bit, own slot, no wave ops";
         t.op.kind = GCN_LOAD;
@@ -1378,6 +1382,38 @@ void AddWaveCases() {
         const u32 tt = AddTemplate(t);
         Job& j = NewJob("lds", tt, RawV(64), 0);
         for (u32 l = 0; l < 64; ++l) SetLane(j, l, 0x51000u + l * 0x101u, 0xABC00u + l);
+    }
+    // Same-halfword contention: lanes 3g and 3g+1 write different values to halfword 0 of dword g,
+    // lane 3g+2 writes halfword 1. GCN: both writers then read one of the two values (either
+    // order), never a mix, and the other halfword is intact. Spilled: the same accesses with guest
+    // LDS above the host limit, where the recompiler moves LDS into a storage buffer.
+    const u32 max_lds = 32 * 1024; // Apple M-series maxComputeSharedMemorySize
+    struct LC { const char* name; u32 bits; bool contend; u32 bytes; };
+    const LC lcs[] = {{"lds: 16-bit same-halfword contention (2 writers + neighbour)", 16, true, 0},
+                      {"lds: spilled (48 KiB > host LDS), 16-bit own slot", 16, false, max_lds + 16 * 1024},
+                      {"lds: spilled (48 KiB > host LDS), 16-bit same-halfword contention", 16, true, max_lds + 16 * 1024},
+                      {"lds: spilled (48 KiB > host LDS), 32-bit own slot", 32, false, max_lds + 16 * 1024}};
+    for (const LC& lc : lcs) {
+        Template t;
+        t.name = lc.name;
+        t.op.kind = GCN_LOAD;
+        t.wave = Wave::Lds;
+        t.lds_bits = lc.bits;
+        t.lds_only = true;
+        t.lds_contend = lc.contend;
+        t.lds_bytes = lc.bytes;
+        const u32 tt = AddTemplate(t);
+        Job& j = NewJob("lds", tt, RawV(64), 0);
+        for (u32 l = 0; l < 64; ++l) {
+            if (!lc.contend) {
+                SetLane(j, l, 0x51000u + l * 0x101u, 0xABC00u + l);
+                continue;
+            }
+            if (l >= 63) continue;
+            const u32 g = l / 3, r = l % 3;
+            const u32 value = r == 0 ? (0xA5A5u ^ g) : (r == 1 ? (0x5A5Au ^ g) : (0x3C00u | g));
+            SetLane(j, l, value, g * 4 + (r == 2 ? 2 : 0));
+        }
     }
     // Control-dependent phi feeding a loop bound (Sol-2's review case), compile-only.
     for (u32 x : {64u, 128u}) {
@@ -1948,7 +1984,7 @@ void CompileJob(std::vector<ProgramState>& programs, Shader::Pools& pools, u32 i
     const Shader::ShaderParams params{.user_data = std::span<const u32, 16>(job.ud),
                                       .code = std::span<const u32>(t.code),
                                       .hash = t.hash};
-    auto rt = MakeRuntime(t.vertex, t.fragment, t.indirect, t.wg, t.clip_planes, t.Threads() * t.lds_bits / 8,
+    auto rt = MakeRuntime(t.vertex, t.fragment, t.indirect, t.wg, t.clip_planes, t.lds_bytes ? t.lds_bytes : t.Threads() * t.lds_bits / 8,
                           t.rect_list, t.helper ? RenderFsInputs() : 1);
     const auto hw = t.fragment ? Shader::HwStage::Fragment
                                : (t.vertex ? Shader::HwStage::Vertex : Shader::HwStage::Compute);
@@ -2263,7 +2299,7 @@ struct Gpu {
     u64 align = 16;
     vk::UniqueCommandPool pool;
     vk::UniqueDescriptorPool dpool;
-    Mem guest, params, results, flat, null_buffer, index, indirect, readback;
+    Mem guest, params, results, flat, null_buffer, index, indirect, readback, lds;
     bool dynamic_vertex_input = false; // VK_EXT_vertex_input_dynamic_state, as the renderer uses it
     std::vector<u8> pristine; // initial guest image of the current batch
 };
@@ -2343,6 +2379,7 @@ void InitGpu(Gpu& g, bool rba) {
     g.params = MakeBuffer(g, u64(MaxBatch) * ParamSlot);
     g.results = MakeBuffer(g, u64(MaxBatch) * ResultSlot);
     g.flat = MakeBuffer(g, u64(MaxBatch) * FlatSlot);
+    g.lds = MakeBuffer(g, u64(MaxBatch) * LdsSlot);
     g.null_buffer = MakeBuffer(g, NullBufferSize);
     g.index = MakeBuffer(g, u64(MaxBatch) * 64 * 4, vk::BufferUsageFlagBits::eIndexBuffer);
     g.indirect = MakeBuffer(g, u64(MaxBatch) * 32, vk::BufferUsageFlagBits::eIndirectBuffer);
@@ -2627,7 +2664,7 @@ std::vector<u32> WaveExpected(const Job& j) {
         }
         case Wave::Lds: {
             const Lane& L = j.lanes[l];
-            r[0] = t.lds_bits == 16 ? (L.vindex & 0xFFFF) : L.vindex;
+            r[0] = t.lds_bits == 8 ? (L.vindex & 0xFF) : (t.lds_bits == 16 ? (L.vindex & 0xFFFF) : L.vindex);
             if (t.lds_bits == 64) r[1] = L.voffset;
             if (!t.lds_only) {
                 r[2] = blo;
@@ -3248,6 +3285,28 @@ JobResult EvaluatePushUd(Gpu& g, const Job& j) {
                                " stored user-data dwords wrong\n" + d};
 }
 
+// Same-halfword LDS contention: lanes 3g, 3g+1 read the same value, one of the two written; lane
+// 3g+2 reads its own halfword.
+JobResult EvaluateLdsContend(const Job& j, const u32* res) {
+    u32 bad = 0;
+    std::string d;
+    for (u32 g = 0; g < 21; ++g) {
+        const u32 a = j.lanes[3 * g].vindex, b = j.lanes[3 * g + 1].vindex, c = j.lanes[3 * g + 2].vindex;
+        const u32 r0 = res[(3 * g) * 4], r1 = res[(3 * g + 1) * 4], r2 = res[(3 * g + 2) * 4];
+        char buf[200];
+        if (r0 != r1 || (r0 != a && r0 != b)) {
+            std::snprintf(buf, sizeof(buf), "    dword %u: writers read %#x / %#x, want both %#x or both %#x\n", g, r0, r1, a, b);
+            if (bad++ < 8) d += buf;
+        }
+        if (r2 != c) {
+            std::snprintf(buf, sizeof(buf), "    dword %u: neighbour halfword read %#x want %#x\n", g, r2, c);
+            if (bad++ < 8) d += buf;
+        }
+    }
+    if (!bad) return {Verdict::Strict, ""};
+    return {Verdict::Fail, "  " + std::to_string(bad) + " contention checks wrong (a mix of both writers or a lost neighbour)\n" + d};
+}
+
 // Run one batch of jobs; returns per-job results (jobs that cannot run get loud/error verdicts).
 std::map<u32, JobResult> RunBatch(Gpu& g, const std::vector<u32>& jobs) {
     std::map<u32, JobResult> out;
@@ -3308,6 +3367,13 @@ std::map<u32, JobResult> RunBatch(Gpu& g, const std::vector<u32>& jobs) {
                 std::memcpy(g.flat.data + off, bp.flat.data(), bytes);
                 infos.push_back({.buffer = *g.flat.buffer, .offset = off, .range = std::max<u64>(bytes, 4)});
                 flat_used += u32((bytes + g.align - 1) / g.align * g.align);
+            } else if (bp.type == u32(Shader::BufferType::SharedMemory)) {
+                // BindBuffers: zeroed SharedMemSize * NumWorkgroups (one workgroup here), no offset.
+                const auto& lt = g_templates[j.tmpl];
+                const u32 bytes = lt.lds_bytes ? lt.lds_bytes : lt.Threads() * lt.lds_bits / 8;
+                assert(bytes <= LdsSlot);
+                std::memset(g.lds.data + u64(j.slot) * LdsSlot, 0, bytes);
+                infos.push_back({.buffer = *g.lds.buffer, .offset = u64(j.slot) * LdsSlot, .range = bytes});
             } else {
                 out[ji] = {Verdict::HarnessError, "  unsupported buffer type " + std::to_string(bp.type) + "\n"};
                 loud = "-";
@@ -3367,6 +3433,10 @@ std::map<u32, JobResult> RunBatch(Gpu& g, const std::vector<u32>& jobs) {
             continue;
         }
         const u32* res = reinterpret_cast<const u32*>(g.results.data + u64(j.slot) * ResultSlot);
+        if (g_templates[j.tmpl].lds_contend) {
+            out[ji] = EvaluateLdsContend(j, res);
+            continue;
+        }
         // the null buffer is shared: attribute a dirty null buffer only to jobs with a null V#
         out[ji] = Evaluate(g, j, tb, g.guest.data, res, work, null_dirty && tb.is_null);
     }

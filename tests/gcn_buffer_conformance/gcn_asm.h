@@ -73,7 +73,7 @@ struct Code {
         Sopp(5, uint32_t(delta) & 0xFFFF);
     }
     void SBarrier() { Sopp(10, 0); }
-    // DS: ds_write_b16/b32/b64 (ops 31/13/77), ds_read_u16/b32/b64 (ops 60/54/118)
+    // DS: ds_write_b8/b16/b32/b64 (ops 30/31/13/77), ds_read_u8/u16/b32/b64 (ops 58/60/54/118)
     void Ds(uint32_t op, uint32_t addr, uint32_t data0, uint32_t vdst) {
         words.push_back(0xD8000000u | (op << 18));
         words.push_back((vdst << 24) | (data0 << 8) | addr);
