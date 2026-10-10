@@ -299,7 +299,9 @@ if (APPLE)
         ../tests/test_gpu_runtime_stubs.cpp)
     add_executable(macos-perf-test EXCLUDE_FROM_ALL ../tests/test_macos_perf.cpp
         ../tests/test_gpu_runtime_stubs.cpp)
-    foreach(bounds_target buffer-bounds-test buffer-bounds-benchmark buffer-dead-resources-test host-import-arena-test vertex-pulling-pipeline-test shader-permutation-info-test gpu-user-dir-test push-userdata-test macos-perf-test)
+    add_executable(depth-bounds-shader-test EXCLUDE_FROM_ALL ../tests/test_depth_bounds_shader.cpp
+        ../tests/test_gpu_runtime_stubs.cpp)
+    foreach(bounds_target buffer-bounds-test buffer-bounds-benchmark buffer-dead-resources-test host-import-arena-test vertex-pulling-pipeline-test shader-permutation-info-test gpu-user-dir-test push-userdata-test macos-perf-test depth-bounds-shader-test)
         target_include_directories(${bounds_target} PRIVATE shim shadps4 third_party/gcn/include)
         target_compile_options(${bounds_target} PRIVATE -UNDEBUG -fPIC)
         target_link_libraries(${bounds_target} PRIVATE bbgpu)
@@ -310,8 +312,9 @@ if (APPLE)
     target_compile_definitions(host-import-arena-test PRIVATE VK_USE_PLATFORM_METAL_EXT)
     # gcn_buffer_conformance/gcn_asm.h assembles the test's GCN fetch shaders.
     target_include_directories(shader-permutation-info-test PRIVATE ../tests)
+    target_include_directories(depth-bounds-shader-test PRIVATE third_party/sirit/externals/SPIRV-Headers/include)
     find_package(Python3 REQUIRED COMPONENTS Interpreter)
-    foreach(test_target motion-shader-test scene-resolution-test taa-shader-test camera-motion-test null-descriptor-test buffer-bounds-test buffer-bounds-benchmark buffer-dead-resources-test host-import-arena-test vertex-pulling-pipeline-test shader-permutation-info-test gpu-user-dir-test push-userdata-test macos-perf-test)
+    foreach(test_target motion-shader-test scene-resolution-test taa-shader-test camera-motion-test null-descriptor-test buffer-bounds-test buffer-bounds-benchmark buffer-dead-resources-test host-import-arena-test vertex-pulling-pipeline-test shader-permutation-info-test gpu-user-dir-test push-userdata-test macos-perf-test depth-bounds-shader-test)
         add_custom_command(TARGET ${test_target} POST_BUILD
             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../packaging/macos/check-exports.py
                 $<TARGET_FILE:bbgpu> $<TARGET_FILE:${test_target}> VERBATIM)

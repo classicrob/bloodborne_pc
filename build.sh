@@ -146,8 +146,8 @@ if [[ ${1:-} == --test ]]; then
     if [[ $(uname -s) == Darwin ]]; then
         # The GPU library has no default user directory on macOS: fixtures get a scratch one.
         export BB_GPU_USER_DIR="$PWD/out/gpu-test-user"
-        ninja -C out/gpu "${ninja_jobs[@]}" null-descriptor-test upscaler-support-test buffer-bounds-test buffer-dead-resources-test host-import-arena-test vertex-pulling-pipeline-test shader-permutation-info-test gpu-user-dir-test push-userdata-test macos-perf-test
-        sign_darwin out/gpu/null-descriptor-test out/gpu/upscaler-support-test out/gpu/buffer-bounds-test out/gpu/buffer-dead-resources-test out/gpu/host-import-arena-test out/gpu/vertex-pulling-pipeline-test out/gpu/shader-permutation-info-test out/gpu/gpu-user-dir-test out/gpu/push-userdata-test out/gpu/macos-perf-test
+        ninja -C out/gpu "${ninja_jobs[@]}" null-descriptor-test upscaler-support-test buffer-bounds-test buffer-dead-resources-test host-import-arena-test vertex-pulling-pipeline-test shader-permutation-info-test gpu-user-dir-test push-userdata-test macos-perf-test depth-bounds-shader-test
+        sign_darwin out/gpu/null-descriptor-test out/gpu/upscaler-support-test out/gpu/buffer-bounds-test out/gpu/buffer-dead-resources-test out/gpu/host-import-arena-test out/gpu/vertex-pulling-pipeline-test out/gpu/shader-permutation-info-test out/gpu/gpu-user-dir-test out/gpu/push-userdata-test out/gpu/macos-perf-test out/gpu/depth-bounds-shader-test
         out/gpu/gpu-user-dir-test
         out/gpu/null-descriptor-test
         out/gpu/upscaler-support-test
@@ -160,6 +160,12 @@ if [[ ${1:-} == --test ]]; then
         out/gpu/shader-permutation-info-test
         out/gpu/push-userdata-test out/push-userdata.spv
         spirv-val --target-env vulkan1.3 out/push-userdata.spv
+        # Depth-bounds emulation shaders: 8 permutations + 2 entry-phi cases, each validated.
+        rm -rf out/depth-bounds-shader && mkdir -p out/depth-bounds-shader
+        out/gpu/depth-bounds-shader-test out/depth-bounds-shader
+        depth_spv=(out/depth-bounds-shader/*.spv)
+        [[ ${#depth_spv[@]} == 10 ]] || { echo "depth-bounds-shader-test wrote ${#depth_spv[@]} SPIR-V files, expected 10" >&2; exit 1; }
+        for spv in "${depth_spv[@]}"; do spirv-val --target-env vulkan1.3 "$spv"; done
         # Default allocated descriptor sets only; --push reproduces a MoltenVK bug and exits 2.
         BB_DEPS_PREFIX="$deps" bash tests/macos_descriptor_sizes/run.sh
         BB_DEPS_PREFIX="$deps" bash tests/test_fp64_policy.sh
