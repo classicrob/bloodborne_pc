@@ -1601,6 +1601,11 @@ bool ProfileHasRobustFlag() {
     }(g_profile);
 }
 
+u32 RenderFsInputs() {
+    const char* env = std::getenv("BB_RENDER_FS_INPUTS");
+    return env ? u32(std::atoi(env)) : 0;
+}
+
 u32 g_fs_export = 9; // MRT0 export format for fragment compiles (9 = ABGR_32; 4 = ABGR_FP16 for compressed exports)
 
 Shader::RuntimeInfo MakeRuntime(bool vertex = false, bool fragment = false, bool indirect = false,
@@ -1643,7 +1648,6 @@ Shader::RuntimeInfo MakeRuntime(bool vertex = false, bool fragment = false, bool
     rt.hw.cs.workgroup_size = wg;
     rt.hw.cs.shared_memory_size = lds_bytes;
     rt.hw.cs.tgid_enable = {false, false, false};
-    rt.hw.cs.shared_memory_size = 0;
     return rt;
 }
 
@@ -1671,7 +1675,7 @@ void CompileJob(std::vector<ProgramState>& programs, Shader::Pools& pools, u32 i
                                       .code = std::span<const u32>(t.code),
                                       .hash = t.hash};
     auto rt = MakeRuntime(t.vertex, t.fragment, t.indirect, t.wg, t.clip_planes, t.Threads() * t.lds_bits / 8,
-                          t.rect_list, t.helper ? 0 : 1);
+                          t.rect_list, t.helper ? RenderFsInputs() : 1);
     const auto hw = t.fragment ? Shader::HwStage::Fragment
                                : (t.vertex ? Shader::HwStage::Vertex : Shader::HwStage::Compute);
     const auto sw = t.fragment ? Shader::SwStage::Fragment
@@ -2740,7 +2744,9 @@ bool RecordRender(Gpu& g, vk::CommandBuffer cmd, Job& j, const std::vector<vk::D
             modules.push_back(g.device->createShaderModuleUnique({.codeSize = spv.size() * 4, .pCode = spv.data()}).value);
             return *modules.back();
         };
-        const auto fs_rt = MakeRuntime(false, true, false, {64, 1, 1}, false, 0, false, 0); // the render FS reads no inputs
+        // The render FS reads no inputs. BB_RENDER_FS_INPUTS=N declares N anyway (VS exports none):
+        // on MoltenVK the RectList aux TCS then passes unwritten locations and nothing is drawn.
+        const auto fs_rt = MakeRuntime(false, true, false, {64, 1, 1}, false, 0, false, RenderFsInputs());
         std::vector<vk::PipelineShaderStageCreateInfo> stages;
         stages.push_back({.stage = vk::ShaderStageFlagBits::eVertex, .module = module(g_spirv.at({j.tmpl, j.perm})), .pName = "main"});
         if (t.rect_list) {
