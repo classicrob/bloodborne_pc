@@ -429,7 +429,7 @@ def wait_until(run, timeout, what, done, start_line):
     die(f'timed out after {timeout} s waiting for {what}')
 
 
-def route(run, until):
+def route(run, until, hold=0):
     names = [name for name, _ in ROUTE]
     if until and until not in names:
         die('known stages: ' + ', '.join(names))
@@ -464,6 +464,13 @@ def route(run, until):
             check_running(run, 0)
         if name == until:
             break
+    if hold:
+        # Stay on the last screen without input, so frame statistics cover it (perf windows).
+        event(run, 'hold', seconds=hold)
+        deadline = time.time() + hold
+        while time.time() < deadline:
+            check_running(run, 0)
+            time.sleep(2)
     event(run, 'route-complete', until=until)
     print(json.dumps({'route': 'complete', 'until': until, 'frame_stats': summarize(frame_stats(log_lines(run)))}))
 
@@ -495,6 +502,8 @@ def main():
         if command == 'route':
             p.add_argument('--until', help='last stage to run: ' + ', '.join(name for name, _ in ROUTE))
             p.add_argument('--keep', action='store_true', help='leave the game running after the route')
+            p.add_argument('--hold', type=int, default=0, metavar='SECONDS',
+                           help='after the last stage, stay idle this long (fails loudly if the game dies)')
     p = sub.add_parser('press')
     p.add_argument('tokens')
     p.add_argument('seconds', type=float, nargs='?', default=0.12)
@@ -516,7 +525,7 @@ def main():
     elif args.command == 'route':
         run = launch(args)
         try:
-            route(run, args.until)
+            route(run, args.until, args.hold)
         finally:
             if not args.keep:
                 stop(run)
