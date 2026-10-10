@@ -295,6 +295,11 @@ def launch(args):
         env['BB_PERF_PHASES'] = '1'  # one submit per phase: perturbs timing, never an FPS measurement
     if args.dump_shaders:
         env['BB_DUMP_SHADERS'] = '1'
+    for item in args.diag_env:
+        key, sep, value = item.partition('=')
+        if not sep or not key.startswith('BB_') or key in env:
+            die(f'--diag-env needs a new BB_ name and a value: {item}')
+        env[key] = value
     if args.disable_optimizations is not None:
         # Diagnostic A/B: optimizations switched off from the start (src/runtime_memory.c bits).
         (run / 'toggles').write_text(f'{args.disable_optimizations}\n')
@@ -308,7 +313,8 @@ def launch(args):
               'env': {k: v for k, v in env.items() if k.startswith(('BB_', 'DYLD_'))}, 'env_removed': removed,
               'diagnostics': [n for n, on in (('BB_DUMP_SHADERS', args.dump_shaders),
                                               ('BB_CAPTURE_TRIGGER', args.frame_capture),
-                                              ('BB_TOGGLE_FILE', args.disable_optimizations is not None)) if on],
+                                              ('BB_TOGGLE_FILE', args.disable_optimizations is not None)) if on]
+                             + args.diag_env,
               'disabled_optimizations': args.disable_optimizations,
               'perf': args.perf, 'perf_phases': args.perf_phases,
               'shader_cache': 'empty (fresh user directory)', 'saves': 'none (fresh user directory)',
@@ -479,6 +485,8 @@ def main():
         p.add_argument('--gpu-log', help='BB_GPU_LOG level (default: the build default)')
         p.add_argument('--frame-capture', action='store_true', help='arm BB_CAPTURE_TRIGGER (frame analyzer)')
         p.add_argument('--dump-shaders', action='store_true', help='BB_DUMP_SHADERS=1 (diagnostic: writes every shader)')
+        p.add_argument('--diag-env', action='append', default=[], metavar='BB_NAME=VALUE',
+                       help='extra diagnostic BB_ variable (recorded; repeatable)')
         p.add_argument('--disable-optimizations', type=int, metavar='MASK',
                        help='BB_TOGGLE_FILE with this decimal mask from the start (diagnostic A/B)')
         p.add_argument('--perf', action='store_true', help='BB_PERF=1, BB_PERF_OUT=<run>/perf.jsonl')
