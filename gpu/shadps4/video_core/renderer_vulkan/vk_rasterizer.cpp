@@ -3641,17 +3641,26 @@ void Rasterizer::UpdateRasterizationState() const {
         regs.primitive_type, regs.stage_enable.IsStageEnabled(u32(Shader::HwStage::Geometry)),
         regs.vgt_gs_out_prim_type.GetPrimitiveType(0),
         regs.stage_enable.IsStageEnabled(u32(Shader::HwStage::Hull)), regs.tess_config.topology);
+    const bool culled = LiverpoolToVK::IsPrimitiveCulled(regs.primitive_type);
+    const bool cull_front = culled && poly.cull_front;
+    const bool cull_back = culled && poly.cull_back;
     if (FeatureChecks::PolygonModesDiffer(raster, poly.enable_polygon_mode != 0,
                                           poly.polygon_mode_front, poly.polygon_mode_back,
-                                          poly.cull_back)) {
-        UNREACHABLE_MSG("macOS: front polygon mode {} and visible back faces in mode {}; Vulkan has "
-                        "one polygon mode",
+                                          cull_front, cull_back)) {
+        UNREACHABLE_MSG("macOS: visible front faces in polygon mode {} and back faces in mode {}; "
+                        "Vulkan has one polygon mode",
                         u32(poly.polygon_mode_front), u32(poly.polygon_mode_back));
+    }
+    const auto visible_mode =
+        FeatureChecks::VisiblePolygonMode(poly.enable_polygon_mode != 0, poly.polygon_mode_front,
+                                          poly.polygon_mode_back, cull_front, cull_back);
+    if (FeatureChecks::PointPolygonModeInexact(raster, visible_mode)) {
+        UNREACHABLE_MSG("macOS: point polygon mode; MoltenVK draws a point list instead, without "
+                        "culling or per-triangle vertices");
     }
     if (!instance.IsWideLinesSupported()) {
         if (FeatureChecks::WideLinesUnsupported(
-                FeatureChecks::RasterizesLines(raster, poly.enable_polygon_mode != 0,
-                                               poly.polygon_mode_front, poly.polygon_mode_back),
+                FeatureChecks::RasterizesLines(raster, visible_mode),
                 regs.line_control.Width(), false)) {
             UNREACHABLE_MSG("macOS: {}-pixel lines need wideLines, which this device lacks",
                             regs.line_control.Width());

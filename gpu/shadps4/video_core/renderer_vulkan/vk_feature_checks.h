@@ -71,12 +71,32 @@ enum class RasterPrimitive { Points, Lines, Triangles };
     }
 }
 
-/// True when lines are rasterized: line primitives, or triangles with either face in line mode.
-[[nodiscard]] constexpr bool RasterizesLines(RasterPrimitive raster, bool polygon_mode_enabled,
-                                             AmdGpu::PolygonMode front, AmdGpu::PolygonMode back) {
+/// The polygon mode of the faces that are drawn. GCN has separate front and back modes, Vulkan
+/// one: with front faces culled only the back mode matters, otherwise the front mode (a visible
+/// back face in another mode is PolygonModesDiffer). `cull_*`: culling that applies to this
+/// primitive type.
+[[nodiscard]] constexpr AmdGpu::PolygonMode VisiblePolygonMode(bool polygon_mode_enabled,
+                                                               AmdGpu::PolygonMode front,
+                                                               AmdGpu::PolygonMode back,
+                                                               bool cull_front, bool cull_back) {
+    if (!polygon_mode_enabled) {
+        return AmdGpu::PolygonMode::Fill;
+    }
+    return cull_front && !cull_back ? back : front;
+}
+
+/// True when lines are rasterized: line primitives, or triangles drawn in line mode.
+[[nodiscard]] constexpr bool RasterizesLines(RasterPrimitive raster,
+                                             AmdGpu::PolygonMode visible_mode) {
     return raster == RasterPrimitive::Lines ||
-           (raster == RasterPrimitive::Triangles && polygon_mode_enabled &&
-            (front == AmdGpu::PolygonMode::Line || back == AmdGpu::PolygonMode::Line));
+           (raster == RasterPrimitive::Triangles && visible_mode == AmdGpu::PolygonMode::Line);
+}
+
+/// MoltenVK has no point polygon mode: it draws the vertex stream as a point list instead, which
+/// ignores face culling and draws a vertex shared by several triangles once.
+[[nodiscard]] constexpr bool PointPolygonModeInexact(RasterPrimitive raster,
+                                                     AmdGpu::PolygonMode visible_mode) {
+    return raster == RasterPrimitive::Triangles && visible_mode == AmdGpu::PolygonMode::Point;
 }
 
 /// Lines of any width other than one pixel need wideLines (a width below one is not known to
@@ -86,13 +106,13 @@ enum class RasterPrimitive { Points, Lines, Triangles };
     return !supported && rasterizes_lines && width != 1.0f;
 }
 
-/// GCN has separate front and back polygon modes; Vulkan has one (the front mode is used).
-/// Visible back faces in a different mode cannot be drawn.
+/// Both faces visible in different polygon modes cannot be drawn with Vulkan's single mode.
 [[nodiscard]] constexpr bool PolygonModesDiffer(RasterPrimitive raster, bool polygon_mode_enabled,
                                                 AmdGpu::PolygonMode front,
-                                                AmdGpu::PolygonMode back, bool cull_back) {
+                                                AmdGpu::PolygonMode back, bool cull_front,
+                                                bool cull_back) {
     return raster == RasterPrimitive::Triangles && polygon_mode_enabled && front != back &&
-           !cull_back;
+           !cull_front && !cull_back;
 }
 
 /// A multisampled storage descriptor view needs shaderStorageImageMultisample. Depth

@@ -72,8 +72,9 @@ int main() {
         return RasterizedPrimitive(prim, gs, out, tess, topo);
     };
     const auto lines = [&](RasterPrimitive r, bool poly = false, PolygonMode front = PolygonMode::Fill,
-                           PolygonMode back = PolygonMode::Fill) {
-        return RasterizesLines(r, poly, front, back);
+                           PolygonMode back = PolygonMode::Fill, bool cull_front = false,
+                           bool cull_back = false) {
+        return RasterizesLines(r, VisiblePolygonMode(poly, front, back, cull_front, cull_back));
     };
     Expect("  triangle list", lines(raster(PrimitiveType::TriangleList)), false);
     Expect("  rect list", lines(raster(PrimitiveType::RectList)), false);
@@ -95,9 +96,18 @@ int main() {
     Expect("  front faces in line mode",
            lines(raster(PrimitiveType::TriangleList), true, PolygonMode::Line, PolygonMode::Fill),
            true);
-    Expect("  back faces in line mode",
-           lines(raster(PrimitiveType::TriangleList), true, PolygonMode::Fill, PolygonMode::Line),
+    Expect("  front culled, back faces in line mode",
+           lines(raster(PrimitiveType::TriangleList), true, PolygonMode::Fill, PolygonMode::Line,
+                 true, false),
            true);
+    Expect("  front culled, front faces in line mode",
+           lines(raster(PrimitiveType::TriangleList), true, PolygonMode::Line, PolygonMode::Fill,
+                 true, false),
+           false);
+    Expect("  back culled, back faces in line mode",
+           lines(raster(PrimitiveType::TriangleList), true, PolygonMode::Fill, PolygonMode::Line,
+                 false, true),
+           false);
     Expect("  points in line polygon mode",
            lines(raster(PrimitiveType::PointList), true, PolygonMode::Line, PolygonMode::Line),
            false);
@@ -112,17 +122,39 @@ int main() {
     std::fprintf(stderr, "front/back polygon modes\n");
     const auto tris = RasterPrimitive::Triangles;
     Expect("  both fill, polygon mode on",
-           PolygonModesDiffer(tris, true, PolygonMode::Fill, PolygonMode::Fill, false), false);
+           PolygonModesDiffer(tris, true, PolygonMode::Fill, PolygonMode::Fill, false, false), false);
     Expect("  differing modes, polygon mode off",
-           PolygonModesDiffer(tris, false, PolygonMode::Line, PolygonMode::Fill, false), false);
+           PolygonModesDiffer(tris, false, PolygonMode::Line, PolygonMode::Fill, false, false),
+           false);
     Expect("  differing modes, back faces culled",
-           PolygonModesDiffer(tris, true, PolygonMode::Fill, PolygonMode::Line, true), false);
+           PolygonModesDiffer(tris, true, PolygonMode::Fill, PolygonMode::Line, false, true), false);
+    Expect("  differing modes, front faces culled",
+           PolygonModesDiffer(tris, true, PolygonMode::Fill, PolygonMode::Line, true, false), false);
     Expect("  differing modes on lines",
            PolygonModesDiffer(RasterPrimitive::Lines, true, PolygonMode::Fill, PolygonMode::Line,
-                              false),
+                              false, false),
            false);
-    Expect("  differing modes, back faces visible",
-           PolygonModesDiffer(tris, true, PolygonMode::Fill, PolygonMode::Line, false), true);
+    Expect("  differing modes, both faces visible",
+           PolygonModesDiffer(tris, true, PolygonMode::Fill, PolygonMode::Line, false, false), true);
+    Expect("  visible mode: front culled -> back mode",
+           VisiblePolygonMode(true, PolygonMode::Fill, PolygonMode::Line, true, false) ==
+               PolygonMode::Line,
+           true);
+    Expect("  visible mode: polygon mode off -> fill",
+           VisiblePolygonMode(false, PolygonMode::Line, PolygonMode::Line, false, false) ==
+               PolygonMode::Fill,
+           true);
+
+    std::fprintf(stderr, "point polygon mode (MoltenVK emulation is inexact)\n");
+    Expect("  triangles filled", PointPolygonModeInexact(tris, PolygonMode::Fill), false);
+    Expect("  triangles in line mode", PointPolygonModeInexact(tris, PolygonMode::Line), false);
+    Expect("  point list (mode irrelevant)",
+           PointPolygonModeInexact(RasterPrimitive::Points, PolygonMode::Point), false);
+    Expect("  front culled, visible back faces filled",
+           PointPolygonModeInexact(tris, VisiblePolygonMode(true, PolygonMode::Point,
+                                                            PolygonMode::Fill, true, false)),
+           false);
+    Expect("  triangles in point mode", PointPolygonModeInexact(tris, PolygonMode::Point), true);
 
     std::fprintf(stderr, "shaderStorageImageMultisample\n");
     Expect("  single-sample storage view", StorageMultisampleUnsupported(true, 1, false), false);
