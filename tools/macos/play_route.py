@@ -368,10 +368,16 @@ def capture(run, stage, min_nonblack=None):
     window = subprocess.run([str(tool), 'window', str(pid)], capture_output=True, text=True)
     if window.returncode:
         die('no game window: ' + window.stderr.strip())
-    shots = sorted((run / 'shots').glob('*.png'))
+    shots = sorted((run / 'shots').glob('*.jpg'))
     target = run / 'shots' / f'{len(shots):02d}-{stage}.png'
     run_checked(['/usr/sbin/screencapture', '-x', '-o', '-l', window.stdout.strip(), str(target)], 'screencapture')
     image = json.loads(run_checked([str(tool), 'stats', str(target)], 'image stats'))
+    # The statistics use the full-resolution capture; the kept copy is a 1512-px JPEG (~0.2 MB).
+    jpeg = target.with_suffix('.jpg')
+    run_checked(['sips', '-s', 'format', 'jpeg', '-s', 'formatOptions', '85', '-Z', '1512', str(target),
+                 '--out', str(jpeg)], 'screenshot conversion')
+    target.unlink()
+    target = jpeg
     lines = log_lines(run)
     samples = frame_stats(lines)
     data = event(run, 'capture', stage=stage, path=str(target), image=image, log_lines=len(lines),
