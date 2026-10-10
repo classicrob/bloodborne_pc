@@ -160,6 +160,7 @@ if [[ ${1:-} == --test ]]; then
         out/gpu/shader-permutation-info-test
         # Default allocated descriptor sets only; --push reproduces a MoltenVK bug and exits 2.
         BB_DEPS_PREFIX="$deps" bash tests/macos_descriptor_sizes/run.sh
+        BB_DEPS_PREFIX="$deps" bash tests/test_fp64_policy.sh
         BB_GPU_BUILD="$PWD/out/gpu" sh tests/macos_float_modes/production.sh
         "$CC" "${platform_flags[@]}" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread -Isrc \
             tests/test_compat_mac.c src/compat_mac.c -o out/compat-mac-test
