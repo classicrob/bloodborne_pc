@@ -14,6 +14,7 @@
 #include "video_core/renderer_vulkan/vk_bind_helper.h"
 #include "video_core/renderer_vulkan/vk_camera_motion.h"
 #include "video_core/renderer_vulkan/vk_constant_ring.h"
+#include "video_core/renderer_vulkan/vk_gs_emulation.h"
 #include "video_core/renderer_vulkan/vk_scene_resolution.h"
 #include "video_core/renderer_vulkan/vk_object_motion.h"
 #include "video_core/renderer_vulkan/vk_draw_pipe.h"
@@ -266,6 +267,10 @@ private:
                       Shader::Backend::Bindings& binding, u32& write_index, bool& barrier,
                       bool on_helper = false);
     bool BindResources(const Pipeline* pipeline);
+    /// bbport (Apple): records the ES and GS compute passes of an emulated geometry stage and
+    /// returns the strip draw (vk_gs_emulation.cpp).
+    GsEmulationDraw RecordGsEmulation(const GraphicsPipeline* pipeline, bool is_indexed,
+                                      u32 index_offset);
     void BindSamplers(const Shader::Info& stage, const PreparedStage* prepared,
                       Shader::Backend::Bindings& binding, u32& write_index);
     /// bbport: a stage's resolved textures remembered by its prepared T# hashes
@@ -484,6 +489,14 @@ private:
     } texture_task;
     /// Draws whose textures the helper bound completely, partly or not at all (BB_FRAME_STATS).
     u64 helper_full = 0, helper_partial = 0, helper_serial = 0;
+    /// bbport (Apple): scratch and index ranges of the emulated geometry draw being recorded.
+    GsEmulationBinding gs_binding{};
+    struct {
+        u64 draws = 0;
+        u64 dispatches = 0;
+        u64 splits = 0; ///< render passes ended for the compute passes
+        u64 scratch_bytes = 0;
+    } gs_stats;
     /// The memoized cache entry of each image binding (FindImage memo taken), else null.
     boost::container::static_vector<ImageDescCacheEntry*, Shader::NUM_IMAGES> image_binding_entries;
     bool fault_process_pending{};
