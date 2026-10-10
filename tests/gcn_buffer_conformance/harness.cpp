@@ -31,6 +31,9 @@
 #include "shader_recompiler/specialization.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_common.h"
+#if __has_include("video_core/renderer_vulkan/vk_feature_checks.h")
+#include "video_core/renderer_vulkan/vk_feature_checks.h"
+#endif
 
 #include "gcn_asm.h"
 #include "shader_recompiler/frontend/decode.h"
@@ -104,6 +107,9 @@ struct Template {
     bool fragment = false; // fragment stage (compile-only)
     bool render = false;   // vertex: rasterized draw into a 16x16 target, read back
     bool rect_list = false; // render: RectList through the production tessellation emulation
+    bool depth_bounds = false; // render: depth attachment holding DbStored(), bounds [db_min, db_max]
+    float db_min = 0.0f, db_max = 1.0f;
+    bool db_d16 = false;       // depth-bounds: D16_UNORM attachment (else D32_SFLOAT)
     bool vs_fetch = false;  // render: positions from a fetch shader (else from the vertex id)
     u32 pos_scale = 246;    // render, vertex-id positions: inline float (246 = 4.0, 244 = 2.0, 242 = 1.0)
     u32 fs_tmpl = ~0u;      // render: the fragment shader template
@@ -180,6 +186,7 @@ struct Job {
     bool pushud_vs = false;    // pushud: the draw job; its fragment job follows it
     bool pushud_chain = false; // pushud: fragment job, bound after the preceding vertex job
     u32 fs_perm = 0;           // pushud: the fragment module permutation
+    u32 db_binding = ~0u;      // fragment: Info::depth_bounds_binding when the tree emulates depth bounds
     std::vector<VertexAttr> vattrs; // fixed-function vertex inputs of the permutation
     std::array<u32, 8> vtable{};    // vertex/srt jobs: table at s[2:3] (V# in dwords 0..3, constant in 4)
 };
@@ -1882,6 +1889,61 @@ void AddPushUdCases() {
     }
 }
 
+// Stored depth of pixel (x, y) for the depth-bounds group: 256 distinct values over [0, 1].
+u16 DbStoredD16(u32 x, u32 y) { return u16(std::lround((y * RenderSize + x) / 255.0 * 65535.0)); }
+float DbStored(u32 x, u32 y, bool d16) {
+    return d16 ? float(DbStoredD16(x, y)) / 65535.0f : float(y * RenderSize + x) / 255.0f;
+}
+
+// DB depth bounds: a fragment is dropped when the depth ALREADY STORED at its pixel lies outside
+// [min, max] (inclusive), whatever its own depth. Full-screen draw, no depth test or write; the
+// colour target must show the constant colour exactly where min <= stored <= max.
+void AddDepthBoundsCases() {
+    auto st = [](u32 x, u32 y, bool d16) { return DbStored(x, y, d16); };
+    struct C { const char* name; float lo, hi; bool d16; };
+    const C cases[] = {
+        {"bounds [0, 1] (always passes: the test is skipped)", 0.0f, 1.0f, false},
+        {"bounds [-1, 2] (always passes)", -1.0f, 2.0f, false},
+        {"bounds exactly at stored values (5,3)..(10,9), inclusive", st(5, 3, false), st(10, 9, false), false},
+        {"min == max == stored value at (7,7)", st(7, 7, false), st(7, 7, false), false},
+        {"bounds between adjacent stored values", (st(4, 2, false) + st(5, 2, false)) / 2, (st(9, 12, false) + st(10, 12, false)) / 2, false},
+        {"min > max (nothing passes)", 0.75f, 0.25f, false},
+        {"D16: bounds exactly at stored values (5,3)..(10,9)", st(5, 3, true), st(10, 9, true), true},
+        {"D16: min == max == stored value at (7,7)", st(7, 7, true), st(7, 7, true), true},
+        {"D16: bounds [0, 1]", 0.0f, 1.0f, true},
+    };
+    for (const C& c : cases) {
+        Template fs;
+        fs.name = std::string("depth-bounds fs: ") + c.name;
+        fs.fragment = true;
+        fs.helper = true;
+        fs.depth_bounds = true;
+        fs.db_min = c.lo;
+        fs.db_max = c.hi;
+        fs.db_d16 = c.d16;
+        const u32 fs_t = AddTemplate(fs);
+        Template t;
+        t.name = std::string("depth-bounds: ") + c.name;
+        t.vertex = true;
+        t.render = true;
+        t.pos_scale = 246;
+        t.fs_tmpl = fs_t;
+        t.op.kind = GCN_LOAD;
+        t.depth_bounds = true;
+        t.db_min = c.lo;
+        t.db_max = c.hi;
+        t.db_d16 = c.d16;
+        const u32 tt = AddTemplate(t);
+        Job& j = NewJob("depth-bounds", tt, RawV(64), 0);
+        j.pushud_vs = true; // the FS job follows, chained
+        for (u32 l = 0; l < 3; ++l) SetLane(j, l, l, 0);
+        const std::string label = j.label;
+        Job& f = NewJob("depth-bounds", fs_t, RawV(64), 0);
+        f.label = label + " (fs)";
+        f.pushud_chain = true;
+    }
+}
+
 // Documents MoltenVK: with VK_KHR_push_descriptor, OpArrayLength of a storage buffer binding
 // reports the wrong size (a 36-byte range reads back as 1 byte / 0 dwords), so explicit bounds
 // checks zero in-range accesses. The renderer binds Apple guest pipelines with allocated sets;
@@ -1929,6 +1991,7 @@ struct DeviceCaps {
     u32 min_subgroup, max_subgroup, required_size_stages, size_control, full_subgroups;
     u32 subgroup_stages, subgroup_ops;
     u32 explicit_layout; // VK_KHR_workgroup_memory_explicit_layout
+    u32 depth_bounds;    // VkPhysicalDeviceFeatures::depthBounds
 };
 
 vk::UniqueInstance CreateInstance() {
@@ -1975,6 +2038,7 @@ DeviceCaps QueryCaps() {
     c.null_descriptor = r2.nullDescriptor;
     c.buffer_int64_atomics = f12.shaderBufferInt64Atomics;
     c.max_shared = p.limits.maxComputeSharedMemorySize;
+    c.depth_bounds = f.depthBounds;
     const auto& p13 = props.get<vk::PhysicalDeviceVulkan13Properties>();
     const auto& f13 = chain.get<vk::PhysicalDeviceVulkan13Features>();
     const auto& sg = props.get<vk::PhysicalDeviceSubgroupProperties>();
@@ -1996,6 +2060,21 @@ DeviceCaps QueryCaps() {
 
 Shader::Profile g_profile;
 DeviceCaps g_caps;
+
+// Depth bounds, as production decides it: the test needs the device feature unless it always
+// passes (bounds covering [0, 1]); trees with vk_feature_checks.h use their own predicate.
+bool DepthBoundsNeedsFeature(float lo, float hi) {
+#if __has_include("video_core/renderer_vulkan/vk_feature_checks.h")
+    return Vulkan::FeatureChecks::DepthBoundsUnsupported(true, true, lo, hi, g_caps.depth_bounds != 0);
+#else
+    return !g_caps.depth_bounds && !(lo <= 0.0f && hi >= 1.0f);
+#endif
+}
+template <typename F>
+constexpr bool kHasDepthBoundsKey = requires(F f) { f.depth_bounds_test; };
+using FsRuntime = std::remove_cvref_t<decltype(std::declval<Shader::RuntimeInfo&>().hw.fs)>;
+// The tree emulates the depth bounds test in the fragment shader (HwFragmentRuntimeInfo key).
+constexpr bool kDepthBoundsEmulated = kHasDepthBoundsKey<FsRuntime>;
 
 Shader::Profile MakeProfile(const DeviceCaps& c) {
     // Same fields vk_pipeline_cache.cpp fills from the Instance; float-control and other
@@ -2057,7 +2136,8 @@ u32 g_fs_export = 9; // MRT0 export format for fragment compiles (9 = ABGR_32; 4
 
 Shader::RuntimeInfo MakeRuntime(bool vertex = false, bool fragment = false, bool indirect = false,
                                 std::array<u32, 3> wg = {64, 1, 1}, bool clip_planes = false,
-                                u32 lds_bytes = 0, bool tess_rect = false, u32 fs_inputs = 1) {
+                                u32 lds_bytes = 0, bool tess_rect = false, u32 fs_inputs = 1,
+                                bool depth_bounds_key = false) {
     Shader::RuntimeInfo rt{};
     if (fragment) {
         rt.Initialize(Shader::HwStage::Fragment, Shader::SwStage::Fragment);
@@ -2066,6 +2146,11 @@ Shader::RuntimeInfo MakeRuntime(bool vertex = false, bool fragment = false, bool
         rt.hw.fs.en_flags.persp_center_ena = 1;
         rt.hw.fs.addr_flags.persp_center_ena = 1;
         rt.hw.fs.num_inputs = fs_inputs;
+        // BuildRuntimeInfo(Fragment): the FS emulates the depth bounds test exactly when the
+        // device lacks it and the bounds do not cover [0, 1].
+        [&](auto& fsrt) {
+            if constexpr (requires { fsrt.depth_bounds_test; }) fsrt.depth_bounds_test = depth_bounds_key;
+        }(rt.hw.fs);
         rt.hw.fs.inputs[0].param_index = 0;
         rt.hw.fs.color_buffers[0].export_format = AmdGpu::ShaderExportFormat(g_fs_export);
         rt.hw.fs.color_buffers[0].data_format = AmdGpu::DataFormat::Format32_32_32_32;
@@ -2135,7 +2220,8 @@ void CompileJob(std::vector<ProgramState>& programs, Shader::Pools& pools, u32 i
                                       .code = std::span<const u32>(t.code),
                                       .hash = t.hash};
     auto rt = MakeRuntime(t.vertex, t.fragment, t.indirect, t.wg, t.clip_planes, t.lds_bytes ? t.lds_bytes : t.Threads() * t.lds_bits / 8,
-                          t.rect_list, t.helper ? RenderFsInputs() : 1);
+                          t.rect_list, t.helper ? RenderFsInputs() : 1,
+                          t.fragment && t.depth_bounds && DepthBoundsNeedsFeature(t.db_min, t.db_max));
     const auto hw = t.fragment ? Shader::HwStage::Fragment
                                : (t.vertex ? Shader::HwStage::Vertex : Shader::HwStage::Compute);
     const auto sw = t.fragment ? Shader::SwStage::Fragment
@@ -2240,6 +2326,10 @@ void CompileJob(std::vector<ProgramState>& programs, Shader::Pools& pools, u32 i
         std::memcpy(dw, &sharp, 16);
         for (u32 x : dw) w.Put(x);
     }
+    w.Put([](const auto& in) -> u32 {
+        if constexpr (requires { in.depth_bounds_binding; }) return u32(in.depth_bounds_binding);
+        else return ~0u;
+    }(info));
     const u8* p = reinterpret_cast<const u8*>(w.buf.data());
     size_t left = w.buf.size() * 4;
     while (left) {
@@ -2398,6 +2488,8 @@ void CompileAll(const std::string& outdir) {
                 job.vattrs.push_back(va);
                 p += 6;
             }
+            if (p >= w.size()) break;
+            job.db_binding = w[p++];
             job.status = *other ? Status::HarnessError : Status::Ok;
             if (*other) job.message = "shader uses images/samplers";
             if (!spv.empty()) {
@@ -2523,8 +2615,9 @@ void InitGpu(Gpu& g, bool rba) {
                                                   : "allocated sets (the Apple guest-pipeline path)", g_max_push);
     g.pool = g.device->createCommandPoolUnique({.flags = vk::CommandPoolCreateFlagBits::eResetCommandBuffer,
                                                 .queueFamilyIndex = g.family}).value;
-    const vk::DescriptorPoolSize size{vk::DescriptorType::eStorageBuffer, MaxBatch * 8};
-    g.dpool = g.device->createDescriptorPoolUnique({.maxSets = MaxBatch, .poolSizeCount = 1, .pPoolSizes = &size}).value;
+    const vk::DescriptorPoolSize sizes[] = {{vk::DescriptorType::eStorageBuffer, MaxBatch * 8},
+                                            {vk::DescriptorType::eSampledImage, MaxBatch}};
+    g.dpool = g.device->createDescriptorPoolUnique({.maxSets = MaxBatch * 2, .poolSizeCount = 2, .pPoolSizes = sizes}).value;
     g.guest = MakeBuffer(g, u64(MaxBatch) * Arena);
     g.params = MakeBuffer(g, u64(MaxBatch) * ParamSlot);
     g.results = MakeBuffer(g, u64(MaxBatch) * ResultSlot);
@@ -2544,6 +2637,7 @@ struct Pipe {
     vk::UniquePipeline pipeline;
     vk::Result result = vk::Result::eSuccess;
     bool push = false; // descriptors pushed (VK_KHR_push_descriptor) like the renderer
+    vk::UniqueDescriptorSetLayout depth_layout; // emulated depth bounds: set 1, binding 0
 };
 std::map<std::tuple<u32, u32, bool>, Pipe> g_pipes;
 
@@ -2567,6 +2661,7 @@ void BindStorageBuffers(Gpu& g, vk::CommandBuffer cmd, vk::PipelineBindPoint bp,
         writes.push_back({.dstSet = set, .dstBinding = b, .descriptorCount = 1,
                           .descriptorType = vk::DescriptorType::eStorageBuffer, .pBufferInfo = &infos[b]});
     }
+
     if (p.push) {
         cmd.pushDescriptorSetKHR(bp, *p.playout, 0, writes);
     } else {
@@ -3224,10 +3319,33 @@ struct RenderTarget {
     vk::UniqueImage image;
     vk::UniqueDeviceMemory memory;
     vk::UniqueImageView view;
+    vk::UniqueImage depth; // depth-bounds: attachment holding the stored depth pattern
+    vk::UniqueDeviceMemory depth_memory;
+    vk::UniqueImageView depth_view;
+    Mem depth_upload;
 };
 
 // VS (+ the RectList aux TCS/TES the GraphicsPipeline adds) + FS into a 16x16 RGBA32F target.
 // Vertex input mirrors GetVertexInputs when the tree does not pull vertices in the shader.
+bool RecordDepthBoundsGate(Job& j) {
+    const Template& t = g_templates[j.tmpl];
+    if (!t.depth_bounds || !DepthBoundsNeedsFeature(t.db_min, t.db_max)) return true;
+    if (!kDepthBoundsEmulated) {
+        char b[200];
+        std::snprintf(b, sizeof(b), "depth bounds test [%g, %g] needs depthBounds, which this device lacks "
+                                    "(the tree's Apple hard error, mirrored)", t.db_min, t.db_max);
+        j.status = Status::LoudPipeline;
+        j.message = b;
+        return false;
+    }
+    if (j.db_binding != 0) { // DescriptorSet 1, Binding 0; UINT32_MAX = absent
+        j.status = Status::HarnessError;
+        j.message = "emulating tree compiled the FS without its depth-bounds binding (set 1, binding 0)";
+        return false;
+    }
+    return true;
+}
+
 bool RecordRender(Gpu& g, vk::CommandBuffer cmd, Job& j, const std::vector<vk::DescriptorBufferInfo>& infos,
                   const Shader::PushData& push, std::vector<RenderTarget>& targets) {
     const Template& t = g_templates[j.tmpl];
@@ -3278,11 +3396,18 @@ bool RecordRender(Gpu& g, vk::CommandBuffer cmd, Job& j, const std::vector<vk::D
         for (u32 i = 0; i < j.binds.size(); ++i) {
             b.push_back({.binding = i, .descriptorType = vk::DescriptorType::eStorageBuffer, .descriptorCount = 1, .stageFlags = all});
         }
+
         p.push = UsePushDescriptors(u32(b.size()));
         p.layout = g.device->createDescriptorSetLayoutUnique({.flags = p.push ? vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR : vk::DescriptorSetLayoutCreateFlags{}, .bindingCount = u32(b.size()), .pBindings = b.data()}).value;
         const vk::PushConstantRange pr{.stageFlags = all, .offset = 0, .size = sizeof(Shader::PushData)};
-        const vk::DescriptorSetLayout l = *p.layout;
-        p.playout = g.device->createPipelineLayoutUnique({.setLayoutCount = 1, .pSetLayouts = &l,
+        std::vector<vk::DescriptorSetLayout> sets{*p.layout};
+        if (j.db_binding != ~0u) { // emulated depth bounds: the stored-depth image in its own set 1
+            const vk::DescriptorSetLayoutBinding db{.binding = 0, .descriptorType = vk::DescriptorType::eSampledImage,
+                                                    .descriptorCount = 1, .stageFlags = vk::ShaderStageFlagBits::eFragment};
+            p.depth_layout = g.device->createDescriptorSetLayoutUnique({.bindingCount = 1, .pBindings = &db}).value;
+            sets.push_back(*p.depth_layout);
+        }
+        p.playout = g.device->createPipelineLayoutUnique({.setLayoutCount = u32(sets.size()), .pSetLayouts = sets.data(),
                                                           .pushConstantRangeCount = 1, .pPushConstantRanges = &pr}).value;
         std::vector<vk::VertexInputBindingDescription> vb;
         std::vector<vk::VertexInputAttributeDescription> va;
@@ -3313,11 +3438,17 @@ bool RecordRender(Gpu& g, vk::CommandBuffer cmd, Job& j, const std::vector<vk::D
         const vk::PipelineColorBlendStateCreateInfo cb{.attachmentCount = 1, .pAttachments = &cba};
         const vk::PipelineDynamicStateCreateInfo ds{.dynamicStateCount = u32(dyn.size()), .pDynamicStates = dyn.data()};
         const vk::Format fmt = vk::Format::eR32G32B32A32Sfloat;
-        const vk::PipelineRenderingCreateInfo rendering{.colorAttachmentCount = 1, .pColorAttachmentFormats = &fmt};
+        const vk::Format dfmt = !t.depth_bounds ? vk::Format::eUndefined
+                                                : (t.db_d16 ? vk::Format::eD16Unorm : vk::Format::eD32Sfloat);
+        const vk::PipelineRenderingCreateInfo rendering{.colorAttachmentCount = 1, .pColorAttachmentFormats = &fmt,
+                                                        .depthAttachmentFormat = dfmt};
+        const vk::PipelineDepthStencilStateCreateInfo dss{.depthTestEnable = false, .depthWriteEnable = false,
+                                                          .depthCompareOp = vk::CompareOp::eAlways};
         auto pipe = g.device->createGraphicsPipelineUnique(
             {}, {.pNext = &rendering, .stageCount = u32(stages.size()), .pStages = stages.data(), .pVertexInputState = &vi,
                  .pInputAssemblyState = &ia, .pTessellationState = t.rect_list ? &ts : nullptr, .pViewportState = &vps,
-                 .pRasterizationState = &rs, .pMultisampleState = &ms, .pColorBlendState = &cb, .pDynamicState = &ds,
+                 .pRasterizationState = &rs, .pMultisampleState = &ms,
+                 .pDepthStencilState = t.depth_bounds ? &dss : nullptr, .pColorBlendState = &cb, .pDynamicState = &ds,
                  .layout = *p.playout});
         p.result = pipe.result;
         if (pipe.result == vk::Result::eSuccess) p.pipeline = std::move(pipe.value);
@@ -3350,12 +3481,85 @@ bool RecordRender(Gpu& g, vk::CommandBuffer cmd, Job& j, const std::vector<vk::D
     const vk::RenderingAttachmentInfo att{.imageView = *rt.view, .imageLayout = vk::ImageLayout::eColorAttachmentOptimal,
                                           .loadOp = vk::AttachmentLoadOp::eClear, .storeOp = vk::AttachmentStoreOp::eStore,
                                           .clearValue = vk::ClearValue{.color = vk::ClearColorValue{std::array<float, 4>{ClearColor[0], ClearColor[1], ClearColor[2], ClearColor[3]}}}};
-    cmd.beginRendering({.renderArea = {.extent = {RenderSize, RenderSize}}, .layerCount = 1, .colorAttachmentCount = 1, .pColorAttachments = &att});
+    vk::RenderingAttachmentInfo datt{};
+    if (t.depth_bounds) {
+        const vk::Format dfmt = t.db_d16 ? vk::Format::eD16Unorm : vk::Format::eD32Sfloat;
+        rt.depth = g.device->createImageUnique({.imageType = vk::ImageType::e2D, .format = dfmt,
+                                                .extent = {RenderSize, RenderSize, 1}, .mipLevels = 1, .arrayLayers = 1,
+                                                .samples = vk::SampleCountFlagBits::e1, .tiling = vk::ImageTiling::eOptimal,
+                                                .usage = vk::ImageUsageFlagBits::eDepthStencilAttachment |
+                                                         vk::ImageUsageFlagBits::eTransferDst |
+                                                         vk::ImageUsageFlagBits::eSampled}).value;
+        const auto dreq = g.device->getImageMemoryRequirements(*rt.depth);
+        u32 dtype = 0;
+        while (!(dreq.memoryTypeBits & (1u << dtype))) ++dtype;
+        rt.depth_memory = g.device->allocateMemoryUnique({.allocationSize = dreq.size, .memoryTypeIndex = dtype}).value;
+        (void)g.device->bindImageMemory(*rt.depth, *rt.depth_memory, 0);
+        const vk::ImageSubresourceRange drange{.aspectMask = vk::ImageAspectFlagBits::eDepth, .levelCount = 1, .layerCount = 1};
+        rt.depth_view = g.device->createImageViewUnique({.image = *rt.depth, .viewType = vk::ImageViewType::e2D,
+                                                         .format = dfmt, .subresourceRange = drange}).value;
+        const u32 texel = t.db_d16 ? 2 : 4;
+        rt.depth_upload = MakeBuffer(g, u64(RenderSize) * RenderSize * texel, vk::BufferUsageFlagBits::eTransferSrc);
+        for (u32 y = 0; y < RenderSize; ++y) {
+            for (u32 x = 0; x < RenderSize; ++x) {
+                u8* dst = rt.depth_upload.data + (y * RenderSize + x) * texel;
+                if (t.db_d16) {
+                    const u16 v = DbStoredD16(x, y);
+                    std::memcpy(dst, &v, 2);
+                } else {
+                    const float v = DbStored(x, y, false);
+                    std::memcpy(dst, &v, 4);
+                }
+            }
+        }
+        const vk::ImageMemoryBarrier to_dst{.dstAccessMask = vk::AccessFlagBits::eTransferWrite,
+                                            .oldLayout = vk::ImageLayout::eUndefined, .newLayout = vk::ImageLayout::eTransferDstOptimal,
+                                            .image = *rt.depth, .subresourceRange = drange};
+        cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTopOfPipe, vk::PipelineStageFlagBits::eTransfer, {}, {}, {}, to_dst);
+        const vk::BufferImageCopy up{.imageSubresource = {.aspectMask = vk::ImageAspectFlagBits::eDepth, .layerCount = 1},
+                                     .imageExtent = {RenderSize, RenderSize, 1}};
+        cmd.copyBufferToImage(*rt.depth_upload.buffer, *rt.depth, vk::ImageLayout::eTransferDstOptimal, up);
+        const vk::ImageMemoryBarrier to_att{.srcAccessMask = vk::AccessFlagBits::eTransferWrite,
+                                            .dstAccessMask = vk::AccessFlagBits::eDepthStencilAttachmentRead |
+                                                             vk::AccessFlagBits::eShaderRead,
+                                            .oldLayout = vk::ImageLayout::eTransferDstOptimal,
+                                            .newLayout = vk::ImageLayout::eDepthReadOnlyOptimal,
+                                            .image = *rt.depth, .subresourceRange = drange};
+        // Same rendering, read-only depth (the renderer's depth-bounds path): attached and sampled.
+        cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+                            vk::PipelineStageFlagBits::eEarlyFragmentTests | vk::PipelineStageFlagBits::eFragmentShader, {}, {}, {}, to_att);
+        datt = vk::RenderingAttachmentInfo{.imageView = *rt.depth_view, .imageLayout = vk::ImageLayout::eDepthReadOnlyOptimal,
+                                           .loadOp = vk::AttachmentLoadOp::eLoad, .storeOp = vk::AttachmentStoreOp::eStore};
+    }
+    cmd.beginRendering({.renderArea = {.extent = {RenderSize, RenderSize}}, .layerCount = 1, .colorAttachmentCount = 1,
+                        .pColorAttachments = &att, .pDepthAttachment = t.depth_bounds ? &datt : nullptr});
     cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *p.pipeline);
+    // Emulated depth bounds: the FS samples the depth-aspect view of the attached (read-only)
+    // depth image, and the bounds come in push data (Rasterizer, Apple).
+    const vk::DescriptorImageInfo depth_info{.imageView = t.depth_bounds ? *rt.depth_view : vk::ImageView{},
+                                             .imageLayout = vk::ImageLayout::eDepthReadOnlyOptimal};
     if (!infos.empty()) {
         BindStorageBuffers(g, cmd, vk::PipelineBindPoint::eGraphics, p, infos);
     }
-    cmd.pushConstants(*p.playout, vk::ShaderStageFlagBits::eAllGraphics, 0, sizeof(push), &push);
+    if (t.depth_bounds && j.db_binding != ~0u) {
+        const vk::DescriptorSetLayout dl = *p.depth_layout;
+        const vk::DescriptorSet ds1 =
+            g.device->allocateDescriptorSets({.descriptorPool = *g.dpool, .descriptorSetCount = 1, .pSetLayouts = &dl}).value.front();
+        const vk::WriteDescriptorSet w{.dstSet = ds1, .dstBinding = 0, .descriptorCount = 1,
+                                       .descriptorType = vk::DescriptorType::eSampledImage, .pImageInfo = &depth_info};
+        g.device->updateDescriptorSets(w, {});
+        cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *p.playout, 1, ds1, {});
+    }
+    Shader::PushData draw_push = push;
+    if (t.depth_bounds) {
+        [&](auto& pd) {
+            if constexpr (requires { pd.depth_bounds_min; pd.depth_bounds_max; }) {
+                pd.depth_bounds_min = t.db_min;
+                pd.depth_bounds_max = t.db_max;
+            }
+        }(draw_push);
+    }
+    cmd.pushConstants(*p.playout, vk::ShaderStageFlagBits::eAllGraphics, 0, sizeof(draw_push), &draw_push);
     if (!pulling && !j.vattrs.empty()) {
         std::vector<vk::Buffer> bufs;
         std::vector<vk::DeviceSize> offs, sizes, strides;
@@ -3414,6 +3618,32 @@ JobResult EvaluateRender(Gpu& g, const Job& j) {
     if (!bad) return {Verdict::Strict, ""};
     return {Verdict::Fail, "  " + std::to_string(bad) + " of " + std::to_string(RenderSize * RenderSize) +
                                " pixels wrong (" + (j.quarter ? "quarter" : "full") + " coverage expected)\n" + d};
+}
+
+// depth-bounds: the constant colour exactly where min <= stored depth <= max (inclusive).
+JobResult EvaluateDepthBounds(Gpu& g, const Job& j) {
+    const Template& t = g_templates[j.tmpl];
+    const float* px = reinterpret_cast<const float*>(g.readback.data + u64(j.slot) * RenderBytes);
+    u32 bad = 0, passing = 0;
+    std::string d;
+    for (u32 y = 0; y < RenderSize; ++y) {
+        for (u32 x = 0; x < RenderSize; ++x) {
+            const float stored = DbStored(x, y, t.db_d16);
+            const bool pass = t.db_min <= stored && stored <= t.db_max;
+            passing += pass;
+            const float* want = pass ? RenderColor : ClearColor;
+            const float* got = px + (y * RenderSize + x) * 4;
+            if (std::memcmp(got, want, 16) != 0 && bad++ < 6) {
+                char b[200];
+                std::snprintf(b, sizeof(b), "    pixel (%u,%u) stored %.9g: %s, want %s\n", x, y, stored,
+                              got[0] == RenderColor[0] ? "drawn" : "not drawn", pass ? "drawn" : "not drawn");
+                d += b;
+            }
+        }
+    }
+    if (!bad) return {Verdict::Strict, ""};
+    return {Verdict::Fail, "  " + std::to_string(bad) + " of " + std::to_string(RenderSize * RenderSize) + " pixels wrong (" +
+                               std::to_string(passing) + " should pass the bounds)\n" + d};
 }
 
 // pushud: the draw covered the target, and each stage stored exactly its user-data values (all
@@ -3591,6 +3821,7 @@ std::map<u32, JobResult> RunBatch(Gpu& g, const std::vector<u32>& jobs) {
             continue;
         }
         if (g_templates[j.tmpl].render) {
+            if (!RecordDepthBoundsGate(j)) continue;
             if (RecordRender(g, cmd, j, infos, push, targets)) ran.push_back(ji);
             continue;
         }
@@ -3628,6 +3859,10 @@ std::map<u32, JobResult> RunBatch(Gpu& g, const std::vector<u32>& jobs) {
     for (u32 ji : ran) {
         const Job& j = g_jobs[ji];
         Bound tb = tbound.count(ji) ? tbound[ji] : Bound{.is_null = true};
+        if (g_templates[j.tmpl].depth_bounds) {
+            out[ji] = EvaluateDepthBounds(g, j);
+            continue;
+        }
         if (j.pushud_vs) {
             out[ji] = EvaluatePushUd(g, j);
             continue;
@@ -3996,6 +4231,7 @@ int main(int argc, char** argv) {
     AddInternalCases();
     AddSpecReuseCases();
     AddRenderCases();
+    AddDepthBoundsCases();
     AddPushUdCases();
     AddTinyCases();
     AddPushDescriptorCases();
@@ -4079,6 +4315,7 @@ int main(int argc, char** argv) {
         j.binds.insert(j.binds.end(), f.binds.begin(), f.binds.end()); // FS bindings follow the VS's
         j.ud_regs = f.ud_regs; // the pipeline push block (VS then FS)
         j.fs_perm = f.perm;
+        j.db_binding = f.db_binding;
     }
     size_t perms = g_spirv.size();
     std::printf("compiled: %zu modules\n", perms);
@@ -4176,6 +4413,10 @@ int main(int argc, char** argv) {
         case Status::LoudCompile:
         case Status::LoudBinder:
         case Status::LoudPipeline: {
+            if (g_templates[j.tmpl].depth_bounds) { // exact emulation is possible (stored-depth read + kill)
+                r.verdict = Verdict::LoudUnneeded;
+                break;
+            }
             // Every Apple binder guard mirrored here is an orchestrator-approved loud check.
             const bool approved = j.approved_struct_soff || j.approved_swizzle || j.isa_invalid || j.approved_offen_only ||
                                   g_templates[j.tmpl].wave_divergent ||
