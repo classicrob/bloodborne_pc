@@ -206,6 +206,7 @@ if [[ ${1:-} == --test ]]; then
         sh tests/macos_spike/test_tls_runtime.sh
         sh tests/macos_spike/test_hle_stack.sh
         bash tests/test_savedata_macos.sh
+        sh tests/test_sync_diagnostics_macos.sh
         python3 tests/test_restart_macos.py
     fi
     "$CC" "${platform_flags[@]}" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread "${includes[@]}" -I. -Isrc tests/test_pad.c "${libraries[@]}" "${caps_link[@]}" -o out/pad-test
