@@ -22,6 +22,7 @@ typedef struct Rwlock {
 typedef struct { int64_t seconds, nanoseconds; } GuestTime;
 static pthread_mutex_t registry_lock = PTHREAD_MUTEX_INITIALIZER;
 static Rwlock *registry;
+#include "runtime_sync_diag.h"
 static size_t created, reads, writes, unlocks;
 static int32_t error(int e) {
     if (!e) return 0;
@@ -46,7 +47,7 @@ static Rwlock *find_locked(Rwlock *handle) {
 static int create_locked(Rwlock **out) {
     Rwlock *r=runtime_guest_calloc(1,sizeof(*r));
     if (!r) return ENOMEM;
-    int e=pthread_rwlock_init(&r->native,NULL);
+    int e=SYNC_NATIVE(pthread_rwlock_init(&r->native,NULL));
     if (e) { runtime_guest_free(r); return e; }
     r->next=registry; registry=r; *out=r; ++created; return 0;
 }
@@ -90,13 +91,13 @@ static int32_t acquire(Rwlock **handle, enum Operation op, const GuestTime *time
     ++r->inflight; ++h->pending;
     pthread_mutex_unlock(&registry_lock);
     /* Timed operations first try the lock, matching POSIX timeout validation. */
-    if (attempt || timed) e=writer ? pthread_rwlock_trywrlock(&r->native) : pthread_rwlock_tryrdlock(&r->native);
-    else e=writer ? pthread_rwlock_wrlock(&r->native) : pthread_rwlock_rdlock(&r->native);
+    if (attempt || timed) e=writer ? SYNC_NATIVE(pthread_rwlock_trywrlock(&r->native)) : SYNC_NATIVE(pthread_rwlock_tryrdlock(&r->native));
+    else e=writer ? SYNC_NATIVE(pthread_rwlock_wrlock(&r->native)) : SYNC_NATIVE(pthread_rwlock_rdlock(&r->native));
     if (timed && e==EBUSY) {
         if (!time || time->nanoseconds<0 || time->nanoseconds>=1000000000) e=EINVAL;
         else {
             struct timespec deadline={.tv_sec=(time_t)time->seconds,.tv_nsec=(long)time->nanoseconds};
-            e=writer ? pthread_rwlock_timedwrlock(&r->native,&deadline) : pthread_rwlock_timedrdlock(&r->native,&deadline);
+            e=writer ? SYNC_NATIVE(pthread_rwlock_timedwrlock(&r->native,&deadline)) : SYNC_NATIVE(pthread_rwlock_timedrdlock(&r->native,&deadline));
         }
     }
     pthread_mutex_lock(&registry_lock);
@@ -122,7 +123,7 @@ static ABI int32_t rw_unlock(Rwlock **handle) {
     Holder *h=r->holders;
     while (h && !pthread_equal(h->thread,pthread_self())) h=h->next;
     if (!h || (!h->readers && !h->writer)) { pthread_mutex_unlock(&registry_lock); return error(EPERM); }
-    int e=pthread_rwlock_unlock(&r->native);
+    int e=SYNC_NATIVE(pthread_rwlock_unlock(&r->native));
     if (!e) { if (h->writer) h->writer=0; else --h->readers; ++unlocks; }
     prune_locked(r,h);
     pthread_mutex_unlock(&registry_lock); return error(e);
@@ -134,7 +135,7 @@ static ABI int32_t rw_destroy(Rwlock **handle) {
     Rwlock *r=find_locked(*handle);
     if (!r) { pthread_mutex_unlock(&registry_lock); return error(EINVAL); }
     if (r->inflight || r->holders) { pthread_mutex_unlock(&registry_lock); return error(EBUSY); }
-    int e=pthread_rwlock_destroy(&r->native);
+    int e=SYNC_NATIVE(pthread_rwlock_destroy(&r->native));
     if (!e) {
         Rwlock **link=&registry;
         while (*link!=r) link=&(*link)->next;
@@ -142,16 +143,27 @@ static ABI int32_t rw_destroy(Rwlock **handle) {
     }
     pthread_mutex_unlock(&registry_lock); return error(e);
 }
+
+SYNC_WRAP(rw_init, (Rwlock **out, void *const *attr, const char *name), (out, attr, name), "rwlock", out, 0, 1, NULL)
+SYNC_WRAP(rw_read, (Rwlock **r), (r), "rwlock", r, 1, 1, NULL)
+SYNC_WRAP(rw_write, (Rwlock **r), (r), "rwlock", r, 1, 1, NULL)
+SYNC_WRAP(rw_tryread, (Rwlock **r), (r), "rwlock", r, 1, 1, NULL)
+SYNC_WRAP(rw_trywrite, (Rwlock **r), (r), "rwlock", r, 1, 1, NULL)
+SYNC_WRAP(rw_timedread, (Rwlock **r,const GuestTime *t), (r, t), "rwlock", r, 1, 1, NULL)
+SYNC_WRAP(rw_timedwrite, (Rwlock **r,const GuestTime *t), (r, t), "rwlock", r, 1, 1, NULL)
+SYNC_WRAP(rw_unlock, (Rwlock **handle), (handle), "rwlock", handle, 1, 1, NULL)
+SYNC_WRAP(rw_destroy, (Rwlock **handle), (handle), "rwlock", handle, 1, 1, NULL)
+
 uintptr_t runtime_rwlock_resolve(const char *name) {
-    if (!strcmp(name,"6ULAa0fq4jA#p#J")) return (uintptr_t)rw_init;
-    if (!strcmp(name,"BB+kb08Tl9A#p#J")) return (uintptr_t)rw_destroy;
-    if (!strcmp(name,"Ox9i0c7L5w0#p#J")) return (uintptr_t)rw_read;
-    if (!strcmp(name,"mqdNorrB+gI#p#J")) return (uintptr_t)rw_write;
-    if (!strcmp(name,"XD3mDeybCnk#p#J")) return (uintptr_t)rw_tryread;
-    if (!strcmp(name,"bIHoZCTomsI#p#J")) return (uintptr_t)rw_trywrite;
-    if (!strcmp(name,"+L98PIbGttk#p#J")) return (uintptr_t)rw_unlock;
-    if (!strcmp(name,"iPtZRWICjrM#p#J")) return (uintptr_t)rw_timedread;
-    if (!strcmp(name,"adh--6nIqTk#p#J")) return (uintptr_t)rw_timedwrite;
+    if (!strcmp(name,"6ULAa0fq4jA#p#J")) return (uintptr_t)SYNC_EXPORT(rw_init);
+    if (!strcmp(name,"BB+kb08Tl9A#p#J")) return (uintptr_t)SYNC_EXPORT(rw_destroy);
+    if (!strcmp(name,"Ox9i0c7L5w0#p#J")) return (uintptr_t)SYNC_EXPORT(rw_read);
+    if (!strcmp(name,"mqdNorrB+gI#p#J")) return (uintptr_t)SYNC_EXPORT(rw_write);
+    if (!strcmp(name,"XD3mDeybCnk#p#J")) return (uintptr_t)SYNC_EXPORT(rw_tryread);
+    if (!strcmp(name,"bIHoZCTomsI#p#J")) return (uintptr_t)SYNC_EXPORT(rw_trywrite);
+    if (!strcmp(name,"+L98PIbGttk#p#J")) return (uintptr_t)SYNC_EXPORT(rw_unlock);
+    if (!strcmp(name,"iPtZRWICjrM#p#J")) return (uintptr_t)SYNC_EXPORT(rw_timedread);
+    if (!strcmp(name,"adh--6nIqTk#p#J")) return (uintptr_t)SYNC_EXPORT(rw_timedwrite);
     return 0;
 }
 void runtime_rwlock_report(void) {
