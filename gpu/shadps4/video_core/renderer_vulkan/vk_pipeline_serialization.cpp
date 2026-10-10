@@ -13,9 +13,9 @@
 namespace Serialization {
 /* You should increment versions below once corresponding serialization scheme is changed. */
 #ifdef __APPLE__
-static constexpr u32 ShaderBinaryVersion = 15u; // DATA-limited atomics and complete integer X2 lowering.
+static constexpr u32 ShaderBinaryVersion = 16u; // Atomic masked stores preserve concurrent subword LDS writes.
 #else
-static constexpr u32 ShaderBinaryVersion = 12u; // DATA-limited atomics and complete integer X2 lowering.
+static constexpr u32 ShaderBinaryVersion = 13u; // Atomic masked stores preserve concurrent subword LDS writes.
 #endif
 static constexpr u32 ShaderMetaVersion = 9u; // Each permutation stores its own translated resource metadata.
 static constexpr u32 PipelineKeyVersion = 9u; // Aux RectList/QuadList stages read only VS-written locations.

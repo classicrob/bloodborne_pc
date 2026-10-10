@@ -50,6 +50,32 @@ public:
     Id Def(const IR::Value& value);
 
     void DefineBufferProperties();
+    void WriteMaskedU32(Id pointer, Id value, Id mask, spv::Scope scope) {
+        const Id header = OpLabel();
+        const Id body = OpLabel();
+        const Id retry = OpLabel();
+        const Id merge = OpLabel();
+        const Id scope_id = ConstU32(static_cast<u32>(scope));
+        const Id semantics = ConstU32(0u);
+        const Id inverse_mask = OpNot(U32[1], mask);
+        const Id masked_value = OpBitwiseAnd(U32[1], value, mask);
+        OpBranch(header);
+        AddLabel(header);
+        OpLoopMerge(merge, retry, spv::LoopControlMask::MaskNone);
+        OpBranch(body);
+        AddLabel(body);
+        // A successful CAS replaces just this lane's bits without losing adjacent subword stores.
+        const Id old = OpAtomicLoad(U32[1], pointer, scope_id, semantics);
+        const Id replacement = OpBitwiseOr(U32[1], OpBitwiseAnd(U32[1], old, inverse_mask),
+                                           masked_value);
+        const Id observed = OpAtomicCompareExchange(U32[1], pointer, scope_id, semantics,
+                                                    semantics, replacement, old);
+        const Id success = OpIEqual(U1[1], observed, old);
+        OpBranchConditional(success, merge, retry);
+        AddLabel(retry);
+        OpBranch(header);
+        AddLabel(merge);
+    }
     void CollectBufferUsage(const IR::Program& program);
     void DefineAmdPerVertexAttribs();
     void DefineWorkgroupIndex();

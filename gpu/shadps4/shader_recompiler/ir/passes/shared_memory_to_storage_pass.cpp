@@ -15,6 +15,7 @@ static bool IsSharedAccess(const IR::Inst& inst) {
     case IR::Opcode::LoadSharedU64:
     case IR::Opcode::WriteSharedU16:
     case IR::Opcode::WriteSharedU32:
+    case IR::Opcode::WriteSharedMaskedU32:
     case IR::Opcode::WriteSharedU64:
     case IR::Opcode::SharedAtomicIAdd32:
     case IR::Opcode::SharedAtomicISub32:
@@ -60,6 +61,7 @@ IR::Type CalculateSharedMemoryTypes(IR::Program& program) {
                 break;
             case IR::Opcode::LoadSharedU32:
             case IR::Opcode::WriteSharedU32:
+            case IR::Opcode::WriteSharedMaskedU32:
             case IR::Opcode::SharedAtomicIAdd32:
             case IR::Opcode::SharedAtomicISub32:
             case IR::Opcode::SharedAtomicSMin32:
@@ -134,7 +136,11 @@ void SharedMemoryToStoragePass(IR::Program& program, const RuntimeInfo& runtime_
             const IR::U32 handle = ir.Imm32(binding);
             const IR::U32 offset = ir.IMul(ir.GetAttributeU32(IR::Attribute::WorkgroupIndex),
                                            ir.Imm32(shared_memory_size));
-            const IR::U32 address = ir.IAdd(IR::U32{inst.Arg(0)}, offset);
+            const auto access_type = inst.Type() == IR::Type::Void ? inst.Arg(1).Type() : inst.Type();
+            const u32 shift = access_type == IR::Type::U16 ? 1u :
+                              access_type == IR::Type::U64 ? 3u : 2u;
+            const IR::U32 byte_address = ir.IAdd(IR::U32{inst.Arg(0)}, offset);
+            const IR::U32 address = ir.ShiftRightLogical(byte_address, ir.Imm32(shift));
             switch (inst.GetOpcode()) {
             case IR::Opcode::SharedAtomicIAdd32:
             case IR::Opcode::SharedAtomicIAdd64:
@@ -200,6 +206,10 @@ void SharedMemoryToStoragePass(IR::Program& program, const RuntimeInfo& runtime_
                 break;
             case IR::Opcode::WriteSharedU16:
                 ir.StoreBufferU16(handle, address, IR::U16{inst.Arg(1)}, {});
+                inst.Invalidate();
+                break;
+            case IR::Opcode::WriteSharedMaskedU32:
+                ir.StoreBufferMaskedU32(handle, address, IR::U32{inst.Arg(1)}, IR::U32{inst.Arg(2)});
                 inst.Invalidate();
                 break;
             case IR::Opcode::WriteSharedU32:

@@ -74,6 +74,7 @@ inline bool IsBufferStore(const IR::Inst& inst) {
     case IR::Opcode::StoreBufferU8:
     case IR::Opcode::StoreBufferU16:
     case IR::Opcode::StoreBufferU32:
+    case IR::Opcode::StoreBufferMaskedU32:
     case IR::Opcode::StoreBufferU32x2:
     case IR::Opcode::StoreBufferU32x3:
     case IR::Opcode::StoreBufferU32x4:
@@ -99,6 +100,7 @@ inline bool IsDataRingInstruction(const IR::Inst& inst) {
     case IR::Opcode::LoadSharedU64:
     case IR::Opcode::WriteSharedU16:
     case IR::Opcode::WriteSharedU32:
+    case IR::Opcode::WriteSharedMaskedU32:
     case IR::Opcode::WriteSharedU64:
     case IR::Opcode::SharedAtomicIAdd32:
     case IR::Opcode::SharedAtomicIAdd64:

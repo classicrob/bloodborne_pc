@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include "shader_recompiler/backend/spirv/emit_spirv_instructions.h"
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
 
@@ -27,6 +28,11 @@ void EmitBarrier(EmitContext& ctx) {
         memory = spv::Scope::Workgroup;
         memory_semantics =
             spv::MemorySemanticsMask::AcquireRelease | spv::MemorySemanticsMask::WorkgroupMemory;
+        if (std::ranges::any_of(ctx.info.buffers, [](const BufferResource& buffer) {
+                return buffer.buffer_type == BufferType::SharedMemory;
+            })) {
+            memory_semantics = memory_semantics | spv::MemorySemanticsMask::UniformMemory;
+        }
     }
     ctx.OpControlBarrier(ctx.ConstU32(static_cast<u32>(execution)),
                          ctx.ConstU32(static_cast<u32>(memory)),

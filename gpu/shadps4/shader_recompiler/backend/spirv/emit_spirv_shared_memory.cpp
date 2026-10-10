@@ -34,6 +34,12 @@ void EmitWriteSharedU16(EmitContext& ctx, Id offset, Id value) {
     ctx.OpStore(pointer, value);
 }
 
+void EmitWriteSharedMaskedU32(EmitContext& ctx, Id offset, Id value, Id mask) {
+    const Id index = ctx.OpShiftRightLogical(ctx.U32[1], offset, ctx.ConstU32(2u));
+    const Id pointer = ctx.EmitSharedMemoryAccess(ctx.shared_u32, ctx.shared_memory_u32, index);
+    ctx.WriteMaskedU32(pointer, value, mask, spv::Scope::Workgroup);
+}
+
 void EmitWriteSharedU32(EmitContext& ctx, Id offset, Id value) {
     const Id shift{ctx.ConstU32(2U)};
     const Id index{ctx.OpShiftRightLogical(ctx.U32[1], offset, shift)};

@@ -86,7 +86,7 @@ void SharedMemorySimplifyPass(IR::Program& program, const Profile& profile) {
                 switch (inst.GetOpcode()) {
                 case IR::Opcode::LoadSharedU16: {
                     const IR::U32 dword_offset{ir.BitwiseAnd(offset, ir.Imm32(~3U))};
-                    const IR::U32 dword_value{ir.LoadShared(32, false, dword_offset)};
+                    const IR::U32 dword_value{ir.LoadShared(32, false, dword_offset, inst.Flags<bool>())};
                     const IR::U32 bit_offset{
                         ir.IMul(ir.BitwiseAnd(offset, ir.Imm32(2U)), ir.Imm32(8U))};
                     const IR::U32 value{ir.BitFieldExtract(dword_value, bit_offset, ir.Imm32(16U))};
@@ -98,11 +98,9 @@ void SharedMemorySimplifyPass(IR::Program& program, const Profile& profile) {
                     const IR::U32 bit_offset{
                         ir.IMul(ir.BitwiseAnd(offset, ir.Imm32(2U)), ir.Imm32(8U))};
                     const IR::U32 dword_offset{ir.BitwiseAnd(offset, ir.Imm32(~3U))};
-                    const IR::U32 dword_value{
-                        ir.LoadShared(32, false, ir.BitwiseAnd(offset, dword_offset))};
-                    const IR::U32 new_dword_value{
-                        ir.BitFieldInsert(dword_value, value, bit_offset, ir.Imm32(16U))};
-                    ir.WriteShared(32, new_dword_value, dword_offset);
+                    const IR::U32 mask{ir.ShiftLeftLogical(ir.Imm32(0xffffU), bit_offset)};
+                    const IR::U32 shifted_value{ir.ShiftLeftLogical(value, bit_offset)};
+                    ir.WriteSharedMaskedU32(dword_offset, shifted_value, mask, inst.Flags<bool>());
                     inst.Invalidate();
                     continue;
                 }

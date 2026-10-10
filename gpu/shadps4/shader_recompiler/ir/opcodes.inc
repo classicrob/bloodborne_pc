@@ -32,6 +32,7 @@ OPCODE(LoadSharedU32,                                       U32,            U32,
 OPCODE(LoadSharedU64,                                       U64,            U32,                                                                            )
 OPCODE(WriteSharedU16,                                      Void,           U32,            U16,                                                            )
 OPCODE(WriteSharedU32,                                      Void,           U32,            U32,                                                            )
+OPCODE(WriteSharedMaskedU32,                                Void,           U32,            U32,            U32,                                            )
 OPCODE(WriteSharedU64,                                      Void,           U32,            U64,                                                            )
 
 // Shared atomic operations
@@ -122,6 +123,7 @@ OPCODE(LoadBufferFormatF32,                                 F32x4,          Opaq
 OPCODE(StoreBufferU8,                                       Void,           Opaque,         Opaque,         U8,                                             )
 OPCODE(StoreBufferU16,                                      Void,           Opaque,         Opaque,         U16,                                            )
 OPCODE(StoreBufferU32,                                      Void,           Opaque,         Opaque,         U32,                                            )
+OPCODE(StoreBufferMaskedU32,                                Void,           Opaque,         Opaque,         U32,            U32,                            )
 OPCODE(StoreBufferU32x2,                                    Void,           Opaque,         Opaque,         U32x2,                                          )
 OPCODE(StoreBufferU32x3,                                    Void,           Opaque,         Opaque,         U32x3,                                          )
 OPCODE(StoreBufferU32x4,                                    Void,           Opaque,         Opaque,         U32x4,                                          )

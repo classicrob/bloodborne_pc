@@ -544,6 +544,10 @@ void PatchGlobalDataShareAccess(IR::Inst& inst, Info& info, Descriptors& descrip
         buffer.used_types |= IR::Type::U16;
         break;
     }
+    case IR::Opcode::WriteSharedMaskedU32:
+        ir.StoreBufferMaskedU32(handle, address_dwords, IR::U32{inst.Arg(1)}, IR::U32{inst.Arg(2)});
+        inst.Invalidate();
+        break;
     case IR::Opcode::WriteSharedU32:
         ir.StoreBufferU32(1, handle, address_dwords, inst.Arg(1), {});
         inst.Invalidate();
