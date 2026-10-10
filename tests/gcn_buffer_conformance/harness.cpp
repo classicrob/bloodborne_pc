@@ -12,6 +12,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
+#include <filesystem>
 #include <map>
 #include <memory>
 #include <optional>
@@ -80,7 +81,7 @@ u8 CanaryByte(u64 va) { return u8(Hash32(va ^ 0xC0FFEE123ull) % 255 + 1); }
 enum class SoffSrc { Inline, Sgpr };
 enum class SmemSrc { None, Imm, Sgpr };
 // Wave64 lane-semantics programs (no buffer access under test).
-enum class Wave { None, Lane, MbcntMask, Readlane, Exec1, Exec2, LoopReadFirstLane, Lds };
+enum class Wave { None, Lane, MbcntMask, Readlane, Exec1, Exec2, LoopReadFirstLane, Lds, CtrlPhi };
 
 struct Template {
     std::string name;
@@ -105,6 +106,9 @@ struct Template {
     u32 pos_scale = 246;    // render, vertex-id positions: inline float (246 = 4.0, 244 = 2.0, 242 = 1.0)
     u32 fs_tmpl = ~0u;      // render: the fragment shader template
     bool helper = false;    // compiled for another job; no verdict of its own
+    bool expect_loud = false; // compile-only: the recompiler must reject this shader
+    bool compute_compile = false; // compile-only compute template (normal assembly, not run)
+    bool force_int64_atomics = false; // compile with Profile::supports_buffer_int64_atomics forced on
     bool compile_only = false; // translate + EmitSPIRV + spirv-val only; an abort is a FAIL
     bool srt = false;      // V# and a constant read through an extended-user-data pointer (s[2:3])
     u32 sdst = 16;         // stage-compile: SDST of the s_buffer_load (0 overlaps user data)
@@ -335,6 +339,43 @@ void AssembleVertex(Template& t) {
 
 // Graphics stages whose only buffer access is s_buffer_load (V# in s[4:7]), compile-only. The
 // fragment shader mirrors the shape of a real game shader that broke the Apple bounds path.
+// Control-dependent uniformity (compile-only, never executed: a wrong lowering would deadlock):
+// s21 = readfirstlane(LII) (per wave); bound = s21 >= 64 ? 2 : 1 through a branch and a phi of two
+// uniform constants; a loop up to the bound with a ballot inside. One wave: uniform; two waves:
+// the trip count differs per wave, so the ballot's barriers must be refused.
+void AssembleCtrlPhi(Template& t) {
+    using namespace GcnAsm;
+    Code c;
+    c.SMovLiteral(VCC_HI, 0x5eed);
+    c.VReadfirstlane(21, 0);
+    c.words.push_back(0xBF000000u | (9u << 16) | (Inline(64) << 8) | 21); // s_cmp_ge_u32 s21, 64
+    const size_t br_else = c.words.size();
+    c.Sopp(5, 0);                     // s_cbranch_scc1 ELSE (patched)
+    c.Sop1(3, 22, Inline(1));         // s_mov_b32 s22, 1
+    const size_t br_join = c.words.size();
+    c.Sopp(2, 0);                     // s_branch JOIN (patched)
+    const size_t else_at = c.words.size();
+    c.Sop1(3, 22, Inline(2));         // ELSE: s_mov_b32 s22, 2
+    const size_t join_at = c.words.size();
+    c.words[br_else] |= u32(int32_t(else_at) - int32_t(br_else + 1)) & 0xFFFF;
+    c.words[br_join] |= u32(int32_t(join_at) - int32_t(br_join + 1)) & 0xFFFF;
+    c.Sop1(3, 20, Inline(0));
+    c.Sop1(3, 24, Inline(0));
+    const size_t loop = c.words.size();
+    c.VCmpNeU32(Inline(0), 0);
+    c.SBcnt1B64(23, VCC_LO);
+    c.SAddU32(24, 24, 23);
+    c.SAddU32(20, 20, Inline(1));
+    c.words.push_back(0xBF000000u | (10u << 16) | (22u << 8) | 20); // s_cmp_lt_u32 s20, s22
+    c.SCbranchScc1To(loop);
+    c.VMov(1, 24);
+    c.VLshlrevB32(2, Inline(2), 0);
+    c.Mubuf(BUFFER_STORE_DWORD, Code::BufFields{.offen = true, .vaddr = 2, .vdata = 1, .srsrc = 4});
+    c.SEndpgm();
+    t.code = std::move(c.words);
+    t.hash = 0xc791ull ^ (u64(t.wg[0]) << 16);
+}
+
 void AssembleStage(Template& t) {
     using namespace GcnAsm;
     Code c;
@@ -426,7 +467,11 @@ void Assemble(Template& t) {
         AssembleVertex(t);
         return;
     }
-    if (t.compile_only) {
+    if (t.compile_only && t.wave == Wave::CtrlPhi) {
+        AssembleCtrlPhi(t);
+        return;
+    }
+    if (t.compile_only && !t.compute_compile) {
         AssembleStage(t);
         return;
     }
@@ -482,6 +527,7 @@ void Assemble(Template& t) {
         }
         c.SWaitcntAll();
         if (t.op.kind == GCN_ATOMIC && t.glc) c.VMov(10, Vgpr(5));
+        if (t.op.kind == GCN_ATOMIC && t.glc && t.op.comp_bytes == 8) c.VMov(11, Vgpr(6));
         if (t.combo) c.VMov(11, 16);
         c.SMovB64(EXEC_LO, t.srt ? 22 : 20);
     }
@@ -1129,6 +1175,60 @@ void AddAtomicCases() {
             }
         }
     }
+    // INC/DEC DATA limits x old values (below / equal / above the limit, 0), with and without glc,
+    // and out of range (unchanged memory, 0 returned).
+    for (auto [name, op, at] : {std::tuple{"buffer_atomic_inc", BUFFER_ATOMIC_INC, GCN_AT_INC},
+                                std::tuple{"buffer_atomic_dec", BUFFER_ATOMIC_DEC, GCN_AT_DEC}}) {
+        for (bool glc : {true, false}) {
+            const u32 t = AtomicOp(name, op, at, false, TArgs{.glc = glc});
+            for (u32 limit : {0u, 1u, 5u, 0xFFFFFFFFu}) {
+                std::vector<u64> olds{0, limit, u64(limit) + 1};
+                if (limit) olds.push_back(limit - 1);
+                for (u64 old : olds) {
+                    if (old > 0xFFFFFFFFull) continue;
+                    Job& j = NewJob("atomic-semantics", t, RawV(64), 0);
+                    j.init_words = {u32(old)};
+                    SetLane(j, 0, 0, 0, {limit, 0, 0, 0});
+                    j.label += " DATA=" + Hex(limit) + " old=" + Hex(old);
+                }
+                Job& oob = NewJob("atomic-semantics", t, RawV(64), 0);
+                oob.init_words = {7};
+                SetLane(oob, 0, 0, 64, {limit, 0, 0, 0});
+                oob.label += " DATA=" + Hex(limit) + " out of range";
+            }
+        }
+    }
+    // Every integer X2 atomic, with and without glc: run (exact or a loud capability error on
+    // devices without 64-bit buffer atomics) and compile-only with the capability forced on, so
+    // the native emitter is validated by spirv-val even where it cannot run.
+    struct X2 { const char* name; u32 op; gcn_atomic at; };
+    const X2 x2s[] = {{"buffer_atomic_swap_x2", 80, GCN_AT_SWAP}, {"buffer_atomic_cmpswap_x2", 81, GCN_AT_CMPSWAP},
+                      {"buffer_atomic_add_x2", 82, GCN_AT_ADD}, {"buffer_atomic_sub_x2", 83, GCN_AT_SUB},
+                      {"buffer_atomic_smin_x2", 85, GCN_AT_SMIN}, {"buffer_atomic_umin_x2", 86, GCN_AT_UMIN},
+                      {"buffer_atomic_smax_x2", 87, GCN_AT_SMAX}, {"buffer_atomic_umax_x2", 88, GCN_AT_UMAX},
+                      {"buffer_atomic_and_x2", 89, GCN_AT_AND}, {"buffer_atomic_or_x2", 90, GCN_AT_OR},
+                      {"buffer_atomic_xor_x2", 91, GCN_AT_XOR}, {"buffer_atomic_inc_x2", 92, GCN_AT_INC},
+                      {"buffer_atomic_dec_x2", 93, GCN_AT_DEC}};
+    for (const X2& x : x2s) {
+        for (bool glc : {false, true}) {
+            const u32 t = AtomicOp(x.name, x.op, x.at, true, TArgs{.glc = glc});
+            for (u32 off : {8u, 60u, 64u}) {
+                Job& j = NewJob("atomic-x2", t, RawV(64), 0);
+                for (u32 k = 0; k < 16; ++k) j.init_words.push_back(0x10000000u * (k & 3) + 0x111u * k + 3);
+                const u32 lo = j.init_words[off / 4 % 16], hi = j.init_words[(off / 4 + 1) % 16];
+                SetLane(j, 0, 0, off, {0x00000005u, 0x00000001u, x.at == GCN_AT_CMPSWAP ? lo : 0u, x.at == GCN_AT_CMPSWAP ? hi : 0u});
+                j.label += " off=" + Hex(off);
+            }
+            Template c = g_templates[t];
+            c.name += " (compile, int64 atomics forced)";
+            c.compile_only = true;
+            c.compute_compile = true;
+            c.force_int64_atomics = true;
+            c.code.clear();
+            const u32 ct = AddTemplate(c);
+            NewJob("atomic-x2", ct, RawV(64), 0);
+        }
+    }
     // Atomic INC/DEC semantics with a small DATA (GCN wraps at DATA, not at 2^32). Not a bounds
     // property; reported in its own group.
     for (auto [name, op, at] : {std::tuple{"buffer_atomic_inc", BUFFER_ATOMIC_INC, GCN_AT_INC},
@@ -1221,6 +1321,19 @@ void AddWaveCases() {
         const u32 tt = AddTemplate(t);
         Job& j = NewJob("wave64", tt, RawV(64), 0);
         for (u32 l = 0; l < 64; ++l) SetLane(j, l, 0x51000u + l * 0x101u, 0xABC00u + l, {u32(l % 5 == 1), 0, 0, 0});
+    }
+    // Control-dependent phi feeding a loop bound (Sol-2's review case), compile-only.
+    for (u32 x : {64u, 128u}) {
+        Template t;
+        t.name = "wave: branch on readfirstlane(LII) -> phi(1,2) loop bound, ballot in loop [" +
+                 std::to_string(x) + "x1] (compile)";
+        t.op.kind = GCN_LOAD;
+        t.wave = Wave::CtrlPhi;
+        t.compile_only = true;
+        t.wg = {x, 1, 1};
+        t.expect_loud = x > 64;
+        const u32 tt = AddTemplate(t);
+        NewJob("wave64", tt, RawV(64), 0);
     }
     // add_tid on a non-linear shape: thread_id[5:0] is the wave lane of LocalInvocationIndex
     {
@@ -1670,6 +1783,8 @@ constexpr u32 RecordMagic = 0x4A4F4231;
 void CompileJob(std::vector<ProgramState>& programs, Shader::Pools& pools, u32 index, int fd) {
     Job& job = g_jobs[index];
     const Template& t = g_templates[job.tmpl];
+    Shader::Profile prof = g_profile;
+    if (t.force_int64_atomics) prof.supports_buffer_int64_atomics = true; // compile-only capability check
     ProgramState& ps = programs[job.tmpl];
     const Shader::ShaderParams params{.user_data = std::span<const u32, 16>(job.ud),
                                       .code = std::span<const u32>(t.code),
@@ -1686,23 +1801,23 @@ void CompileJob(std::vector<ProgramState>& programs, Shader::Pools& pools, u32 i
     if (!ps.info) {
         ps.info = std::make_unique<Shader::Info>(hw, sw, params);
         const auto start = binding;
-        const auto program = Shader::TranslateProgram(t.code, pools, *ps.info, rt, g_profile);
-        spv = Shader::Backend::SPIRV::EmitSPIRV(g_profile, rt, program, binding);
-        ps.specs.emplace_back(*ps.info, rt, g_profile, start);
+        const auto program = Shader::TranslateProgram(t.code, pools, *ps.info, rt, prof);
+        spv = Shader::Backend::SPIRV::EmitSPIRV(prof, rt, program, binding);
+        ps.specs.emplace_back(*ps.info, rt, prof, start);
     } else {
         auto& info = *ps.info;
         info.pgm_base = params.Base();
         info.user_data = params.user_data;
         info.RefreshFlatBuf();
-        Shader::StageSpecialization spec(info, rt, g_profile, binding);
+        Shader::StageSpecialization spec(info, rt, prof, binding);
         const auto it = std::ranges::find(ps.specs, spec);
         if (it != ps.specs.end()) {
             perm = u32(std::distance(ps.specs.begin(), it));
         } else {
             perm = u32(ps.specs.size());
             Shader::Info new_info(hw, sw, params);
-            const auto program = Shader::TranslateProgram(t.code, pools, new_info, rt, g_profile);
-            spv = Shader::Backend::SPIRV::EmitSPIRV(g_profile, rt, program, binding);
+            const auto program = Shader::TranslateProgram(t.code, pools, new_info, rt, prof);
+            spv = Shader::Backend::SPIRV::EmitSPIRV(prof, rt, program, binding);
             ps.specs.push_back(std::move(spec));
         }
     }
@@ -2397,6 +2512,7 @@ std::vector<Outcome> Expected(Gpu& g, const Job& j, std::vector<u8>& work, const
                 for (u32 i = 0; i < op.ncomp; ++i) o.regs[lane * 4 + i] = res.value[i];
             } else if (op.kind == GCN_ATOMIC && op.atomic_return) {
                 o.regs[lane * 4] = res.value[0];
+                if (op.comp_bytes == 8) o.regs[lane * 4 + 1] = res.value[1];
             }
             // collect and undo memory changes
             if (res.touch_lo != res.touch_hi && (op.kind == GCN_STORE || op.kind == GCN_ATOMIC)) {
@@ -3264,6 +3380,14 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "gcn-conformance: --out DIR is required\n");
         return 2;
     }
+    {
+        std::error_code ec;
+        std::filesystem::create_directories(opt.outdir, ec);
+        if (ec) {
+            std::fprintf(stderr, "gcn-conformance: cannot create %s: %s\n", opt.outdir.c_str(), ec.message().c_str());
+            return 2;
+        }
+    }
     std::setvbuf(stdout, nullptr, _IOLBF, 0);
 
     // Phase 0: device capabilities in a child process.
@@ -3494,6 +3618,11 @@ int main(int argc, char** argv) {
                                                                      " declares bindings " + list(got) +
                                                                      ", the pipeline layout expects " + list(want) +
                                                                      " (reused across start bindings)\n"};
+        } else if (g_templates[j.tmpl].expect_loud) {
+            results[ji] = j.status == Status::LoudCompile
+                              ? JobResult{Verdict::Strict, ""}
+                              : JobResult{Verdict::Fail, "  compiled, but must be rejected (workgroup-divergent "
+                                                         "barrier would deadlock)\n"};
         } else if (j.status == Status::Ok) {
             results[ji] = {Verdict::Strict, ""};
         } else if (j.status == Status::LoudCompile) {
