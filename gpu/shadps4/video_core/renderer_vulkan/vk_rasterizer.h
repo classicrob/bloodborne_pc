@@ -511,6 +511,14 @@ private:
     u64 proxy_samples = 0; ///< texture bindings that read a scene proxy (statistics)
     float sampler_lod_bias = 0.0f; ///< bbport: extra bias of this draw's samplers
     bool scene_debug_frame = false; ///< BB_SCENE_DEBUG: this frame's passes are printed
+    /// bbport diagnostic BB_DUMP_SAMPLED=<guest address>[,...]: during a BB_CAPTURE_TRIGGER frame,
+    /// images at those addresses are read back when first bound for sampling (the content the
+    /// consumer reads) and written to BB_DUMP_DIR as raw mip-0/layer-0 texels.
+    std::mutex sampled_dump_mutex;
+    std::vector<VideoCore::ImageId> sampled_dump_pending;
+    std::vector<VAddr> sampled_dump_done;
+    void NoteSampledForDump(VideoCore::ImageId image_id, VAddr address);
+    void DumpSampledImages();
     bool PendingWriteOverlaps(VAddr address, u64 size);
     /// Stage B: the ring bindings of the stages of the packet being recorded.
     struct RingStage {

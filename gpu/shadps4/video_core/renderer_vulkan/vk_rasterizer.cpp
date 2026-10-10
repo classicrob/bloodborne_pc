@@ -27,6 +27,7 @@
 #include "video_core/renderer_vulkan/vk_shader_hle.h"
 #include "video_core/texture_cache/image_view.h"
 #include "video_core/texture_cache/texture_cache.h"
+#include <vk_mem_alloc.h>
 
 namespace Vulkan {
 
@@ -1670,8 +1671,113 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
         buffer_cache.SynchronizeDmaBuffers();
         fault_process_pending = true;
     }
+    if (FrameCapture::IsRecording()) {
+        DumpSampledImages();
+    } else if (!sampled_dump_done.empty()) {
+        sampled_dump_done.clear(); // the next captured frame dumps again (helper joined above)
+    }
 
     return true;
+}
+
+namespace {
+const std::vector<VAddr>& SampledDumpAddresses() {
+    static const std::vector<VAddr> addresses = [] {
+        std::vector<VAddr> list;
+        if (const char* env = std::getenv("BB_DUMP_SAMPLED")) {
+            for (const char* at = env; *at;) {
+                char* end{};
+                const VAddr address = std::strtoull(at, &end, 0);
+                if (end == at) {
+                    break;
+                }
+                list.push_back(address);
+                at = *end == ',' ? end + 1 : end;
+            }
+        }
+        return list;
+    }();
+    return addresses;
+}
+} // namespace
+
+void Rasterizer::NoteSampledForDump(VideoCore::ImageId image_id, VAddr address) {
+    const auto& addresses = SampledDumpAddresses();
+    if (addresses.empty() || std::ranges::find(addresses, address) == addresses.end()) {
+        return;
+    }
+    std::scoped_lock lk{sampled_dump_mutex}; // the texture helper thread binds too
+    if (std::ranges::find(sampled_dump_done, address) == sampled_dump_done.end()) {
+        sampled_dump_done.push_back(address);
+        sampled_dump_pending.push_back(image_id);
+    }
+}
+
+void Rasterizer::DumpSampledImages() {
+    std::vector<VideoCore::ImageId> pending;
+    {
+        std::scoped_lock lk{sampled_dump_mutex};
+        pending.swap(sampled_dump_pending);
+    }
+    if (pending.empty()) {
+        return;
+    }
+    // On the thread recording commands, after the bindings' layout transitions.
+    scheduler.EndRendering();
+    runtime.FlushBarriers();
+    for (const auto image_id : pending) {
+        auto& image = texture_cache.GetImage(image_id);
+        const auto& info = image.info;
+        const bool depth = info.props.is_depth;
+        const u32 texel_bytes = depth ? 4 : info.num_bits / 8;
+        if (info.props.is_block || image.backing->num_samples > 1 || texel_bytes == 0) {
+            LOG_WARNING(Render, "BB_DUMP_SAMPLED: {:#x} {} not dumped (block, MSAA or packed)",
+                        info.guest_address, vk::to_string(info.pixel_format));
+            continue;
+        }
+        const u32 w = info.size.width, h = info.size.height;
+        const VkBufferCreateInfo buffer_ci{.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+                                           .size = VkDeviceSize(w) * h * texel_bytes,
+                                           .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+        const VmaAllocationCreateInfo alloc_ci{
+            .flags = VMA_ALLOCATION_CREATE_MAPPED_BIT | VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT,
+            .usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST};
+        VkBuffer buffer{};
+        VmaAllocation allocation{};
+        VmaAllocationInfo alloc_info{};
+        ASSERT_MSG(vmaCreateBuffer(instance.GetAllocator(), &buffer_ci, &alloc_ci, &buffer,
+                                   &allocation, &alloc_info) == VK_SUCCESS,
+                   "BB_DUMP_SAMPLED: readback buffer");
+        const auto sample_layout = image.backing->state.layout;
+        runtime.Transit(&image, vk::ImageLayout::eTransferSrcOptimal,
+                        vk::PipelineStageFlagBits2::eCopy, vk::AccessFlagBits2::eTransferRead);
+        runtime.FlushBarriers();
+        const vk::BufferImageCopy region{
+            .imageSubresource = {depth ? vk::ImageAspectFlagBits::eDepth
+                                       : vk::ImageAspectFlagBits::eColor,
+                                 0, 0, 1},
+            .imageExtent = {w, h, 1}};
+        scheduler.Record([image = image.GetImage(), buffer, region](vk::CommandBuffer cmdbuf) {
+            cmdbuf.copyImageToBuffer(image, vk::ImageLayout::eTransferSrcOptimal, buffer, region);
+        });
+        runtime.Transit(&image, sample_layout, vk::PipelineStageFlagBits2::eAllCommands,
+                        vk::AccessFlagBits2::eShaderRead);
+        runtime.FlushBarriers();
+        const char* dir = std::getenv("BB_DUMP_DIR");
+        const std::string path =
+            fmt::format("{}/sampled_{:x}_{}x{}_{}.raw", dir && *dir ? dir : "out/dump",
+                        info.guest_address, w, h, vk::to_string(info.pixel_format));
+        LOG_INFO(Render, "BB_DUMP_SAMPLED: {} ({} bytes)", path, buffer_ci.size);
+        scheduler.DeferPriorityOperation([allocator = instance.GetAllocator(), buffer, allocation,
+                                          alloc_info, size = buffer_ci.size, path] {
+            vmaInvalidateAllocation(allocator, allocation, 0, VK_WHOLE_SIZE);
+            if (FILE* f = std::fopen(path.c_str(), "wb")) {
+                std::fwrite(alloc_info.pMappedData, 1, size, f);
+                std::fclose(f);
+            }
+            vmaDestroyBuffer(allocator, buffer, allocation);
+        });
+    }
 }
 
 void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline, const PreparedDraw* prepared) {
@@ -2543,6 +2649,9 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
             image.usage.texture |= !is_storage;
             if (FrameCapture::Active()) {
                 FrameCapture::Sampled(image.info, is_storage);
+                if (!is_storage) {
+                    NoteSampledForDump(image_id, image.info.guest_address);
+                }
             }
 
             vk::ImageView view = *image_view.image_view;
