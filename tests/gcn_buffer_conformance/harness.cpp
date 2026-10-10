@@ -135,6 +135,7 @@ struct Template {
                                      // 3: ds_write_b32, read lane 63-l's dword (barrier visibility)
     u32 workgroups = 1;              // compute dispatch width (spilled LDS: one region per workgroup)
     u32 pushud_mask = 0;             // pushud: user-data SGPRs the stage reads (s[0:3] = its V#)
+    bool fs_count = false;           // pushud-style FS: buffer_atomic_add 1 at its V# (side-effect count)
     u32 Threads() const { return wg[0] * wg[1] * wg[2]; }
     std::vector<u32> code;
     u64 hash = 0;
@@ -558,6 +559,10 @@ void AssemblePushUd(Template& t) {
         c.VMov(8, k); // v_mov_b32 v8, s[k]
         c.Mubuf(BUFFER_STORE_DWORD, Code::BufFields{.offset = k * 4, .vaddr = 0, .vdata = 8, .srsrc = 0});
     }
+    if (t.fs_count) { // one atomic increment per executing fragment
+        c.VMov(8, Inline(1));
+        c.Mubuf(BUFFER_ATOMIC_ADD, Code::BufFields{.offset = 0, .vaddr = 0, .vdata = 8, .srsrc = 0});
+    }
     if (t.fragment) {
         for (u32 i = 0; i < 4; ++i) c.VMovLiteral(i, std::bit_cast<u32>(RenderColor[i]));
         c.Exp(0, 0xF, true, 0, 1, 2, 3, true);
@@ -576,7 +581,7 @@ void AssemblePushUd(Template& t) {
     }
     c.SEndpgm();
     t.code = std::move(c.words);
-    u64 h = 0xcbf29ce484222325ull ^ (t.fragment ? 0xf5u : 0x75u) ^ (u64(t.pushud_mask) << 8);
+    u64 h = 0xcbf29ce484222325ull ^ (t.fragment ? 0xf5u : 0x75u) ^ (u64(t.pushud_mask) << 8) ^ (t.fs_count ? 0xc0u : 0);
     for (u32 w : t.code) h = (h ^ w) * 0x100000001b3ull;
     t.hash = h;
 }
@@ -1900,7 +1905,7 @@ float DbStored(u32 x, u32 y, bool d16) {
 // colour target must show the constant colour exactly where min <= stored <= max.
 void AddDepthBoundsCases() {
     auto st = [](u32 x, u32 y, bool d16) { return DbStored(x, y, d16); };
-    struct C { const char* name; float lo, hi; bool d16; };
+    struct C { const char* name; float lo, hi; bool d16; bool count = false; };
     const C cases[] = {
         {"bounds [0, 1] (always passes: the test is skipped)", 0.0f, 1.0f, false},
         {"bounds [-1, 2] (always passes)", -1.0f, 2.0f, false},
@@ -1911,6 +1916,10 @@ void AddDepthBoundsCases() {
         {"D16: bounds exactly at stored values (5,3)..(10,9)", st(5, 3, true), st(10, 9, true), true},
         {"D16: min == max == stored value at (7,7)", st(7, 7, true), st(7, 7, true), true},
         {"D16: bounds [0, 1]", 0.0f, 1.0f, true},
+        // Side effects: the FS does a storage atomic per fragment; killed fragments must not.
+        {"FS atomic counter: bounds at stored values (5,3)..(10,9)", st(5, 3, false), st(10, 9, false), false, true},
+        {"FS atomic counter: min > max", 0.75f, 0.25f, false, true},
+        {"FS atomic counter: bounds [0, 1]", 0.0f, 1.0f, false, true},
     };
     for (const C& c : cases) {
         Template fs;
@@ -1921,6 +1930,10 @@ void AddDepthBoundsCases() {
         fs.db_min = c.lo;
         fs.db_max = c.hi;
         fs.db_d16 = c.d16;
+        if (c.count) {
+            fs.pushud_mask = 0x000Fu; // V# in s[0:3]
+            fs.fs_count = true;
+        }
         const u32 fs_t = AddTemplate(fs);
         Template t;
         t.name = std::string("depth-bounds: ") + c.name;
@@ -3641,9 +3654,23 @@ JobResult EvaluateDepthBounds(Gpu& g, const Job& j) {
             }
         }
     }
+    const Job& f = g_jobs[size_t(&j - g_jobs.data()) + 1];
+    if (g_templates[f.tmpl].fs_count) {
+        const u64 k = SlotBase(j.slot) + BaseInArena + PushUdRegion - GuestVa;
+        u32 got, before;
+        std::memcpy(&got, g.guest.data + k, 4);
+        std::memcpy(&before, g.pristine.data() + k, 4);
+        if (got - before != passing) {
+            char b[160];
+            std::snprintf(b, sizeof(b), "    FS storage atomics: %u executed, want %u (one per fragment inside the bounds)\n",
+                          got - before, passing);
+            d += b;
+            ++bad;
+        }
+    }
     if (!bad) return {Verdict::Strict, ""};
-    return {Verdict::Fail, "  " + std::to_string(bad) + " of " + std::to_string(RenderSize * RenderSize) + " pixels wrong (" +
-                               std::to_string(passing) + " should pass the bounds)\n" + d};
+    return {Verdict::Fail, "  " + std::to_string(bad) + " checks wrong (" + std::to_string(passing) +
+                               " pixels should pass the bounds)\n" + d};
 }
 
 // pushud: the draw covered the target, and each stage stored exactly its user-data values (all
