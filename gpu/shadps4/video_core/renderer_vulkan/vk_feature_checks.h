@@ -71,6 +71,14 @@ enum class RasterPrimitive { Points, Lines, Triangles };
     }
 }
 
+/// Whether face culling applies to what reaches the rasterizer: triangles a geometry or
+/// tessellation stage produced are culled; otherwise it depends on the input type
+/// (`input_type_culled`, LiverpoolToVK::IsPrimitiveCulled: rect lists, for one, are not).
+[[nodiscard]] constexpr bool FacesCullable(RasterPrimitive raster, bool later_stage,
+                                           bool input_type_culled) {
+    return raster == RasterPrimitive::Triangles && (later_stage || input_type_culled);
+}
+
 /// The polygon mode of the faces that are drawn. GCN has separate front and back modes, Vulkan
 /// one: with front faces culled only the back mode matters, otherwise the front mode (a visible
 /// back face in another mode is PolygonModesDiffer). `cull_*`: culling that applies to this

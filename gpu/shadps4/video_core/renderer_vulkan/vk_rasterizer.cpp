@@ -3637,11 +3637,13 @@ void Rasterizer::UpdateRasterizationState() const {
 #ifdef __APPLE__
     // Without wideLines only width 1 is valid. The width matters only when lines are rasterized.
     const auto& poly = regs.polygon_control;
+    const bool gs = regs.stage_enable.IsStageEnabled(u32(Shader::HwStage::Geometry));
+    const bool tess = regs.stage_enable.IsStageEnabled(u32(Shader::HwStage::Hull));
     const auto raster = FeatureChecks::RasterizedPrimitive(
-        regs.primitive_type, regs.stage_enable.IsStageEnabled(u32(Shader::HwStage::Geometry)),
-        regs.vgt_gs_out_prim_type.GetPrimitiveType(0),
-        regs.stage_enable.IsStageEnabled(u32(Shader::HwStage::Hull)), regs.tess_config.topology);
-    const bool culled = LiverpoolToVK::IsPrimitiveCulled(regs.primitive_type);
+        regs.primitive_type, gs, regs.vgt_gs_out_prim_type.GetPrimitiveType(0), tess,
+        regs.tess_config.topology);
+    const bool culled = FeatureChecks::FacesCullable(
+        raster, gs || tess, LiverpoolToVK::IsPrimitiveCulled(regs.primitive_type));
     const bool cull_front = culled && poly.cull_front;
     const bool cull_back = culled && poly.cull_back;
     if (FeatureChecks::PolygonModesDiffer(raster, poly.enable_polygon_mode != 0,

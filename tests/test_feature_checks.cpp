@@ -145,6 +145,16 @@ int main() {
                PolygonMode::Fill,
            true);
 
+    std::fprintf(stderr, "face culling applies\n");
+    Expect("  input triangles, culled type", FacesCullable(tris, false, true), true);
+    Expect("  rect list (input type never culled)", FacesCullable(tris, false, false), false);
+    Expect("  triangles from a GS on point input", FacesCullable(tris, true, false), true);
+    Expect("  lines from a GS", FacesCullable(RasterPrimitive::Lines, true, false), false);
+    Expect("  front culled on GS triangles, modes differ (back mode visible)",
+           PolygonModesDiffer(tris, true, PolygonMode::Fill, PolygonMode::Line,
+                              FacesCullable(tris, true, false), false),
+           false);
+
     std::fprintf(stderr, "point polygon mode (MoltenVK emulation is inexact)\n");
     Expect("  triangles filled", PointPolygonModeInexact(tris, PolygonMode::Fill), false);
     Expect("  triangles in line mode", PointPolygonModeInexact(tris, PolygonMode::Line), false);

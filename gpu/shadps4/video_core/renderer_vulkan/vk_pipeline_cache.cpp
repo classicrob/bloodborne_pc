@@ -517,7 +517,13 @@ bool PipelineCache::RefreshGraphicsKey(PipelineSelection& sel) {
     // One Vulkan polygon mode: the visible faces' (vk_feature_checks.h; mismatches are errors).
     {
         const auto& poly = regs.polygon_control;
-        const bool culled = LiverpoolToVK::IsPrimitiveCulled(regs.primitive_type);
+        const bool gs = regs.stage_enable.IsStageEnabled(u32(Shader::HwStage::Geometry));
+        const bool tess = regs.stage_enable.IsStageEnabled(u32(Shader::HwStage::Hull));
+        const auto raster = FeatureChecks::RasterizedPrimitive(
+            regs.primitive_type, gs, regs.vgt_gs_out_prim_type.GetPrimitiveType(0), tess,
+            regs.tess_config.topology);
+        const bool culled = FeatureChecks::FacesCullable(
+            raster, gs || tess, LiverpoolToVK::IsPrimitiveCulled(regs.primitive_type));
         key.polygon_mode = FeatureChecks::VisiblePolygonMode(
             poly.enable_polygon_mode != 0, poly.polygon_mode_front, poly.polygon_mode_back,
             culled && poly.cull_front, culled && poly.cull_back);
