@@ -451,6 +451,14 @@ GraphicsPipeline::GraphicsPipeline(
         }
     }
 
+#ifdef __APPLE__
+    // Without the feature a guest ROP would be dropped and the draw blended normally.
+    if (key.logic_op != AmdGpu::ColorControl::LogicOp::Copy && key.num_color_attachments > 0 &&
+        !instance.IsLogicOpSupported()) {
+        UNREACHABLE_MSG("macOS: color logic op {} needs logicOp, which this device lacks",
+                        static_cast<u32>(key.logic_op));
+    }
+#endif
     const vk::PipelineColorBlendStateCreateInfo color_blending = {
         .logicOpEnable =
             instance.IsLogicOpSupported() && key.logic_op != AmdGpu::ColorControl::LogicOp::Copy,

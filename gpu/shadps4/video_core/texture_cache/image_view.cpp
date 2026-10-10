@@ -102,6 +102,11 @@ ImageView::ImageView(const Vulkan::Instance& instance, const ImageViewInfo& info
     ASSERT_MSG(!StorageUsageMissing(info, image.usage_flags),
                "macOS: storage view of format {} image at {:#x}, which cannot be a storage image",
                vk::to_string(image.info.pixel_format), image.info.guest_address);
+    ASSERT_MSG(!info.is_storage || image.info.num_samples == 1 ||
+                   instance.IsStorageImageMultisampleSupported(),
+               "macOS: storage view of a {}-sample image at {:#x} needs "
+               "shaderStorageImageMultisample, which this device lacks",
+               image.info.num_samples, image.info.guest_address);
 #endif
     vk::ImageViewMinLodCreateInfoEXT min_lod_ci{};
     if (info.min_lod != 0 && instance.IsImageViewMinLodSupported()) {
