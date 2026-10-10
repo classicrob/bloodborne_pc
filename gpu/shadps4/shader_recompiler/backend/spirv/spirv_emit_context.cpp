@@ -87,6 +87,7 @@ EmitContext::EmitContext(const Profile& profile_, const RuntimeInfo& runtime_inf
     DefineSharedMemory();
     DefineBuffers();
     DefineImagesAndSamplers();
+    DefineDepthBoundsImage();
     DefineFunctions();
 }
 
@@ -418,7 +419,7 @@ void EmitContext::DefineInputs() {
         break;
     }
     case SwStage::Fragment: {
-        if (FragmentMotion() || info.loads.GetAny(IR::Attribute::FragCoord) ||
+        if (DepthBoundsTest() || FragmentMotion() || info.loads.GetAny(IR::Attribute::FragCoord) ||
             (info.loads.GetAny(IR::Attribute::BaryCoordPullModel) &&
              !profile.supports_amd_shader_explicit_vertex_parameter)) {
             frag_coord = DefineVariable(F32[4], spv::BuiltIn::FragCoord, spv::StorageClass::Input);
@@ -850,6 +851,10 @@ void EmitContext::DefinePushDataBlock() {
     members.push_back(U32[2]);
     members.push_back(U32[1]);
     members.push_back(U32[1]);
+#ifdef __APPLE__
+    members.push_back(F32[1]);
+    members.push_back(F32[1]);
+#endif
     const Id struct_type{Name(TypeStruct(std::span<const Id>(members)), "AuxData")};
     Decorate(struct_type, spv::Decoration::Block);
     MemberName(struct_type, PushData::XOffsetIndex, "xoffset");
@@ -880,6 +885,14 @@ void EmitContext::DefinePushDataBlock() {
     MemberName(struct_type, PushData::SceneSizeIndex, "scene_size");
     MemberDecorate(struct_type, PushData::SceneSizeIndex, spv::Decoration::Offset,
                    u32(offsetof(PushData, scene_size)));
+#ifdef __APPLE__
+    MemberName(struct_type, PushData::DepthBoundsMinIndex, "depth_bounds_min");
+    MemberDecorate(struct_type, PushData::DepthBoundsMinIndex, spv::Decoration::Offset,
+                   u32(offsetof(PushData, depth_bounds_min)));
+    MemberName(struct_type, PushData::DepthBoundsMaxIndex, "depth_bounds_max");
+    MemberDecorate(struct_type, PushData::DepthBoundsMaxIndex, spv::Decoration::Offset,
+                   u32(offsetof(PushData, depth_bounds_max)));
+#endif
     push_data_block = DefineVar(struct_type, spv::StorageClass::PushConstant);
     Name(push_data_block, "push_data");
     interfaces.push_back(push_data_block);
@@ -1143,6 +1156,29 @@ void EmitContext::DefineImagesAndSamplers() {
         samplers.push_back(id);
         interfaces.push_back(id);
     }
+}
+
+void EmitContext::DefineDepthBoundsImage() {
+#ifdef __APPLE__
+    info.depth_bounds_binding = std::numeric_limits<u32>::max();
+    if (!DepthBoundsTest()) {
+        return;
+    }
+    ASSERT_MSG(runtime_info.hw.fs.num_samples == 1,
+               "macOS per-sample depth bounds emulation is not implemented: shader={:#x}, samples={}",
+               info.pgm_hash, runtime_info.hw.fs.num_samples);
+    ASSERT_MSG(!profile.lower_left_origin_mode,
+               "macOS depth bounds requires upper-left fragment coordinates: shader={:#x}",
+               info.pgm_hash);
+    depth_bounds_image_type = TypeImage(F32[1], spv::Dim::Dim2D, 0, false, false, 1,
+                                       spv::ImageFormat::Unknown);
+    depth_bounds_image = DefineVar(depth_bounds_image_type, spv::StorageClass::UniformConstant);
+    info.depth_bounds_binding = 0u;
+    Decorate(depth_bounds_image, spv::Decoration::Binding, info.depth_bounds_binding);
+    Decorate(depth_bounds_image, spv::Decoration::DescriptorSet, 1U);
+    Name(depth_bounds_image, "stored_depth_bounds");
+    interfaces.push_back(depth_bounds_image);
+#endif
 }
 
 void EmitContext::DefineSharedMemory() {

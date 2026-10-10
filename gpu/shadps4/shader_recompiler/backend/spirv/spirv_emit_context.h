@@ -50,6 +50,14 @@ public:
     Id Def(const IR::Value& value);
 
     void DefineBufferProperties();
+    void DefineDepthBoundsTest();
+    bool DepthBoundsTest() const {
+#ifdef __APPLE__
+        return sw_stage == SwStage::Fragment && runtime_info.hw.fs.depth_bounds_test;
+#else
+        return false;
+#endif
+    }
     void WriteMaskedU32(Id pointer, Id value, Id mask, spv::Scope scope) {
         const Id header = OpLabel();
         const Id body = OpLabel();
@@ -302,6 +310,8 @@ public:
     Id base_vertex{};
     Id base_instance{};
     Id frag_coord{};
+    Id depth_bounds_image{};
+    Id depth_bounds_image_type{};
     Id front_facing{};
     Id frag_depth{};
     Id stencil_ref{};
@@ -554,6 +564,7 @@ private:
     void DefinePushDataBlock();
     void DefineBuffers();
     void DefineImagesAndSamplers();
+    void DefineDepthBoundsImage();
     void DefineSharedMemory();
     void DefineFunctions();
 
