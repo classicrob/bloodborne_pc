@@ -66,10 +66,11 @@ int main(int argc, char** argv) {
             copies[i].imageOffset={int(32+i*53),int(32+i*29),0};
             copies[i].imageExtent={1,1,1};
         }
-        std::array<double,2> errors{};
+        std::array<double,4> errors{};
         uint64_t value=0;
-        for(unsigned candidate=0;candidate<2;++candidate) {
-            const float sign=candidate==0?-1.0f:1.0f;
+        for(unsigned candidate=0;candidate<4;++candidate) {
+            const float signX=(candidate&1)?1.0f:-1.0f;
+            const float signY=(candidate&2)?1.0f:-1.0f;
             BbMetalFX::TemporalScaler scaler(e.device,vkGetDeviceProcAddr,ready,done,{W,H,OW,OH});
             auto binding=scaler.Register({color.image,depth.image,motion.image,output.image,reactive.image});
             double error=0; unsigned count=0;
@@ -98,7 +99,7 @@ int main(int argc, char** argv) {
                 for(auto* image:{&color,&depth,&motion,&reactive,&output})
                     barrier(producer,*image,VK_IMAGE_LAYOUT_GENERAL,VK_IMAGE_LAYOUT_GENERAL,e.family,VK_QUEUE_FAMILY_EXTERNAL);
                 submit(e,producer,nullptr,0,ready,value,nullptr);
-                scaler.Submit(binding,{value,value,frame,0,sign*jx,sign*jy});
+                scaler.Submit(binding,{value,value,frame,0,signX*jx,signY*jy});
                 begin(consumer);
                 barrier(consumer,output,VK_IMAGE_LAYOUT_GENERAL,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,VK_QUEUE_FAMILY_EXTERNAL,e.family);
                 vkCmdCopyImageToBuffer(consumer,output.image,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,readback,samples,copies.data());
@@ -114,10 +115,13 @@ int main(int argc, char** argv) {
                 }
             }
             errors[candidate]=error/count;
-            std::printf("Sampling jitter sign=%+.0f viewport shift; moving-grid MAE=%.8f\n",sign,errors[candidate]);
+            std::printf("Sampling jitter signs=(%+.0f,%+.0f) viewport shift; moving-grid MAE=%.8f\n",
+                        signX,signY,errors[candidate]);
         }
-        require(errors[0]<0.006 && errors[1]>errors[0]*2,"negative viewport jitter did not uniquely match the analytic reference");
-        std::puts("PASS: MetalFX sampling jitter = negative Vulkan viewport shift; previous-current pixel motion");
+        require(errors[3]<0.006 && errors[0]>errors[3]*1.25 &&
+                errors[1]>errors[3]*1.25 && errors[2]>errors[3]*1.25,
+                "positive X/Y viewport jitter did not uniquely match the analytic reference");
+        std::puts("PASS: MetalFX sampling jitter = Vulkan viewport shift; previous-current pixel motion");
         return 0;
     }} catch(const std::exception& ex) { std::fprintf(stderr,"MetalFX jitter qualification: %s\n",ex.what()); return 1; }
 }

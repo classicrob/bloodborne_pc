@@ -305,13 +305,15 @@ static FfxVkPortableImage describe(const Image& x,FfxVkPortableResourceState sta
 int main(int argc,char** argv) {
     setbuf(stdout,nullptr);
     try {
-        bool wantPresent=false, depthStencil=false, useModule=false;
+        bool wantPresent=false, depthStencil=false, useModule=false, reactiveHistory=false;
         for(int i=1;i<argc;++i) {
             if(!std::strcmp(argv[i],"--present")) wantPresent=true;
             else if(!std::strcmp(argv[i],"--depth-stencil")) depthStencil=true;
             else if(!std::strcmp(argv[i],"--module")) useModule=true;
-            else throw std::runtime_error("expected --present, --depth-stencil or --module");
+            else if(!std::strcmp(argv[i],"--reactive-history")) reactiveHistory=true;
+            else throw std::runtime_error("expected --present, --depth-stencil, --module or --reactive-history");
         } @autoreleasepool {
+        require(!reactiveHistory || useModule,"reactive-history qualification requires --module");
         int translated=0; size_t n=sizeof(translated);
         require(sysctlbyname("sysctl.proc_translated",&translated,&n,nullptr,0)==0 && translated==1,
                 "prototype requires actual Rosetta x86_64");
@@ -403,13 +405,15 @@ int main(int argc,char** argv) {
             VkClearDepthStencilValue dv{0.5f,0}; VkClearColorValue mv{};
             vkCmdClearDepthStencilImage(producer,depth.image,VK_IMAGE_LAYOUT_GENERAL,&dv,1,&dr);
             vkCmdClearColorImage(producer,motion.image,VK_IMAGE_LAYOUT_GENERAL,&mv,1,&mr);
-            vkCmdClearColorImage(producer,reactive.image,VK_IMAGE_LAYOUT_GENERAL,&mv,1,&mr);
+            VkClearColorValue reactiveValue{};
+            reactiveValue.float32[0]=reactiveHistory?1.0f:0.0f;
+            vkCmdClearColorImage(producer,reactive.image,VK_IMAGE_LAYOUT_GENERAL,&reactiveValue,1,&mr);
             for(auto* x:{&color,&depth,&motion,&output,&reactive})
                 barrier(producer,*x,VK_IMAGE_LAYOUT_GENERAL,VK_IMAGE_LAYOUT_GENERAL,e.family,VK_QUEUE_FAMILY_EXTERNAL);
             submit(e,producer,nullptr,0,ready,value,nullptr);
             id<MTLCommandBuffer> cb=nil;
             if(provider && value<=8) {
-                provider->Submit(binding,{value,value,value-1,value,0,0});
+                provider->Submit(binding,{value,value,value-1,reactiveHistory?0:value,0,0});
             } else {
                 cb=[e.metalQueue commandBuffer];
                 [cb encodeWaitForEvent:readyMetal value:value];
@@ -437,13 +441,18 @@ int main(int argc,char** argv) {
         }
         std::puts("PASS: same-texture interop, separate GPU queues, shared timeline events; 16 alternating frames");
         if(provider) std::puts("PASS: standalone signed Apple module, cached exports, history reset and GPU event interop");
+        if(reactiveHistory) std::puts("PASS: reactive mask=1 rejects alternating color history with a continuous epoch");
         if(wantPresent) {
-            auto cb=[e.metalQueue commandBuffer];
-            [cb encodeWaitForEvent:readyMetal value:16];
-            temporal.reset=YES; [temporal encodeToCommandBuffer:cb];
-            [cb encodeSignalEvent:doneMetal value:17]; [cb commit];
+            id<MTLCommandBuffer> cb=nil;
+            if(provider) provider->Submit(binding,{16,17,16,17,0,0});
+            else {
+                cb=[e.metalQueue commandBuffer];
+                [cb encodeWaitForEvent:readyMetal value:16];
+                temporal.reset=YES; [temporal encodeToCommandBuffer:cb];
+                [cb encodeSignalEvent:doneMetal value:17]; [cb commit];
+            }
             present(e,output,done,17);
-            metalComplete(cb);
+            if(provider) provider->Drain(); else metalComplete(cb);
         }
         for(bool isTemporal:{true,false}) {
             std::vector<double> times;
@@ -524,6 +533,7 @@ int main(int argc,char** argv) {
         require(ffxVkPortableUpscaleContextDestroy(context)==FFX_VK_PORTABLE_OK,"FSR3 destroy failed");
         VK(vkDeviceWaitIdle(e.device));
         std::puts("PASS: MetalFX Rosetta encodes + isolated FSR3 Vulkan benchmark; no renderer changes");
+        return 0;
     }} catch(const std::exception& error) {
         std::fprintf(stderr,"FAIL MetalFX prototype: %s\n",error.what()); return 1;
     }

@@ -40,7 +40,7 @@ void Completed(id<MTLCommandBuffer> command) {
 
 struct Textures::Impl {
     id<MTLTexture> color, depth, motion, output, reactive;
-    const void* owner;
+    std::shared_ptr<const unsigned char> owner;
 };
 Textures::Textures(std::shared_ptr<Impl> value) : impl{std::move(value)} {}
 Textures::~Textures() = default;
@@ -54,6 +54,7 @@ struct TemporalScaler::Impl {
     id<MTLSharedEvent> producer, consumer;
     id<MTLFXTemporalScaler> scaler;
     std::thread::id owner = std::this_thread::get_id();
+    std::shared_ptr<const unsigned char> binding_owner = std::make_shared<const unsigned char>(0);
     std::deque<id<MTLCommandBuffer>> pending;
     uint64_t last_producer = 0, last_consumer = 0, last_frame = 0, last_epoch = 0;
     bool dispatched = false;
@@ -167,7 +168,7 @@ std::shared_ptr<Textures> TemporalScaler::Register(Images images) {
     @autoreleasepool {
         impl->CheckOwner();
         auto textures = std::make_shared<Textures::Impl>();
-        textures->owner = impl.get();
+        textures->owner = impl->binding_owner;
         textures->color = impl->ExportImage(images.color, VK_IMAGE_ASPECT_COLOR_BIT);
         textures->depth = impl->ExportImage(images.depth, VK_IMAGE_ASPECT_DEPTH_BIT);
         textures->motion = impl->ExportImage(images.motion, VK_IMAGE_ASPECT_COLOR_BIT);
@@ -196,7 +197,8 @@ std::shared_ptr<Textures> TemporalScaler::Register(Images images) {
 void TemporalScaler::Submit(const std::shared_ptr<Textures>& textures, Frame frame) {
     @autoreleasepool {
         impl->CheckOwner();
-        Require(textures && textures->impl->owner == impl.get(), "binding belongs to another provider");
+        Require(textures && textures->impl->owner == impl->binding_owner,
+                "binding belongs to another provider");
         Require(frame.producer_value > impl->last_producer && frame.consumer_value > impl->last_consumer,
                 "shared-event values must increase for each temporal submission");
         Require(!impl->dispatched || frame.frame_id > impl->last_frame,
@@ -225,8 +227,9 @@ void TemporalScaler::Submit(const std::shared_ptr<Textures>& textures, Frame fra
         [scaler encodeToCommandBuffer:command];
         [command encodeSignalEvent:impl->consumer value:frame.consumer_value];
         // Keep the exported textures alive until Metal execution retires.
+        const auto retained_textures = textures;
         [command addCompletedHandler:^(id<MTLCommandBuffer> completed) {
-            (void)textures;
+            (void)retained_textures;
             Completed(completed);
         }];
         impl->pending.push_back(command);

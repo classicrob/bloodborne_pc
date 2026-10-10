@@ -21,7 +21,7 @@ struct Frame {
     // Vulkan signals producer_value before this encode; waits on consumer_value afterwards.
     uint64_t producer_value, consumer_value;
     uint64_t frame_id, history_epoch;
-    // Sampling offsets in render pixels, X right/Y down; these are not viewport shifts.
+    // Render-pixel jitter, X right/Y down; matches the Vulkan viewport shift.
     float sampling_jitter_x, sampling_jitter_y;
     float pre_exposure = 1.0f;
 };
