@@ -656,6 +656,16 @@ void PatchPhiNodes(const IR::Program& program, EmitContext& ctx) {
 
 std::vector<u32> EmitSPIRV(const Profile& profile, const RuntimeInfo& runtime_info,
                            const IR::Program& program, Bindings& binding) {
+#ifdef __APPLE__
+    constexpr u32 capacity = std::tuple_size_v<decltype(PushData::ud_regs)>;
+    const u32 count = program.info.ud_mask.NumRegs();
+    ASSERT_MSG((program.info.ud_mask.mask >> NUM_USER_DATA_REGS) == 0 &&
+                   binding.user_data <= capacity && count <= capacity - binding.user_data,
+               "Apple shader user-data push capacity exceeded: shader={:#x}, stage={}, "
+               "mask={:#x}, start={}, count={}, capacity={}",
+               program.info.pgm_hash, u32(program.info.sw_stage), program.info.ud_mask.mask,
+               binding.user_data, count, capacity);
+#endif
     EmitContext ctx{profile, runtime_info, program.info, binding};
     ctx.CollectBufferUsage(program);
     const Id main{DefineMain(ctx, program)};

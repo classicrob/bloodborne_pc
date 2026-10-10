@@ -225,7 +225,9 @@ struct Info : InfoPersistent {
         u32 mask = ud_mask.mask;
         while (mask) {
             const u32 index = std::countr_zero(mask);
-            ASSERT(bnd.user_data < NUM_USER_DATA_REGS && index < NUM_USER_DATA_REGS);
+            ASSERT_MSG(bnd.user_data < NUM_PUSH_USER_DATA_REGS && index < NUM_USER_DATA_REGS,
+                       "pipeline user data exceeds the push block: slot {} of {}, SGPR {}",
+                       bnd.user_data, NUM_PUSH_USER_DATA_REGS, index);
             mask &= ~(1U << index);
             push.ud_regs[bnd.user_data++] = ud[index];
         }

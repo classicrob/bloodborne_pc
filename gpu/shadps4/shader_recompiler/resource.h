@@ -7,11 +7,22 @@
 #include "shader_recompiler/ir/type.h"
 #include "video_core/amdgpu/resource.h"
 
+#include <cstddef>
 #include <boost/container/static_vector.hpp>
 
 namespace Shader {
 
 static constexpr u32 NUM_USER_DATA_REGS = 16;
+// User-data registers of ALL stages of a pipeline share one push block, each stage taking its
+// ud_mask.NumRegs() slots in stage order. Apple's inline vertex fetch and guard prologues read
+// more user SGPRs than native shaders, so VS+FS can exceed 16; Apple sizes the block for four
+// full stages (VS, TCS, TES, FS: geometry stages are a hard error there). Native keeps 16.
+#ifdef __APPLE__
+static constexpr u32 NUM_PUSH_USER_DATA_REGS = 4 * NUM_USER_DATA_REGS;
+#else
+static constexpr u32 NUM_PUSH_USER_DATA_REGS = NUM_USER_DATA_REGS;
+#endif
+static_assert(NUM_PUSH_USER_DATA_REGS % 4 == 0, "user data is declared as uvec4 members");
 static constexpr u32 NUM_IMAGES = 64;
 static constexpr u32 NUM_BUFFERS = 40;
 static constexpr u32 NUM_SAMPLERS = 16;
@@ -212,20 +223,27 @@ struct FMaskResource {
 using FMaskResourceList = boost::container::static_vector<FMaskResource, NUM_FMASKS>;
 
 struct PushData {
+    // SPIR-V member indices (DefinePushDataBlock): four floats, ud_regs as uvec4 members,
+    // buf_offsets as two uvec4 and one uvec2, then motion_param and scene_size.
     static constexpr u32 XOffsetIndex = 0;
     static constexpr u32 YOffsetIndex = 1;
     static constexpr u32 XScaleIndex = 2;
     static constexpr u32 YScaleIndex = 3;
     static constexpr u32 UdRegsIndex = 4;
-    static constexpr u32 BufOffsetIndex = UdRegsIndex + NUM_USER_DATA_REGS / 4;
+    static constexpr u32 BufOffsetIndex = UdRegsIndex + NUM_PUSH_USER_DATA_REGS / 4;
     static constexpr u32 MotionParamIndex = BufOffsetIndex + NUM_BUFFERS / 16 + 1;
     static constexpr u32 SceneSizeIndex = MotionParamIndex + 1;
+    // Byte offsets of those members.
+    static constexpr u32 UdRegsOffset = 16;
+    static constexpr u32 BufOffsetsOffset = UdRegsOffset + 4 * NUM_PUSH_USER_DATA_REGS;
+    static constexpr u32 MotionParamOffset = BufOffsetsOffset + NUM_BUFFERS;
+    static constexpr u32 SceneSizeOffset = MotionParamOffset + 4;
 
     float xoffset;
     float yoffset;
     float xscale;
     float yscale;
-    std::array<u32, NUM_USER_DATA_REGS> ud_regs;
+    std::array<u32, NUM_PUSH_USER_DATA_REGS> ud_regs;
     std::array<u8, NUM_BUFFERS> buf_offsets;
     u32 motion_param; ///< bbport: object motion parameter index (0: off)
     u32 scene_size; ///< reduced width | height << 16; zero means native pixel coordinates
@@ -235,7 +253,19 @@ struct PushData {
         buf_offsets[binding] = offset;
     }
 };
+static_assert(offsetof(PushData, ud_regs) == PushData::UdRegsOffset);
+static_assert(offsetof(PushData, buf_offsets) == PushData::BufOffsetsOffset);
+static_assert(offsetof(PushData, motion_param) == PushData::MotionParamOffset);
+static_assert(offsetof(PushData, scene_size) == PushData::SceneSizeOffset);
+static_assert(NUM_BUFFERS == 2 * 16 + 8, "buf_offsets is declared as two uvec4 and one uvec2");
+#ifdef __APPLE__
+// Above Vulkan's guaranteed 128 bytes: Instance checks maxPushConstantsSize (4096 on M4).
+static_assert(sizeof(PushData) == 320);
+#else
 static_assert(sizeof(PushData) <= 128,
               "PushData size is greater than minimum size guaranteed by Vulkan spec");
+static_assert(PushData::BufOffsetsOffset == 80 && PushData::SceneSizeOffset == 124,
+              "native push layout must not change");
+#endif
 
 } // namespace Shader
