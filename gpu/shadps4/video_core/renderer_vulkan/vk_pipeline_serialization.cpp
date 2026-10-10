@@ -18,7 +18,7 @@ static constexpr u32 ShaderBinaryVersion = 17u; // Apple wave64 emulation (16: L
 static constexpr u32 ShaderBinaryVersion = 13u; // Atomic masked stores preserve concurrent subword LDS writes.
 #endif
 static constexpr u32 ShaderMetaVersion = 9u; // Each permutation stores its own translated resource metadata.
-static constexpr u32 PipelineKeyVersion = 9u; // Aux RectList/QuadList stages read only VS-written locations.
+static constexpr u32 PipelineKeyVersion = 10u; // Geometry runtime keys distinguish invocation counts, strides and modes.
 } // namespace Serialization
 
 namespace Vulkan {
