@@ -1781,6 +1781,17 @@ struct Writer {
     }
 };
 
+// RectList aux tessellation shaders. Trees with the VS-output-location argument get 0: the render
+// VS writes position only.
+template <typename Fs>
+std::vector<u32> AuxTess(Shader::Backend::SPIRV::AuxShaderType type, const Fs& fs) {
+    if constexpr (requires { Shader::Backend::SPIRV::EmitAuxilaryTessShader(type, fs, 0u); }) {
+        return Shader::Backend::SPIRV::EmitAuxilaryTessShader(type, fs, 0u);
+    } else {
+        return Shader::Backend::SPIRV::EmitAuxilaryTessShader(type, fs);
+    }
+}
+
 constexpr u32 RecordMagic = 0x4A4F4231;
 
 void CompileJob(std::vector<ProgramState>& programs, Shader::Pools& pools, u32 index, int fd) {
@@ -2871,10 +2882,10 @@ bool RecordRender(Gpu& g, vk::CommandBuffer cmd, Job& j, const std::vector<vk::D
         if (t.rect_list) {
             using Shader::Backend::SPIRV::AuxShaderType;
             stages.push_back({.stage = vk::ShaderStageFlagBits::eTessellationControl,
-                              .module = module(Shader::Backend::SPIRV::EmitAuxilaryTessShader(AuxShaderType::RectListTCS, fs_rt.hw.fs)),
+                              .module = module(AuxTess(AuxShaderType::RectListTCS, fs_rt.hw.fs)),
                               .pName = "main"});
             stages.push_back({.stage = vk::ShaderStageFlagBits::eTessellationEvaluation,
-                              .module = module(Shader::Backend::SPIRV::EmitAuxilaryTessShader(AuxShaderType::PassthroughTES, fs_rt.hw.fs)),
+                              .module = module(AuxTess(AuxShaderType::PassthroughTES, fs_rt.hw.fs)),
                               .pName = "main"});
         }
         stages.push_back({.stage = vk::ShaderStageFlagBits::eFragment, .module = module(g_spirv.at({t.fs_tmpl, 0})), .pName = "main"});
@@ -2889,8 +2900,8 @@ bool RecordRender(Gpu& g, vk::CommandBuffer cmd, Job& j, const std::vector<vk::D
             dump("vs", g_spirv.at({j.tmpl, j.perm}));
             dump("fs", g_spirv.at({t.fs_tmpl, 0}));
             if (t.rect_list) {
-                dump("tcs", Shader::Backend::SPIRV::EmitAuxilaryTessShader(AuxShaderType::RectListTCS, fs_rt.hw.fs));
-                dump("tes", Shader::Backend::SPIRV::EmitAuxilaryTessShader(AuxShaderType::PassthroughTES, fs_rt.hw.fs));
+                dump("tcs", AuxTess(AuxShaderType::RectListTCS, fs_rt.hw.fs));
+                dump("tes", AuxTess(AuxShaderType::PassthroughTES, fs_rt.hw.fs));
             }
         }
         const auto all = vk::ShaderStageFlagBits::eAllGraphics;
