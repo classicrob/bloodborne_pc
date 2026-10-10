@@ -63,6 +63,11 @@ static std::vector<u32> shader(int scenario) {
         put(EmitLoadBufferU32(ctx,nullptr,0,address(index,offset,soffset)),want);
     };
     if(scenario==0) {
+        put(ctx.BufferLength(0,EmitContext::PointerType::U8),36);
+        put(ctx.BufferLength(0,EmitContext::PointerType::U16),18);
+        put(ctx.BufferLength(0,EmitContext::PointerType::U32),9);
+        put(ctx.BufferLength(0,EmitContext::PointerType::F32),9);
+        put(ctx.BufferLength(0,EmitContext::PointerType::U64),4);
         load(0,0,0x1001);load(0,28,0x1008);load(0,32,0);load(0,6,0x1002);
         load(0,UINT32_MAX,0);load(0,28,0,4);
         auto a=address(0,28);auto v=EmitLoadBufferU32x4(ctx,nullptr,0,a);

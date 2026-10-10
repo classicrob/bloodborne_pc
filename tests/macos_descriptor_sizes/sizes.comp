@@ -1,0 +1,14 @@
+#version 450
+#extension GL_EXT_shader_8bit_storage : require
+layout(local_size_x = 1) in;
+layout(set = 0, binding = 0, std430) readonly buffer Bytes { uint8_t values[]; } bytes;
+layout(set = 0, binding = 0, std430) readonly buffer Words { uint values[]; } words;
+layout(set = 0, binding = 1, std430) readonly buffer Other { uint values[]; } other;
+layout(set = 0, binding = 2, std430) buffer Results { uint values[]; } result;
+void main() {
+    result.values[0] = bytes.values.length();
+    result.values[1] = words.values.length();
+    result.values[2] = other.values.length();
+    result.values[3] = words.values[0];
+    result.values[4] = other.values[0];
+}
