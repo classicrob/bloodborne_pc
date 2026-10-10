@@ -5,6 +5,8 @@
 #define VK_USE_PLATFORM_METAL_EXT
 #include <vulkan/vulkan.h>
 #include "ffx_vk_portable.h"
+#include "../../gpu/shim/macos_metalfx.h"
+#include <memory>
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>
 #include <algorithm>
@@ -303,12 +305,15 @@ static FfxVkPortableImage describe(const Image& x,FfxVkPortableResourceState sta
 int main(int argc,char** argv) {
     setbuf(stdout,nullptr);
     try {
-        bool wantPresent=false, depthStencil=false;
+        bool wantPresent=false, depthStencil=false, useModule=false, reactiveHistory=false;
         for(int i=1;i<argc;++i) {
             if(!std::strcmp(argv[i],"--present")) wantPresent=true;
             else if(!std::strcmp(argv[i],"--depth-stencil")) depthStencil=true;
-            else throw std::runtime_error("expected --present or --depth-stencil");
+            else if(!std::strcmp(argv[i],"--module")) useModule=true;
+            else if(!std::strcmp(argv[i],"--reactive-history")) reactiveHistory=true;
+            else throw std::runtime_error("expected --present, --depth-stencil, --module or --reactive-history");
         } @autoreleasepool {
+        require(!reactiveHistory || useModule,"reactive-history qualification requires --module");
         int translated=0; size_t n=sizeof(translated);
         require(sysctlbyname("sysctl.proc_translated",&translated,&n,nullptr,0)==0 && translated==1,
                 "prototype requires actual Rosetta x86_64");
@@ -336,6 +341,7 @@ int main(int argc,char** argv) {
         std::printf("Depth format Metal=%lu Vulkan=%d direct base texture\n",
                     (unsigned long)depth.texture.pixelFormat,depth.format);
         Image motion=e.image(VK_FORMAT_R16G16_SFLOAT,W,H,VK_IMAGE_ASPECT_COLOR_BIT);
+        Image reactive=e.image(VK_FORMAT_R8_UNORM,W,H,VK_IMAGE_ASPECT_COLOR_BIT);
         Image output=e.image(VK_FORMAT_R16G16B16A16_SFLOAT,OW,OH,VK_IMAGE_ASPECT_COLOR_BIT);
         require(output.texture.storageMode==MTLStorageModePrivate,"MetalFX output must be private");
         auto usage=[](id<MTLTexture> t,MTLTextureUsage need) {require((t.usage&need)==need,"exported texture lacks MetalFX usage");};
@@ -350,6 +356,13 @@ int main(int argc,char** argv) {
         spatial.colorTexture=color.texture; spatial.outputTexture=output.texture;
         spatial.inputContentWidth=W; spatial.inputContentHeight=H;
         auto [ready,readyMetal]=event(e); auto [done,doneMetal]=event(e);
+        std::unique_ptr<BbMetalFX::TemporalScaler> provider;
+        std::shared_ptr<BbMetalFX::Textures> binding;
+        if(useModule) {
+            provider=std::make_unique<BbMetalFX::TemporalScaler>(e.device,vkGetDeviceProcAddr,
+                ready,done,BbMetalFX::Config{W,H,OW,OH,depthStencil});
+            binding=provider->Register({color.image,depth.image,motion.image,output.image,reactive.image});
+        }
         VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO}; VkFence fence{};
         VK(vkCreateFence(e.device,&fi,nullptr,&fence));
         VkCommandBuffer producer=e.command(), consumer=e.command();
@@ -379,7 +392,7 @@ int main(int argc,char** argv) {
         for(uint64_t value=1; value<=16; ++value) {
             const float red=value%2 ? 0.25f : 0.75f;
             begin(producer);
-            for(auto* x:{&color,&depth,&motion,&output})
+            for(auto* x:{&color,&depth,&motion,&output,&reactive})
                 barrier(producer,*x,value==1?VK_IMAGE_LAYOUT_UNDEFINED:VK_IMAGE_LAYOUT_GENERAL,
                         VK_IMAGE_LAYOUT_GENERAL,value==1?VK_QUEUE_FAMILY_IGNORED:VK_QUEUE_FAMILY_EXTERNAL,
                         value==1?VK_QUEUE_FAMILY_IGNORED:e.family);
@@ -392,14 +405,22 @@ int main(int argc,char** argv) {
             VkClearDepthStencilValue dv{0.5f,0}; VkClearColorValue mv{};
             vkCmdClearDepthStencilImage(producer,depth.image,VK_IMAGE_LAYOUT_GENERAL,&dv,1,&dr);
             vkCmdClearColorImage(producer,motion.image,VK_IMAGE_LAYOUT_GENERAL,&mv,1,&mr);
-            for(auto* x:{&color,&depth,&motion,&output})
+            VkClearColorValue reactiveValue{};
+            reactiveValue.float32[0]=reactiveHistory?1.0f:0.0f;
+            vkCmdClearColorImage(producer,reactive.image,VK_IMAGE_LAYOUT_GENERAL,&reactiveValue,1,&mr);
+            for(auto* x:{&color,&depth,&motion,&output,&reactive})
                 barrier(producer,*x,VK_IMAGE_LAYOUT_GENERAL,VK_IMAGE_LAYOUT_GENERAL,e.family,VK_QUEUE_FAMILY_EXTERNAL);
             submit(e,producer,nullptr,0,ready,value,nullptr);
-            id<MTLCommandBuffer> cb=[e.metalQueue commandBuffer];
-            [cb encodeWaitForEvent:readyMetal value:value];
-            if(value<=8) {temporal.reset=YES; [temporal encodeToCommandBuffer:cb];}
-            else [spatial encodeToCommandBuffer:cb];
-            [cb encodeSignalEvent:doneMetal value:value]; [cb commit];
+            id<MTLCommandBuffer> cb=nil;
+            if(provider && value<=8) {
+                provider->Submit(binding,{value,value,value-1,reactiveHistory?0:value,0,0});
+            } else {
+                cb=[e.metalQueue commandBuffer];
+                [cb encodeWaitForEvent:readyMetal value:value];
+                if(value<=8) {temporal.reset=YES; [temporal encodeToCommandBuffer:cb];}
+                else [spatial encodeToCommandBuffer:cb];
+                [cb encodeSignalEvent:doneMetal value:value]; [cb commit];
+            }
             begin(consumer);
             barrier(consumer,output,VK_IMAGE_LAYOUT_GENERAL,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                     VK_QUEUE_FAMILY_EXTERNAL,e.family);
@@ -408,7 +429,8 @@ int main(int argc,char** argv) {
             vkCmdCopyImageToBuffer(consumer,output.image,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,readback,1,&copy);
             barrier(consumer,output,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,VK_IMAGE_LAYOUT_GENERAL,
                     e.family,VK_QUEUE_FAMILY_EXTERNAL);
-            submit(e,consumer,done,value,nullptr,0,fence); complete(e,fence); metalComplete(cb);
+            submit(e,consumer,done,value,nullptr,0,fence); complete(e,fence);
+            if(cb) metalComplete(cb); else provider->Drain();
             _Float16 actual[4]; std::memcpy(actual,pixel,8);
             std::printf("interop frame=%llu scaler=%s rgb=%.4f,%.4f,%.4f expected=%.2f,.5,.25\n",
                (unsigned long long)value,value<=8?"temporal":"spatial",
@@ -418,13 +440,19 @@ int main(int argc,char** argv) {
                     "Vulkan -> MetalFX -> Vulkan pixel mismatch");
         }
         std::puts("PASS: same-texture interop, separate GPU queues, shared timeline events; 16 alternating frames");
+        if(provider) std::puts("PASS: standalone signed Apple module, cached exports, history reset and GPU event interop");
+        if(reactiveHistory) std::puts("PASS: reactive mask=1 rejects alternating color history with a continuous epoch");
         if(wantPresent) {
-            auto cb=[e.metalQueue commandBuffer];
-            [cb encodeWaitForEvent:readyMetal value:16];
-            temporal.reset=YES; [temporal encodeToCommandBuffer:cb];
-            [cb encodeSignalEvent:doneMetal value:17]; [cb commit];
+            id<MTLCommandBuffer> cb=nil;
+            if(provider) provider->Submit(binding,{16,17,16,17,0,0});
+            else {
+                cb=[e.metalQueue commandBuffer];
+                [cb encodeWaitForEvent:readyMetal value:16];
+                temporal.reset=YES; [temporal encodeToCommandBuffer:cb];
+                [cb encodeSignalEvent:doneMetal value:17]; [cb commit];
+            }
             present(e,output,done,17);
-            metalComplete(cb);
+            if(provider) provider->Drain(); else metalComplete(cb);
         }
         for(bool isTemporal:{true,false}) {
             std::vector<double> times;
@@ -505,6 +533,7 @@ int main(int argc,char** argv) {
         require(ffxVkPortableUpscaleContextDestroy(context)==FFX_VK_PORTABLE_OK,"FSR3 destroy failed");
         VK(vkDeviceWaitIdle(e.device));
         std::puts("PASS: MetalFX Rosetta encodes + isolated FSR3 Vulkan benchmark; no renderer changes");
+        return 0;
     }} catch(const std::exception& error) {
         std::fprintf(stderr,"FAIL MetalFX prototype: %s\n",error.what()); return 1;
     }
