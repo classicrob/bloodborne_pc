@@ -1349,19 +1349,21 @@ Shader::Profile MakeProfile(const DeviceCaps& c) {
     p.needs_buffer_offsets = c.storage_align > 4;
     p.emulate_null_descriptors = !c.null_descriptor;
     p.supports_workgroup_explicit_memory_layout = c.explicit_layout;
-    // Sol-2's robustness emulation flag, when the tree under test has it: on when the device
-    // lacks robustBufferAccess2 (the Apple case).
+    // Apple-only Profile switches: set exactly when the tree's PipelineCache sets them on Apple
+    // (build.sh detects each assignment), so the suite tests what the renderer would compile.
     [&](auto& prof) {
-        if constexpr (requires { prof.emulate_robust_buffer_access; }) {
-            prof.emulate_robust_buffer_access = !c.rba2;
-        }
-        // Sol-2's vertex pulling: Apple has no robustBufferAccess2 for fixed-function fetch.
-        if constexpr (requires { prof.emulate_wave64; }) {
-            prof.emulate_wave64 = c.subgroup_size < 64; // Apple: 32-wide subgroups
-        }
-        if constexpr (requires { prof.emulate_vertex_fetch; }) {
-            prof.emulate_vertex_fetch = !c.rba2;
-        }
+#ifdef BB_MIRROR_PROFILE_ROBUST
+        if constexpr (requires { prof.emulate_robust_buffer_access; }) prof.emulate_robust_buffer_access = true;
+#endif
+#ifdef BB_MIRROR_PROFILE_WAVE64
+        if constexpr (requires { prof.emulate_wave64; }) prof.emulate_wave64 = true;
+#endif
+#ifdef BB_MIRROR_PROFILE_VERTEX_FETCH
+        if constexpr (requires { prof.emulate_vertex_fetch; }) prof.emulate_vertex_fetch = true;
+#endif
+#ifdef BB_MIRROR_PROFILE_SIGNED_ZERO
+        if constexpr (requires { prof.repair_mul_signed_zero; }) prof.repair_mul_signed_zero = true;
+#endif
     }(p);
     return p;
 }
@@ -2197,6 +2199,7 @@ struct Options {
     std::string outdir;
     std::string dump_spv;
     std::string compile_only, stage = "cs";
+    bool bench = false;
     std::array<u32, 16> ud{};
 };
 
@@ -2574,6 +2577,133 @@ bool LoudRequired(Gpu& g, Job& j) {
 
 } // namespace
 
+// --bench: GPU time of K ballot rounds (VOPC -> VCC read as a value, s_bcnt1, v_mbcnt over the
+// mask) per invocation, with and without the Apple wave64 emulation, over many workgroups.
+Template BenchTemplate(u32 rounds, std::array<u32, 3> wg, u32 salt) {
+    using namespace GcnAsm;
+    Template t;
+    t.name = "bench rounds=" + std::to_string(rounds);
+    t.wg = wg;
+    Code c;
+    c.SMovLiteral(VCC_HI, 0x5eed);
+    u32 log2x = 0;
+    while ((1u << log2x) < wg[0]) ++log2x;
+    c.VLshlrevB32(15, Inline(log2x), 1);
+    c.Vop2(37, 15, 15, Vgpr(0));    // v15 = local invocation index
+    c.VMov(10, Inline(0));
+    c.VMov(11, Inline(0));
+    for (u32 r = 0; r < rounds; ++r) {
+        c.Vop2(27, 12, 15, Inline(1 + r % 31)); // v12 = v15 & k
+        c.VCmpNeU32(Inline(0), 12);            // vcc = ballot(v12 != 0)
+        c.SBcnt1B64(16, VCC_LO);
+        c.VMbcnt(false, 13, VCC_LO, 10);
+        c.VMbcnt(true, 10, VCC_HI, 13);        // v10 += lanes below with the bit set
+        c.Vop2(37, 11, 11, 16);                // v11 += s16 (popcount)
+    }
+    c.VLshlrevB32(14, Inline(3), 15);
+    c.Mubuf(BUFFER_STORE_DWORDX2, Code::BufFields{.offen = true, .vaddr = 14, .vdata = 10, .srsrc = 8});
+    c.SWaitcntAll();
+    c.SEndpgm();
+    t.code = std::move(c.words);
+    t.hash = 0xbe9c00ull ^ (u64(rounds) << 8) ^ (u64(wg[0] * wg[1]) << 20) ^ (u64(salt) << 40);
+    return t;
+}
+
+int Bench(const Options& opt) {
+    struct Variant { u32 rounds; std::array<u32, 3> wg; bool emulate; };
+    const Variant variants[] = {{0, {64, 1, 1}, true},   {16, {64, 1, 1}, false}, {16, {64, 1, 1}, true},
+                                {0, {256, 1, 1}, true},  {16, {256, 1, 1}, false}, {16, {256, 1, 1}, true}};
+    const Shader::Profile saved = g_profile;
+    std::vector<std::pair<u32, Job>> compiled; // template index, job
+    for (u32 i = 0; i < std::size(variants); ++i) {
+        const auto& v = variants[i];
+        g_profile = saved;
+        [&](auto& prof) {
+            if constexpr (requires { prof.emulate_wave64; }) prof.emulate_wave64 = v.emulate;
+        }(g_profile);
+        g_templates.push_back(BenchTemplate(v.rounds, v.wg, i));
+        const u32 ti = u32(g_templates.size() - 1);
+        Job j;
+        j.tmpl = ti;
+        j.group = "bench";
+        gcn_vsharp ov = RawV(256 * 8);
+        ov.base = GuestVa;
+        const auto o = Pack(ov);
+        for (u32 k = 0; k < 4; ++k) j.ud[8 + k] = o[k];
+        g_jobs = {j};
+        CompileAll(opt.outdir);
+        if (g_jobs[0].status != Status::Ok) {
+            std::printf("bench variant %u: compile failed: %s\n", i, g_jobs[0].message.c_str());
+            return 1;
+        }
+        compiled.push_back({ti, g_jobs[0]});
+    }
+    g_profile = saved;
+    Gpu g;
+    InitGpu(g, true);
+    const auto props = g.physical.getProperties();
+    auto qpool = g.device->createQueryPoolUnique({.queryType = vk::QueryType::eTimestamp, .queryCount = 2}).value;
+    constexpr u32 kWorkgroups = 16384;
+    std::printf("bench: %u workgroups, timestampPeriod %.2f ns\n", kWorkgroups, props.limits.timestampPeriod);
+    for (u32 i = 0; i < compiled.size(); ++i) {
+        auto& [ti, j] = compiled[i];
+        const auto& v = variants[i];
+        Pipe& pipe = GetPipe(g, ti, j.perm, u32(j.binds.size()));
+        if (pipe.result != vk::Result::eSuccess) return 1;
+        std::vector<vk::DescriptorBufferInfo> infos;
+        Shader::PushData push{};
+        std::copy(j.ud_regs.begin(), j.ud_regs.end(), push.ud_regs.begin());
+        for (u32 b = 0; b < j.binds.size(); ++b) {
+            if (j.binds[b].type == u32(Shader::BufferType::Guest)) {
+                Bound bd = BindGuest(g, j.binds[b].sharp, j.binds[b].required);
+                push.AddOffset(b, bd.adjust);
+                infos.push_back(bd.info);
+            } else {
+                infos.push_back({.buffer = *g.flat.buffer, .offset = 0, .range = std::max<u64>(j.binds[b].flat.size() * 4, 4)});
+                std::memcpy(g.flat.data, j.binds[b].flat.data(), j.binds[b].flat.size() * 4);
+            }
+        }
+        double best = 1e30;
+        for (u32 rep = 0; rep < 5; ++rep) {
+            assert(g.device->resetDescriptorPool(*g.dpool) == vk::Result::eSuccess);
+            const vk::DescriptorSetLayout l = *pipe.layout;
+            auto set = g.device->allocateDescriptorSets({.descriptorPool = *g.dpool, .descriptorSetCount = 1,
+                                                         .pSetLayouts = &l}).value.front();
+            std::vector<vk::WriteDescriptorSet> writes;
+            for (u32 b = 0; b < infos.size(); ++b) {
+                writes.push_back({.dstSet = set, .dstBinding = b, .descriptorCount = 1,
+                                  .descriptorType = vk::DescriptorType::eStorageBuffer, .pBufferInfo = &infos[b]});
+            }
+            g.device->updateDescriptorSets(writes, {});
+            auto cmd = g.device->allocateCommandBuffers({.commandPool = *g.pool, .level = vk::CommandBufferLevel::ePrimary,
+                                                         .commandBufferCount = 1}).value.front();
+            (void)cmd.begin(vk::CommandBufferBeginInfo{.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit});
+            cmd.resetQueryPool(*qpool, 0, 2);
+            cmd.bindPipeline(vk::PipelineBindPoint::eCompute, *pipe.pipeline);
+            cmd.bindDescriptorSets(vk::PipelineBindPoint::eCompute, *pipe.playout, 0, set, {});
+            cmd.pushConstants(*pipe.playout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
+            cmd.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, *qpool, 0);
+            cmd.dispatch(kWorkgroups * 64 / v.wg[0], 1, 1);
+            cmd.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, *qpool, 1);
+            (void)cmd.end();
+            const vk::SubmitInfo submit{.commandBufferCount = 1, .pCommandBuffers = &cmd};
+            (void)g.queue.submit(submit);
+            (void)g.queue.waitIdle();
+            u64 ts[2]{};
+            (void)g.device->getQueryPoolResults(*qpool, 0, 2, sizeof(ts), ts, sizeof(u64),
+                                                vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait);
+            g.device->freeCommandBuffers(*g.pool, cmd);
+            best = std::min(best, double(ts[1] - ts[0]) * props.limits.timestampPeriod);
+        }
+        const double invocations = double(kWorkgroups) * 64;
+        std::printf("  wg %3ux1  rounds %2u  %-22s %8.3f ms  %6.2f ns/invocation%s\n", v.wg[0], v.rounds,
+                    v.rounds == 0 ? "(baseline)" : (v.emulate ? "wave64 emulation" : "32-wide subgroups (wrong)"),
+                    best / 1e6, best / invocations,
+                    v.rounds ? ("  " + std::to_string(best / invocations / v.rounds) + " ns/ballot").c_str() : "");
+    }
+    return 0;
+}
+
 // --disasm FILE: decode a GCN binary with the production decoder and flag wave-level operations
 // (results depend on the 64-lane wave; see the wave64 group).
 int Disasm(const char* path) {
@@ -2634,6 +2764,7 @@ int main(int argc, char** argv) {
         else if (a == "--out" && i + 1 < argc) opt.outdir = argv[++i];
         else if (a == "--dump-spv" && i + 1 < argc) opt.dump_spv = argv[++i];
         else if (a == "--compile-only" && i + 1 < argc) opt.compile_only = argv[++i];
+        else if (a == "--bench") opt.bench = true;
         else if (a == "--stage" && i + 1 < argc) opt.stage = argv[++i];
         else if (a == "--fs-export" && i + 1 < argc) g_fs_export = u32(std::atoi(argv[++i]));
         else if (a == "--ud" && i + 1 < argc) {
@@ -2709,11 +2840,21 @@ int main(int argc, char** argv) {
     );
     std::printf("vertex fetch: %s\n", VertexPulling() ? "pulled in the shader (Profile::emulate_vertex_fetch)"
                                                       : "fixed-function vertex input (mirrored)");
-    std::printf("profile: emulate_null_descriptors %d, emulate_robust_buffer_access %s, robustBufferAccess %s\n",
-                g_profile.emulate_null_descriptors,
-                ProfileHasRobustFlag() ? (g_caps.rba2 ? "present, off" : "present, ON") : "absent in this tree",
+    const auto flag = [](auto& prof, int which) -> const char* {
+        bool present = false, on = false;
+        if (which == 0) { if constexpr (requires { prof.emulate_robust_buffer_access; }) { present = true; on = prof.emulate_robust_buffer_access; } }
+        if (which == 1) { if constexpr (requires { prof.emulate_wave64; }) { present = true; on = prof.emulate_wave64; } }
+        if (which == 2) { if constexpr (requires { prof.emulate_vertex_fetch; }) { present = true; on = prof.emulate_vertex_fetch; } }
+        return !present ? "absent" : (on ? "ON" : "off");
+    };
+    std::printf("profile: null_descriptors %d, robust_buffer_access %s, wave64 %s, vertex_fetch %s; "
+                "robustBufferAccess %s\n",
+                g_profile.emulate_null_descriptors, flag(g_profile, 0), flag(g_profile, 1), flag(g_profile, 2),
                 opt.rba ? "enabled (production)" : "DISABLED (--no-rba)");
 
+    if (opt.bench) {
+        return Bench(opt);
+    }
     if (!opt.compile_only.empty()) {
         // A real game shader through the production recompiler: compile + spirv-val only.
         FILE* f = std::fopen(opt.compile_only.c_str(), "rb");

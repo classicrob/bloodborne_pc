@@ -54,6 +54,13 @@ mirror=()
 grep -q "structured access escapes bound guest buffer" "$rast" && mirror+=(-DBB_MIRROR_REQUIRED_SPAN)
 grep -q "incomplete swizzled buffer index group" "$rast" && mirror+=(-DBB_MIRROR_SWIZZLE_GROUP)
 grep -q "exceeds 32-bit descriptor range" "$rast" && mirror+=(-DBB_MIRROR_U32_RANGE)
+# Mirror the Apple Profile switches this tree's PipelineCache sets.
+cache="$src/gpu/shadps4/video_core/renderer_vulkan/vk_pipeline_cache.cpp"
+grep -q "profile.emulate_robust_buffer_access = true" "$cache" && mirror+=(-DBB_MIRROR_PROFILE_ROBUST)
+grep -q "profile.emulate_wave64 = true" "$cache" && mirror+=(-DBB_MIRROR_PROFILE_WAVE64)
+grep -q "profile.emulate_vertex_fetch = true" "$cache" && mirror+=(-DBB_MIRROR_PROFILE_VERTEX_FETCH)
+grep -q "profile.repair_mul_signed_zero = true" "$cache" && mirror+=(-DBB_MIRROR_PROFILE_SIGNED_ZERO)
+echo "mirrored: ${mirror[*]:-none}"
 # Production flags for recompiler objects (CMake RelWithDebInfo), our own asserts kept on in the harness.
 prod=(-O2 -DNDEBUG)
 
