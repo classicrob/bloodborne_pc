@@ -3084,12 +3084,21 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
                                     ? vk::ImageLayout::eDepthReadOnlyStencilAttachmentOptimal
                                 : has_stencil ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
                                               : vk::ImageLayout::eDepthReadOnlyOptimal;
-        if (!reduced) needs_barrier |= runtime.Transit(&image, new_layout,
-                                         vk::PipelineStageFlagBits2::eEarlyFragmentTests |
-                                             vk::PipelineStageFlagBits2::eLateFragmentTests,
-                                         vk::AccessFlagBits2::eDepthStencilAttachmentWrite |
-                                             vk::AccessFlagBits2::eDepthStencilAttachmentRead,
-                                         desc.view_info.range);
+        auto depth_stages = vk::PipelineStageFlagBits2::eEarlyFragmentTests |
+                            vk::PipelineStageFlagBits2::eLateFragmentTests;
+        auto depth_access = vk::AccessFlagBits2::eDepthStencilAttachmentWrite |
+                            vk::AccessFlagBits2::eDepthStencilAttachmentRead;
+#ifdef __APPLE__
+        // Depth-bounds emulation samples the read-only attachment in the fragment shader
+        // (BindDepthBoundsSource). Every read-only transition makes earlier depth writes visible to
+        // that read too: draws of the same pass may reuse this render state without a transition.
+        if (!desc.view_info.is_depth_write) {
+            depth_stages |= vk::PipelineStageFlagBits2::eFragmentShader;
+            depth_access |= vk::AccessFlagBits2::eShaderSampledRead;
+        }
+#endif
+        if (!reduced) needs_barrier |= runtime.Transit(&image, new_layout, depth_stages,
+                                                       depth_access, desc.view_info.range);
 
         state.width = std::min<u32>(state.width, image.info.size.width);
         state.height = std::min<u32>(state.height, image.info.size.height);
