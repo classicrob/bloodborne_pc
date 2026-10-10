@@ -295,6 +295,10 @@ def launch(args):
         env['BB_PERF_PHASES'] = '1'  # one submit per phase: perturbs timing, never an FPS measurement
     if args.dump_shaders:
         env['BB_DUMP_SHADERS'] = '1'
+    if args.disable_optimizations is not None:
+        # Diagnostic A/B: optimizations switched off from the start (src/runtime_memory.c bits).
+        (run / 'toggles').write_text(f'{args.disable_optimizations}\n')
+        env['BB_TOGGLE_FILE'] = str(run / 'toggles')
     if args.frame_capture:
         (run / 'captures').mkdir()
         env.update(BB_CAPTURE_TRIGGER=str(run / 'capture.trigger'), BB_CAPTURE_DIR=str(run / 'captures'))
@@ -303,7 +307,9 @@ def launch(args):
                   ['git', '-C', str(ROOT), 'rev-parse', 'HEAD'], capture_output=True, text=True).stdout.strip(),
               'env': {k: v for k, v in env.items() if k.startswith(('BB_', 'DYLD_'))}, 'env_removed': removed,
               'diagnostics': [n for n, on in (('BB_DUMP_SHADERS', args.dump_shaders),
-                                              ('BB_CAPTURE_TRIGGER', args.frame_capture)) if on],
+                                              ('BB_CAPTURE_TRIGGER', args.frame_capture),
+                                              ('BB_TOGGLE_FILE', args.disable_optimizations is not None)) if on],
+              'disabled_optimizations': args.disable_optimizations,
               'perf': args.perf, 'perf_phases': args.perf_phases,
               'shader_cache': 'empty (fresh user directory)', 'saves': 'none (fresh user directory)',
               'host': {'load_average': os.getloadavg(), 'other_bb_probe': running}}
@@ -473,6 +479,8 @@ def main():
         p.add_argument('--gpu-log', help='BB_GPU_LOG level (default: the build default)')
         p.add_argument('--frame-capture', action='store_true', help='arm BB_CAPTURE_TRIGGER (frame analyzer)')
         p.add_argument('--dump-shaders', action='store_true', help='BB_DUMP_SHADERS=1 (diagnostic: writes every shader)')
+        p.add_argument('--disable-optimizations', type=int, metavar='MASK',
+                       help='BB_TOGGLE_FILE with this decimal mask from the start (diagnostic A/B)')
         p.add_argument('--perf', action='store_true', help='BB_PERF=1, BB_PERF_OUT=<run>/perf.jsonl')
         p.add_argument('--perf-phases', action='store_true',
                        help='BB_PERF_PHASES=1 (needs --perf; perturbed timing, not for FPS claims)')
