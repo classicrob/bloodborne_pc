@@ -881,6 +881,24 @@ bool Instance::IsFormatSupported(const vk::Format format,
 
 vk::Format Instance::GetSupportedFormat(const vk::Format format,
                                         const vk::FormatFeatureFlags2 flags) const {
+#ifdef __APPLE__
+    // The substitutes below are not exact (D16+S8 -> D32F+S8 changes depth precision and the
+    // depth-bias unit), so Apple refuses them. Image creation names the guest image first.
+    // See docs/macos/format-support.md.
+    if (!IsFormatSupported(format, flags)) [[unlikely]] {
+        switch (format) {
+        case vk::Format::eD16UnormS8Uint:
+        case vk::Format::eR8Srgb:
+        case vk::Format::eR8G8Srgb:
+            UNREACHABLE_MSG("macOS: {} lacks {} and has no exact substitute",
+                            vk::to_string(format),
+                            vk::to_string(flags & ~GetFormatFeatureFlags(format)));
+        default:
+            break;
+        }
+    }
+    return format;
+#endif
     if (!IsFormatSupported(format, flags)) [[unlikely]] {
         switch (format) {
         case vk::Format::eD16UnormS8Uint:

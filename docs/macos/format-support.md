@@ -42,10 +42,13 @@ Nothing in this table was seen being used by the game. The checks above will nam
   requires the depth and stencil attachments to be the same image view. So with MoltenVK there is
   no exact combined D16 + S8 attachment.
 
-Policy options: make the substitution a hard error on Apple, and learn from the first abort whether
-Bloodborne uses Z16 with stencil; or keep D32F + S8 and compensate depth bias for the format
-change, which is close but not exact. The orchestrator decides. Until then the substitution
-remains as it was.
+Decision (orchestrator, 2026-10-10): hard error on Apple now, naming the guest image
+(`Image::Image`) or, for a pipeline depth attachment, the format (`Instance::GetSupportedFormat`),
+so the first use tells us whether Bloodborne needs Z16 + S8. If it does, the follow-up is designed
+for exactness first: quantize depth to 16-bit in the FS (`round(z * 65535) / 65535`) with exact
+bias rescaling, and measure the early-Z cost. Only then is it compared with a documented
+bias-scaling approximation, which needs explicit sign-off as an accepted deviation. The `R8Srgb`
+and `R8G8Srgb` substitutes are refused on Apple too.
 
 `R8Srgb` and `R8G8Srgb` have UNORM substitutes in the same function, but M4 supports both sRGB
 formats (sampled, color, storage), so those substitutions never run on Apple. Measured by a direct

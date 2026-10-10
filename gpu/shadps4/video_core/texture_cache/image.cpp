@@ -155,6 +155,16 @@ Image::Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime_,
     }
 
     constexpr auto tiling = vk::ImageTiling::eOptimal;
+#ifdef __APPLE__
+    // Apple GPUs have no D16+S8 (or D24+S8): the D32F+S8 stand-in changes depth precision and the
+    // depth-bias unit. See docs/macos/format-support.md.
+    if (info.pixel_format == vk::Format::eD16UnormS8Uint &&
+        !instance.IsFormatSupported(info.pixel_format, format_features)) {
+        UNREACHABLE_MSG("macOS: guest Z16+S8 depth image {}x{} at {:#x} (stencil at {:#x}) has no "
+                        "exact Metal format",
+                        info.size.width, info.size.height, info.guest_address, info.stencil_addr);
+    }
+#endif
     const auto supported_format = instance.GetSupportedFormat(info.pixel_format, format_features);
     vk::PhysicalDeviceImageFormatInfo2 format_info{
         .format = supported_format,
