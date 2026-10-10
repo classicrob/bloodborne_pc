@@ -10,6 +10,7 @@
 #include "common/types.h"
 #include "imgui/renderer/imgui_core.h"
 #include "sdl_window.h"
+#include "shader_recompiler/resource.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
@@ -287,6 +288,11 @@ bool Instance::CreateDevice() {
                "Required Vulkan feature unavailable: nullDescriptor");
 #else
     emulate_null_descriptors = !robustness2_features.nullDescriptor;
+#endif
+#ifdef __APPLE__
+    ASSERT_MSG(properties.limits.maxPushConstantsSize >= sizeof(Shader::PushData),
+               "macOS push block needs {} bytes of push constants, device offers {}",
+               sizeof(Shader::PushData), properties.limits.maxPushConstantsSize);
 #endif
 
     // Optional
