@@ -252,6 +252,8 @@ def translated_games():
 
 
 def launch(args):
+    if args.perf_phases and not args.perf:
+        die('--perf-phases requires --perf')
     dyld = sorted(k for k in os.environ if k.startswith('DYLD_'))
     if dyld:
         die('refusing to launch with library overrides (unset them): ' + ', '.join(dyld))
@@ -287,6 +289,10 @@ def launch(args):
                BB_FRAME_STATS='1', BB_MODS_ENABLED='0', BB_TIMEOUT=str(args.timeout))
     if args.gpu_log:
         env['BB_GPU_LOG'] = args.gpu_log
+    if args.perf:
+        env.update(BB_PERF='1', BB_PERF_OUT=str(run / 'perf.jsonl'))  # the library creates it (fails if present)
+    if args.perf_phases:
+        env['BB_PERF_PHASES'] = '1'  # one submit per phase: perturbs timing, never an FPS measurement
     if args.dump_shaders:
         env['BB_DUMP_SHADERS'] = '1'
     if args.frame_capture:
@@ -298,6 +304,7 @@ def launch(args):
               'env': {k: v for k, v in env.items() if k.startswith(('BB_', 'DYLD_'))}, 'env_removed': removed,
               'diagnostics': [n for n, on in (('BB_DUMP_SHADERS', args.dump_shaders),
                                               ('BB_CAPTURE_TRIGGER', args.frame_capture)) if on],
+              'perf': args.perf, 'perf_phases': args.perf_phases,
               'shader_cache': 'empty (fresh user directory)', 'saves': 'none (fresh user directory)',
               'host': {'load_average': os.getloadavg(), 'other_bb_probe': running}}
     (run / 'manifest.json').write_text(json.dumps(record, indent=2) + '\n')
@@ -466,6 +473,9 @@ def main():
         p.add_argument('--gpu-log', help='BB_GPU_LOG level (default: the build default)')
         p.add_argument('--frame-capture', action='store_true', help='arm BB_CAPTURE_TRIGGER (frame analyzer)')
         p.add_argument('--dump-shaders', action='store_true', help='BB_DUMP_SHADERS=1 (diagnostic: writes every shader)')
+        p.add_argument('--perf', action='store_true', help='BB_PERF=1, BB_PERF_OUT=<run>/perf.jsonl')
+        p.add_argument('--perf-phases', action='store_true',
+                       help='BB_PERF_PHASES=1 (needs --perf; perturbed timing, not for FPS claims)')
         if command == 'route':
             p.add_argument('--until', help='last stage to run: ' + ', '.join(name for name, _ in ROUTE))
             p.add_argument('--keep', action='store_true', help='leave the game running after the route')
