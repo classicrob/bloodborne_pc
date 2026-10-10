@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <chrono>
 #include <pthread.h>
 #ifdef __APPLE__
@@ -169,10 +170,17 @@ void Liverpool::Process(std::stop_token stoken) {
         }
 
         if (submit_done) {
+            ReportCommandMemorySyncs();
             VideoCore::EndCapture();
             if (rasterizer) {
                 rasterizer->OnSubmit();
-                rasterizer->Flush();
+                const u64 flushed = rasterizer->Flush();
+                // DMA_DATA handed on so far is in this flush or an earlier one.
+                for (auto& dma : pending_dma_writes) {
+                    if (dma.tick == 0) {
+                        dma.tick = flushed;
+                    }
+                }
             }
             submit_done = false;
         }
@@ -385,6 +393,103 @@ void Liverpool::NotePendingWrite(const PM4CmdWriteData& write_data, u32 num_byte
     std::memcpy(&data, write_data.data, num_bytes);
     pending_fences.push_back(
         {write_data.Address<VAddr>(), data, num_bytes, rasterizer->DrawPipeHead()});
+}
+
+void Liverpool::SyncCommandMemory(VAddr address, u64 size, u32 reason, const char* reader) {
+#ifdef __APPLE__
+    if (!rasterizer || size == 0) {
+        return;
+    }
+    const auto log = [&](const char* what, u64 count) {
+        if (count <= 8 || (count & 1023) == 0) {
+            LOG_INFO(Render, "Command memory order: {} {:#x}+{:#x} waited for {} (#{})", reader,
+                     address, size, what, count);
+        }
+    };
+    if (rasterizer->PendingWriteOverlaps(address, size)) {
+        // WRITE_DATA and fence writes run on the draw recording thread; deferred fences after.
+        const auto start = std::chrono::steady_clock::now();
+        rasterizer->DrainDrawPipe(reason);
+        rasterizer->WaitDeferredSignals();
+        const u64 ns = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                            std::chrono::steady_clock::now() - start)
+                                            .count());
+        for (auto* stats : {&command_memory_syncs, &command_memory_window}) {
+            ++stats->drains;
+            stats->drain_ns += ns;
+        }
+        log("the draw recording thread", command_memory_syncs.drains);
+    }
+    const VAddr end = address + size;
+    std::erase_if(pending_dma_writes, [&](const PendingDma& dma) {
+        return dma.tick != 0 && rasterizer->IsTickFree(dma.tick);
+    });
+    const bool dma_pending = std::ranges::any_of(pending_dma_writes, [&](const PendingDma& dma) {
+        return address < dma.end && dma.begin < end;
+    });
+    if (dma_pending) {
+        // DMA_DATA copies and fills execute on the GPU: memory holds them only after it ran.
+        const auto start = std::chrono::steady_clock::now();
+        rasterizer->Finish();
+        pending_dma_writes.clear();
+        const u64 ns = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                            std::chrono::steady_clock::now() - start)
+                                            .count());
+        for (auto* stats : {&command_memory_syncs, &command_memory_window}) {
+            ++stats->gpu_waits;
+            stats->gpu_wait_ns += ns;
+        }
+        log("the GPU (DMA_DATA)", command_memory_syncs.gpu_waits);
+    }
+#endif
+}
+
+void Liverpool::NoteCommandMemoryWrite(VAddr address, u64 size, bool dma, u32 reason,
+                                       const char* writer) {
+#ifdef __APPLE__
+    if (!rasterizer || size == 0) {
+        return;
+    }
+    const VAddr end = address + size;
+    if (dma) {
+        // Merging keeps the list short; a merged entry waits for the newest flush.
+        auto merged = std::ranges::find_if(pending_dma_writes, [&](const PendingDma& other) {
+            return address <= other.end && other.begin <= end;
+        });
+        if (merged != pending_dma_writes.end()) {
+            merged->begin = std::min(merged->begin, address);
+            merged->end = std::max(merged->end, end);
+            merged->tick = 0;
+        } else {
+            pending_dma_writes.push_back({address, end, 0});
+        }
+    }
+    // The rest of every buffer being parsed is read after this write on the PS4.
+    for (const auto* rest : gfx_chain) {
+        const VAddr begin = reinterpret_cast<VAddr>(rest->data());
+        if (address < begin + rest->size_bytes() && begin < end) {
+            SyncCommandMemory(address, size, reason, writer);
+            return;
+        }
+    }
+#endif
+}
+
+void Liverpool::ReportCommandMemorySyncs() {
+#ifdef __APPLE__
+    auto& window = command_memory_window;
+    if (++window.frames < 600) {
+        return;
+    }
+    if (window.drains || window.gpu_waits) {
+        LOG_INFO(Render,
+                 "Command memory order, last {} frames: {} drains ({:.2f} ms), {} GPU waits "
+                 "({:.2f} ms)",
+                 window.frames, window.drains, window.drain_ns / 1e6, window.gpu_waits,
+                 window.gpu_wait_ns / 1e6);
+    }
+    window = {};
+#endif
 }
 
 bool Liverpool::PendingFenceValue(VAddr address, u32& value) {
@@ -734,6 +839,11 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
         RESUME_GFX(ce_task);
     }
 
+#ifdef __APPLE__
+    gfx_chain.push_back(&dcb);
+    SyncCommandMemory(reinterpret_cast<VAddr>(dcb.data()), dcb.size_bytes(),
+                      Vulkan::DrawPipe::ReasonCommands, "command buffer");
+#endif
     const auto base_addr = reinterpret_cast<uintptr_t>(dcb.data());
     while (!dcb.empty()) {
         ProcessCommands();
@@ -1156,12 +1266,17 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 if (dma_data->dst_addr_lo == 0x3022C || !rasterizer) {
                     break;
                 }
+                const bool to_memory = dma_data->dst_sel == DmaDataDst::Memory ||
+                                       dma_data->dst_sel == DmaDataDst::MemoryUsingL2;
                 if (rasterizer->RunInOrder(&RunDmaData, dma_data, sizeof(PM4DmaData),
                                            BbToggle::PipelinedMemoryWrites) &&
-                    (dma_data->dst_sel == DmaDataDst::Memory ||
-                     dma_data->dst_sel == DmaDataDst::MemoryUsingL2)) {
+                    to_memory) {
                     rasterizer->NotePendingGpuWrite(dma_data->DstAddress<VAddr>(),
                                                     dma_data->NumBytes());
+                }
+                if (to_memory) {
+                    NoteCommandMemoryWrite(dma_data->DstAddress<VAddr>(), dma_data->NumBytes(),
+                                           true, static_cast<u32>(opcode), "DMA_DATA");
                 }
                 break;
             }
@@ -1179,6 +1294,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                         NotePendingWrite(*write_data, (count - 2) * sizeof(u32));
                         rasterizer->NotePendingGpuWrite(write_data->Address<VAddr>(),
                                                         (count - 2) * sizeof(u32));
+                        NoteCommandMemoryWrite(write_data->Address<VAddr>(),
+                                               (count - 2) * sizeof(u32), false,
+                                               static_cast<u32>(opcode), "WRITE_DATA");
                     }
                 } else {
                     std::memcpy(write_data->Address<u64*>(), write_data->data, (count - 2) * 4);
@@ -1304,6 +1422,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 if (cond_exec->command.Value() != 0) {
                     LOG_WARNING(Render, "IT_COND_EXEC used a reserved command");
                 }
+                SyncCommandMemory(reinterpret_cast<VAddr>(cond_exec->Address()), sizeof(u32),
+                                  static_cast<u32>(opcode), "COND_EXEC predicate");
                 const auto skip = *cond_exec->Address() == false;
                 if (skip) {
                     dcb = NextPacket(dcb,
@@ -1320,6 +1440,10 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             break;
         }
     }
+#ifdef __APPLE__
+    ASSERT(!gfx_chain.empty() && gfx_chain.back() == &dcb);
+    gfx_chain.pop_back();
+#endif
 
     if (ce_task.handle) {
         while (!ce_task.handle.done()) {
