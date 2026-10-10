@@ -191,6 +191,26 @@ void Swapchain::FindPresentFormat() {
 void Swapchain::FindPresentMode() {
     const auto [modes_result, modes] =
         instance.GetPhysicalDevice().getSurfacePresentModesKHR(surface);
+#ifdef __APPLE__
+    // MoltenVK presents through CAMetalLayer: FIFO (displaySyncEnabled) or Immediate (not
+    // synchronized). It has no Mailbox. Every frame-rate preset caps at or below the display
+    // refresh, so FIFO never holds up the present/vblank thread. See docs/macos/present-mode.md.
+    ASSERT_MSG(modes_result == vk::Result::eSuccess, "macOS: present mode query failed: {}",
+               vk::to_string(modes_result));
+    const auto requested = EmulatorSettings.GetPresentMode();
+    if (requested == "Fifo") {
+        present_mode = vk::PresentModeKHR::eFifo;
+    } else if (requested == "Immediate") {
+        present_mode = vk::PresentModeKHR::eImmediate;
+    } else {
+        UNREACHABLE_MSG("macOS: BB_PRESENT_MODE={} is not available; MoltenVK presents with Fifo "
+                        "(default) or Immediate",
+                        requested);
+    }
+    ASSERT_MSG(std::ranges::find(modes, present_mode) != modes.cend(),
+               "macOS: surface does not offer present mode {}", vk::to_string(present_mode));
+    LOG_INFO(Render_Vulkan, "Present mode {}", vk::to_string(present_mode));
+#else
     if (modes_result != vk::Result::eSuccess) {
         LOG_ERROR(Render, "Failed to query available present modes, falling back to Fifo as "
                           "guaranteed supported option.");
@@ -218,6 +238,7 @@ void Swapchain::FindPresentMode() {
                     vk::to_string(present_mode), vk::to_string(fallback));
         present_mode = fallback;
     }
+#endif
 }
 
 void Swapchain::SetSurfaceProperties() {
