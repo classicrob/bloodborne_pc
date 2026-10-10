@@ -43,6 +43,9 @@ struct InfoPersistent {
     ImageResourceList images;
     SamplerResourceList samplers;
     FMaskResourceList fmasks;
+#ifdef __APPLE__
+    u32 depth_bounds_binding{std::numeric_limits<u32>::max()};
+#endif
 
     struct UserDataMask {
         void Set(IR::ScalarReg reg) noexcept {

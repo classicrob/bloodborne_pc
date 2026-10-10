@@ -18,6 +18,34 @@ void EmitPrologue(EmitContext& ctx) {
     ctx.DefineBufferProperties();
 }
 
+void EmitContext::DefineDepthBoundsTest() {
+#ifdef __APPLE__
+    if (!DepthBoundsTest()) {
+        return;
+    }
+    const Id position = OpLoad(F32[4], frag_coord);
+    const Id xy = OpVectorShuffle(F32[2], position, position, 0, 1);
+    const Id pixel = OpConvertFToS(S32[2], xy);
+    const Id image = OpLoad(depth_bounds_image_type, depth_bounds_image);
+    const Id texel = OpImageFetch(F32[4], image, pixel, spv::ImageOperandsMask::Lod, ConstU32(0u));
+    const Id stored_depth = OpCompositeExtract(F32[1], texel, 0);
+    const Id push_float = TypePointer(spv::StorageClass::PushConstant, F32[1]);
+    const Id min_ptr = OpAccessChain(push_float, push_data_block, ConstU32(PushData::DepthBoundsMinIndex));
+    const Id max_ptr = OpAccessChain(push_float, push_data_block, ConstU32(PushData::DepthBoundsMaxIndex));
+    const Id minimum = OpLoad(F32[1], min_ptr);
+    const Id maximum = OpLoad(F32[1], max_ptr);
+    const Id passes = OpLogicalAnd(U1[1], OpFOrdLessThanEqual(U1[1], minimum, stored_depth),
+                                   OpFOrdLessThanEqual(U1[1], stored_depth, maximum));
+    const Id killed = OpLabel();
+    const Id continuation = OpLabel();
+    OpSelectionMerge(continuation, spv::SelectionControlMask::MaskNone);
+    OpBranchConditional(passes, continuation, killed);
+    AddLabel(killed);
+    OpKill();
+    AddLabel(continuation);
+#endif
+}
+
 void ConvertDepthMode(EmitContext& ctx) {
     const Id type{ctx.F32[1]};
     const Id position{ctx.OpLoad(ctx.F32[4], ctx.output_position)};

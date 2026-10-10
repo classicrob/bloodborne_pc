@@ -106,6 +106,14 @@ public:
         return key;
     }
 
+    /// macOS depth-bounds emulation: the layout of descriptor set 1 (the stored depth the
+    /// fragment shader tests), or null when the pipeline does not emulate the test.
+    vk::DescriptorSetLayout DepthBoundsLayout() const noexcept {
+        return *depth_bounds_layout;
+    }
+    /// Commits and binds set 1 with the stored-depth view (DepthBoundsLayout non-null).
+    void BindDepthBoundsImage(vk::ImageView view, vk::ImageLayout layout) const;
+
     /// Gets the attributes and bindings for vertex inputs.
     template <typename Attribute, typename Binding>
     void GetVertexInputs(VertexInputs<Attribute>& attributes, VertexInputs<Binding>& bindings,
@@ -119,6 +127,7 @@ private:
 private:
     GraphicsPipelineKey key;
     std::optional<const Shader::Gcn::FetchShaderData> fetch_shader{};
+    vk::UniqueDescriptorSetLayout depth_bounds_layout;
 };
 
 struct ClipDistanceShaderKey {

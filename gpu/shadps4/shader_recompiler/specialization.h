@@ -251,7 +251,11 @@ struct StageSpecialization {
 
         // Validity bits exclude internal descriptors. Apple emulation still declares
         // those bindings, and push data also depends on preceding stages' offsets.
-        if ((emulate_robust_buffer_access || emulate_null_descriptors) && start != other.start) {
+        if ((emulate_robust_buffer_access || emulate_null_descriptors
+#ifdef __APPLE__
+             || (runtime_info.sw_stage == SwStage::Fragment && runtime_info.hw.fs.depth_bounds_test)
+#endif
+             ) && start != other.start) {
             return false;
         }
 

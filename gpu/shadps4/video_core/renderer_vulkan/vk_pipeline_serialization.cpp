@@ -13,7 +13,7 @@
 namespace Serialization {
 /* You should increment versions below once corresponding serialization scheme is changed. */
 #ifdef __APPLE__
-static constexpr u32 ShaderBinaryVersion = 19u; // Safe-index guarded loads avoid per-access divergent branches.
+static constexpr u32 ShaderBinaryVersion = 20u; // Depth bounds adds stored-depth sampling and Apple push fields.
 #else
 static constexpr u32 ShaderBinaryVersion = 13u; // Atomic masked stores preserve concurrent subword LDS writes.
 #endif

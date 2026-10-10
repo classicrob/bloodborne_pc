@@ -1105,6 +1105,7 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
         }
     }
     pipeline->BindResources(set_writes, push_data);
+    BindDepthBoundsSource(pipeline);
     // bbport: jitter geometry drawn with the scene depth, not full-screen passes (a shifted
     // full-screen quad leaves an edge column unwritten).
     draw_jitter = {};
@@ -1245,6 +1246,7 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
     push_data.yscale *= target_scale[1];
     push_data.yoffset *= target_scale[1];
     pipeline->BindResources(set_writes, push_data);
+    BindDepthBoundsSource(pipeline);
     draw_jitter = {};
     if (upscaler->Enabled() && db_desc.first && db_desc.first == camera_motion->Depth()) {
         draw_jitter = upscaler->Jitter();
@@ -1592,6 +1594,10 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
     // Bind resource buffers and textures.
     Shader::Backend::Bindings binding{};
     push_data = MakeUserData(Regs());
+#ifdef __APPLE__
+    push_data.depth_bounds_min = Regs().depth_bounds_min;
+    push_data.depth_bounds_max = Regs().depth_bounds_max;
+#endif
     if (!HelperEligible(pipeline)) {
         ++helper_serial;
         for (const auto* stage : pipeline->GetStages()) {
@@ -2955,6 +2961,7 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
                           !same_size(texture_cache.GetImage(db_desc.first), 0))) {
         reduced = false;
     }
+    render_reduced = reduced;
     if (debug_pass) {
         if (db_desc.first) {
             const auto& depth = texture_cache.GetImage(db_desc.first);
@@ -3077,12 +3084,21 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
                                     ? vk::ImageLayout::eDepthReadOnlyStencilAttachmentOptimal
                                 : has_stencil ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
                                               : vk::ImageLayout::eDepthReadOnlyOptimal;
-        if (!reduced) needs_barrier |= runtime.Transit(&image, new_layout,
-                                         vk::PipelineStageFlagBits2::eEarlyFragmentTests |
-                                             vk::PipelineStageFlagBits2::eLateFragmentTests,
-                                         vk::AccessFlagBits2::eDepthStencilAttachmentWrite |
-                                             vk::AccessFlagBits2::eDepthStencilAttachmentRead,
-                                         desc.view_info.range);
+        auto depth_stages = vk::PipelineStageFlagBits2::eEarlyFragmentTests |
+                            vk::PipelineStageFlagBits2::eLateFragmentTests;
+        auto depth_access = vk::AccessFlagBits2::eDepthStencilAttachmentWrite |
+                            vk::AccessFlagBits2::eDepthStencilAttachmentRead;
+#ifdef __APPLE__
+        // Depth-bounds emulation samples the read-only attachment in the fragment shader
+        // (BindDepthBoundsSource). Every read-only transition makes earlier depth writes visible to
+        // that read too: draws of the same pass may reuse this render state without a transition.
+        if (!desc.view_info.is_depth_write) {
+            depth_stages |= vk::PipelineStageFlagBits2::eFragmentShader;
+            depth_access |= vk::AccessFlagBits2::eShaderSampledRead;
+        }
+#endif
+        if (!reduced) needs_barrier |= runtime.Transit(&image, new_layout, depth_stages,
+                                                       depth_access, desc.view_info.range);
 
         state.width = std::min<u32>(state.width, image.info.size.width);
         state.height = std::min<u32>(state.height, image.info.size.height);
@@ -3608,6 +3624,49 @@ void Rasterizer::UpdateViewportScissorState() const {
     dynamic_state.SetScissors(scissors);
 }
 
+void Rasterizer::BindDepthBoundsSource(const GraphicsPipeline* pipeline) {
+#ifdef __APPLE__
+    const auto& regs = Regs();
+    const vk::DescriptorSetLayout set_layout = pipeline->DepthBoundsLayout();
+    if (!FeatureChecks::DepthBoundsUnsupported(
+            regs.depth_control.depth_bounds_enable, regs.depth_buffer.DepthValid(),
+            regs.depth_bounds_min, regs.depth_bounds_max, instance.IsDepthBoundsSupported())) {
+        ASSERT_MSG(!set_layout, "depth-bounds pipeline selected for a draw without the test");
+        return;
+    }
+    // The fragment shader kills fragments whose stored depth lies outside the bounds. It reads
+    // the depth attachment itself, attached read-only in this pass: exact while the draw does not
+    // write depth (docs/macos/depth-bounds.md).
+    ASSERT_MSG(set_layout, "macOS: depth bounds test [{}, {}] in a draw without a fragment shader",
+               regs.depth_bounds_min, regs.depth_bounds_max);
+    ASSERT_MSG(!(regs.depth_control.depth_enable && regs.depth_control.depth_write_enable),
+               "macOS: depth bounds test [{}, {}] in a draw that writes depth",
+               regs.depth_bounds_min, regs.depth_bounds_max);
+    ASSERT_MSG(regs.depth_buffer.NumSamples() == 1,
+               "macOS: depth bounds test on a {}-sample depth buffer",
+               regs.depth_buffer.NumSamples());
+    ASSERT_MSG(db_desc.first && !render_reduced,
+               "macOS: depth bounds test against a reduced-size scene depth proxy");
+    auto& image = texture_cache.GetImage(db_desc.first);
+    VideoCore::ImageViewInfo view_info{};
+    view_info.type = AmdGpu::ImageType::Color2D;
+    // A depth-compatible colour format makes ImageView create a depth-aspect view.
+    view_info.format = image.info.pixel_format == vk::Format::eD16Unorm ? vk::Format::eR16Unorm
+                                                                         : vk::Format::eR32Sfloat;
+    view_info.range = db_desc.second.view_info.range;
+    view_info.range.extent.layers = 1;
+    const vk::ImageView view = *image.FindView(view_info).image_view;
+    // The layout BeginRendering gave the attachment (read-only depth, as the draw does not write
+    // depth).
+    const vk::ImageLayout layout = image.backing->state.layout;
+    ASSERT_MSG(layout == vk::ImageLayout::eDepthReadOnlyStencilAttachmentOptimal ||
+                   layout == vk::ImageLayout::eDepthStencilReadOnlyOptimal ||
+                   layout == vk::ImageLayout::eDepthReadOnlyOptimal,
+               "depth-bounds source in layout {}", vk::to_string(layout));
+    pipeline->BindDepthBoundsImage(view, layout);
+#endif
+}
+
 void Rasterizer::UpdateDepthStencilState() const {
     const auto& regs = Regs();
     auto& dynamic_state = scheduler.GetDynamicState();
@@ -3622,17 +3681,8 @@ void Rasterizer::UpdateDepthStencilState() const {
     }
 
     const auto depth_bounds_test_enabled = regs.depth_control.depth_bounds_enable;
-#ifdef __APPLE__
-    // Without the feature the test is skipped. That is exact only when it would always pass:
-    // no depth buffer, or bounds covering [0, 1], the range stored depth is clamped to.
-    if (FeatureChecks::DepthBoundsUnsupported(
-            depth_bounds_test_enabled, regs.depth_buffer.DepthValid(), regs.depth_bounds_min,
-            regs.depth_bounds_max, instance.IsDepthBoundsSupported())) {
-        UNREACHABLE_MSG("macOS: depth bounds test [{}, {}] needs depthBounds, which this device "
-                        "lacks",
-                        regs.depth_bounds_min, regs.depth_bounds_max);
-    }
-#endif
+    // macOS: the device has no depth bounds test; the fragment shader emulates it where the
+    // result depends on it (BindDepthBoundsSource).
     dynamic_state.SetDepthBoundsTestEnabled(depth_bounds_test_enabled);
     if (depth_bounds_test_enabled) {
         dynamic_state.SetDepthBounds(regs.depth_bounds_min, regs.depth_bounds_max);

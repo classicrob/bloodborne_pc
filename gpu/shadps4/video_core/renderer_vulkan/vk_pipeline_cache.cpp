@@ -189,6 +189,13 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(PipelineSelection& se
                 : 1;
         info.hw.fs.z_export_format = regs.z_export_format;
         info.hw.fs.motion_vectors = sel.motion;
+#ifdef __APPLE__
+        // The device has no depth bounds test: the fragment shader emulates it against the
+        // stored depth whenever skipping it would change the result (docs/macos/depth-bounds.md).
+        info.hw.fs.depth_bounds_test = FeatureChecks::DepthBoundsUnsupported(
+            regs.depth_control.depth_bounds_enable, regs.depth_buffer.DepthValid(),
+            regs.depth_bounds_min, regs.depth_bounds_max, instance.IsDepthBoundsSupported());
+#endif
         u8 stencil_ref_export_enable = regs.depth_shader_control.stencil_op_val_export_enable |
                                        regs.depth_shader_control.stencil_test_val_export_enable;
         info.hw.fs.mrtz_mask = regs.depth_shader_control.z_export_enable |

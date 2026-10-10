@@ -238,6 +238,13 @@ struct PushData {
     static constexpr u32 BufOffsetsOffset = UdRegsOffset + 4 * NUM_PUSH_USER_DATA_REGS;
     static constexpr u32 MotionParamOffset = BufOffsetsOffset + NUM_BUFFERS;
     static constexpr u32 SceneSizeOffset = MotionParamOffset + 4;
+#ifdef __APPLE__
+    // Depth bounds emulation (HwFragmentRuntimeInfo::depth_bounds_test): DB_DEPTH_BOUNDS_MIN/MAX.
+    static constexpr u32 DepthBoundsMinIndex = SceneSizeIndex + 1;
+    static constexpr u32 DepthBoundsMaxIndex = SceneSizeIndex + 2;
+    static constexpr u32 DepthBoundsMinOffset = SceneSizeOffset + 4;
+    static constexpr u32 DepthBoundsMaxOffset = SceneSizeOffset + 8;
+#endif
 
     float xoffset;
     float yoffset;
@@ -247,6 +254,10 @@ struct PushData {
     std::array<u8, NUM_BUFFERS> buf_offsets;
     u32 motion_param; ///< bbport: object motion parameter index (0: off)
     u32 scene_size; ///< reduced width | height << 16; zero means native pixel coordinates
+#ifdef __APPLE__
+    float depth_bounds_min; ///< inclusive bounds on the stored depth (depth_bounds_test)
+    float depth_bounds_max;
+#endif
 
     void AddOffset(u32 binding, u32 offset) {
         ASSERT(offset < 256 && binding < buf_offsets.size());
@@ -260,7 +271,9 @@ static_assert(offsetof(PushData, scene_size) == PushData::SceneSizeOffset);
 static_assert(NUM_BUFFERS == 2 * 16 + 8, "buf_offsets is declared as two uvec4 and one uvec2");
 #ifdef __APPLE__
 // Above Vulkan's guaranteed 128 bytes: Instance checks maxPushConstantsSize (4096 on M4).
-static_assert(sizeof(PushData) == 320);
+static_assert(offsetof(PushData, depth_bounds_min) == PushData::DepthBoundsMinOffset);
+static_assert(offsetof(PushData, depth_bounds_max) == PushData::DepthBoundsMaxOffset);
+static_assert(PushData::DepthBoundsMinOffset == 320 && sizeof(PushData) == 328);
 #else
 static_assert(sizeof(PushData) <= 128,
               "PushData size is greater than minimum size guaranteed by Vulkan spec");
