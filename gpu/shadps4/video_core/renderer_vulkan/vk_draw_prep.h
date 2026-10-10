@@ -32,6 +32,7 @@ namespace Vulkan {
 
 struct PreparedStage {
     const Program* program;
+    const Shader::Info* info;
     u64 hash;
     Shader::HwStage hw_stage;
     VAddr pgm_base;

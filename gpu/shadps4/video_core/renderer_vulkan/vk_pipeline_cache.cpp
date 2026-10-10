@@ -403,9 +403,18 @@ const GraphicsPipeline* PipelineCache::TryPreparedPipeline(const PreparedDraw& p
         if (params.hash != stage.hash) {
             return nullptr;
         }
-        auto& info = const_cast<Program*>(stage.program)->info;
+        auto& info = *const_cast<Shader::Info*>(stage.info);
         info.pgm_base = params.Base();
         info.user_data = params.user_data;
+        if (info.has_fetch_shader) {
+            const auto module = std::ranges::find_if(stage.program->modules, [&](const auto& entry) {
+                return entry.info.get() == stage.info;
+            });
+            if (module == stage.program->modules.end() ||
+                Shader::Gcn::ParseFetchShader(info) != module->spec.fetch_shader_data) {
+                return nullptr;
+            }
+        }
         info.RefreshFlatBuf();
         if (info.pgm_base != stage.pgm_base || info.flattened_ud_buf.size() != stage.flat_size ||
             std::memcmp(info.flattened_ud_buf.data(), stage.flat,
@@ -856,107 +865,104 @@ PipelineCache::Result PipelineCache::GetProgram(PipelineSelection& sel, HwStage 
                                                 const Shader::ShaderParams& params,
                                                 Shader::Backend::Bindings& binding) {
     auto runtime_info = BuildRuntimeInfo(sel, hw_stage, sw_stage);
-    if (sel.worker) {
-        // bbport: draw-preparation worker: look up only, with the worker's own Info copy.
-        auto& worker = *sel.worker;
-        std::shared_lock lk{programs_mutex};
-        const auto found_program = program_cache.find(params.hash);
-        if (found_program == program_cache.end() || !found_program->second->info_template) {
-            worker.failed = true;
-            return {};
-        }
-        const Program* program = found_program->second.get();
-        auto [it_info, new_info] = worker.infos.try_emplace(program, *program->info_template);
-        auto& info = it_info->second;
+    const auto refresh = [&](Shader::Info& info, const Program::Module& module) {
         info.pgm_base = params.Base();
         info.user_data = params.user_data;
-        // The walk of resource tables and the fetch shader parse read guest memory through
-        // pointers in the registers; ahead of the GPU thread that memory may already be
-        // reused. A fault returns here (runtime_fault_recover) and the draw is left to the GPU
-        // thread. A jump out of the specialization leaks its partial allocations (rare).
-        sigjmp_buf recover;
-        if (sigsetjmp(recover, 0)) {
-            worker.failed = true;
-            return {};
+        // A different fetch program can walk different tables. Check its identity before
+        // running the previous permutation's flattened-data walker.
+        if (info.has_fetch_shader &&
+            Shader::Gcn::ParseFetchShader(info) != module.spec.fetch_shader_data) {
+            return false;
         }
-        runtime_fault_recover = &recover;
         info.RefreshFlatBuf();
-        auto spec = Shader::StageSpecialization(info, runtime_info, profile, binding);
-        runtime_fault_recover = nullptr;
-        const auto it = std::ranges::find(program->modules, spec, &Program::Module::spec);
-        if (it == program->modules.end()) {
+        return true;
+    };
+    if (sel.worker) {
+        auto& worker = *sel.worker;
+        std::shared_lock lk{programs_mutex};
+        const auto found = program_cache.find(params.hash);
+        if (found == program_cache.end()) {
             worker.failed = true;
             return {};
         }
-        info.AddBindings(binding);
-        const size_t perm_idx = std::distance(program->modules.begin(), it);
-        worker.stages.push_back(
-            {program, params.hash, hw_stage, info.pgm_base, &info.flattened_ud_buf});
-        return std::make_tuple(&info, it->module, it->spec.fetch_shader_data,
-                               HashCombine(params.hash, perm_idx));
-    }
-
-    auto it_pgm = program_cache.find(params.hash); // this thread is the only writer
-    if (it_pgm == program_cache.end()) {
-        auto new_program = std::make_unique<Program>(hw_stage, sw_stage, params);
-        auto start = binding;
-        const auto module =
-            CompileModule(new_program->info, runtime_info, params.code, 0, binding);
-        auto spec = Shader::StageSpecialization(new_program->info, runtime_info, profile, start);
-        const auto perm_hash = HashCombine(params.hash, 0);
-
-        RegisterShaderMeta(new_program->info, spec.fetch_shader_data, spec, perm_hash, 0);
-        new_program->AddPermut(module, std::move(spec));
-        new_program->info_template = std::make_unique<Shader::Info>(new_program->info);
-        Program* program = new_program.get();
-        {
-            std::unique_lock lk{programs_mutex};
-            program_cache.emplace(params.hash, std::move(new_program));
+        const Program* program = found->second.get();
+        for (size_t index = 0; index < program->modules.size(); ++index) {
+            const auto& module = program->modules[index];
+            if (!module.info || !module.info_template) {
+                continue;
+            }
+            auto it = worker.infos.try_emplace(module.info.get(), *module.info_template).first;
+            auto& info = it->second;
+            sigjmp_buf recover;
+            if (sigsetjmp(recover, 0)) {
+                runtime_fault_recover = nullptr;
+                worker.failed = true;
+                return {};
+            }
+            runtime_fault_recover = &recover;
+            if (!refresh(info, module)) {
+                runtime_fault_recover = nullptr;
+                continue;
+            }
+            const auto spec = Shader::StageSpecialization(info, runtime_info, profile, binding);
+            runtime_fault_recover = nullptr;
+            if (!(module.spec == spec)) {
+                continue;
+            }
+            info.AddBindings(binding);
+            worker.stages.push_back({program, module.info.get(), params.hash, hw_stage,
+                                     info.pgm_base, &info.flattened_ud_buf});
+            return {&info, module.module, module.spec.fetch_shader_data,
+                    HashCombine(params.hash, index)};
         }
-        return std::make_tuple(&program->info, module, program->modules[0].spec.fetch_shader_data,
-                               perm_hash);
+        worker.failed = true;
+        return {};
     }
 
-    auto& program = it_pgm.value();
-    if (!program->info_template) {
-        // Programs loaded by the pipeline cache warm-up get their template on first use.
+    auto found = program_cache.find(params.hash);
+    if (found == program_cache.end()) {
+        auto program = std::make_unique<Program>();
         std::unique_lock lk{programs_mutex};
-        program->info_template = std::make_unique<Shader::Info>(program->info);
+        found = program_cache.emplace(params.hash, std::move(program)).first;
     }
-    auto& info = program->info;
-    info.pgm_base = params.Base(); // Needs to be actualized for inline cbuffer address fixup
-    info.user_data = params.user_data;
-    info.RefreshFlatBuf();
-    auto spec = Shader::StageSpecialization(info, runtime_info, profile, binding);
-
-    size_t perm_idx = program->modules.size();
-    u64 perm_hash = HashCombine(params.hash, perm_idx);
-
-    vk::ShaderModule module{};
-
-    // bbport: consecutive draws of a program almost always use the same permutation.
-    auto it = program->last_used < program->modules.size() &&
-                      program->modules[program->last_used].spec == spec
-                  ? program->modules.begin() + program->last_used
-                  : std::ranges::find(program->modules, spec, &Program::Module::spec);
-    if (it != program->modules.end()) {
-        program->last_used = std::distance(program->modules.begin(), it);
-    }
-    if (it == program->modules.end()) {
-        auto new_info = Shader::Info(hw_stage, sw_stage, params);
-        module = CompileModule(new_info, runtime_info, params.code, perm_idx, binding);
-
-        RegisterShaderMeta(info, spec.fetch_shader_data, spec, perm_hash, perm_idx);
-        std::unique_lock lk{programs_mutex};
-        program->AddPermut(module, std::move(spec));
+    auto& program = *found->second;
+    const auto matches = [&](size_t index) {
+        auto& module = program.modules[index];
+        if (!module.info) {
+            return false;
+        }
+        if (!refresh(*module.info, module)) {
+            return false;
+        }
+        return module.spec ==
+               Shader::StageSpecialization(*module.info, runtime_info, profile, binding);
+    };
+    size_t index = program.modules.size();
+    if (program.last_used < program.modules.size() && matches(program.last_used)) {
+        index = program.last_used;
     } else {
-        info.AddBindings(binding);
-        module = it->module;
-        perm_idx = std::distance(program->modules.begin(), it);
-        perm_hash = HashCombine(params.hash, perm_idx);
+        for (size_t candidate = 0; candidate < program.modules.size(); ++candidate) {
+            if (candidate != program.last_used && matches(candidate)) {
+                index = candidate;
+                break;
+            }
+        }
     }
-    return std::make_tuple(&program->info, module,
-                           program->modules[perm_idx].spec.fetch_shader_data, perm_hash);
+    if (index == program.modules.size()) {
+        const auto start = binding;
+        Shader::Info info(hw_stage, sw_stage, params);
+        const auto module = CompileModule(info, runtime_info, params.code, index, binding);
+        auto spec = Shader::StageSpecialization(info, runtime_info, profile, start);
+        RegisterShaderMeta(info, spec.fetch_shader_data, spec, HashCombine(params.hash, index), index);
+        std::unique_lock lk{programs_mutex};
+        program.AddPermut(module, std::move(spec), std::move(info));
+    } else {
+        program.modules[index].info->AddBindings(binding);
+    }
+    program.last_used = index;
+    const auto& selected = program.modules[index];
+    return {selected.info.get(), selected.module, selected.spec.fetch_shader_data,
+            HashCombine(params.hash, index)};
 }
 
 std::optional<vk::ShaderModule> PipelineCache::ReplaceShader(vk::ShaderModule module,

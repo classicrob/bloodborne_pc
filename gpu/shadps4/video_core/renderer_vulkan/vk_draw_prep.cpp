@@ -456,13 +456,14 @@ void DrawPreparation::WorkerLoop(std::stop_token stop, u32 index) {
                         const auto& stage = prep_worker.stages[i];
                         draw.stages[i] = {
                             .program = stage.program,
+                            .info = stage.info,
                             .hash = stage.hash,
                             .hw_stage = stage.hw_stage,
                             .pgm_base = stage.pgm_base,
                             .flat = arena.Append(*stage.flat),
                             .flat_size = static_cast<u32>(stage.flat->size()),
                         };
-                        PrepareResources(prep_worker.infos.at(stage.program), draw.stages[i],
+                        PrepareResources(prep_worker.infos.at(stage.info), draw.stages[i],
                                          arena);
                     }
                     draw.vertex.valid = false;
