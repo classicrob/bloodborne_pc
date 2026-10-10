@@ -306,21 +306,23 @@ void LowerWave64Compute(IR::Program& program, const RuntimeInfo& runtime_info) {
     const auto word = [](IR::IREmitter& ir, u32 base_offset, const IR::U32& slot) {
         return ir.IAdd(ir.Imm32(base_offset), ir.ShiftLeftLogical(slot, ir.Imm32(2)));
     };
-    // 64-bit wave mask of a predicate: clear, OR each lane's bit into its half's word, read.
+    // 64-bit wave mask of a predicate. The mask words start at zero (cleared at entry); each lane
+    // ORs its own bit, everyone reads after a barrier, and after a second barrier each lane
+    // clears only its own bit again. A lane that runs ahead into the next ballot only touches its
+    // own bit, and nobody reads the next mask before everyone has cleared, so two barriers suffice.
     const auto wave_ballot = [&](IR::IREmitter& ir, const Lanes& l, const IR::U1& pred) -> IR::U64 {
         const IR::U32 lo_addr = word(ir, mask_base, ir.ShiftLeftLogical(l.wave, ir.Imm32(1)));
         const IR::U32 hi_addr = ir.IAdd(lo_addr, ir.Imm32(4));
-        ir.WriteShared(32, ir.Imm32(0), lo_addr);
-        ir.WriteShared(32, ir.Imm32(0), hi_addr);
-        ir.Barrier();
-        (void)ir.SharedAtomicOr(word(ir, mask_base, l.half_word),
-                                IR::U32{ir.Select(pred, l.bit, ir.Imm32(0))}, false);
+        const IR::U32 own = word(ir, mask_base, l.half_word);
+        (void)ir.SharedAtomicOr(own, IR::U32{ir.Select(pred, l.bit, ir.Imm32(0))}, false);
         ir.Barrier();
         const IR::U32 lo{ir.LoadShared(32, false, lo_addr)};
         const IR::U32 hi{ir.LoadShared(32, false, hi_addr)};
         ir.Barrier();
+        (void)ir.SharedAtomicAnd(own, ir.BitwiseNot(l.bit), false);
         return ir.PackUint2x32(ir.CompositeConstruct(lo, hi));
     };
+    bool uses_mask_words = false;
     // The value of `value` at wave lane `target` (wave-uniform).
     const auto wave_read_lane = [&](IR::IREmitter& ir, const Lanes& l, const IR::U32& value,
                                     const IR::U32& target) -> IR::U32 {
@@ -378,9 +380,11 @@ void LowerWave64Compute(IR::Program& program, const RuntimeInfo& runtime_info) {
         const Lanes l = lanes(ir);
         switch (inst->GetOpcode()) {
         case IR::Opcode::Ballot:
+            uses_mask_words = true;
             inst->ReplaceUsesWithAndRemove(wave_ballot(ir, l, IR::U1{inst->Arg(0)}));
             break;
         case IR::Opcode::GroupAny:
+            uses_mask_words = true;
             inst->ReplaceUsesWithAndRemove(
                 ir.INotEqual(wave_ballot(ir, l, IR::U1{inst->Arg(0)}), ir.Imm64(u64{0})));
             break;
@@ -389,6 +393,7 @@ void LowerWave64Compute(IR::Program& program, const RuntimeInfo& runtime_info) {
                 ir, l, IR::U32{inst->Arg(0)}, ir.BitwiseAnd(IR::U32{inst->Arg(1)}, ir.Imm32(63))));
             break;
         case IR::Opcode::ReadFirstLane: {
+            uses_mask_words = true;
             // V_READFIRSTLANE_B32: lane = FindFirst1fromLSB(exec), lane 0 if exec is zero
             const IR::U64 exec = wave_ballot(ir, l, ir.Imm1(true));
             const IR::U32 first{ir.Select(ir.IEqual(exec, ir.Imm64(u64{0})), ir.Imm32(0), find_lsb64(ir, exec))};
@@ -413,6 +418,14 @@ void LowerWave64Compute(IR::Program& program, const RuntimeInfo& runtime_info) {
             break;
         }
         }
+    }
+    if (uses_mask_words) {
+        // Workgroup memory starts undefined: clear the mask words once, before any ballot.
+        IR::Block* entry = program.syntax_list.front().data.block;
+        IR::IREmitter ir{*entry, entry->begin()};
+        const Lanes l = lanes(ir);
+        ir.WriteShared(32, ir.Imm32(0), word(ir, mask_base, l.half_word));
+        ir.Barrier();
     }
 }
 
