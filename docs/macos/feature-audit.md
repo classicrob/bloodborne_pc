@@ -3,15 +3,18 @@
 This audit covers every Vulkan feature the renderer can depend on that M4 MoltenVK reports as
 absent (`out/m4-moltenvk-full.txt`, Sol-1's device report), and how the Apple path handles a guest
 use of it. "Exact" means the Apple result equals the PS4/Linux result. "Hard error" means the first
-use aborts with a message naming the state. A missing feature is never silently skipped.
+use aborts with a message naming the state. A missing feature is never silently skipped. The
+per-draw checks evaluate the pure predicates in `vk_feature_checks.h`;
+`tests/test_feature_checks.cpp` runs each on the legitimate state next to the unsupported one.
 
 | Feature (M4) | Guest use | Apple handling | Where |
 |---|---|---|---|
 | geometryShader | ES/GS stages, on-chip GS, stream-out | Hard error | `vk_pipeline_cache.cpp` RefreshGraphicsStages |
-| logicOp | `CB_COLOR_CONTROL.ROP3` other than copy, with a colour target | Hard error (formerly dropped silently: the draw blended normally) | `vk_graphics_pipeline.cpp` |
-| depthBounds | `DB_DEPTH_CONTROL.DEPTH_BOUNDS_ENABLE` | Exact when the test always passes: no depth buffer, or bounds covering [0, 1] (stored depth is clamped there). Otherwise a hard error (formerly the test was skipped) | `vk_rasterizer.cpp` UpdateDepthStencilState |
+| logicOp | `CB_COLOR_CONTROL.ROP3` other than copy, on a bound, written UNORM/SNORM/integer target (Vulkan and GCN ignore the logic op on float and sRGB targets; CB mode Disable leaves no bound target) | Hard error (formerly dropped silently: the draw blended normally) | `vk_graphics_pipeline.cpp` |
+| depthBounds | `DB_DEPTH_CONTROL.DEPTH_BOUNDS_ENABLE` | Exact when the test always passes: no depth buffer, or bounds covering [0, 1]. Stored depth cannot leave [0, 1] here: MoltenVK has no `VK_EXT_depth_range_unrestricted`, so viewport depth ranges and fragment depth are clamped to it. Otherwise a hard error (formerly the test was skipped) | `vk_rasterizer.cpp` UpdateDepthStencilState |
 | drawIndirectCount | `DRAW_INDEX_INDIRECT_COUNT_MULTI` with a count address | Hard error (formerly called anyway: invalid Vulkan). An exact path would be a compute pass that zeroes the arguments past the GPU count, then a plain multi-draw-indirect (`multiDrawIndirect` is supported) | `vk_rasterizer.cpp` DrawIndirectRecord |
-| wideLines | line primitives or line polygon mode with width ≠ 1 | Hard error. Width is forced to 1 otherwise, the only valid value; it has no effect on non-line draws | `vk_rasterizer.cpp` UpdateRasterizationState |
+| wideLines | lines reaching the rasterizer (line primitives, a GS emitting line strips, isoline tessellation, or triangles with either face in line polygon mode) with width ≠ 1 | Hard error; widths below 1 too, as GCN's thin-line rasterization is not known to match. Width is forced to 1 otherwise, the only valid value; it has no effect on other draws. Guest init sequences program width 1 (`PA_SU_LINE_CNTL` = 8) | `vk_rasterizer.cpp` UpdateRasterizationState |
+| (one polygon mode) | `PA_SU_SC_MODE_CNTL` front and back polygon modes differ with back faces not culled | Hard error: Vulkan has one polygon mode and the front mode is used | `vk_rasterizer.cpp` UpdateRasterizationState |
 | shaderStorageImageMultisample | storage view of an MSAA image | Hard error | `image_view.cpp` |
 | shaderBufferInt64Atomics / shaderSharedInt64Atomics | 64-bit atomics | Recompiler hard error | `emit_spirv.cpp` SetupCapabilities |
 | shaderFloat64 | F64 ALU | Recompiler hard error (Sol-2) | `LowerFp64ToFp32` |

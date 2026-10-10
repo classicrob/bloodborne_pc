@@ -3636,10 +3636,23 @@ void Rasterizer::UpdateRasterizationState() const {
     auto& dynamic_state = scheduler.GetDynamicState();
 #ifdef __APPLE__
     // Without wideLines only width 1 is valid. The width matters only when lines are rasterized.
+    const auto& poly = regs.polygon_control;
+    const auto raster = FeatureChecks::RasterizedPrimitive(
+        regs.primitive_type, regs.stage_enable.IsStageEnabled(u32(Shader::HwStage::Geometry)),
+        regs.vgt_gs_out_prim_type.GetPrimitiveType(0),
+        regs.stage_enable.IsStageEnabled(u32(Shader::HwStage::Hull)), regs.tess_config.topology);
+    if (FeatureChecks::PolygonModesDiffer(raster, poly.enable_polygon_mode != 0,
+                                          poly.polygon_mode_front, poly.polygon_mode_back,
+                                          poly.cull_back)) {
+        UNREACHABLE_MSG("macOS: front polygon mode {} and visible back faces in mode {}; Vulkan has "
+                        "one polygon mode",
+                        u32(poly.polygon_mode_front), u32(poly.polygon_mode_back));
+    }
     if (!instance.IsWideLinesSupported()) {
-        if (FeatureChecks::WideLinesUnsupported(regs.primitive_type,
-                                                regs.polygon_control.PolyMode(),
-                                                regs.line_control.Width(), false)) {
+        if (FeatureChecks::WideLinesUnsupported(
+                FeatureChecks::RasterizesLines(raster, poly.enable_polygon_mode != 0,
+                                               poly.polygon_mode_front, poly.polygon_mode_back),
+                regs.line_control.Width(), false)) {
             UNREACHABLE_MSG("macOS: {}-pixel lines need wideLines, which this device lacks",
                             regs.line_control.Width());
         }

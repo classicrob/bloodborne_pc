@@ -19,12 +19,32 @@ int main() {
     using AmdGpu::PolygonMode;
     using AmdGpu::PrimitiveType;
     using Op = AmdGpu::ColorControl::LogicOp;
+    using AmdGpu::DataFormat;
+    using AmdGpu::NumberFormat;
+    using AmdGpu::TessellationTopology;
+    using Gs = AmdGpu::GsOutputPrimitiveType;
+    constexpr auto Rgba8 = DataFormat::Format8_8_8_8;
 
+    std::fprintf(stderr, "logicOp targets\n");
+    Expect("  unbound target (CB disabled or MRT masked)",
+           LogicOpAppliesTo(DataFormat::FormatInvalid, NumberFormat::Unorm, 0), false);
+    Expect("  UNORM target with write mask 0", LogicOpAppliesTo(Rgba8, NumberFormat::Unorm, 0),
+           false);
+    Expect("  float target", LogicOpAppliesTo(DataFormat::Format16_16_16_16, NumberFormat::Float,
+                                              0xF),
+           false);
+    Expect("  sRGB target", LogicOpAppliesTo(Rgba8, NumberFormat::Srgb, 0xF), false);
+    Expect("  UNORM target, written", LogicOpAppliesTo(Rgba8, NumberFormat::Unorm, 0xF), true);
+    Expect("  UINT target, alpha only", LogicOpAppliesTo(Rgba8, NumberFormat::Uint, 0x8), true);
     std::fprintf(stderr, "logicOp\n");
-    Expect("  copy ROP, colour target, no logicOp", LogicOpUnsupported(Op::Copy, 1, false), false);
-    Expect("  xor ROP, no colour target, no logicOp", LogicOpUnsupported(Op::Xor, 0, false), false);
-    Expect("  xor ROP, colour target, logicOp present", LogicOpUnsupported(Op::Xor, 1, true), false);
-    Expect("  xor ROP, colour target, no logicOp", LogicOpUnsupported(Op::Xor, 1, false), true);
+    Expect("  copy ROP on an UNORM target, no logicOp", LogicOpUnsupported(Op::Copy, true, false),
+           false);
+    Expect("  xor ROP, no applicable target, no logicOp", LogicOpUnsupported(Op::Xor, false, false),
+           false);
+    Expect("  xor ROP, applicable target, logicOp present", LogicOpUnsupported(Op::Xor, true, true),
+           false);
+    Expect("  xor ROP, applicable target, no logicOp", LogicOpUnsupported(Op::Xor, true, false),
+           true);
 
     std::fprintf(stderr, "depthBounds\n");
     Expect("  test disabled", DepthBoundsUnsupported(false, true, 0.2f, 0.8f, false), false);
@@ -45,29 +65,64 @@ int main() {
     Expect("  count buffer, feature present", DrawIndirectCountUnsupported(0x1000, true), false);
     Expect("  count buffer, no feature", DrawIndirectCountUnsupported(0x1000, false), true);
 
+    std::fprintf(stderr, "rasterized primitive\n");
+    const auto raster = [](PrimitiveType prim, bool gs = false, Gs out = Gs::TriangleStrip,
+                           bool tess = false,
+                           TessellationTopology topo = TessellationTopology::TriangleCw) {
+        return RasterizedPrimitive(prim, gs, out, tess, topo);
+    };
+    const auto lines = [&](RasterPrimitive r, bool poly = false, PolygonMode front = PolygonMode::Fill,
+                           PolygonMode back = PolygonMode::Fill) {
+        return RasterizesLines(r, poly, front, back);
+    };
+    Expect("  triangle list", lines(raster(PrimitiveType::TriangleList)), false);
+    Expect("  rect list", lines(raster(PrimitiveType::RectList)), false);
+    Expect("  line list", lines(raster(PrimitiveType::LineList)), true);
+    Expect("  adjacency line strip", lines(raster(PrimitiveType::AdjLineStrip)), true);
+    Expect("  line list into a triangle-strip GS",
+           lines(raster(PrimitiveType::LineList, true, Gs::TriangleStrip)), false);
+    Expect("  triangles into a line-strip GS",
+           lines(raster(PrimitiveType::TriangleList, true, Gs::LineStrip)), true);
+    Expect("  patches tessellated to triangles",
+           lines(raster(PrimitiveType::PatchPrimitive, false, Gs::TriangleStrip, true)), false);
+    Expect("  patches tessellated to isolines",
+           lines(raster(PrimitiveType::PatchPrimitive, false, Gs::TriangleStrip, true,
+                        TessellationTopology::Line)),
+           true);
+    Expect("  polygon mode off (registers say line)",
+           lines(raster(PrimitiveType::TriangleList), false, PolygonMode::Line, PolygonMode::Line),
+           false);
+    Expect("  front faces in line mode",
+           lines(raster(PrimitiveType::TriangleList), true, PolygonMode::Line, PolygonMode::Fill),
+           true);
+    Expect("  back faces in line mode",
+           lines(raster(PrimitiveType::TriangleList), true, PolygonMode::Fill, PolygonMode::Line),
+           true);
+    Expect("  points in line polygon mode",
+           lines(raster(PrimitiveType::PointList), true, PolygonMode::Line, PolygonMode::Line),
+           false);
+
     std::fprintf(stderr, "wideLines\n");
-    Expect("  triangle list, width 4", WideLinesUnsupported(PrimitiveType::TriangleList,
-                                                           PolygonMode::Fill, 4.0f, false),
+    Expect("  no lines, width 4", WideLinesUnsupported(false, 4.0f, false), false);
+    Expect("  lines, width 1", WideLinesUnsupported(true, 1.0f, false), false);
+    Expect("  lines, width 2, feature present", WideLinesUnsupported(true, 2.0f, true), false);
+    Expect("  lines, width 2", WideLinesUnsupported(true, 2.0f, false), true);
+    Expect("  lines, width 0.5", WideLinesUnsupported(true, 0.5f, false), true);
+
+    std::fprintf(stderr, "front/back polygon modes\n");
+    const auto tris = RasterPrimitive::Triangles;
+    Expect("  both fill, polygon mode on",
+           PolygonModesDiffer(tris, true, PolygonMode::Fill, PolygonMode::Fill, false), false);
+    Expect("  differing modes, polygon mode off",
+           PolygonModesDiffer(tris, false, PolygonMode::Line, PolygonMode::Fill, false), false);
+    Expect("  differing modes, back faces culled",
+           PolygonModesDiffer(tris, true, PolygonMode::Fill, PolygonMode::Line, true), false);
+    Expect("  differing modes on lines",
+           PolygonModesDiffer(RasterPrimitive::Lines, true, PolygonMode::Fill, PolygonMode::Line,
+                              false),
            false);
-    Expect("  rect list, width 0.125", WideLinesUnsupported(PrimitiveType::RectList,
-                                                           PolygonMode::Fill, 0.125f, false),
-           false);
-    Expect("  point polygon mode, width 2", WideLinesUnsupported(PrimitiveType::TriangleList,
-                                                                PolygonMode::Point, 2.0f, false),
-           false);
-    Expect("  line list, width 1", WideLinesUnsupported(PrimitiveType::LineList, PolygonMode::Fill,
-                                                       1.0f, false),
-           false);
-    Expect("  line strip, width 2, feature present",
-           WideLinesUnsupported(PrimitiveType::LineStrip, PolygonMode::Fill, 2.0f, true), false);
-    Expect("  line list, width 2", WideLinesUnsupported(PrimitiveType::LineList, PolygonMode::Fill,
-                                                       2.0f, false),
-           true);
-    Expect("  line polygon mode, width 2", WideLinesUnsupported(PrimitiveType::TriangleList,
-                                                               PolygonMode::Line, 2.0f, false),
-           true);
-    Expect("  adjacency line strip, width 0.5",
-           WideLinesUnsupported(PrimitiveType::AdjLineStrip, PolygonMode::Fill, 0.5f, false), true);
+    Expect("  differing modes, back faces visible",
+           PolygonModesDiffer(tris, true, PolygonMode::Fill, PolygonMode::Line, false), true);
 
     std::fprintf(stderr, "shaderStorageImageMultisample\n");
     Expect("  single-sample storage view", StorageMultisampleUnsupported(true, 1, false), false);

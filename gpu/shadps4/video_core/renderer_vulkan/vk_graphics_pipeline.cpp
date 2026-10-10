@@ -454,7 +454,13 @@ GraphicsPipeline::GraphicsPipeline(
 
 #ifdef __APPLE__
     // Without the feature a guest ROP would be dropped and the draw blended normally.
-    if (FeatureChecks::LogicOpUnsupported(key.logic_op, key.num_color_attachments,
+    bool logic_op_applies = false;
+    for (u32 i = 0; i < key.num_color_attachments; ++i) {
+        logic_op_applies |= FeatureChecks::LogicOpAppliesTo(
+            key.color_buffers[i].data_format, key.color_buffers[i].num_format,
+            static_cast<u32>(key.write_masks[i]));
+    }
+    if (FeatureChecks::LogicOpUnsupported(key.logic_op, logic_op_applies,
                                           instance.IsLogicOpSupported())) {
         UNREACHABLE_MSG("macOS: color logic op {} needs logicOp, which this device lacks",
                         static_cast<u32>(key.logic_op));

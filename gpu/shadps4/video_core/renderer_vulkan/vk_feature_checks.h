@@ -6,16 +6,25 @@
 #pragma once
 
 #include "common/types.h"
+#include "video_core/amdgpu/pixel_format.h"
 #include "video_core/amdgpu/regs_color.h"
 #include "video_core/amdgpu/regs_primitive.h"
 #include "video_core/amdgpu/regs_vertex.h"
 
 namespace Vulkan::FeatureChecks {
 
-/// A colour logic op other than copy, with at least one colour target, needs logicOp.
+/// Whether a colour target is affected by the logic op: bound, written, and of a normalized or
+/// integer format. Vulkan (and GCN's CB) ignore the logic op for float and sRGB targets.
+[[nodiscard]] constexpr bool LogicOpAppliesTo(AmdGpu::DataFormat data_format,
+                                              AmdGpu::NumberFormat num_format, u32 write_mask) {
+    return data_format != AmdGpu::DataFormat::FormatInvalid && write_mask != 0 &&
+           num_format != AmdGpu::NumberFormat::Float && num_format != AmdGpu::NumberFormat::Srgb;
+}
+
+/// A colour logic op other than copy, on a target it applies to, needs logicOp.
 [[nodiscard]] constexpr bool LogicOpUnsupported(AmdGpu::ColorControl::LogicOp op,
-                                                u32 num_color_attachments, bool supported) {
-    return !supported && op != AmdGpu::ColorControl::LogicOp::Copy && num_color_attachments > 0;
+                                                bool applies_to_a_target, bool supported) {
+    return !supported && op != AmdGpu::ColorControl::LogicOp::Copy && applies_to_a_target;
 }
 
 /// Skipping the depth bounds test is exact only when it would always pass: no depth buffer, or
@@ -30,20 +39,60 @@ namespace Vulkan::FeatureChecks {
     return !supported && count_address != 0;
 }
 
-/// True when lines are rasterized: line primitives, or polygons drawn in line mode.
-[[nodiscard]] constexpr bool RasterizesLines(AmdGpu::PrimitiveType prim,
-                                             AmdGpu::PolygonMode poly_mode) {
+enum class RasterPrimitive { Points, Lines, Triangles };
+
+/// The primitive class reaching the rasterizer: the geometry shader's output when one runs,
+/// else the tessellator's output topology, else the input primitive type.
+[[nodiscard]] constexpr RasterPrimitive RasterizedPrimitive(
+    AmdGpu::PrimitiveType prim, bool geometry_stage, AmdGpu::GsOutputPrimitiveType gs_output,
+    bool tessellation, AmdGpu::TessellationTopology tess_topology) {
     using AmdGpu::PrimitiveType;
-    return prim == PrimitiveType::LineList || prim == PrimitiveType::LineStrip ||
-           prim == PrimitiveType::LineLoop || prim == PrimitiveType::AdjLineList ||
-           prim == PrimitiveType::AdjLineStrip || poly_mode == AmdGpu::PolygonMode::Line;
+    if (geometry_stage) {
+        return gs_output == AmdGpu::GsOutputPrimitiveType::PointList   ? RasterPrimitive::Points
+               : gs_output == AmdGpu::GsOutputPrimitiveType::LineStrip ? RasterPrimitive::Lines
+                                                                       : RasterPrimitive::Triangles;
+    }
+    if (tessellation) {
+        return tess_topology == AmdGpu::TessellationTopology::Point  ? RasterPrimitive::Points
+               : tess_topology == AmdGpu::TessellationTopology::Line ? RasterPrimitive::Lines
+                                                                     : RasterPrimitive::Triangles;
+    }
+    switch (prim) {
+    case PrimitiveType::PointList:
+        return RasterPrimitive::Points;
+    case PrimitiveType::LineList:
+    case PrimitiveType::LineStrip:
+    case PrimitiveType::LineLoop:
+    case PrimitiveType::AdjLineList:
+    case PrimitiveType::AdjLineStrip:
+        return RasterPrimitive::Lines;
+    default:
+        return RasterPrimitive::Triangles;
+    }
 }
 
-/// Lines wider than one pixel need wideLines; the width of other draws has no effect.
-[[nodiscard]] constexpr bool WideLinesUnsupported(AmdGpu::PrimitiveType prim,
-                                                  AmdGpu::PolygonMode poly_mode, float width,
+/// True when lines are rasterized: line primitives, or triangles with either face in line mode.
+[[nodiscard]] constexpr bool RasterizesLines(RasterPrimitive raster, bool polygon_mode_enabled,
+                                             AmdGpu::PolygonMode front, AmdGpu::PolygonMode back) {
+    return raster == RasterPrimitive::Lines ||
+           (raster == RasterPrimitive::Triangles && polygon_mode_enabled &&
+            (front == AmdGpu::PolygonMode::Line || back == AmdGpu::PolygonMode::Line));
+}
+
+/// Lines of any width other than one pixel need wideLines (a width below one is not known to
+/// match either); the width of other draws has no effect.
+[[nodiscard]] constexpr bool WideLinesUnsupported(bool rasterizes_lines, float width,
                                                   bool supported) {
-    return !supported && RasterizesLines(prim, poly_mode) && width != 1.0f;
+    return !supported && rasterizes_lines && width != 1.0f;
+}
+
+/// GCN has separate front and back polygon modes; Vulkan has one (the front mode is used).
+/// Visible back faces in a different mode cannot be drawn.
+[[nodiscard]] constexpr bool PolygonModesDiffer(RasterPrimitive raster, bool polygon_mode_enabled,
+                                                AmdGpu::PolygonMode front,
+                                                AmdGpu::PolygonMode back, bool cull_back) {
+    return raster == RasterPrimitive::Triangles && polygon_mode_enabled && front != back &&
+           !cull_back;
 }
 
 /// A multisampled storage descriptor view needs shaderStorageImageMultisample. Depth
