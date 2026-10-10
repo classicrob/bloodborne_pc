@@ -87,6 +87,13 @@ struct Liverpool {
     /// Top-level graphics submissions, numbered for the draw preparation workers.
     static constexpr u64 NoSeq = ~0ull;
     u64 gfx_submit_seq{};
+    /// bbport (macOS): GpuIdle is raised only while no submission is queued
+    /// (docs/macos/gpu-idle.md). Statistics per 600 frames: graphics submissions queued ahead of
+    /// the parser when the guest submits, and GpuIdle interrupts held back because the guest
+    /// submitted while the previous ones were being retired.
+    struct ParseLagStats {
+        u64 frames{}, samples{}, queued_sum{}, queued_max{}, idle_held_back{};
+    } parse_lag;
     static u64 HashRegisterPacket(u64 checksum, const u32* words, u32 count);
     /// `dirty` (draw-preparation scanner) records the register blocks written.
     static void ApplyGraphicsRegisterPacket(Regs& regs, const PM4Header* header, u64& checksum,

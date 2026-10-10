@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <chrono>
 #include <pthread.h>
 #ifdef __APPLE__
@@ -169,6 +170,21 @@ void Liverpool::Process(std::stop_token stoken) {
         }
 
         if (submit_done) {
+#ifdef __APPLE__
+            {
+                std::scoped_lock lk{submit_mutex};
+                if (++parse_lag.frames == 600) {
+                    LOG_INFO(Render,
+                             "Parse lag, last 600 frames: {} graphics submissions, queued ahead of "
+                             "the parser at submit: mean {:.1f}, max {}; GpuIdle held back {} times",
+                             parse_lag.samples,
+                             parse_lag.samples ? double(parse_lag.queued_sum) / parse_lag.samples
+                                               : 0.0,
+                             parse_lag.queued_max, parse_lag.idle_held_back);
+                    parse_lag = {};
+                }
+            }
+#endif
             VideoCore::EndCapture();
             if (rasterizer) {
                 rasterizer->OnSubmit();
@@ -188,6 +204,23 @@ void Liverpool::Process(std::stop_token stoken) {
             rasterizer->DrainDrawPipe(Vulkan::DrawPipe::ReasonSubmissionEnd);
             rasterizer->WaitDeferredSignals();
         }
+#ifdef __APPLE__
+        // GpuIdle releases the guest's sceGnmSubmitDone throttle (submission_lock), after which
+        // it rebuilds command buffers it double-buffers. The drain above can take long while the
+        // recording thread lags; a guest that submitted (and called sceGnmSubmitDone) meanwhile
+        // must not be told the GPU is idle: it would rewrite buffers the parser has not reached
+        // (torn packets, "Wrong PM4 type"). Decide and raise under the lock submissions take.
+        {
+            std::scoped_lock lk{submit_mutex};
+            if (num_submits == 0) {
+                work_retired = true;
+                Platform::IrqC::Instance()->Signal(Platform::InterruptId::GpuIdle);
+            } else if (++parse_lag.idle_held_back <= 8) {
+                LOG_INFO(Render, "GpuIdle held back: {} submissions arrived while retiring",
+                         num_submits.load());
+            }
+        }
+#else
         {
             std::scoped_lock lk{submit_mutex};
             if (num_submits == 0) {
@@ -195,6 +228,7 @@ void Liverpool::Process(std::stop_token stoken) {
             }
         }
         Platform::IrqC::Instance()->Signal(Platform::InterruptId::GpuIdle);
+#endif
     }
 }
 
@@ -1706,6 +1740,11 @@ void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
     std::scoped_lock lk{submit_mutex};
     ++num_submits;
     work_retired = false;
+#ifdef __APPLE__
+    ++parse_lag.samples;
+    parse_lag.queued_sum += num_submits;
+    parse_lag.queued_max = std::max<u64>(parse_lag.queued_max, num_submits);
+#endif
     submit_cv.notify_one();
 }
 
