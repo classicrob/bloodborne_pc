@@ -134,6 +134,10 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
       swapchain{instance, window}, runtime{instance, draw_scheduler},
       rasterizer{std::make_unique<Rasterizer>(instance, draw_scheduler, runtime, liverpool)},
       texture_cache{rasterizer->GetTextureCache()} {
+#ifdef __APPLE__
+    draw_scheduler.InitPerf(false);
+    present_scheduler.InitPerf(true);
+#endif
     const u32 num_images = swapchain.GetImageCount();
     const vk::Device device = instance.GetDevice();
 

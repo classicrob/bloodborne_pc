@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 
 #include "video_core/renderer_vulkan/vk_gpu_profiler.h"
@@ -14,6 +15,14 @@ void GpuProfiler::Init(const Instance& instance, Scheduler& scheduler) {
     if (!env || env[0] != '1' || instance_ptr) {
         return;
     }
+#ifdef __APPLE__
+    // Its segments are timestamps inside one command buffer, which MoltenVK does not attribute
+    // to the work between them (tests/macos_perf, docs/macos/perf.md): the numbers would be wrong.
+    std::fprintf(stderr, "BB_GPU_PROFILE is not supported on macOS: MoltenVK timestamps inside a "
+                         "command buffer do not measure the work between them. Use BB_PERF=1 "
+                         "(and BB_PERF_PHASES=1) instead; see docs/macos/perf.md\n");
+    std::abort();
+#endif
     instance_ptr = new GpuProfiler(instance, scheduler);
 }
 

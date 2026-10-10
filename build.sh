@@ -146,8 +146,8 @@ if [[ ${1:-} == --test ]]; then
     if [[ $(uname -s) == Darwin ]]; then
         # The GPU library has no default user directory on macOS: fixtures get a scratch one.
         export BB_GPU_USER_DIR="$PWD/out/gpu-test-user"
-        ninja -C out/gpu "${ninja_jobs[@]}" null-descriptor-test upscaler-support-test buffer-bounds-test buffer-dead-resources-test host-import-arena-test vertex-pulling-pipeline-test shader-permutation-info-test gpu-user-dir-test push-userdata-test
-        sign_darwin out/gpu/null-descriptor-test out/gpu/upscaler-support-test out/gpu/buffer-bounds-test out/gpu/buffer-dead-resources-test out/gpu/host-import-arena-test out/gpu/vertex-pulling-pipeline-test out/gpu/shader-permutation-info-test out/gpu/gpu-user-dir-test out/gpu/push-userdata-test
+        ninja -C out/gpu "${ninja_jobs[@]}" null-descriptor-test upscaler-support-test buffer-bounds-test buffer-dead-resources-test host-import-arena-test vertex-pulling-pipeline-test shader-permutation-info-test gpu-user-dir-test push-userdata-test macos-perf-test
+        sign_darwin out/gpu/null-descriptor-test out/gpu/upscaler-support-test out/gpu/buffer-bounds-test out/gpu/buffer-dead-resources-test out/gpu/host-import-arena-test out/gpu/vertex-pulling-pipeline-test out/gpu/shader-permutation-info-test out/gpu/gpu-user-dir-test out/gpu/push-userdata-test out/gpu/macos-perf-test
         out/gpu/gpu-user-dir-test
         out/gpu/null-descriptor-test
         out/gpu/upscaler-support-test
@@ -165,6 +165,9 @@ if [[ ${1:-} == --test ]]; then
         BB_DEPS_PREFIX="$deps" bash tests/test_fp64_policy.sh
         BB_DEPS_PREFIX="$deps" BB_GPU_BUILD="$PWD/out/gpu" sh tests/test_buffer_atomic_wrap.sh
         BB_DEPS_PREFIX="$deps" BB_GPU_BUILD="$PWD/out/gpu" sh tests/test_lds_subword.sh
+        # BB_PERF's GPU numbers rely on per-submission timestamps; qualify them on this device.
+        BB_DEPS_PREFIX="$deps" bash tests/macos_perf/timestamps.sh
+        out/gpu/macos-perf-test
         BB_GPU_BUILD="$PWD/out/gpu" sh tests/macos_float_modes/production.sh
         "$CC" "${platform_flags[@]}" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread -Isrc \
             tests/test_compat_mac.c src/compat_mac.c -o out/compat-mac-test

@@ -297,7 +297,9 @@ if (APPLE)
         ../tests/test_gpu_runtime_stubs.cpp)
     add_executable(push-userdata-test EXCLUDE_FROM_ALL ../tests/test_push_userdata.cpp
         ../tests/test_gpu_runtime_stubs.cpp)
-    foreach(bounds_target buffer-bounds-test buffer-bounds-benchmark buffer-dead-resources-test host-import-arena-test vertex-pulling-pipeline-test shader-permutation-info-test gpu-user-dir-test push-userdata-test)
+    add_executable(macos-perf-test EXCLUDE_FROM_ALL ../tests/test_macos_perf.cpp
+        ../tests/test_gpu_runtime_stubs.cpp)
+    foreach(bounds_target buffer-bounds-test buffer-bounds-benchmark buffer-dead-resources-test host-import-arena-test vertex-pulling-pipeline-test shader-permutation-info-test gpu-user-dir-test push-userdata-test macos-perf-test)
         target_include_directories(${bounds_target} PRIVATE shim shadps4 third_party/gcn/include)
         target_compile_options(${bounds_target} PRIVATE -UNDEBUG -fPIC)
         target_link_libraries(${bounds_target} PRIVATE bbgpu)
@@ -309,7 +311,7 @@ if (APPLE)
     # gcn_buffer_conformance/gcn_asm.h assembles the test's GCN fetch shaders.
     target_include_directories(shader-permutation-info-test PRIVATE ../tests)
     find_package(Python3 REQUIRED COMPONENTS Interpreter)
-    foreach(test_target motion-shader-test scene-resolution-test taa-shader-test camera-motion-test null-descriptor-test buffer-bounds-test buffer-bounds-benchmark buffer-dead-resources-test host-import-arena-test vertex-pulling-pipeline-test shader-permutation-info-test gpu-user-dir-test push-userdata-test)
+    foreach(test_target motion-shader-test scene-resolution-test taa-shader-test camera-motion-test null-descriptor-test buffer-bounds-test buffer-bounds-benchmark buffer-dead-resources-test host-import-arena-test vertex-pulling-pipeline-test shader-permutation-info-test gpu-user-dir-test push-userdata-test macos-perf-test)
         add_custom_command(TARGET ${test_target} POST_BUILD
             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../packaging/macos/check-exports.py
                 $<TARGET_FILE:bbgpu> $<TARGET_FILE:${test_target}> VERBATIM)

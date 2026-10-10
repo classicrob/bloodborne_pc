@@ -3727,6 +3727,9 @@ void Rasterizer::NoteFrameStart() {
         profiler->BeginFrame();
     }
     const u64 frame = BbStats::gpu_frames.fetch_add(1, std::memory_order_relaxed) + 1;
+#ifdef __APPLE__
+    scheduler.PerfMark(BbPerf::Phase::Scene, frame);
+#endif
     // BB_BUFFER_STATS=1: how many earlier frames the GPU has not finished when the GPU thread
     // starts a frame — the lag that decides whether guest memory can be read in place.
     static const bool stats = [] {
