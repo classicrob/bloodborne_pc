@@ -310,7 +310,7 @@ private:
     /// bbport: BindVertexBuffers/BindIndexBuffer in two halves: obtaining the buffers
     /// (vertex_binds, index_bind) and recording the binds.
     void ResolveVertexBuffers(const GraphicsPipeline* pipeline, const PreparedDraw* prepared);
-    void EmitVertexBuffers();
+    void EmitVertexBuffers(const GraphicsPipeline* pipeline);
     void ResolveIndexBuffer(u32 index_offset);
     void EmitIndexBuffer();
 

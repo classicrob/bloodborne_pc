@@ -302,10 +302,10 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
 
 static std::pair<u32, u32> GetDrawOffsets(
     const AmdGpu::Regs& regs, const Shader::Info& info,
-    const std::optional<Shader::Gcn::FetchShaderData>& fetch_shader) {
+    const std::optional<Shader::Gcn::FetchShaderData>& fetch_shader, bool vertex_pulling) {
     u32 vertex_offset = regs.index_offset;
     u32 instance_offset = 0;
-    if (fetch_shader) {
+    if (!vertex_pulling && fetch_shader) {
         if (vertex_offset == 0 && fetch_shader->vertex_offset_sgpr != -1) {
             vertex_offset = info.UserData()[fetch_shader->vertex_offset_sgpr];
         }
@@ -1006,7 +1006,7 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
             ResolveIndexBuffer(index_offset);
         }
     }
-    EmitVertexBuffers();
+    EmitVertexBuffers(pipeline);
     if (is_indexed) {
         EmitIndexBuffer();
     }
@@ -1023,7 +1023,7 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     if (motion_draw && motion_geometry) {
         const auto& vs = pipeline->GetStage(Shader::SwStage::Vertex);
         const auto [base_vertex, first_instance] =
-            GetDrawOffsets(regs, vs, pipeline->GetFetchShader());
+            GetDrawOffsets(regs, vs, pipeline->GetFetchShader(), pipeline->UsesVertexPulling());
         const u32 index_size =
             regs.index_buffer_type.index_type == AmdGpu::IndexType::Index16 ? 2u : 4u;
         const VAddr index_address = is_indexed
@@ -1116,7 +1116,8 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
 
     const auto& vs_info = pipeline->GetStage(Shader::SwStage::Vertex);
     const auto& fetch_shader = pipeline->GetFetchShader();
-    const auto [vertex_offset, instance_offset] = GetDrawOffsets(regs, vs_info, fetch_shader);
+    const auto [vertex_offset, instance_offset] =
+        GetDrawOffsets(regs, vs_info, fetch_shader, pipeline->UsesVertexPulling());
 
     const vk::Pipeline handle = pipeline->Handle();
     const u32 num_indices = regs.num_indices;
@@ -1665,10 +1666,13 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
 
 void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline, const PreparedDraw* prepared) {
     ResolveVertexBuffers(pipeline, prepared);
-    EmitVertexBuffers();
+    EmitVertexBuffers(pipeline);
 }
 
-void Rasterizer::EmitVertexBuffers() {
+void Rasterizer::EmitVertexBuffers(const GraphicsPipeline* pipeline) {
+    if (pipeline->UsesVertexPulling()) {
+        return;
+    }
     // bbport: only the used entries go into the recording chunk (the static vectors hold 32 of
     // each: ~3 KiB copied per draw).
     auto& v = vertex_binds;
@@ -1717,6 +1721,20 @@ void Rasterizer::ResolveVertexBuffers(const GraphicsPipeline* pipeline,
     auto& bindings = v.bindings;
     attributes.clear();
     bindings.clear();
+    if (pipeline->UsesVertexPulling()) {
+        if (motion_draw && pipeline->GetFetchShader()) {
+            VertexInputs<AmdGpu::Buffer> streams;
+            const auto& vs = pipeline->GetStage(Shader::SwStage::Vertex);
+            for (const auto& attribute : pipeline->GetFetchShader()->attributes) {
+                streams.push_back(attribute.GetSharp(vs));
+            }
+            if (!streams.empty()) {
+                motion_geometry =
+                    XXH3_64bits(streams.data(), streams.size() * sizeof(AmdGpu::Buffer));
+            }
+        }
+        return;
+    }
     VertexInputs<vk::VertexInputBindingDivisorDescriptionEXT> divisors;
     VertexInputs<AmdGpu::Buffer> guest_buffers;
     // Inputs a draw-preparation worker read from the same registers and (verified) user data.

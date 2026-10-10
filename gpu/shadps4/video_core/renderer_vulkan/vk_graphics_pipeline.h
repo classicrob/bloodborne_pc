@@ -98,6 +98,10 @@ public:
         return fetch_shader;
     }
 
+    bool UsesVertexPulling() const noexcept {
+        return profile.emulate_vertex_fetch;
+    }
+
     const GraphicsPipelineKey& GetGraphicsKey() const {
         return key;
     }

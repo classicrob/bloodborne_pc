@@ -348,6 +348,7 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     profile.emulate_null_descriptors = instance.EmulatesNullDescriptors();
 #ifdef __APPLE__
     profile.emulate_robust_buffer_access = true;
+    profile.emulate_vertex_fetch = true;
     profile.repair_mul_signed_zero = true;
 #endif
     WarmUp();
@@ -789,7 +790,8 @@ bool PipelineCache::RefreshGraphicsStages(PipelineSelection& sel) {
     }
 
     const auto* vs_info = sel.infos[static_cast<u32>(SwStage::Vertex)];
-    if (vs_info && sel.fetch_shader && !instance.IsVertexInputDynamicState()) {
+    if (!profile.emulate_vertex_fetch && vs_info && sel.fetch_shader &&
+        !instance.IsVertexInputDynamicState()) {
         // Without vertex input dynamic state, the pipeline needs to specialize on format.
         // Stride will still be handled outside the pipeline using dynamic state.
         u32 vertex_binding = 0;

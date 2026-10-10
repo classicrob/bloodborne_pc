@@ -60,7 +60,11 @@ GraphicsPipeline::GraphicsPipeline(
     pipeline_layout = std::move(layout);
     SetObjectName(device, *pipeline_layout, "Graphics PipelineLayout {}", debug_str);
 
-    if (!preloading) {
+    if (profile.emulate_vertex_fetch) {
+        sdata.vertex_attributes.clear();
+        sdata.vertex_bindings.clear();
+        sdata.divisors.clear();
+    } else if (!preloading) {
         VertexInputs<AmdGpu::Buffer> guest_buffers;
         if (!instance.IsVertexInputDynamicState()) {
             const auto& vs_info = runtime_infos[u32(Shader::SwStage::Vertex)].sw.vs;
@@ -155,7 +159,7 @@ GraphicsPipeline::GraphicsPipeline(
     if (instance.IsDynamicColorWriteMaskSupported()) {
         dynamic_states.push_back(vk::DynamicState::eColorWriteMaskEXT);
     }
-    if (instance.IsVertexInputDynamicState()) {
+    if (!profile.emulate_vertex_fetch && instance.IsVertexInputDynamicState()) {
         dynamic_states.push_back(vk::DynamicState::eVertexInputEXT);
     } else if (!sdata.vertex_bindings.empty()) {
         dynamic_states.push_back(vk::DynamicState::eVertexInputBindingStride);
@@ -407,7 +411,8 @@ GraphicsPipeline::GraphicsPipeline(
         .pNext = &pipeline_rendering_ci,
         .stageCount = static_cast<u32>(shader_stages.size()),
         .pStages = shader_stages.data(),
-        .pVertexInputState = !instance.IsVertexInputDynamicState() ? &vertex_input_info : nullptr,
+        .pVertexInputState = profile.emulate_vertex_fetch || !instance.IsVertexInputDynamicState()
+                                 ? &vertex_input_info : nullptr,
         .pInputAssemblyState = &input_assembly,
         .pTessellationState = &tessellation_state,
         .pViewportState = &viewport_info,
@@ -436,7 +441,7 @@ void GraphicsPipeline::GetVertexInputs(
     VertexInputs<vk::VertexInputBindingDivisorDescriptionEXT>& divisors,
     VertexInputs<AmdGpu::Buffer>& guest_buffers, u32 step_rate_0, u32 step_rate_1) const {
     using InstanceIdType = Shader::Gcn::VertexAttribute::InstanceIdType;
-    if (!fetch_shader || fetch_shader->attributes.empty()) {
+    if (profile.emulate_vertex_fetch || !fetch_shader || fetch_shader->attributes.empty()) {
         return;
     }
     const auto& vs_info = GetStage(Shader::SwStage::Vertex);

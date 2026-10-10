@@ -467,7 +467,7 @@ void DrawPreparation::WorkerLoop(std::stop_token stop, u32 index) {
                     }
                     draw.vertex.valid = false;
                     const auto* vs = sel.infos[static_cast<u32>(Shader::SwStage::Vertex)];
-                    if (vs && sel.fetch_shader) {
+                    if (!pipeline_cache.GetProfile().emulate_vertex_fetch && vs && sel.fetch_shader) {
                         PrepareVertexInputs(*vs, *sel.fetch_shader, *regs, draw.vertex, arena);
                     }
                     draw.state.store(PreparedDraw::Ready, std::memory_order_release);
