@@ -87,6 +87,21 @@ static void Run(int frames) {
     scheduler.Finish();
 }
 
+// Reads each submission's timestamps right after its timeline value is reached, without
+// Finish(): MoltenVK can signal the timeline before the results resolve (VK_NOT_READY), and
+// those reads must be retried, not fail, and every submission still measured exactly once.
+static void RunTight(int submissions) {
+    Vulkan::Instance instance(0, false);
+    Vulkan::Scheduler scheduler(instance);
+    scheduler.InitPerf(false);
+    for (int i = 0; i < submissions; ++i) {
+        const u64 tick = scheduler.CurrentTick();
+        scheduler.Flush();
+        scheduler.Wait(tick); // the next Flush's Begin reads these results immediately
+    }
+    BbPerf::Flip();
+}
+
 int main() {
     char dir_template[] = "/tmp/bbport-perf-test-XXXXXX";
     assert(mkdtemp(dir_template));
@@ -141,6 +156,17 @@ int main() {
     for (const char* name : {"gpu_scene_ms", "gpu_post_ms", "gpu_upscaler_ms", "gpu_frame_work_ms"})
         assert(Has(lines[2], std::string("\"") + name + "\":{\"n\":" + std::to_string(Frames - 1)));
 
+    // Reads immediately after the timeline: deferred, never lost or doubled.
+    constexpr int Tight = 400;
+    const std::string tight = dir + "/tight.jsonl";
+    assert(Passed(InChild([&] { Env("1", tight.c_str(), nullptr); RunTight(Tight); })));
+    lines = Lines(tight);
+    assert(lines.size() == 3);
+    assert(Number(lines[2], "main_submissions") == Tight);
+    const long long deferred = Number(lines[2], "deferred_reads");
+    std::printf("BB_PERF read-after-timeline: %d submissions, %lld deferred reads\n", Tight, deferred);
+
+    std::remove(tight.c_str());
     std::remove(existing.c_str());
     std::remove(plain.c_str());
     std::remove(phases.c_str());

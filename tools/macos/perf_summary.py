@@ -31,7 +31,7 @@ def main():
     perturbed = schema[0]['perturbed']
     print(f"BB_PERF {'PERTURBED (BB_PERF_PHASES=1): attribution only, not FPS' if perturbed else 'unperturbed'}")
     print(f"{'t(s)':>7} {'FPS':>6} {'GPU/flip':>9} {'flip p50':>9} {'flip p95':>9} {'flip max':>9} "
-          f"{'LvpCPU p50':>10} {'p95':>6} {'fence p95':>9} {'subm':>5}" +
+          f"{'LvpCPU p50':>10} {'p95':>6} {'fence p95':>9} {'subm':>5} {'defer':>5}" +
           (f" {'scene':>7} {'post':>7} {'upsc':>7} {'frame p95':>9}" if perturbed else ''))
     flips = seconds = busy = 0.0
     for w in windows:
@@ -42,7 +42,7 @@ def main():
         line = (f"{w['elapsed_seconds']:7.1f} {fps:6.1f} {per_flip:>9} {p(m, 'guest_flip_interval_ms', 'p50'):>9} "
                 f"{p(m, 'guest_flip_interval_ms', 'p95'):>9} {p(m, 'guest_flip_interval_ms', 'max'):>9} "
                 f"{p(m, 'liverpool_cpu_ms', 'p50'):>10} {p(m, 'liverpool_cpu_ms', 'p95'):>6} "
-                f"{p(m, 'fence_wait_wall_ms', 'p95'):>9} {g['main_submissions']:>5}")
+                f"{p(m, 'fence_wait_wall_ms', 'p95'):>9} {g['main_submissions']:>5} {g['deferred_reads']:>5}")
         if perturbed:
             line += (f" {p(m, 'gpu_scene_ms', 'mean'):>7} {p(m, 'gpu_post_ms', 'mean'):>7} "
                      f"{p(m, 'gpu_upscaler_ms', 'mean'):>7} {p(m, 'gpu_frame_work_ms', 'p95'):>9}")

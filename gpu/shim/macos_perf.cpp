@@ -16,6 +16,7 @@
 #include <map>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -26,8 +27,10 @@ using Clock = std::chrono::steady_clock;
     std::fprintf(stderr, "macOS performance measurement: %s\n", message);
     std::abort();
 }
-void Check(VkResult result) {
-    if (result != VK_SUCCESS) Fail("Vulkan timestamp/timeline operation failed");
+void Check(VkResult result, const char* call) {
+    if (result == VK_SUCCESS) return;
+    std::fprintf(stderr, "macOS performance measurement: %s returned VkResult %d\n", call, int(result));
+    std::abort();
 }
 uint64_t ThreadCpu() {
     timespec time{};
@@ -81,6 +84,7 @@ struct Reporter {
     std::vector<std::pair<double, double>> intervals; ///< [begin, end] in ms on the GPU clock
     std::array<double, 2> stream_ms{};                ///< main, present: sum of submissions
     std::array<uint64_t, 2> stream_submissions{};
+    uint64_t deferred_reads = 0; ///< timestamp reads retried: timeline done, results not yet
     Reporter() {
         const char* path = std::getenv("BB_PERF_OUT");
         if (!path || !*path) Fail("BB_PERF=1 requires BB_PERF_OUT (a new JSONL file)");
@@ -121,10 +125,12 @@ struct Reporter {
         const double busy = BusyUnion();
         std::fprintf(file, "{\"type\":\"window\",\"final\":%s,\"perturbed\":%s,\"elapsed_seconds\":%.6f,"
             "\"seconds\":%.6f,\"flips\":%llu,\"gpu\":{\"main_submissions\":%llu,\"present_submissions\":%llu,"
-            "\"main_ms\":%.6f,\"present_ms\":%.6f,\"busy_union_ms\":%.6f,\"busy_union_ms_per_flip\":",
+            "\"deferred_reads\":%llu,\"main_ms\":%.6f,\"present_ms\":%.6f,\"busy_union_ms\":%.6f,"
+            "\"busy_union_ms_per_flip\":",
             final ? "true" : "false", phases ? "true" : "false", elapsed, seconds,
             (unsigned long long)flips, (unsigned long long)stream_submissions[0],
-            (unsigned long long)stream_submissions[1], stream_ms[0], stream_ms[1], busy);
+            (unsigned long long)stream_submissions[1], (unsigned long long)deferred_reads,
+            stream_ms[0], stream_ms[1], busy);
         if (flips) std::fprintf(file, "%.6f", busy / double(flips));
         else std::fprintf(file, "null");
         std::fprintf(file, "},\"metrics\":{");
@@ -145,6 +151,7 @@ struct Reporter {
         std::fprintf(file, "}}\n");
         Flush();
         samples.clear(); intervals.clear(); stream_ms = {}; stream_submissions = {}; flips = 0;
+        deferred_reads = 0;
         window = now;
     }
 };
@@ -175,7 +182,12 @@ bool Phases() {
 
 struct GpuStream::Impl {
     static constexpr unsigned Slots = 512; // submissions in flight; 2 timestamps each
-    struct Slot { bool used = false; uint64_t tick = 0, frame = 0; Phase phase = Phase::Scene; };
+    struct Slot {
+        bool used = false;
+        uint64_t tick = 0, frame = 0;
+        Phase phase = Phase::Scene;
+        Clock::time_point completed_at{}; ///< first seen complete but its results not ready
+    };
     VkDevice device;
     VkQueryPool pool;
     VkSemaphore completion;
@@ -199,15 +211,32 @@ struct GpuStream::Impl {
     }
     void Collect() {
         uint64_t complete = 0;
-        Check(VULKAN_HPP_DEFAULT_DISPATCHER.vkGetSemaphoreCounterValue(device, completion, &complete));
+        Check(VULKAN_HPP_DEFAULT_DISPATCHER.vkGetSemaphoreCounterValue(device, completion, &complete),
+              "vkGetSemaphoreCounterValue");
         while (!pending.empty() && slots[pending.front()].tick <= complete) {
             const unsigned index = pending.front();
             auto& slot = slots[index];
             struct Result { uint64_t timestamp, available; };
             std::array<Result, 2> stamps{};
-            Check(VULKAN_HPP_DEFAULT_DISPATCHER.vkGetQueryPoolResults(device, pool, index * 2, 2, sizeof(stamps), stamps.data(),
-                sizeof(Result), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT));
-            if (!stamps[0].available || !stamps[1].available) Fail("completed timestamp query unavailable");
+            const VkResult result = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetQueryPoolResults(device, pool,
+                index * 2, 2, sizeof(stamps), stamps.data(), sizeof(Result),
+                VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+            // MoltenVK signals the timeline before it has resolved the submission's timestamps
+            // (docs/macos/perf.md): VK_NOT_READY here means "later", so the slot stays pending
+            // and is read at a later submission. Still unavailable 2 s after completion is an error.
+            if (result == VK_NOT_READY) {
+                const auto now = Clock::now();
+                if (slot.completed_at == Clock::time_point{}) slot.completed_at = now;
+                else if (now - slot.completed_at > std::chrono::seconds(2))
+                    Fail("vkGetQueryPoolResults still VK_NOT_READY 2 s after the submission completed");
+                auto& report = Report();
+                std::scoped_lock lock{report.mutex};
+                ++report.deferred_reads;
+                return;
+            }
+            Check(result, "vkGetQueryPoolResults");
+            if (!stamps[0].available || !stamps[1].available)
+                Fail("vkGetQueryPoolResults returned VK_SUCCESS with an unavailable timestamp");
             const double begin = double(stamps[0].timestamp & mask) * period / 1e6;
             const double ms = double((stamps[1].timestamp - stamps[0].timestamp) & mask) * period / 1e6;
             if (!std::isfinite(ms) || !std::isfinite(begin)) Fail("invalid GPU timestamp duration");
@@ -250,7 +279,8 @@ GpuStream::GpuStream(VkPhysicalDevice physical, VkDevice device, uint32_t family
     impl->period = properties.limits.timestampPeriod;
     VkQueryPoolCreateInfo create{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
     create.queryType = VK_QUERY_TYPE_TIMESTAMP; create.queryCount = Impl::Slots * 2;
-    Check(VULKAN_HPP_DEFAULT_DISPATCHER.vkCreateQueryPool(device, &create, nullptr, &impl->pool));
+    Check(VULKAN_HPP_DEFAULT_DISPATCHER.vkCreateQueryPool(device, &create, nullptr, &impl->pool),
+          "vkCreateQueryPool");
     auto& report = Report(); std::scoped_lock lock{report.mutex};
     std::fprintf(report.file, "{\"type\":\"queue\",\"present\":%s,\"family\":%u,\"timestamp_valid_bits\":%u,"
         "\"timestamp_period_ns\":%.9f}\n", present ? "true" : "false", family, bits, impl->period);
@@ -265,9 +295,11 @@ GpuStream::~GpuStream() {
         wait.semaphoreCount = 1;
         wait.pSemaphores = &impl->completion;
         wait.pValues = &impl->last_tick;
-        if (VULKAN_HPP_DEFAULT_DISPATCHER.vkWaitSemaphores(impl->device, &wait, 5'000'000'000ull) != VK_SUCCESS)
-            Fail("timestamped GPU work did not complete within 5 s of renderer teardown");
-        impl->Collect();
+        Check(VULKAN_HPP_DEFAULT_DISPATCHER.vkWaitSemaphores(impl->device, &wait, 5'000'000'000ull),
+              "vkWaitSemaphores (timestamped work at renderer teardown, 5 s)");
+        // The timestamps may resolve after the timeline; Collect fails loudly after 2 s.
+        while (impl->Collect(), !impl->pending.empty())
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     VULKAN_HPP_DEFAULT_DISPATCHER.vkDestroyQueryPool(impl->device, impl->pool, nullptr);
     auto& report = Report(); std::scoped_lock lock{report.mutex};

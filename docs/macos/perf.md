@@ -49,6 +49,16 @@ repeat between 0.6 and 1.6. The empty segment must stay under 0.1 ms and under 5
 what separates the valid case (about 0.004 ms) from the invalid one: in-buffer compute gave
 0.26 to 2.7 ms, with repeats of 0.0 to 0.22x, over seven runs at host load 20 to 70.
 
+The timeline semaphore is not the end of the story either. MoltenVK can signal a submission's
+timeline value before it has resolved that submission's timestamps. A
+`vkGetQueryPoolResults` without `WAIT` right after the timeline passes can return
+`VK_NOT_READY`. The first BB_PERF game run (9668c1c, 4K title) aborted on that within
+seconds. BB_PERF now keeps such a submission pending and reads it again at a later
+submission, so nothing waits. Results still unavailable 2 s after completion abort with the
+call named. Windows count these retries as `gpu.deferred_reads`. `macos-perf-test` reads
+400 submissions straight after their timeline values, without `Finish()`, and requires every
+one to be measured exactly once.
+
 Consequences:
 - BB_PERF measures GPU time per submission, for the main (draw) and present schedulers. It
   never places timestamps between commands.
@@ -81,6 +91,8 @@ A window holds:
 - `gpu.main_ms`, `gpu.present_ms`, `gpu.*_submissions`: the sums and counts of submissions
   completed in the window. Results are read when later submissions begin, a few submissions
   behind.
+- `gpu.deferred_reads`: timestamp reads retried because MoltenVK had not resolved them yet
+  (see above). These are retries, not lost data.
 - `gpu.busy_union_ms`: the union of all submission spans on the GPU clock, both streams. It
   is the GPU busy time on the shared graphics queue; overlap is not double counted.
   `busy_union_ms_per_flip` divides it by `flips`, which is the number to compare with the
