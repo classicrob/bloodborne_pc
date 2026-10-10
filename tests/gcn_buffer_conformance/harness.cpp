@@ -1324,6 +1324,9 @@ void AddWaveCases() {
     }
     // Control-dependent phi feeding a loop bound (Sol-2's review case), compile-only.
     for (u32 x : {64u, 128u}) {
+#ifndef BB_MIRROR_PROFILE_WAVE64
+        if (x > 64) continue; // the rejection is a property of the wave64 emulation
+#endif
         Template t;
         t.name = "wave: branch on readfirstlane(LII) -> phi(1,2) loop bound, ballot in loop [" +
                  std::to_string(x) + "x1] (compile)";
