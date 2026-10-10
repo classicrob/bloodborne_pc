@@ -22,6 +22,7 @@
 #include <vector>
 
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
+#include "shader_recompiler/backend/spirv/emit_spirv_quad_rect.h"
 #include "shader_recompiler/info.h"
 #include "shader_recompiler/profile.h"
 #include "shader_recompiler/recompiler.h"
@@ -51,14 +52,17 @@ constexpr u64 ParamVa = 0x3000000000ull;  // per-lane parameters
 constexpr u64 ResultVa = 0x3800000000ull; // per-lane results
 constexpr u32 Arena = 64 * 1024;          // per-job slot of patterned guest memory
 constexpr u32 BaseInArena = 16 * 1024;    // V# base offset inside its arena (before misalign)
-constexpr u32 ParamSlot = 64 * 32;
-constexpr u32 ResultSlot = 64 * 16;
+constexpr u32 kLanes = 128; // up to two GCN waves per workgroup
+constexpr u32 ParamSlot = kLanes * 32;
+constexpr u32 ResultSlot = kLanes * 16;
 constexpr u32 FlatSlot = 4096;
 constexpr u32 MaxBatch = 256;
 constexpr u32 VgprMarker = 0xDEAD0000u;
 constexpr u32 SgprMarker = 0x5EED0000u;
 constexpr u32 ResultFill = 0x0BAD0BADu;
 constexpr u32 NullBufferSize = 64; // vk_null_resources.h NullResources::BufferSize
+constexpr u32 RenderSize = 16;     // render group target: 16x16 R32G32B32A32_SFLOAT
+constexpr u32 RenderBytes = RenderSize * RenderSize * 16;
 
 u32 Hash32(u64 x) {
     x ^= x >> 33;
@@ -76,7 +80,7 @@ u8 CanaryByte(u64 va) { return u8(Hash32(va ^ 0xC0FFEE123ull) % 255 + 1); }
 enum class SoffSrc { Inline, Sgpr };
 enum class SmemSrc { None, Imm, Sgpr };
 // Wave64 lane-semantics programs (no buffer access under test).
-enum class Wave { None, Lane, MbcntMask, Readlane, Exec1, Exec2 };
+enum class Wave { None, Lane, MbcntMask, Readlane, Exec1, Exec2, LoopReadFirstLane, Lds };
 
 struct Template {
     std::string name;
@@ -89,16 +93,30 @@ struct Template {
     u32 soff_inline = 0;
     SmemSrc smem = SmemSrc::None;
     u32 smem_imm = 0;      // dwords
+    std::array<u32, 4> smem_pick{0, 1, 2, 3}; // which SDST dwords are copied to v10..v13
     bool combo = false;    // s_buffer_load_dword (imm) + buffer_load_dword on the same V#
     Wave wave = Wave::None;
     bool vertex = false;   // vertex shader + fetch shader (s_swappc_b64), indexed draw
     bool indirect = false; // vertex: indirect draw; the fetch shader adds the base vertex from s13
     bool fragment = false; // fragment stage (compile-only)
+    bool render = false;   // vertex: rasterized draw into a 16x16 target, read back
+    bool rect_list = false; // render: RectList through the production tessellation emulation
+    bool vs_fetch = false;  // render: positions from a fetch shader (else from the vertex id)
+    u32 pos_scale = 246;    // render, vertex-id positions: inline float (246 = 4.0, 244 = 2.0, 242 = 1.0)
+    u32 fs_tmpl = ~0u;      // render: the fragment shader template
+    bool helper = false;    // compiled for another job; no verdict of its own
     bool compile_only = false; // translate + EmitSPIRV + spirv-val only; an abort is a FAIL
     bool srt = false;      // V# and a constant read through an extended-user-data pointer (s[2:3])
     u32 sdst = 16;         // stage-compile: SDST of the s_buffer_load (0 overlaps user data)
     bool dead = false;     // the access under test is dead (its result is never used)
+    bool wave_divergent = false; // wave: cross-lane ops in divergent flow (loud by design on Apple)
+    bool clip_planes = false;  // vertex: user clip plane 0 enabled (adds the ClipPlanes buffer)
+    bool check_bindings = false; // compile-only: the chosen module's bindings must start at the job's start
+    bool no_buffer_load = false; // stage-compile: export constants only (no s_buffer_load)
     std::vector<u32> fetch;
+    std::array<u32, 3> wg{64, 1, 1}; // compute workgroup shape (power-of-two x)
+    u32 lds_bits = 0;                // Wave::Lds: guest LDS access width (16, 32, 64)
+    u32 Threads() const { return wg[0] * wg[1] * wg[2]; }
     std::vector<u32> code;
     u64 hash = 0;
 };
@@ -129,8 +147,12 @@ struct Job {
     u64 base_delta = 0; // V# base = slot base + BaseInArena + base_delta (unless zero_sharp)
     bool zero_sharp = false;
     u32 sgpr_soff = 0, smem_sgpr = 0;
+    std::vector<u32> init_words; // written at the V# base after the pattern fill
+    bool quarter = false;        // render: only the top-left 8x8 quarter is covered
+    bool force_push = false;     // moltenvk-push: bind with push descriptors whatever the default
     s32 vertex_offset = 0; // vertex jobs: drawIndexed vertexOffset (lanes hold index + offset)
-    std::array<Lane, 64> lanes{};
+    u32 start_unified = 0, start_buffer = 0; // Backend::Bindings at which this stage starts
+    std::array<Lane, kLanes> lanes{};
     bool approved_struct_soff = false, approved_swizzle = false;
     bool isa_invalid = false; // violates an ISA programming rule (e.g. element_size < access size)
     bool approved_offen_only = false; // structured, offen without idxen/add_tid: offset never checked
@@ -228,9 +250,47 @@ void AssembleWave(GcnAsm::Code& c, Wave w) {
         c.VMov(10, 26);
         c.VMov(11, 27);
         break;
-    case Wave::None:
+    case Wave::LoopReadFirstLane: {
+        // s21 = v_readfirstlane(v3) (one value per wave); loop: ballot of v5 != 0 counted into s24,
+        // s20 += s21 until s20 >= 0x3000. The loop exit is wave-uniform, workgroup-uniform only
+        // for a single-wave workgroup (loop-carried through the s20 phi).
+        c.Sop1(3, 20, Inline(0));
+        c.Sop1(3, 24, Inline(0));
+        c.VReadfirstlane(21, 3);
+        c.Sop2(14, 21, 21, LITERAL); // s_and_b32 s21, s21, 0xF000 | 0x1000 floor: never 0 (bounded loop)
+        c.words.push_back(0xF000u);
+        c.Sop2(16, 21, 21, LITERAL); // s_or_b32 s21, s21, 0x1000
+        c.words.push_back(0x1000u);
+        const size_t loop = c.words.size();
+        c.VCmpNeU32(Inline(0), 5);
+        c.SBcnt1B64(22, VCC_LO);
+        c.SAddU32(24, 24, 22);
+        c.SAddU32(20, 20, 21);
+        c.SCmpLtU32Literal(20, 0x3000);
+        c.SCbranchScc1To(loop);
+        c.VMov(10, 24);
+        c.VMov(11, 20);
         break;
     }
+    case Wave::None:
+    case Wave::Lds:
+        break;
+    }
+}
+
+// Guest LDS of one width (each lane writes and reads its own slot) next to a VOPC ballot.
+void AssembleLds(GcnAsm::Code& c, u32 bits) {
+    using namespace GcnAsm;
+    const u32 shift = bits == 64 ? 3 : (bits == 32 ? 2 : 1);
+    c.VLshlrevB32(16, Inline(shift), 15);
+    c.Ds(bits == 64 ? 77 : (bits == 32 ? 13 : 31), 16, 3, 0); // ds_write v16, v3 (v[3:4] for b64)
+    c.SWaitcntAll();
+    c.SBarrier();
+    c.Ds(bits == 64 ? 118 : (bits == 32 ? 54 : 60), 16, 0, 10); // ds_read -> v10 (v[10:11] for b64)
+    c.SWaitcntAll();
+    c.VCmpNeU32(Inline(0), 5);
+    c.VMov(12, VCC_LO);
+    c.VMov(13, VCC_HI);
 }
 
 constexpr u32 IndirectBaseSgpr = 13;
@@ -280,10 +340,12 @@ void AssembleStage(Template& t) {
     Code c;
     c.SMovLiteral(VCC_HI, 0x5eed);
     c.Sop1(3, 124, 8); // s_mov_b32 m0, s8
-    c.SBufferLoad(t.op.ncomp, t.sdst, 4, t.smem == SmemSrc::Imm, t.smem == SmemSrc::Imm ? t.smem_imm : 9);
-    c.SWaitcntAll();
+    if (!t.no_buffer_load) {
+        c.SBufferLoad(t.op.ncomp, t.sdst, 4, t.smem == SmemSrc::Imm, t.smem == SmemSrc::Imm ? t.smem_imm : 9);
+        c.SWaitcntAll();
+    }
     for (u32 i = 0; i < 4; ++i) {
-        if (t.dead) c.VMovLiteral(i, 0x3f800000);
+        if (t.dead || t.no_buffer_load) c.VMovLiteral(i, 0x3f800000);
         else c.VMov(i, t.sdst + (i < t.op.ncomp ? i : 0));
     }
     if (t.fragment) {
@@ -298,8 +360,68 @@ void AssembleStage(Template& t) {
     t.hash = h;
 }
 
+// Render group: VS positions from the vertex id (x = (id & 1) * k - 1, y = (id >> 1) * k - 1)
+// or from a fetch shader (buffer_load_format_xyzw v[4:7], v0 idxen); FS exports a constant color.
+constexpr float RenderColor[4] = {0.25f, 0.5f, 0.75f, 1.0f};
+constexpr float ClearColor[4] = {0.125f, 0.125f, 0.125f, 0.125f};
+
+void AssembleRender(Template& t) {
+    using namespace GcnAsm;
+    Code c;
+    c.SMovLiteral(VCC_HI, 0x5eed);
+    if (t.vs_fetch) {
+        c.SSwappcB64(0, 0);
+        c.Exp(12, 0xF, true, 4, 5, 6, 7);
+        Code f;
+        f.SLoadDwordx4(4, 2, 0);
+        f.SWaitcntAll();
+        f.Mubuf(BUFFER_LOAD_FORMAT_XYZW, Code::BufFields{.idxen = true, .vaddr = 0, .vdata = 4, .srsrc = 4});
+        f.SWaitcntAll();
+        f.SSetpcB64(0);
+        t.fetch = std::move(f.words);
+    } else {
+        c.Vop2(27, 1, 0, Inline(1));  // v_and_b32 v1, 1, v0
+        c.Vop2(22, 2, 0, Inline(1));  // v_lshrrev_b32 v2, 1, v0
+        c.Vop1(6, 1, Vgpr(1));        // v_cvt_f32_u32
+        c.Vop1(6, 2, Vgpr(2));
+        c.Vop2(8, 1, 1, t.pos_scale); // v_mul_f32 v1, k, v1
+        c.Vop2(8, 2, 2, t.pos_scale);
+        c.Vop2(5, 1, 1, 242);         // v_subrev_f32 v1, 1.0, v1 -> v1 - 1
+        c.Vop2(5, 2, 2, 242);
+        c.VMov(3, Inline(0));
+        c.VMov(4, 242);
+        c.Exp(12, 0xF, true, 1, 2, 3, 4);
+    }
+    c.SEndpgm();
+    t.code = std::move(c.words);
+    u64 h = 0xcbf29ce484222325ull ^ 0x7e9d;
+    for (u32 w : t.code) h = (h ^ w) * 0x100000001b3ull;
+    for (u32 w : t.fetch) h = (h ^ w) * 0x100000001b3ull;
+    h ^= t.rect_list ? 0x55 : 0;
+    t.hash = h;
+}
+
+void AssembleColorFs(Template& t) {
+    using namespace GcnAsm;
+    Code c;
+    c.SMovLiteral(VCC_HI, 0x5eed);
+    for (u32 i = 0; i < 4; ++i) c.VMovLiteral(i, std::bit_cast<u32>(RenderColor[i]));
+    c.Exp(0, 0xF, true, 0, 1, 2, 3, true);
+    c.SEndpgm();
+    t.code = std::move(c.words);
+    t.hash = 0xf5c0104ull;
+}
+
 void Assemble(Template& t) {
     using namespace GcnAsm;
+    if (t.render) {
+        AssembleRender(t);
+        return;
+    }
+    if (t.fragment && t.helper) {
+        AssembleColorFs(t);
+        return;
+    }
     if (t.vertex && !t.compile_only) {
         AssembleVertex(t);
         return;
@@ -310,7 +432,12 @@ void Assemble(Template& t) {
     }
     Code c;
     c.SMovLiteral(VCC_HI, 0x5eed); // the recompiler expects s_mov_b32 vcc_hi, #imm first
-    c.VLshlrevB32(1, Inline(5), 0);
+    // v15 = local invocation index = x + y * size_x (v0, v1 = local id x, y)
+    u32 log2x = 0;
+    while ((1u << log2x) < t.wg[0]) ++log2x;
+    c.VLshlrevB32(15, Inline(log2x), 1);
+    c.Vop2(37, 15, 15, Vgpr(0)); // v_add_i32 v15, v0, v15
+    c.VLshlrevB32(1, Inline(5), 15);
     Code::BufFields p{.offen = true, .vaddr = 1, .vdata = 2, .srsrc = 4};
     c.Mubuf(BUFFER_LOAD_DWORDX4, p); // v2 active, v3 vindex, v4 voffset, v5 data0
     p.offset = 16;
@@ -319,16 +446,18 @@ void Assemble(Template& t) {
     c.SWaitcntAll();
     for (u32 i = 0; i < 4; ++i) c.VMovLiteral(10 + i, VgprMarker + i);
     const bool smem = t.smem != SmemSrc::None;
-    if (t.wave != Wave::None) {
+    if (t.wave == Wave::Lds) {
+        AssembleLds(c, t.lds_bits);
+    } else if (t.wave != Wave::None) {
         AssembleWave(c, t.wave);
     } else if (smem || t.combo) {
-        for (u32 i = 0; i < 4; ++i) c.SMovLiteral(16 + i, SgprMarker + i);
+        for (u32 i = 0; i < std::max<u32>(4, smem ? t.op.ncomp : 1); ++i) c.SMovLiteral(16 + i, SgprMarker + i);
     }
     if (t.wave != Wave::None) {
     } else if (smem) {
         c.SBufferLoad(t.op.ncomp, 16, 0, t.smem == SmemSrc::Imm, t.smem == SmemSrc::Imm ? t.smem_imm : 13);
         c.SWaitcntAll();
-        for (u32 i = 0; i < 4; ++i) c.VMov(10 + i, 16 + i);
+        for (u32 i = 0; i < 4; ++i) c.VMov(10 + i, 16 + t.smem_pick[i]);
     } else {
         if (t.combo) {
             c.SBufferLoad(1, 16, 0, true, t.smem_imm);
@@ -357,7 +486,7 @@ void Assemble(Template& t) {
         c.SMovB64(EXEC_LO, t.srt ? 22 : 20);
     }
     if (t.srt) c.VMov(11, 20);
-    c.VLshlrevB32(14, Inline(4), 0);
+    c.VLshlrevB32(14, Inline(4), 15);
     Code::BufFields o{.offen = true, .vaddr = 14, .vdata = 10, .srsrc = 8};
     c.Mubuf(BUFFER_STORE_DWORDX4, o);
     c.SWaitcntAll();
@@ -446,6 +575,8 @@ u32 AtomicOp(const char* name, u32 opcode, gcn_atomic at, bool x2, const TArgs& 
 
 u32 SmemOp(u32 count, SmemSrc src, u32 imm) {
     Template t;
+    if (count == 8) t.smem_pick = {0, 3, 4, 7};
+    if (count == 16) t.smem_pick = {0, 7, 8, 15};
     t.name = "s_buffer_load_dword" + (count > 1 ? "x" + std::to_string(count) : std::string{}) +
              (src == SmemSrc::Imm ? " imm:" + std::to_string(imm) : std::string(" soff:s13"));
     t.op.kind = GCN_SLOAD;
@@ -828,6 +959,23 @@ void AddLoadCases() {
                 for (u32 lane = 0; lane < 64; ++lane) SetLane(j, lane, 0, 0);
             }
         }
+        // Constant-buffer sized loads (x8/x16): last dword in range, first dword out, straddles.
+        for (u32 count : {8u, 16u}) {
+            for (u32 imm : {0u, 4u, 8u, 12u, 16u, 20u, 24u, 60u}) {
+                const u32 t = SmemOp(count, SmemSrc::Imm, imm);
+                for (const gcn_vsharp& v : {RawV(64), RawV(100), RawV(0x80), StructV(16, 4), StructV(16, 8)}) {
+                    Job& j = NewJob("smem", t, v, 0);
+                    for (u32 lane = 0; lane < 64; ++lane) SetLane(j, lane, 0, 0);
+                }
+            }
+            const u32 ts = SmemOp(count, SmemSrc::Sgpr, 0);
+            for (u32 off : {0u, 32u, 64u, 66u, 96u, 0x100u, 0xFFFFFFC0u}) {
+                Job& j = NewJob("smem", ts, RawV(128), 0);
+                j.smem_sgpr = off;
+                j.label += " s13=" + Hex(off);
+                for (u32 lane = 0; lane < 64; ++lane) SetLane(j, lane, 0, 0);
+            }
+        }
         // One V# used by both s_buffer_load and buffer_load: INVALID dfmt zeroes only the
         // vector load (§7.2.2 ignores the format).
         const u32 combo = ComboOp(2);
@@ -993,44 +1141,99 @@ void AddAtomicCases() {
 
 // Wave64 lane semantics: the PS4 runs 64-lane waves; Apple subgroups are 32 wide.
 void AddWaveCases() {
-    auto tmpl = [](const char* name, Wave w) {
-        Template t;
-        t.name = name;
-        t.op.kind = GCN_LOAD;
-        t.wave = w;
-        return AddTemplate(t);
-    };
-    const u32 lane = tmpl("wave: v_mbcnt(-1) lane id + VOPC ballot + s_bcnt1", Wave::Lane);
-    const u32 mbcnt = tmpl("wave: v_mbcnt over VCC + s_mov_b64 vcc + v_cndmask", Wave::MbcntMask);
-    const u32 rl = tmpl("wave: v_readlane 37/s13/s12 + v_readfirstlane", Wave::Readlane);
-    const u32 e1 = tmpl("wave: under saveexec: v_readfirstlane, s_bcnt1 exec, masked v_mov", Wave::Exec1);
-    const u32 e2 = tmpl("wave: under saveexec: s_mov_b64 exec, v_mbcnt over exec", Wave::Exec2);
+    auto rotl = [](u64 x, u32 r) { return r ? (x << r) | (x >> (64 - r)) : x; };
     auto value = [](u32 l) { return 0x1000u + l * 0x11u; };
     struct M { const char* name; u64 mask; };
     const M masks[] = {{"all", ~0ull}, {"none", 0}, {"lane63", 1ull << 63}, {"upper32", 0xFFFFFFFF00000000ull},
                        {"lower32", 0xFFFFFFFFull}, {"even", 0x5555555555555555ull}, {"lanes0+37", 1ull | 1ull << 37},
                        {"lane33", 1ull << 33}, {"lanes5+40", 1ull << 5 | 1ull << 40}};
-    for (const M& m : masks) {
-        for (u32 t : {lane, mbcnt}) {
-            Job& j = NewJob("wave64", t, RawV(64), 0);
-            j.label += " ballot=" + std::string(m.name);
-            for (u32 l = 0; l < 64; ++l) SetLane(j, l, value(l), 0, {u32(m.mask >> l & 1), 0, 0, 0});
-        }
-        if (m.mask == 0) continue; // an all-zero exec skips the scope
-        for (u32 t : {e1, e2}) {
-            Job& j = NewJob("wave64", t, RawV(64), 0);
-            j.label += " exec=" + std::string(m.name);
-            for (u32 l = 0; l < 64; ++l) {
-                SetLane(j, l, value(l), 0);
-                j.lanes[l].active = u32(m.mask >> l & 1);
+    const std::array<u32, 3> shapes[] = {{64, 1, 1}, {8, 8, 1}, {16, 4, 1}, {2, 32, 1}, {128, 1, 1}, {32, 4, 1}};
+    for (const auto& wg : shapes) {
+        const std::string shape = " [" + std::to_string(wg[0]) + "x" + std::to_string(wg[1]) + "]";
+        auto tmpl = [&](const char* name, Wave w) {
+            Template t;
+            t.name = std::string(name) + shape;
+            t.op.kind = GCN_LOAD;
+            t.wave = w;
+            t.wg = wg;
+            // cross-lane ops inside an s_and_saveexec scope: divergent, loud by design on Apple
+            t.wave_divergent = w == Wave::Exec1 || w == Wave::Exec2;
+            return AddTemplate(t);
+        };
+        const u32 threads = wg[0] * wg[1] * wg[2];
+        const u32 lane = tmpl("wave: v_mbcnt(-1) lane id + VOPC ballot + s_bcnt1", Wave::Lane);
+        const u32 mbcnt = tmpl("wave: v_mbcnt over VCC + s_mov_b64 vcc + v_cndmask", Wave::MbcntMask);
+        const u32 rl = tmpl("wave: v_readlane 37/s13/s12 + v_readfirstlane", Wave::Readlane);
+        const u32 e1 = tmpl("wave: under saveexec: v_readfirstlane, s_bcnt1 exec, masked v_mov", Wave::Exec1);
+        const u32 e2 = tmpl("wave: under saveexec: s_mov_b64 exec, v_mbcnt over exec", Wave::Exec2);
+        const bool all_masks = wg[0] == 64; // full mask matrix on 64x1, a subset on the other shapes
+        for (const M& m : masks) {
+            if (!all_masks && std::string(m.name) != "all" && std::string(m.name) != "lanes5+40" &&
+                std::string(m.name) != "upper32") {
+                continue;
+            }
+            auto bit = [&](u32 l) { return u32((l < 64 ? m.mask : rotl(m.mask, 7)) >> (l % 64) & 1); };
+            for (u32 t : {lane, mbcnt}) {
+                Job& j = NewJob("wave64", t, RawV(64), 0);
+                j.label += " ballot=" + std::string(m.name);
+                for (u32 l = 0; l < threads; ++l) SetLane(j, l, value(l), 0, {bit(l), 0, 0, 0});
+            }
+            if (m.mask == 0) continue; // an all-zero exec skips the scope
+            for (u32 t : {e1, e2}) {
+                Job& j = NewJob("wave64", t, RawV(64), 0);
+                j.label += " exec=" + std::string(m.name);
+                for (u32 l = 0; l < threads; ++l) {
+                    SetLane(j, l, value(l), 0);
+                    j.lanes[l].active = bit(l);
+                }
             }
         }
+        for (auto [a, b] : {std::pair{0u, 31u}, std::pair{32u, 63u}, std::pair{45u, 1u}, std::pair{63u, 32u}}) {
+            if (!all_masks && a != 45) continue;
+            Job& j = NewJob("wave64", rl, RawV(64), 0, b);
+            j.smem_sgpr = a;
+            j.label += " s13=" + std::to_string(a) + " s12=" + std::to_string(b);
+            for (u32 l = 0; l < threads; ++l) SetLane(j, l, value(l), 0);
+        }
     }
-    for (auto [a, b] : {std::pair{0u, 31u}, std::pair{32u, 63u}, std::pair{45u, 1u}, std::pair{63u, 32u}}) {
-        Job& j = NewJob("wave64", rl, RawV(64), 0, b);
-        j.smem_sgpr = a;
-        j.label += " s13=" + std::to_string(a) + " s12=" + std::to_string(b);
-        for (u32 l = 0; l < 64; ++l) SetLane(j, l, value(l), 0);
+    // Loop-carried divergence: one wave -> exact; two waves -> the loop exit differs per wave, so a
+    // ballot in the loop body cannot be exchanged between barriers (loud by design).
+    for (const std::array<u32, 3>& wg : {std::array<u32, 3>{64, 1, 1}, std::array<u32, 3>{128, 1, 1}}) {
+        Template t;
+        t.name = "wave: loop counter += v_readfirstlane, ballot in the loop [" + std::to_string(wg[0]) + "x1]";
+        t.op.kind = GCN_LOAD;
+        t.wave = Wave::LoopReadFirstLane;
+        t.wg = wg;
+        t.wave_divergent = wg[0] > 64;
+        const u32 tt = AddTemplate(t);
+        Job& j = NewJob("wave64", tt, RawV(64), 0);
+        for (u32 l = 0; l < wg[0]; ++l) SetLane(j, l, 0x1000u + l * 0x11u, 0, {u32(l % 3 == 0), 0, 0, 0});
+    }
+    // Guest LDS widths next to the wave scratch: 32-bit is exact; 16/64-bit would need a second
+    // workgroup type (explicit layout), a named loud rejection on Apple.
+    for (u32 bits : {32u, 16u, 64u}) {
+        Template t;
+        t.name = "wave: guest LDS " + std::to_string(bits) + "-bit + VOPC ballot";
+        t.op.kind = GCN_LOAD;
+        t.wave = Wave::Lds;
+        t.lds_bits = bits;
+        t.wave_divergent = bits != 32;
+        const u32 tt = AddTemplate(t);
+        Job& j = NewJob("wave64", tt, RawV(64), 0);
+        for (u32 l = 0; l < 64; ++l) SetLane(j, l, 0x51000u + l * 0x101u, 0xABC00u + l, {u32(l % 5 == 1), 0, 0, 0});
+    }
+    // add_tid on a non-linear shape: thread_id[5:0] is the wave lane of LocalInvocationIndex
+    {
+        Template t = Base("buffer_load_dword", GCN_LOAD, GcnAsm::BUFFER_LOAD_DWORD, TArgs{.idxen = true, .offen = true});
+        t.name += " [8x8]";
+        t.op.comp_bytes = 4;
+        t.op.ncomp = 1;
+        t.wg = {8, 8, 1};
+        const u32 tt = AddTemplate(t);
+        gcn_vsharp v = StructV(16, 40);
+        v.add_tid = 1;
+        Job& j = NewJob("add-tid", tt, v, 0);
+        for (u32 l = 0; l < 64; ++l) SetLane(j, l, l % 3 == 0 ? 0 : 1, (l % 5) * 4);
     }
 }
 
@@ -1166,6 +1369,92 @@ void AddInternalCases() {
     }
 }
 
+// Specialization reuse across start bindings: the same vertex shader used after fragment
+// shaders with different resource counts must get a module whose bindings start where the
+// pipeline layout puts them (Backend::Bindings start), even when its only binding is special.
+void AddSpecReuseCases() {
+    for (bool only_special : {true, false}) {
+        Template t;
+        t.name = std::string("vs + user clip plane 0, ") +
+                 (only_special ? "no guest buffer (ClipPlanes only)" : "s_buffer_load s[4:7] (control)") + " (compile)";
+        t.compile_only = true;
+        t.vertex = true;
+        t.clip_planes = true;
+        t.no_buffer_load = only_special;
+        t.op.kind = GCN_SLOAD;
+        t.op.ncomp = 4;
+        t.smem = SmemSrc::Imm;
+        t.sdst = 16;
+        t.check_bindings = true;
+        const u32 tt = AddTemplate(t);
+        for (u32 start : {0u, 3u, 0u, 5u}) {
+            Job& j = NewJob("spec-reuse", tt, RawV(64), 0);
+            j.start_unified = j.start_buffer = start;
+            j.label += " start binding " + std::to_string(start);
+        }
+    }
+}
+
+// Rasterized draws read back from a render target: a vertex-id full-screen triangle with no
+// fetch shader, the same from fetched positions, and RectLists through the production
+// tessellation emulation (aux TCS/TES), full and quarter coverage.
+void AddRenderCases() {
+    Template fs;
+    fs.name = "render: constant-color fragment shader";
+    fs.fragment = true;
+    fs.helper = true;
+    const u32 fs_t = AddTemplate(fs);
+    struct R { const char* name; bool rect, fetch, quarter; u32 scale; };
+    const R cases[] = {{"triangle list, positions from vertex id, no fetch shader", false, false, false, 246},
+                       {"triangle list, positions fetched", false, true, false, 0},
+                       {"RectList, positions from vertex id, full", true, false, false, 244},
+                       {"RectList, positions from vertex id, quarter", true, false, true, 242},
+                       {"RectList, positions fetched, quarter", true, true, true, 0}};
+    for (const R& r : cases) {
+        Template t;
+        t.name = std::string("render: ") + r.name;
+        t.vertex = true;
+        t.render = true;
+        t.rect_list = r.rect;
+        t.vs_fetch = r.fetch;
+        t.pos_scale = r.scale;
+        t.fs_tmpl = fs_t;
+        t.op.kind = GCN_LOAD;
+        const u32 tt = AddTemplate(t);
+        Job& f = NewJob("render", fs_t, RawV(64), 0);
+        f.label = "fs helper";
+        const gcn_vsharp v = StructV(16, 3, GCN_DFMT_32_32_32_32, GCN_NFMT_FLOAT);
+        Job& j = NewJob("render", tt, v, 0);
+        j.quarter = r.quarter;
+        if (r.fetch) {
+            const float hi = r.quarter ? 0.0f : 3.0f;
+            const float pos[3][4] = {{-1, -1, 0, 1}, {hi, -1, 0, 1}, {-1, hi, 0, 1}};
+            for (const auto& p4 : pos) for (float x : p4) j.init_words.push_back(std::bit_cast<u32>(x));
+        }
+        for (u32 l = 0; l < 3; ++l) SetLane(j, l, l, 0);
+    }
+}
+
+// Documents MoltenVK: with VK_KHR_push_descriptor, OpArrayLength of a storage buffer binding
+// reports the wrong size (a 36-byte range reads back as 1 byte / 0 dwords), so explicit bounds
+// checks zero in-range accesses. The renderer binds Apple guest pipelines with allocated sets;
+// these jobs bind with push descriptors on purpose. FAIL here is KNOWN-MOLTENVK; a PASS means
+// MoltenVK fixed it.
+void AddPushDescriptorCases() {
+    using namespace GcnAsm;
+    const u32 dw = RawOp("buffer_load_dword", GCN_LOAD, BUFFER_LOAD_DWORD, 4, 1, false, TArgs{});
+    const u32 ub = RawOp("buffer_load_ubyte", GCN_LOAD, BUFFER_LOAD_UBYTE, 1, 1, false, TArgs{});
+    for (u32 t : {dw, ub}) {
+        for (u32 nr : {36u, 64u, 7u}) {
+            Job& j = NewJob("moltenvk-push", t, RawV(nr), 0);
+            j.force_push = true;
+            j.label += " (push descriptors)";
+            const auto offs = Uniq({0, 4, nr >= 4 ? nr - 4ull : 0, nr - 1ull, nr, nr + 4ull});
+            for (u32 i = 0; i < offs.size(); ++i) SetLane(j, i, 0, offs[i]);
+        }
+    }
+}
+
 // Shader reuse: StageSpecialization decides whether a compiled module is reused for a new V#.
 // Fields outside the key (num_records, add_tid, base) must be read at run time.
 void AddReuseCases() {
@@ -1279,16 +1568,21 @@ Shader::Profile MakeProfile(const DeviceCaps& c) {
     p.needs_buffer_offsets = c.storage_align > 4;
     p.emulate_null_descriptors = !c.null_descriptor;
     p.supports_workgroup_explicit_memory_layout = c.explicit_layout;
-    // Sol-2's robustness emulation flag, when the tree under test has it: on when the device
-    // lacks robustBufferAccess2 (the Apple case).
+    // Apple-only Profile switches: set exactly when the tree's PipelineCache sets them on Apple
+    // (build.sh detects each assignment), so the suite tests what the renderer would compile.
     [&](auto& prof) {
-        if constexpr (requires { prof.emulate_robust_buffer_access; }) {
-            prof.emulate_robust_buffer_access = !c.rba2;
-        }
-        // Sol-2's vertex pulling: Apple has no robustBufferAccess2 for fixed-function fetch.
-        if constexpr (requires { prof.emulate_vertex_fetch; }) {
-            prof.emulate_vertex_fetch = !c.rba2;
-        }
+#ifdef BB_MIRROR_PROFILE_ROBUST
+        if constexpr (requires { prof.emulate_robust_buffer_access; }) prof.emulate_robust_buffer_access = true;
+#endif
+#ifdef BB_MIRROR_PROFILE_WAVE64
+        if constexpr (requires { prof.emulate_wave64; }) prof.emulate_wave64 = true;
+#endif
+#ifdef BB_MIRROR_PROFILE_VERTEX_FETCH
+        if constexpr (requires { prof.emulate_vertex_fetch; }) prof.emulate_vertex_fetch = true;
+#endif
+#ifdef BB_MIRROR_PROFILE_SIGNED_ZERO
+        if constexpr (requires { prof.repair_mul_signed_zero; }) prof.repair_mul_signed_zero = true;
+#endif
     }(p);
     return p;
 }
@@ -1307,9 +1601,16 @@ bool ProfileHasRobustFlag() {
     }(g_profile);
 }
 
+u32 RenderFsInputs() {
+    const char* env = std::getenv("BB_RENDER_FS_INPUTS");
+    return env ? u32(std::atoi(env)) : 0;
+}
+
 u32 g_fs_export = 9; // MRT0 export format for fragment compiles (9 = ABGR_32; 4 = ABGR_FP16 for compressed exports)
 
-Shader::RuntimeInfo MakeRuntime(bool vertex = false, bool fragment = false, bool indirect = false) {
+Shader::RuntimeInfo MakeRuntime(bool vertex = false, bool fragment = false, bool indirect = false,
+                                std::array<u32, 3> wg = {64, 1, 1}, bool clip_planes = false,
+                                u32 lds_bytes = 0, bool tess_rect = false, u32 fs_inputs = 1) {
     Shader::RuntimeInfo rt{};
     if (fragment) {
         rt.Initialize(Shader::HwStage::Fragment, Shader::SwStage::Fragment);
@@ -1317,15 +1618,23 @@ Shader::RuntimeInfo MakeRuntime(bool vertex = false, bool fragment = false, bool
         rt.props.num_allocated_vgprs = 64;
         rt.hw.fs.en_flags.persp_center_ena = 1;
         rt.hw.fs.addr_flags.persp_center_ena = 1;
-        rt.hw.fs.num_inputs = 1;
+        rt.hw.fs.num_inputs = fs_inputs;
         rt.hw.fs.inputs[0].param_index = 0;
         rt.hw.fs.color_buffers[0].export_format = AmdGpu::ShaderExportFormat(g_fs_export);
+        rt.hw.fs.color_buffers[0].data_format = AmdGpu::DataFormat::Format32_32_32_32;
+        rt.hw.fs.color_buffers[0].num_format = AmdGpu::NumberFormat::Float;
+        rt.hw.fs.color_buffers[0].swizzle = AmdGpu::CompMapping{{AmdGpu::CompSwizzle::Red, AmdGpu::CompSwizzle::Green,
+                                                                 AmdGpu::CompSwizzle::Blue, AmdGpu::CompSwizzle::Alpha}};
         return rt;
     }
     if (vertex) {
         rt.Initialize(Shader::HwStage::Vertex, Shader::SwStage::Vertex);
         rt.props.num_user_data = 16;
         rt.props.num_allocated_vgprs = 64;
+        if (clip_planes) {
+            rt.hw.vs.user_clip_plane_mask = 1;
+        }
+        rt.sw.vs.tess_emulated_primitive = tess_rect;
         if (indirect) {
             // DrawIndirectParams: SH offset of the SGPR the CP writes the base vertex into
             // (translate.cpp UdRegFromShOffset: vertex stage user data start at 0x4c).
@@ -1336,9 +1645,9 @@ Shader::RuntimeInfo MakeRuntime(bool vertex = false, bool fragment = false, bool
     rt.Initialize(Shader::HwStage::Compute, Shader::SwStage::Compute);
     rt.props.num_user_data = 16;
     rt.props.num_allocated_vgprs = 64;
-    rt.hw.cs.workgroup_size = {64, 1, 1};
+    rt.hw.cs.workgroup_size = wg;
+    rt.hw.cs.shared_memory_size = lds_bytes;
     rt.hw.cs.tgid_enable = {false, false, false};
-    rt.hw.cs.shared_memory_size = 0;
     return rt;
 }
 
@@ -1365,12 +1674,13 @@ void CompileJob(std::vector<ProgramState>& programs, Shader::Pools& pools, u32 i
     const Shader::ShaderParams params{.user_data = std::span<const u32, 16>(job.ud),
                                       .code = std::span<const u32>(t.code),
                                       .hash = t.hash};
-    auto rt = MakeRuntime(t.vertex, t.fragment, t.indirect);
+    auto rt = MakeRuntime(t.vertex, t.fragment, t.indirect, t.wg, t.clip_planes, t.Threads() * t.lds_bits / 8,
+                          t.rect_list, t.helper ? RenderFsInputs() : 1);
     const auto hw = t.fragment ? Shader::HwStage::Fragment
                                : (t.vertex ? Shader::HwStage::Vertex : Shader::HwStage::Compute);
     const auto sw = t.fragment ? Shader::SwStage::Fragment
                                : (t.vertex ? Shader::SwStage::Vertex : Shader::SwStage::Compute);
-    Shader::Backend::Bindings binding{};
+    Shader::Backend::Bindings binding{.unified = job.start_unified, .buffer = job.start_buffer};
     std::vector<u32> spv;
     u32 perm = 0;
     if (!ps.info) {
@@ -1637,6 +1947,10 @@ void CompileAll(const std::string& outdir) {
 // ---------------------------------------------------------------------------------------------
 // Vulkan phase
 
+// Push-descriptor state (set in InitGpu; see BindStorageBuffers).
+bool g_push_supported = false, g_force_sets = true; // Apple guest pipelines: allocated sets
+u32 g_max_push = 0;
+
 struct Mem {
     vk::UniqueBuffer buffer;
     vk::UniqueDeviceMemory memory;
@@ -1653,7 +1967,7 @@ struct Gpu {
     u64 align = 16;
     vk::UniqueCommandPool pool;
     vk::UniqueDescriptorPool dpool;
-    Mem guest, params, results, flat, null_buffer, index, indirect;
+    Mem guest, params, results, flat, null_buffer, index, indirect, readback;
     bool dynamic_vertex_input = false; // VK_EXT_vertex_input_dynamic_state, as the renderer uses it
     std::vector<u8> pristine; // initial guest image of the current batch
 };
@@ -1692,6 +2006,10 @@ void InitGpu(Gpu& g, bool rba) {
     std::vector<const char*> exts;
     for (const auto& e : g.physical.enumerateDeviceExtensionProperties().value) {
         if (std::strcmp(e.extensionName, "VK_KHR_portability_subset") == 0) exts.push_back("VK_KHR_portability_subset");
+        if (std::strcmp(e.extensionName, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME) == 0) {
+            exts.push_back(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME);
+            g_push_supported = true;
+        }
         if (std::strcmp(e.extensionName, VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME) == 0) {
             exts.push_back(VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME);
             g.dynamic_vertex_input = true;
@@ -1714,6 +2032,13 @@ void InitGpu(Gpu& g, bool rba) {
     VULKAN_HPP_DEFAULT_DISPATCHER.init(*g.device);
     g.queue = g.device->getQueue(g.family, 0);
     g.align = g.physical.getProperties().limits.minStorageBufferOffsetAlignment;
+    if (g_push_supported) {
+        auto props = g.physical.getProperties2<vk::PhysicalDeviceProperties2, vk::PhysicalDevicePushDescriptorPropertiesKHR>();
+        g_max_push = props.get<vk::PhysicalDevicePushDescriptorPropertiesKHR>().maxPushDescriptors;
+    }
+    std::printf("descriptors: %s (maxPushDescriptors %u)\n",
+                g_push_supported && !g_force_sets ? "pushed (vkCmdPushDescriptorSetKHR)"
+                                                  : "allocated sets (the Apple guest-pipeline path)", g_max_push);
     g.pool = g.device->createCommandPoolUnique({.flags = vk::CommandPoolCreateFlagBits::eResetCommandBuffer,
                                                 .queueFamilyIndex = g.family}).value;
     const vk::DescriptorPoolSize size{vk::DescriptorType::eStorageBuffer, MaxBatch * 8};
@@ -1725,6 +2050,7 @@ void InitGpu(Gpu& g, bool rba) {
     g.null_buffer = MakeBuffer(g, NullBufferSize);
     g.index = MakeBuffer(g, u64(MaxBatch) * 64 * 4, vk::BufferUsageFlagBits::eIndexBuffer);
     g.indirect = MakeBuffer(g, u64(MaxBatch) * 32, vk::BufferUsageFlagBits::eIndirectBuffer);
+    g.readback = MakeBuffer(g, u64(MaxBatch) * RenderBytes, vk::BufferUsageFlagBits::eTransferDst);
     std::memset(g.null_buffer.data, 0, NullBufferSize);
 }
 
@@ -1734,11 +2060,40 @@ struct Pipe {
     vk::UniquePipelineLayout playout;
     vk::UniquePipeline pipeline;
     vk::Result result = vk::Result::eSuccess;
+    bool push = false; // descriptors pushed (VK_KHR_push_descriptor) like the renderer
 };
-std::map<std::pair<u32, u32>, Pipe> g_pipes;
+std::map<std::tuple<u32, u32, bool>, Pipe> g_pipes;
 
-Pipe& GetPipe(Gpu& g, u32 tmpl, u32 perm, u32 nbind) {
-    auto [it, fresh] = g_pipes.try_emplace({tmpl, perm});
+// Renderer: uses_push_descriptors = binding < instance.MaxPushDescriptors() (vk_*_pipeline.cpp),
+// then cmdbuf.pushDescriptorSetKHR (vk_pipeline_common.cpp). --descriptor-sets forces allocated sets.
+bool UsePushDescriptors(u32 nbind, bool force_push = false) {
+    return g_push_supported && (force_push || !g_force_sets) && nbind < g_max_push;
+}
+
+void BindStorageBuffers(Gpu& g, vk::CommandBuffer cmd, vk::PipelineBindPoint bp, const Pipe& p,
+                        const std::vector<vk::DescriptorBufferInfo>& infos) {
+    if (infos.empty()) return;
+    std::vector<vk::WriteDescriptorSet> writes;
+    vk::DescriptorSet set{};
+    if (!p.push) {
+        const vk::DescriptorSetLayout l = *p.layout;
+        set = g.device->allocateDescriptorSets({.descriptorPool = *g.dpool, .descriptorSetCount = 1, .pSetLayouts = &l})
+                  .value.front();
+    }
+    for (u32 b = 0; b < infos.size(); ++b) {
+        writes.push_back({.dstSet = set, .dstBinding = b, .descriptorCount = 1,
+                          .descriptorType = vk::DescriptorType::eStorageBuffer, .pBufferInfo = &infos[b]});
+    }
+    if (p.push) {
+        cmd.pushDescriptorSetKHR(bp, *p.playout, 0, writes);
+    } else {
+        g.device->updateDescriptorSets(writes, {});
+        cmd.bindDescriptorSets(bp, *p.playout, 0, set, {});
+    }
+}
+
+Pipe& GetPipe(Gpu& g, u32 tmpl, u32 perm, u32 nbind, bool force_push = false) {
+    auto [it, fresh] = g_pipes.try_emplace({tmpl, perm, force_push});
     Pipe& p = it->second;
     if (!fresh) return p;
     const auto& spv = g_spirv.at({tmpl, perm});
@@ -1753,7 +2108,8 @@ Pipe& GetPipe(Gpu& g, u32 tmpl, u32 perm, u32 nbind) {
         b.push_back({.binding = i, .descriptorType = vk::DescriptorType::eStorageBuffer, .descriptorCount = 1,
                      .stageFlags = vk::ShaderStageFlagBits::eCompute});
     }
-    p.layout = g.device->createDescriptorSetLayoutUnique({.bindingCount = nbind, .pBindings = b.data()}).value;
+    p.push = UsePushDescriptors(nbind, force_push);
+    p.layout = g.device->createDescriptorSetLayoutUnique({.flags = p.push ? vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR : vk::DescriptorSetLayoutCreateFlags{}, .bindingCount = nbind, .pBindings = b.data()}).value;
     const vk::PushConstantRange push{.stageFlags = vk::ShaderStageFlagBits::eCompute, .offset = 0,
                                      .size = sizeof(Shader::PushData)};
     const vk::DescriptorSetLayout l = *p.layout;
@@ -1796,7 +2152,8 @@ Pipe& GetGfxPipe(Gpu& g, const Job& j, u32 nbind, bool pulling) {
         b.push_back({.binding = i, .descriptorType = vk::DescriptorType::eStorageBuffer, .descriptorCount = 1,
                      .stageFlags = vk::ShaderStageFlagBits::eVertex});
     }
-    p.layout = g.device->createDescriptorSetLayoutUnique({.bindingCount = nbind, .pBindings = b.data()}).value;
+    p.push = UsePushDescriptors(nbind);
+    p.layout = g.device->createDescriptorSetLayoutUnique({.flags = p.push ? vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR : vk::DescriptorSetLayoutCreateFlags{}, .bindingCount = nbind, .pBindings = b.data()}).value;
     const vk::PushConstantRange push{.stageFlags = vk::ShaderStageFlagBits::eVertex, .offset = 0,
                                      .size = sizeof(Shader::PushData)};
     const vk::DescriptorSetLayout l = *p.layout;
@@ -1928,37 +2285,58 @@ gcn_vsharp ActualV(const Job& j) {
 
 std::vector<u32> WaveExpected(const Job& j) {
     const Template& t = g_templates[j.tmpl];
-    std::vector<u32> regs(64 * 4);
-    u64 ballot = 0, exec = 0;
-    for (u32 l = 0; l < 64; ++l) {
-        if (j.lanes[l].data[0] != 0) ballot |= 1ull << l;
-        if (j.lanes[l].active != 0) exec |= 1ull << l;
+    const u32 threads = t.Threads();
+    std::vector<u32> regs(kLanes * 4, ResultFill);
+    for (u32 l = 0; l < threads; ++l) {
         for (u32 i = 0; i < 4; ++i) regs[l * 4 + i] = VgprMarker + i;
     }
-    const u32 blo = u32(ballot), bhi = u32(ballot >> 32);
-    auto value = [&](u32 lane) { return j.lanes[lane & 63].vindex; };
-    for (u32 l = 0; l < 64; ++l) {
+    for (u32 l = 0; l < threads; ++l) {
+        // GCN wave = 64 consecutive invocations; lane = index & 63
+        const u32 w = l / 64, lane = l % 64;
+        u64 ballot = 0, exec = 0;
+        for (u32 k = 0; k < 64 && w * 64 + k < threads; ++k) {
+            if (j.lanes[w * 64 + k].data[0] != 0) ballot |= 1ull << k;
+            if (j.lanes[w * 64 + k].active != 0) exec |= 1ull << k;
+        }
+        const u32 blo = u32(ballot), bhi = u32(ballot >> 32);
+        auto value = [&](u32 sel) { return j.lanes[w * 64 + (sel & 63)].vindex; };
         u32* r = &regs[l * 4];
         switch (t.wave) {
         case Wave::Lane:
-            r[0] = gcn_mbcnt(~0u, gcn_mbcnt(~0u, 0, l, 0), l, 1);
+            r[0] = gcn_mbcnt(~0u, gcn_mbcnt(~0u, 0, lane, 0), lane, 1);
             r[1] = blo; r[2] = bhi; r[3] = gcn_popcount64(ballot);
             break;
         case Wave::MbcntMask:
-            r[0] = gcn_mbcnt(bhi, gcn_mbcnt(blo, 0, l, 0), l, 1);
-            r[1] = blo; r[2] = bhi; r[3] = (ballot >> l) & 1;
+            r[0] = gcn_mbcnt(bhi, gcn_mbcnt(blo, 0, lane, 0), lane, 1);
+            r[1] = blo; r[2] = bhi; r[3] = (ballot >> lane) & 1;
             break;
         case Wave::Readlane: // lane selects are kept in 0..63 by the jobs
             r[0] = value(37); r[1] = value(j.smem_sgpr); r[2] = value(j.sgpr_soff); r[3] = value(0);
             break;
         case Wave::Exec1:
             r[0] = value(gcn_first_lane(exec)); r[1] = gcn_popcount64(exec);
-            if (exec >> l & 1) r[3] = value(l);
+            if (exec >> lane & 1) r[3] = value(lane);
             break;
         case Wave::Exec2:
             r[0] = u32(exec); r[1] = u32(exec >> 32);
-            if (exec >> l & 1) r[2] = gcn_mbcnt(u32(exec >> 32), gcn_mbcnt(u32(exec), 0, l, 0), l, 1);
+            if (exec >> lane & 1) r[2] = gcn_mbcnt(u32(exec >> 32), gcn_mbcnt(u32(exec), 0, lane, 0), lane, 1);
             break;
+        case Wave::LoopReadFirstLane: {
+            const u32 step = (j.lanes[w * 64].vindex & 0xF000u) | 0x1000u; // first exec lane, as masked
+            u32 s20 = 0, n = 0;
+            do { s20 += step; ++n; } while (s20 < 0x3000u);
+            r[0] = n * gcn_popcount64(ballot);
+            r[1] = s20;
+            break;
+        }
+        case Wave::Lds: {
+            const Lane& L = j.lanes[l];
+            r[0] = t.lds_bits == 16 ? (L.vindex & 0xFFFF) : L.vindex;
+            if (t.lds_bits == 64) r[1] = L.voffset;
+            r[2] = blo;
+            r[3] = bhi;
+            break;
+        }
         case Wave::None:
             break;
         }
@@ -1980,9 +2358,13 @@ std::vector<Outcome> Expected(Gpu& g, const Job& j, std::vector<u8>& work, const
     std::vector<Outcome> outs;
     for (u32 r = 0; r < GCN_NUM_READINGS; ++r) {
         Outcome o;
-        o.regs.assign(64 * 4, 0);
-        for (u32 lane = 0; lane < 64; ++lane) {
+        o.regs.assign(kLanes * 4, 0);
+        for (u32 lane = 0; lane < kLanes; ++lane) {
             for (u32 i = 0; i < 4; ++i) o.regs[lane * 4 + i] = t.vertex ? ResultFill : VgprMarker + i;
+            if (!t.vertex && lane >= t.Threads()) {
+                for (u32 i = 0; i < 4; ++i) o.regs[lane * 4 + i] = ResultFill; // no such invocation
+                continue;
+            }
             const Lane& L = j.lanes[lane];
             const bool smem = t.smem != SmemSrc::None;
             if (!L.active && !smem) continue;
@@ -2008,7 +2390,8 @@ std::vector<Outcome> Expected(Gpu& g, const Job& j, std::vector<u8>& work, const
             if (res.touch_lo != res.touch_hi) o.touches.push_back({res.touch_lo, res.touch_hi});
             if (smem) {
                 for (u32 i = 0; i < 4; ++i) {
-                    o.regs[lane * 4 + i] = (i < op.ncomp && res.written[i]) ? res.value[i] : SgprMarker + i;
+                    const u32 k = t.smem_pick[i];
+                    o.regs[lane * 4 + i] = (k < op.ncomp && res.written[k]) ? res.value[k] : SgprMarker + k;
                 }
             } else if (op.kind == GCN_LOAD) {
                 for (u32 i = 0; i < op.ncomp; ++i) o.regs[lane * 4 + i] = res.value[i];
@@ -2028,10 +2411,10 @@ std::vector<Outcome> Expected(Gpu& g, const Job& j, std::vector<u8>& work, const
             }
         }
         if (t.srt) {
-            for (u32 lane = 0; lane < 64; ++lane) o.regs[lane * 4 + 1] = j.vtable[4];
+            for (u32 lane = 0; lane < t.Threads(); ++lane) o.regs[lane * 4 + 1] = j.vtable[4];
         }
         if (t.dead) { // the load's destination is never stored: only the markers come back
-            for (u32 lane = 0; lane < 64; ++lane) {
+            for (u32 lane = 0; lane < t.Threads(); ++lane) {
                 for (u32 i = 0; i < 4; ++i) o.regs[lane * 4 + i] = VgprMarker + i;
             }
         }
@@ -2079,12 +2462,13 @@ std::string DescribeReadings(const std::vector<u32>& rs) {
     return s.empty() ? "alternative" : s;
 }
 
-enum class Verdict { Strict, Ambiguous, Fail, InvalidSpirv, LoudRequired, LoudApproved, LoudUnneeded, Crash, HarnessError };
+enum class Verdict { Strict, Ambiguous, Fail, KnownMoltenVk, InvalidSpirv, LoudRequired, LoudApproved, LoudUnneeded, Crash, HarnessError };
 const char* VerdictName(Verdict v) {
     switch (v) {
     case Verdict::Strict: return "PASS(strict)";
     case Verdict::Ambiguous: return "PASS(ambiguous)";
     case Verdict::Fail: return "FAIL";
+    case Verdict::KnownMoltenVk: return "KNOWN-MOLTENVK";
     case Verdict::InvalidSpirv: return "INVALID-SPIRV";
     case Verdict::LoudRequired: return "LOUD(required)";
     case Verdict::LoudApproved: return "LOUD(approved)";
@@ -2111,6 +2495,7 @@ struct Options {
     std::string outdir;
     std::string dump_spv;
     std::string compile_only, stage = "cs";
+    bool bench = false;
     std::array<u32, 16> ud{};
 };
 
@@ -2123,6 +2508,7 @@ void FillPristine(Gpu& g, const std::vector<u32>& jobs) {
         const gcn_vsharp v = ActualV(j);
         const u64 lo = v.base, hi = std::min<u64>(v.base + BoundSize(v), SlotBase(j.slot) + Arena);
         for (u64 va = lo; va < hi; ++va) g.pristine[va - GuestVa] = BufferByte(va);
+        if (!j.init_words.empty()) std::memcpy(&g.pristine[lo - GuestVa], j.init_words.data(), j.init_words.size() * 4);
     }
 }
 
@@ -2151,7 +2537,7 @@ JobResult Evaluate(Gpu& g, const Job& j, const Bound& tb, const u8* guest_after,
     const Template& t = g_templates[j.tmpl];
     auto outs = Expected(g, j, work, tb);
     // observed
-    std::vector<u32> regs(results, results + 64 * 4);
+    std::vector<u32> regs(results, results + kLanes * 4);
     // compare region: arena + every outcome's touch ranges
     std::vector<std::pair<u64, u64>> region{{SlotBase(j.slot), SlotBase(j.slot) + Arena}};
     for (const auto& o : outs) for (auto r : o.touches) region.push_back(r);
@@ -2209,12 +2595,12 @@ JobResult Evaluate(Gpu& g, const Job& j, const Bound& tb, const u8* guest_after,
     for (const auto& o : outs) {
         if (o.unknown) continue;
         size_t bad = 0;
-        for (u32 lane = 0; lane < 64; ++lane) {
+        for (u32 lane = 0; lane < kLanes; ++lane) {
             for (u32 i = 0; i < 4; ++i) {
                 if (regs[lane * 4 + i] != o.regs[lane * 4 + i]) { ++bad; break; }
             }
         }
-        if (!mem_matches(o, nullptr)) bad += 64;
+        if (!mem_matches(o, nullptr)) bad += kLanes;
         if (bad < best) { best = bad; lit = &o; }
     }
     if (!lit) {
@@ -2235,7 +2621,7 @@ JobResult Evaluate(Gpu& g, const Job& j, const Bound& tb, const u8* guest_after,
     }
     if (lit) {
         int shown = 0;
-        for (u32 lane = 0; lane < 64 && shown < 10; ++lane) {
+        for (u32 lane = 0; lane < kLanes && shown < 10; ++lane) {
             bool bad = false;
             for (u32 i = 0; i < 4; ++i) bad |= regs[lane * 4 + i] != lit->regs[lane * 4 + i];
             if (!bad) continue;
@@ -2274,15 +2660,6 @@ bool RecordDraw(Gpu& g, vk::CommandBuffer cmd, Job& j, const std::vector<vk::Des
         j.message = "graphics pipeline creation failed: " + vk::to_string(pipe.result);
         return false;
     }
-    const vk::DescriptorSetLayout l = *pipe.layout;
-    auto set = g.device->allocateDescriptorSets({.descriptorPool = *g.dpool, .descriptorSetCount = 1,
-                                                 .pSetLayouts = &l}).value.front();
-    std::vector<vk::WriteDescriptorSet> writes;
-    for (u32 b = 0; b < infos.size(); ++b) {
-        writes.push_back({.dstSet = set, .dstBinding = b, .descriptorCount = 1,
-                          .descriptorType = vk::DescriptorType::eStorageBuffer, .pBufferInfo = &infos[b]});
-    }
-    g.device->updateDescriptorSets(writes, {});
     std::vector<vk::Buffer> bufs;
     std::vector<vk::DeviceSize> offsets, sizes, strides;
     std::vector<vk::VertexInputBindingDescription2EXT> bind2;
@@ -2321,7 +2698,7 @@ bool RecordDraw(Gpu& g, vk::CommandBuffer cmd, Job& j, const std::vector<vk::Des
     }
     cmd.beginRendering({.renderArea = {.extent = {1, 1}}, .layerCount = 1});
     cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *pipe.pipeline);
-    cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *pipe.playout, 0, set, {});
+    BindStorageBuffers(g, cmd, vk::PipelineBindPoint::eGraphics, pipe, infos);
     cmd.pushConstants(*pipe.playout, vk::ShaderStageFlagBits::eVertex, 0, sizeof(push), &push);
     if (!pulling && !bufs.empty()) {
         if (g.dynamic_vertex_input) {
@@ -2344,6 +2721,202 @@ bool RecordDraw(Gpu& g, vk::CommandBuffer cmd, Job& j, const std::vector<vk::Des
     return true;
 }
 
+struct RenderTarget {
+    vk::UniqueImage image;
+    vk::UniqueDeviceMemory memory;
+    vk::UniqueImageView view;
+};
+
+// VS (+ the RectList aux TCS/TES the GraphicsPipeline adds) + FS into a 16x16 RGBA32F target.
+// Vertex input mirrors GetVertexInputs when the tree does not pull vertices in the shader.
+bool RecordRender(Gpu& g, vk::CommandBuffer cmd, Job& j, const std::vector<vk::DescriptorBufferInfo>& infos,
+                  const Shader::PushData& push, std::vector<RenderTarget>& targets) {
+    const Template& t = g_templates[j.tmpl];
+    const bool pulling = VertexPulling();
+    static std::map<std::string, Pipe> pipes;
+    const std::string key = std::to_string(j.tmpl) + "/" + std::to_string(j.perm);
+    auto [it, fresh] = pipes.try_emplace(key);
+    Pipe& p = it->second;
+    static std::map<std::string, std::vector<vk::UniqueShaderModule>> module_store; // live as long as the pipelines
+    std::vector<vk::UniqueShaderModule>& modules = module_store[key];
+    if (fresh) {
+        auto module = [&](const std::vector<u32>& spv) {
+            modules.push_back(g.device->createShaderModuleUnique({.codeSize = spv.size() * 4, .pCode = spv.data()}).value);
+            return *modules.back();
+        };
+        // The render FS reads no inputs. BB_RENDER_FS_INPUTS=N declares N anyway (VS exports none):
+        // on MoltenVK the RectList aux TCS then passes unwritten locations and nothing is drawn.
+        const auto fs_rt = MakeRuntime(false, true, false, {64, 1, 1}, false, 0, false, RenderFsInputs());
+        std::vector<vk::PipelineShaderStageCreateInfo> stages;
+        stages.push_back({.stage = vk::ShaderStageFlagBits::eVertex, .module = module(g_spirv.at({j.tmpl, j.perm})), .pName = "main"});
+        if (t.rect_list) {
+            using Shader::Backend::SPIRV::AuxShaderType;
+            stages.push_back({.stage = vk::ShaderStageFlagBits::eTessellationControl,
+                              .module = module(Shader::Backend::SPIRV::EmitAuxilaryTessShader(AuxShaderType::RectListTCS, fs_rt.hw.fs)),
+                              .pName = "main"});
+            stages.push_back({.stage = vk::ShaderStageFlagBits::eTessellationEvaluation,
+                              .module = module(Shader::Backend::SPIRV::EmitAuxilaryTessShader(AuxShaderType::PassthroughTES, fs_rt.hw.fs)),
+                              .pName = "main"});
+        }
+        stages.push_back({.stage = vk::ShaderStageFlagBits::eFragment, .module = module(g_spirv.at({t.fs_tmpl, 0})), .pName = "main"});
+        if (const char* dir = std::getenv("BB_DUMP_RENDER")) { // debugging aid: the exact stage SPIR-V
+            auto dump = [&](const std::string& n, const std::vector<u32>& spv) {
+                if (FILE* f = std::fopen((std::string(dir) + "/" + key.substr(0, key.find('/')) + "-" + n + ".spv").c_str(), "wb")) {
+                    std::fwrite(spv.data(), 4, spv.size(), f);
+                    std::fclose(f);
+                }
+            };
+            using Shader::Backend::SPIRV::AuxShaderType;
+            dump("vs", g_spirv.at({j.tmpl, j.perm}));
+            dump("fs", g_spirv.at({t.fs_tmpl, 0}));
+            if (t.rect_list) {
+                dump("tcs", Shader::Backend::SPIRV::EmitAuxilaryTessShader(AuxShaderType::RectListTCS, fs_rt.hw.fs));
+                dump("tes", Shader::Backend::SPIRV::EmitAuxilaryTessShader(AuxShaderType::PassthroughTES, fs_rt.hw.fs));
+            }
+        }
+        const auto all = vk::ShaderStageFlagBits::eAllGraphics;
+        std::vector<vk::DescriptorSetLayoutBinding> b;
+        for (u32 i = 0; i < j.binds.size(); ++i) {
+            b.push_back({.binding = i, .descriptorType = vk::DescriptorType::eStorageBuffer, .descriptorCount = 1, .stageFlags = all});
+        }
+        p.push = UsePushDescriptors(u32(b.size()));
+        p.layout = g.device->createDescriptorSetLayoutUnique({.flags = p.push ? vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR : vk::DescriptorSetLayoutCreateFlags{}, .bindingCount = u32(b.size()), .pBindings = b.data()}).value;
+        const vk::PushConstantRange pr{.stageFlags = all, .offset = 0, .size = sizeof(Shader::PushData)};
+        const vk::DescriptorSetLayout l = *p.layout;
+        p.playout = g.device->createPipelineLayoutUnique({.setLayoutCount = 1, .pSetLayouts = &l,
+                                                          .pushConstantRangeCount = 1, .pPushConstantRanges = &pr}).value;
+        std::vector<vk::VertexInputBindingDescription> vb;
+        std::vector<vk::VertexInputAttributeDescription> va;
+        std::vector<vk::DynamicState> dyn;
+        if (!pulling && !j.vattrs.empty()) {
+            if (g.dynamic_vertex_input) {
+                dyn.push_back(vk::DynamicState::eVertexInputEXT);
+            } else {
+                for (const auto& a : j.vattrs) {
+                    vb.push_back({.binding = a.semantic, .stride = (a.sharp[1] >> 16) & 0x3FFF, .inputRate = vk::VertexInputRate::eVertex});
+                    va.push_back({.location = a.semantic, .binding = a.semantic, .format = vk::Format(a.format), .offset = 0});
+                }
+                dyn.push_back(vk::DynamicState::eVertexInputBindingStride);
+            }
+        }
+        const vk::PipelineVertexInputStateCreateInfo vi{.vertexBindingDescriptionCount = u32(vb.size()), .pVertexBindingDescriptions = vb.data(),
+                                                        .vertexAttributeDescriptionCount = u32(va.size()), .pVertexAttributeDescriptions = va.data()};
+        const vk::PipelineInputAssemblyStateCreateInfo ia{.topology = t.rect_list ? vk::PrimitiveTopology::ePatchList : vk::PrimitiveTopology::eTriangleList};
+        const vk::PipelineTessellationStateCreateInfo ts{.patchControlPoints = 3};
+        const vk::Viewport vp{.x = 0, .y = 0, .width = float(RenderSize), .height = float(RenderSize), .minDepth = 0, .maxDepth = 1};
+        const vk::Rect2D sc{.offset = {0, 0}, .extent = {RenderSize, RenderSize}};
+        const vk::PipelineViewportStateCreateInfo vps{.viewportCount = 1, .pViewports = &vp, .scissorCount = 1, .pScissors = &sc};
+        const vk::PipelineRasterizationStateCreateInfo rs{.polygonMode = vk::PolygonMode::eFill, .cullMode = vk::CullModeFlagBits::eNone,
+                                                          .frontFace = vk::FrontFace::eCounterClockwise, .lineWidth = 1.0f};
+        const vk::PipelineMultisampleStateCreateInfo ms{.rasterizationSamples = vk::SampleCountFlagBits::e1};
+        const vk::PipelineColorBlendAttachmentState cba{.colorWriteMask = vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
+                                                                          vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA};
+        const vk::PipelineColorBlendStateCreateInfo cb{.attachmentCount = 1, .pAttachments = &cba};
+        const vk::PipelineDynamicStateCreateInfo ds{.dynamicStateCount = u32(dyn.size()), .pDynamicStates = dyn.data()};
+        const vk::Format fmt = vk::Format::eR32G32B32A32Sfloat;
+        const vk::PipelineRenderingCreateInfo rendering{.colorAttachmentCount = 1, .pColorAttachmentFormats = &fmt};
+        auto pipe = g.device->createGraphicsPipelineUnique(
+            {}, {.pNext = &rendering, .stageCount = u32(stages.size()), .pStages = stages.data(), .pVertexInputState = &vi,
+                 .pInputAssemblyState = &ia, .pTessellationState = t.rect_list ? &ts : nullptr, .pViewportState = &vps,
+                 .pRasterizationState = &rs, .pMultisampleState = &ms, .pColorBlendState = &cb, .pDynamicState = &ds,
+                 .layout = *p.playout});
+        p.result = pipe.result;
+        if (pipe.result == vk::Result::eSuccess) p.pipeline = std::move(pipe.value);
+    }
+    if (p.result != vk::Result::eSuccess) {
+        j.status = Status::LoudPipeline;
+        j.message = "render pipeline creation failed: " + vk::to_string(p.result);
+        return false;
+    }
+    // target
+    RenderTarget rt;
+    rt.image = g.device->createImageUnique({.imageType = vk::ImageType::e2D, .format = vk::Format::eR32G32B32A32Sfloat,
+                                           .extent = {RenderSize, RenderSize, 1}, .mipLevels = 1, .arrayLayers = 1,
+                                           .samples = vk::SampleCountFlagBits::e1, .tiling = vk::ImageTiling::eOptimal,
+                                           .usage = vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eTransferSrc}).value;
+    const auto req = g.device->getImageMemoryRequirements(*rt.image);
+    const auto props = g.physical.getMemoryProperties();
+    u32 type = 0;
+    while (!(req.memoryTypeBits & (1u << type))) ++type;
+    rt.memory = g.device->allocateMemoryUnique({.allocationSize = req.size, .memoryTypeIndex = type}).value;
+    (void)props;
+    (void)g.device->bindImageMemory(*rt.image, *rt.memory, 0);
+    const vk::ImageSubresourceRange range{.aspectMask = vk::ImageAspectFlagBits::eColor, .levelCount = 1, .layerCount = 1};
+    rt.view = g.device->createImageViewUnique({.image = *rt.image, .viewType = vk::ImageViewType::e2D,
+                                               .format = vk::Format::eR32G32B32A32Sfloat, .subresourceRange = range}).value;
+    const vk::ImageMemoryBarrier to_color{.dstAccessMask = vk::AccessFlagBits::eColorAttachmentWrite,
+                                          .oldLayout = vk::ImageLayout::eUndefined, .newLayout = vk::ImageLayout::eColorAttachmentOptimal,
+                                          .image = *rt.image, .subresourceRange = range};
+    cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTopOfPipe, vk::PipelineStageFlagBits::eColorAttachmentOutput, {}, {}, {}, to_color);
+    const vk::RenderingAttachmentInfo att{.imageView = *rt.view, .imageLayout = vk::ImageLayout::eColorAttachmentOptimal,
+                                          .loadOp = vk::AttachmentLoadOp::eClear, .storeOp = vk::AttachmentStoreOp::eStore,
+                                          .clearValue = vk::ClearValue{.color = vk::ClearColorValue{std::array<float, 4>{ClearColor[0], ClearColor[1], ClearColor[2], ClearColor[3]}}}};
+    cmd.beginRendering({.renderArea = {.extent = {RenderSize, RenderSize}}, .layerCount = 1, .colorAttachmentCount = 1, .pColorAttachments = &att});
+    cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *p.pipeline);
+    if (!infos.empty()) {
+        BindStorageBuffers(g, cmd, vk::PipelineBindPoint::eGraphics, p, infos);
+    }
+    cmd.pushConstants(*p.playout, vk::ShaderStageFlagBits::eAllGraphics, 0, sizeof(push), &push);
+    if (!pulling && !j.vattrs.empty()) {
+        std::vector<vk::Buffer> bufs;
+        std::vector<vk::DeviceSize> offs, sizes, strides;
+        std::vector<vk::VertexInputBindingDescription2EXT> bind2;
+        std::vector<vk::VertexInputAttributeDescription2EXT> attr2;
+        for (const auto& a : j.vattrs) {
+            const u64 base = a.sharp[0] | (u64(a.sharp[1] & 0xFF) << 32);
+            const u32 stride = (a.sharp[1] >> 16) & 0x3FFF;
+            bufs.push_back(*g.guest.buffer);
+            offs.push_back(base - GuestVa);
+            sizes.push_back(u64(stride) * a.sharp[2]);
+            strides.push_back(stride);
+            bind2.push_back({.binding = a.semantic, .stride = stride, .inputRate = vk::VertexInputRate::eVertex, .divisor = 1});
+            attr2.push_back({.location = a.semantic, .binding = a.semantic, .format = vk::Format(a.format), .offset = 0});
+        }
+        if (g.dynamic_vertex_input) {
+            cmd.setVertexInputEXT(bind2, attr2);
+            cmd.bindVertexBuffers(0, u32(bufs.size()), bufs.data(), offs.data());
+        } else {
+            cmd.bindVertexBuffers2(0, u32(bufs.size()), bufs.data(), offs.data(), sizes.data(), strides.data());
+        }
+    }
+    cmd.draw(3, 1, 0, 0);
+    cmd.endRendering();
+    const vk::ImageMemoryBarrier to_src{.srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite, .dstAccessMask = vk::AccessFlagBits::eTransferRead,
+                                        .oldLayout = vk::ImageLayout::eColorAttachmentOptimal, .newLayout = vk::ImageLayout::eTransferSrcOptimal,
+                                        .image = *rt.image, .subresourceRange = range};
+    cmd.pipelineBarrier(vk::PipelineStageFlagBits::eColorAttachmentOutput, vk::PipelineStageFlagBits::eTransfer, {}, {}, {}, to_src);
+    const vk::BufferImageCopy copy{.bufferOffset = u64(j.slot) * RenderBytes,
+                                   .imageSubresource = {.aspectMask = vk::ImageAspectFlagBits::eColor, .layerCount = 1},
+                                   .imageExtent = {RenderSize, RenderSize, 1}};
+    cmd.copyImageToBuffer(*rt.image, vk::ImageLayout::eTransferSrcOptimal, *g.readback.buffer, copy);
+    targets.push_back(std::move(rt));
+    return true;
+}
+
+JobResult EvaluateRender(Gpu& g, const Job& j) {
+    const float* px = reinterpret_cast<const float*>(g.readback.data + u64(j.slot) * RenderBytes);
+    u32 bad = 0;
+    std::string d;
+    for (u32 y = 0; y < RenderSize; ++y) {
+        for (u32 x = 0; x < RenderSize; ++x) {
+            const bool covered = !j.quarter || (x < RenderSize / 2 && y < RenderSize / 2);
+            const float* want = covered ? RenderColor : ClearColor;
+            const float* got = px + (y * RenderSize + x) * 4;
+            if (std::memcmp(got, want, 16) != 0) {
+                if (bad++ < 4) {
+                    char b[160];
+                    std::snprintf(b, sizeof(b), "    pixel (%u,%u): got (%g %g %g %g) want (%g %g %g %g)\n", x, y, got[0], got[1],
+                                  got[2], got[3], want[0], want[1], want[2], want[3]);
+                    d += b;
+                }
+            }
+        }
+    }
+    if (!bad) return {Verdict::Strict, ""};
+    return {Verdict::Fail, "  " + std::to_string(bad) + " of " + std::to_string(RenderSize * RenderSize) +
+                               " pixels wrong (" + (j.quarter ? "quarter" : "full") + " coverage expected)\n" + d};
+}
+
 // Run one batch of jobs; returns per-job results (jobs that cannot run get loud/error verdicts).
 std::map<u32, JobResult> RunBatch(Gpu& g, const std::vector<u32>& jobs) {
     std::map<u32, JobResult> out;
@@ -2358,16 +2931,17 @@ std::map<u32, JobResult> RunBatch(Gpu& g, const std::vector<u32>& jobs) {
            vk::Result::eSuccess);
     std::map<u32, Bound> tbound;
     std::vector<u32> ran;
+    std::vector<RenderTarget> targets;
     for (u32 ji : jobs) {
         Job& j = g_jobs[ji];
         // params
         u32* p = reinterpret_cast<u32*>(g.params.data + u64(j.slot) * ParamSlot);
-        for (u32 lane = 0; lane < 64; ++lane) {
+        for (u32 lane = 0; lane < kLanes; ++lane) {
             const Lane& L = j.lanes[lane];
             const u32 w[8] = {L.active, L.vindex, L.voffset, L.data[0], L.data[1], L.data[2], L.data[3], 0};
             std::memcpy(p + lane * 8, w, 32);
         }
-        if (j.status != Status::Ok || g_templates[j.tmpl].compile_only) continue;
+        if (j.status != Status::Ok || g_templates[j.tmpl].compile_only || g_templates[j.tmpl].helper) continue;
         // bind
         std::vector<vk::DescriptorBufferInfo> infos;
         Shader::PushData push{};
@@ -2415,27 +2989,22 @@ std::map<u32, JobResult> RunBatch(Gpu& g, const std::vector<u32>& jobs) {
             j.message = loud;
             continue;
         }
+        if (g_templates[j.tmpl].render) {
+            if (RecordRender(g, cmd, j, infos, push, targets)) ran.push_back(ji);
+            continue;
+        }
         if (g_templates[j.tmpl].vertex) {
             if (RecordDraw(g, cmd, j, infos, push, tbound)) ran.push_back(ji);
             continue;
         }
-        Pipe& pipe = GetPipe(g, j.tmpl, j.perm, u32(j.binds.size()));
+        Pipe& pipe = GetPipe(g, j.tmpl, j.perm, u32(j.binds.size()), j.force_push);
         if (pipe.result != vk::Result::eSuccess) {
             j.status = Status::LoudPipeline;
             j.message = "pipeline creation failed: " + vk::to_string(pipe.result);
             continue;
         }
-        const vk::DescriptorSetLayout l = *pipe.layout;
-        auto set = g.device->allocateDescriptorSets({.descriptorPool = *g.dpool, .descriptorSetCount = 1,
-                                                     .pSetLayouts = &l}).value.front();
-        std::vector<vk::WriteDescriptorSet> writes;
-        for (u32 b = 0; b < infos.size(); ++b) {
-            writes.push_back({.dstSet = set, .dstBinding = b, .descriptorCount = 1,
-                              .descriptorType = vk::DescriptorType::eStorageBuffer, .pBufferInfo = &infos[b]});
-        }
-        g.device->updateDescriptorSets(writes, {});
         cmd.bindPipeline(vk::PipelineBindPoint::eCompute, *pipe.pipeline);
-        cmd.bindDescriptorSets(vk::PipelineBindPoint::eCompute, *pipe.playout, 0, set, {});
+        BindStorageBuffers(g, cmd, vk::PipelineBindPoint::eCompute, pipe, infos);
         cmd.pushConstants(*pipe.playout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
         cmd.dispatch(1, 1, 1);
         ran.push_back(ji);
@@ -2458,6 +3027,10 @@ std::map<u32, JobResult> RunBatch(Gpu& g, const std::vector<u32>& jobs) {
     for (u32 ji : ran) {
         const Job& j = g_jobs[ji];
         Bound tb = tbound.count(ji) ? tbound[ji] : Bound{.is_null = true};
+        if (g_templates[j.tmpl].render) {
+            out[ji] = EvaluateRender(g, j);
+            continue;
+        }
         const u32* res = reinterpret_cast<const u32*>(g.results.data + u64(j.slot) * ResultSlot);
         // the null buffer is shared: attribute a dirty null buffer only to jobs with a null V#
         out[ji] = Evaluate(g, j, tb, g.guest.data, res, work, null_dirty && tb.is_null);
@@ -2487,6 +3060,124 @@ bool LoudRequired(Gpu& g, Job& j) {
 }
 
 } // namespace
+
+// --bench: GPU time of K ballot rounds (VOPC -> VCC read as a value, s_bcnt1, v_mbcnt over the
+// mask) per invocation, with and without the Apple wave64 emulation, over many workgroups.
+Template BenchTemplate(u32 rounds, std::array<u32, 3> wg, u32 salt) {
+    using namespace GcnAsm;
+    Template t;
+    t.name = "bench rounds=" + std::to_string(rounds);
+    t.wg = wg;
+    Code c;
+    c.SMovLiteral(VCC_HI, 0x5eed);
+    u32 log2x = 0;
+    while ((1u << log2x) < wg[0]) ++log2x;
+    c.VLshlrevB32(15, Inline(log2x), 1);
+    c.Vop2(37, 15, 15, Vgpr(0));    // v15 = local invocation index
+    c.VMov(10, Inline(0));
+    c.VMov(11, Inline(0));
+    for (u32 r = 0; r < rounds; ++r) {
+        c.Vop2(27, 12, 15, Inline(1 + r % 31)); // v12 = v15 & k
+        c.VCmpNeU32(Inline(0), 12);            // vcc = ballot(v12 != 0)
+        c.SBcnt1B64(16, VCC_LO);
+        c.VMbcnt(false, 13, VCC_LO, 10);
+        c.VMbcnt(true, 10, VCC_HI, 13);        // v10 += lanes below with the bit set
+        c.Vop2(37, 11, 11, 16);                // v11 += s16 (popcount)
+    }
+    c.VLshlrevB32(14, Inline(3), 15);
+    c.Mubuf(BUFFER_STORE_DWORDX2, Code::BufFields{.offen = true, .vaddr = 14, .vdata = 10, .srsrc = 8});
+    c.SWaitcntAll();
+    c.SEndpgm();
+    t.code = std::move(c.words);
+    t.hash = 0xbe9c00ull ^ (u64(rounds) << 8) ^ (u64(wg[0] * wg[1]) << 20) ^ (u64(salt) << 40);
+    return t;
+}
+
+int Bench(const Options& opt) {
+    struct Variant { u32 rounds; std::array<u32, 3> wg; bool emulate; };
+    const Variant variants[] = {{0, {64, 1, 1}, true},   {16, {64, 1, 1}, false}, {16, {64, 1, 1}, true},
+                                {0, {256, 1, 1}, true},  {16, {256, 1, 1}, false}, {16, {256, 1, 1}, true}};
+    const Shader::Profile saved = g_profile;
+    std::vector<std::pair<u32, Job>> compiled; // template index, job
+    for (u32 i = 0; i < std::size(variants); ++i) {
+        const auto& v = variants[i];
+        g_profile = saved;
+        [&](auto& prof) {
+            if constexpr (requires { prof.emulate_wave64; }) prof.emulate_wave64 = v.emulate;
+        }(g_profile);
+        g_templates.push_back(BenchTemplate(v.rounds, v.wg, i));
+        const u32 ti = u32(g_templates.size() - 1);
+        Job j;
+        j.tmpl = ti;
+        j.group = "bench";
+        gcn_vsharp ov = RawV(256 * 8);
+        ov.base = GuestVa;
+        const auto o = Pack(ov);
+        for (u32 k = 0; k < 4; ++k) j.ud[8 + k] = o[k];
+        g_jobs = {j};
+        CompileAll(opt.outdir);
+        if (g_jobs[0].status != Status::Ok) {
+            std::printf("bench variant %u: compile failed: %s\n", i, g_jobs[0].message.c_str());
+            return 1;
+        }
+        compiled.push_back({ti, g_jobs[0]});
+    }
+    g_profile = saved;
+    Gpu g;
+    InitGpu(g, true);
+    const auto props = g.physical.getProperties();
+    auto qpool = g.device->createQueryPoolUnique({.queryType = vk::QueryType::eTimestamp, .queryCount = 2}).value;
+    constexpr u32 kWorkgroups = 16384;
+    std::printf("bench: %u workgroups, timestampPeriod %.2f ns\n", kWorkgroups, props.limits.timestampPeriod);
+    for (u32 i = 0; i < compiled.size(); ++i) {
+        auto& [ti, j] = compiled[i];
+        const auto& v = variants[i];
+        Pipe& pipe = GetPipe(g, ti, j.perm, u32(j.binds.size()));
+        if (pipe.result != vk::Result::eSuccess) return 1;
+        std::vector<vk::DescriptorBufferInfo> infos;
+        Shader::PushData push{};
+        std::copy(j.ud_regs.begin(), j.ud_regs.end(), push.ud_regs.begin());
+        for (u32 b = 0; b < j.binds.size(); ++b) {
+            if (j.binds[b].type == u32(Shader::BufferType::Guest)) {
+                Bound bd = BindGuest(g, j.binds[b].sharp, j.binds[b].required);
+                push.AddOffset(b, bd.adjust);
+                infos.push_back(bd.info);
+            } else {
+                infos.push_back({.buffer = *g.flat.buffer, .offset = 0, .range = std::max<u64>(j.binds[b].flat.size() * 4, 4)});
+                std::memcpy(g.flat.data, j.binds[b].flat.data(), j.binds[b].flat.size() * 4);
+            }
+        }
+        double best = 1e30;
+        for (u32 rep = 0; rep < 5; ++rep) {
+            assert(g.device->resetDescriptorPool(*g.dpool) == vk::Result::eSuccess);
+            auto cmd = g.device->allocateCommandBuffers({.commandPool = *g.pool, .level = vk::CommandBufferLevel::ePrimary,
+                                                         .commandBufferCount = 1}).value.front();
+            (void)cmd.begin(vk::CommandBufferBeginInfo{.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit});
+            cmd.resetQueryPool(*qpool, 0, 2);
+            cmd.bindPipeline(vk::PipelineBindPoint::eCompute, *pipe.pipeline);
+            BindStorageBuffers(g, cmd, vk::PipelineBindPoint::eCompute, pipe, infos);
+            cmd.pushConstants(*pipe.playout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
+            cmd.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, *qpool, 0);
+            cmd.dispatch(kWorkgroups * 64 / v.wg[0], 1, 1);
+            cmd.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, *qpool, 1);
+            (void)cmd.end();
+            const vk::SubmitInfo submit{.commandBufferCount = 1, .pCommandBuffers = &cmd};
+            (void)g.queue.submit(submit);
+            (void)g.queue.waitIdle();
+            u64 ts[2]{};
+            (void)g.device->getQueryPoolResults(*qpool, 0, 2, sizeof(ts), ts, sizeof(u64),
+                                                vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait);
+            g.device->freeCommandBuffers(*g.pool, cmd);
+            best = std::min(best, double(ts[1] - ts[0]) * props.limits.timestampPeriod);
+        }
+        const double invocations = double(kWorkgroups) * 64;
+        std::printf("  wg %3ux1  rounds %2u  %-22s %8.3f ms  %6.2f ns/invocation%s\n", v.wg[0], v.rounds,
+                    v.rounds == 0 ? "(baseline)" : (v.emulate ? "wave64 emulation" : "32-wide subgroups (wrong)"),
+                    best / 1e6, best / invocations,
+                    v.rounds ? ("  " + std::to_string(best / invocations / v.rounds) + " ns/ballot").c_str() : "");
+    }
+    return 0;
+}
 
 // --disasm FILE: decode a GCN binary with the production decoder and flag wave-level operations
 // (results depend on the 64-lane wave; see the wave64 group).
@@ -2548,6 +3239,9 @@ int main(int argc, char** argv) {
         else if (a == "--out" && i + 1 < argc) opt.outdir = argv[++i];
         else if (a == "--dump-spv" && i + 1 < argc) opt.dump_spv = argv[++i];
         else if (a == "--compile-only" && i + 1 < argc) opt.compile_only = argv[++i];
+        else if (a == "--bench") opt.bench = true;
+        else if (a == "--descriptor-sets") g_force_sets = true;
+        else if (a == "--push-descriptors") g_force_sets = false;
         else if (a == "--stage" && i + 1 < argc) opt.stage = argv[++i];
         else if (a == "--fs-export" && i + 1 < argc) g_fs_export = u32(std::atoi(argv[++i]));
         else if (a == "--ud" && i + 1 < argc) {
@@ -2623,11 +3317,21 @@ int main(int argc, char** argv) {
     );
     std::printf("vertex fetch: %s\n", VertexPulling() ? "pulled in the shader (Profile::emulate_vertex_fetch)"
                                                       : "fixed-function vertex input (mirrored)");
-    std::printf("profile: emulate_null_descriptors %d, emulate_robust_buffer_access %s, robustBufferAccess %s\n",
-                g_profile.emulate_null_descriptors,
-                ProfileHasRobustFlag() ? (g_caps.rba2 ? "present, off" : "present, ON") : "absent in this tree",
+    const auto flag = [](auto& prof, int which) -> const char* {
+        bool present = false, on = false;
+        if (which == 0) { if constexpr (requires { prof.emulate_robust_buffer_access; }) { present = true; on = prof.emulate_robust_buffer_access; } }
+        if (which == 1) { if constexpr (requires { prof.emulate_wave64; }) { present = true; on = prof.emulate_wave64; } }
+        if (which == 2) { if constexpr (requires { prof.emulate_vertex_fetch; }) { present = true; on = prof.emulate_vertex_fetch; } }
+        return !present ? "absent" : (on ? "ON" : "off");
+    };
+    std::printf("profile: null_descriptors %d, robust_buffer_access %s, wave64 %s, vertex_fetch %s; "
+                "robustBufferAccess %s\n",
+                g_profile.emulate_null_descriptors, flag(g_profile, 0), flag(g_profile, 1), flag(g_profile, 2),
                 opt.rba ? "enabled (production)" : "DISABLED (--no-rba)");
 
+    if (opt.bench) {
+        return Bench(opt);
+    }
     if (!opt.compile_only.empty()) {
         // A real game shader through the production recompiler: compile + spirv-val only.
         FILE* f = std::fopen(opt.compile_only.c_str(), "rb");
@@ -2666,6 +3370,9 @@ int main(int argc, char** argv) {
     AddWaveCases();
     AddVertexCases();
     AddInternalCases();
+    AddSpecReuseCases();
+    AddRenderCases();
+    AddPushDescriptorCases();
     if (!opt.only.empty()) {
         std::vector<Job> kept;
         for (auto& j : g_jobs) {
@@ -2754,11 +3461,40 @@ int main(int argc, char** argv) {
             if (alone.count(ji)) r = alone[ji];
         }
     }
+    for (auto& [ji, r] : results) {
+        if (g_jobs[ji].force_push && r.verdict == Verdict::Fail) {
+            r.verdict = Verdict::KnownMoltenVk;
+            r.detail = "  MoltenVK OpArrayLength under push descriptors (renderer uses allocated sets on Apple)\n" + r.detail;
+        }
+    }
     // Compile-only jobs: a valid shader must compile; an abort blocks the game.
     for (u32 ji = 0; ji < g_jobs.size(); ++ji) {
         const Job& j = g_jobs[ji];
         if (!g_templates[j.tmpl].compile_only) continue;
-        if (j.status == Status::Ok) {
+        if (j.status == Status::Ok && g_templates[j.tmpl].check_bindings) {
+            // OpDecorate (71) ... Binding (33) N in the module this job would use
+            const auto& spv = g_spirv.at({j.tmpl, j.perm});
+            std::vector<u32> got;
+            for (size_t w = 5; w < spv.size();) {
+                const u32 count = spv[w] >> 16, opcode = spv[w] & 0xFFFF;
+                if (count == 0) break;
+                if (opcode == 71 && count >= 4 && spv[w + 2] == 33) got.push_back(spv[w + 3]);
+                w += count;
+            }
+            std::sort(got.begin(), got.end());
+            std::vector<u32> want;
+            for (u32 b = 0; b < j.binds.size(); ++b) want.push_back(j.start_unified + b);
+            auto list = [](const std::vector<u32>& v) {
+                std::string r;
+                for (u32 x : v) r += (r.empty() ? "" : ",") + std::to_string(x);
+                return "{" + r + "}";
+            };
+            results[ji] = got == want ? JobResult{Verdict::Strict, ""}
+                                      : JobResult{Verdict::Fail, "  module perm " + std::to_string(j.perm) +
+                                                                     " declares bindings " + list(got) +
+                                                                     ", the pipeline layout expects " + list(want) +
+                                                                     " (reused across start bindings)\n"};
+        } else if (j.status == Status::Ok) {
             results[ji] = {Verdict::Strict, ""};
         } else if (j.status == Status::LoudCompile) {
             results[ji] = {Verdict::Fail, "  aborts while compiling a valid shader: " + j.message + "\n"};
@@ -2783,6 +3519,7 @@ int main(int argc, char** argv) {
         case Status::LoudPipeline: {
             // Every Apple binder guard mirrored here is an orchestrator-approved loud check.
             const bool approved = j.approved_struct_soff || j.approved_swizzle || j.isa_invalid || j.approved_offen_only ||
+                                  g_templates[j.tmpl].wave_divergent ||
                                   j.status == Status::LoudBinder;
             r.verdict = LoudRequired(g, j) ? Verdict::LoudRequired
                                            : (approved ? Verdict::LoudApproved : Verdict::LoudUnneeded);
@@ -2795,6 +3532,9 @@ int main(int argc, char** argv) {
         if (!results.count(ji) || results[ji].verdict == Verdict::HarnessError) results[ji] = r;
     }
 
+    for (u32 ji = 0; ji < g_jobs.size(); ++ji) {
+        if (g_templates[g_jobs[ji].tmpl].helper && g_jobs[ji].status == Status::Ok) results.erase(ji);
+    }
     // Report
     std::map<Verdict, u32> totals;
     std::map<std::string, std::map<Verdict, u32>> by_group;

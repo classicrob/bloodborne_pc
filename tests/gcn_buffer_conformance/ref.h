@@ -66,8 +66,8 @@ typedef struct {
 } gcn_mem;
 
 typedef struct {
-    uint32_t value[4];    /* VGPR (or SGPR for GCN_SLOAD) results */
-    int written[4];       /* scalar loads: whether SDST i was written */
+    uint32_t value[16];   /* VGPR (or SGPR for GCN_SLOAD, up to 16 dwords) results */
+    int written[16];      /* scalar loads: whether SDST i was written */
     int unknown;          /* touched memory outside the model: expected value unknowable */
     uint64_t touch_lo, touch_hi; /* union of bytes the access reads or writes; lo==hi: none */
     int any_in_range;
