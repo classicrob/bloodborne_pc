@@ -289,6 +289,11 @@ Value IREmitter::LoadShared(int bit_size, bool is_signed, const U32& offset, boo
     }
 }
 
+void IREmitter::WriteSharedMaskedU32(const U32& offset, const U32& value, const U32& mask,
+                                      bool is_gds) {
+    Inst(Opcode::WriteSharedMaskedU32, Flags{is_gds}, offset, value, mask);
+}
+
 void IREmitter::WriteShared(int bit_size, const Value& value, const U32& offset, bool is_gds) {
     switch (bit_size) {
     case 16:
@@ -509,6 +514,11 @@ void IREmitter::StoreBufferU32(int num_dwords, const Value& handle, const Value&
     default:
         UNREACHABLE_MSG("Invalid number of dwords {}", num_dwords);
     }
+}
+
+void IREmitter::StoreBufferMaskedU32(const Value& handle, const Value& address, const U32& value,
+                                      const U32& mask) {
+    Inst(Opcode::StoreBufferMaskedU32, Flags{BufferInstInfo{}}, handle, address, value, mask);
 }
 
 void IREmitter::StoreBufferU64(const Value& handle, const Value& address, const U64& data,

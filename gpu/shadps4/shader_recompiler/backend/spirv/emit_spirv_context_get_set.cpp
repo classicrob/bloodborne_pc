@@ -696,6 +696,19 @@ void EmitStoreBufferU16(EmitContext& ctx, IR::Inst*, u32 handle, Id address, Id 
     });
 }
 
+void EmitStoreBufferMaskedU32(EmitContext& ctx, u32 handle, Id address, Id value, Id mask) {
+    const Id original_index = address;
+    const auto& buffer = ctx.buffers[handle];
+    if (const Id offset = buffer.Offset(PointerSize::B32); Sirit::ValidId(offset)) {
+        address = ctx.OpIAdd(ctx.U32[1], address, offset);
+    }
+    const auto [id, pointer_type] = buffer.Alias(PointerType::U32);
+    ctx.BufferWrite(handle, PointerType::U32, original_index, address, [&] {
+        const Id pointer = ctx.OpAccessChain(pointer_type, id, ctx.u32_zero_value, address);
+        ctx.WriteMaskedU32(pointer, value, mask, spv::Scope::Device);
+    });
+}
+
 void EmitStoreBufferU32(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address, Id value) {
     EmitStoreBufferB32xN<1, PointerType::U32>(ctx, inst, handle, address, value);
 }

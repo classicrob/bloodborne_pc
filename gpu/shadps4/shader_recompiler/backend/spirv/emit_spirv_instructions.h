@@ -77,6 +77,7 @@ Id EmitLoadBufferF32x4(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address)
 Id EmitLoadBufferFormatF32(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address);
 void EmitStoreBufferU8(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address, Id value);
 void EmitStoreBufferU16(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address, Id value);
+void EmitStoreBufferMaskedU32(EmitContext& ctx, u32 handle, Id address, Id value, Id mask);
 void EmitStoreBufferU32(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address, Id value);
 void EmitStoreBufferU32x2(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address, Id value);
 void EmitStoreBufferU32x3(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address, Id value);
@@ -147,6 +148,7 @@ Id EmitLoadSharedU16(EmitContext& ctx, Id offset);
 Id EmitLoadSharedU32(EmitContext& ctx, Id offset);
 Id EmitLoadSharedU64(EmitContext& ctx, Id offset);
 void EmitWriteSharedU16(EmitContext& ctx, Id offset, Id value);
+void EmitWriteSharedMaskedU32(EmitContext& ctx, Id offset, Id value, Id mask);
 void EmitWriteSharedU32(EmitContext& ctx, Id offset, Id value);
 void EmitWriteSharedU64(EmitContext& ctx, Id offset, Id value);
 Id EmitSharedAtomicIAdd32(EmitContext& ctx, Id offset, Id value);

@@ -21,6 +21,7 @@ static bool IsWriteShared(const IR::Inst& inst) {
         return !inst.Flags<bool>();
     }
     return opcode == IR::Opcode::WriteSharedU16 || opcode == IR::Opcode::WriteSharedU32 ||
+           opcode == IR::Opcode::WriteSharedMaskedU32 ||
            opcode == IR::Opcode::WriteSharedU64;
 }
 

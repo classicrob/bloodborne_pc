@@ -93,6 +93,7 @@ public:
 
     [[nodiscard]] Value LoadShared(int bit_size, bool is_signed, const U32& offset,
                                    bool is_gds = false);
+    void WriteSharedMaskedU32(const U32& offset, const U32& value, const U32& mask, bool is_gds);
     void WriteShared(int bit_size, const Value& value, const U32& offset, bool is_gds = false);
 
     [[nodiscard]] U32U64 SharedAtomicIAdd(const U32& address, const U32U64& data, bool is_gds);
@@ -132,6 +133,8 @@ public:
                         BufferInstInfo info);
     void StoreBufferU32(int num_dwords, const Value& handle, const Value& address,
                         const Value& data, BufferInstInfo info);
+    void StoreBufferMaskedU32(const Value& handle, const Value& address, const U32& value,
+                              const U32& mask);
     void StoreBufferU64(const Value& handle, const Value& address, const U64& data,
                         BufferInstInfo info);
     void StoreBufferF32(int num_dwords, const Value& handle, const Value& address,
