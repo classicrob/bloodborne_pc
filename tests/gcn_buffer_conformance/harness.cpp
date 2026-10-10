@@ -125,7 +125,8 @@ struct Template {
     bool lds_only = false;           // Wave::Lds without the VOPC ballot (no wave-level operation)
     bool lds_contend = false;        // Wave::Lds: LDS address from voffset (several lanes per halfword)
     u32 lds_bytes = 0;               // guest LDS size when not Threads()*lds_bits/8 (e.g. above the host limit)
-    u32 lds_cross = 0;               // 1: ds_write_b32 then two ds_read_u16; 2: ds_write_b16 then ds_read_b32
+    u32 lds_cross = 0;               // 1: ds_write_b32 then two ds_read_u16; 2: ds_write_b16 then ds_read_b32;
+                                     // 3: ds_write_b32, read lane 63-l's dword (barrier visibility)
     u32 workgroups = 1;              // compute dispatch width (spilled LDS: one region per workgroup)
     u32 pushud_mask = 0;             // pushud: user-data SGPRs the stage reads (s[0:3] = its V#)
     u32 Threads() const { return wg[0] * wg[1] * wg[2]; }
@@ -303,6 +304,17 @@ void AssembleLds(GcnAsm::Code& c, u32 bits, bool lds_only, bool addr_from_voffse
         c.SBarrier();
         c.Ds(60, 16, 0, 10);
         c.Ds(60, 16, 0, 11, 2);
+        c.SWaitcntAll();
+        return;
+    }
+    if (cross == 3) { // dword per lane, read back the dword of lane 63-l (other SIMD group)
+        c.VLshlrevB32(16, Inline(2), 15);
+        c.Ds(13, 16, 3, 0);
+        c.SWaitcntAll();
+        c.SBarrier();
+        c.Vop2(29, 17, 16, LITERAL); // v_xor_b32 v17, 0xFC, v16: (63-l)*4
+        c.words.push_back(0xFCu);
+        c.Ds(54, 17, 0, 10);
         c.SWaitcntAll();
         return;
     }
@@ -1425,6 +1437,8 @@ void AddWaveCases() {
                       {"lds: spilled, cross-width 32-bit write, two 16-bit reads, 2 workgroups", 32, 1, max_lds + 8 * 1024, 2},
                       {"lds: spilled, cross-width 16-bit writes, 32-bit read, 2 workgroups", 16, 2, max_lds + 8 * 1024, 2},
                       {"lds: spilled, 32-bit own slot, 2 workgroups", 32, 0, max_lds + 8 * 1024, 2},
+                      {"lds: 32-bit write, read lane 63-l after the barrier", 32, 3, 0, 1},
+                      {"lds: spilled, 32-bit write, read lane 63-l after the barrier, 2 workgroups", 32, 3, max_lds + 8 * 1024, 2},
                       {"lds: spilled, 16-bit own slot, 2 workgroups", 16, 0, max_lds + 8 * 1024, 2}};
     for (const LX& lx : lxs) {
         Template t;
@@ -2719,6 +2733,10 @@ std::vector<u32> WaveExpected(const Job& j) {
                 r[1] = L.vindex >> 16;
                 break;
             }
+            if (t.lds_cross == 3) {
+                r[0] = j.lanes[63 - l].vindex;
+                break;
+            }
             if (t.lds_cross == 2) {
                 r[0] = (j.lanes[l & ~1u].vindex & 0xFFFF) | (j.lanes[l | 1u].vindex & 0xFFFF) << 16;
                 break;
@@ -3354,7 +3372,7 @@ std::string CheckSpillImage(Gpu& g, const Job& j) {
     const u32 size = t.lds_bytes ? t.lds_bytes : t.Threads() * t.lds_bits / 8;
     std::vector<u8> want(LdsSlot, LdsCanary);
     std::fill_n(want.begin(), size * t.workgroups, u8(0));
-    const u32 width = t.lds_cross == 1 ? 4 : (t.lds_cross == 2 ? 2 : t.lds_bits / 8);
+    const u32 width = (t.lds_cross == 1 || t.lds_cross == 3) ? 4 : (t.lds_cross == 2 ? 2 : t.lds_bits / 8);
     for (u32 w = 0; w < t.workgroups; ++w) {
         for (u32 l = 0; l < 64; ++l) {
             const Lane& L = j.lanes[l];
