@@ -203,7 +203,7 @@ void Scheduler::WaitDeferredSignals() {
         BbToggle::Disabled(BbToggle::OrderedGuestWrites)) {
         return;
     }
-    BbStats::WaitTimer timer{BbStats::host_copies_wait_ns};
+    BbStats::WaitTimer timer{BbStats::deferred_signals_wait_ns};
     KickRecording(true);
     while (deferred_signals_done->load(std::memory_order_acquire) < issued) {
         // Helps the copy threads the signals wait for.
@@ -214,7 +214,7 @@ void Scheduler::WaitDeferredSignals() {
 
 void Scheduler::WaitHostCopies() {
     if (host_copies_done.load(std::memory_order_acquire) < host_copies_issued) {
-        BbStats::WaitTimer timer{BbStats::host_copies_wait_ns};
+        BbStats::WaitTimer timer{BbStats::host_copy_record_wait_ns};
         BbStats::host_copy_waits.fetch_add(1, std::memory_order_relaxed);
         KickRecording(true);
         while (host_copies_done.load(std::memory_order_acquire) < host_copies_issued) {
