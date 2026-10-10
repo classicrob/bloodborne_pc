@@ -166,6 +166,7 @@ if [[ ${1:-} == --test ]]; then
         BB_DEPS_PREFIX="$deps" BB_GPU_BUILD="$PWD/out/gpu" sh tests/test_buffer_atomic_wrap.sh
         BB_DEPS_PREFIX="$deps" BB_GPU_BUILD="$PWD/out/gpu" sh tests/test_lds_subword.sh
         BB_DEPS_PREFIX="$deps" sh tests/test_geometry_runtime_info.sh
+        BB_DEPS_PREFIX="$deps" BB_GPU_BUILD="$PWD/out/gpu" bash tests/macos_fp16/run.sh
         # BB_PERF's GPU numbers rely on per-submission timestamps; qualify them on this device.
         BB_DEPS_PREFIX="$deps" bash tests/macos_perf/timestamps.sh
         out/gpu/macos-perf-test
@@ -205,6 +206,7 @@ if [[ ${1:-} == --test ]]; then
         sh tests/macos_spike/test_tls_runtime.sh
         sh tests/macos_spike/test_hle_stack.sh
         bash tests/test_savedata_macos.sh
+        sh tests/test_sync_diagnostics_macos.sh
         python3 tests/test_restart_macos.py
     fi
     "$CC" "${platform_flags[@]}" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread "${includes[@]}" -I. -Isrc tests/test_pad.c "${libraries[@]}" "${caps_link[@]}" -o out/pad-test
