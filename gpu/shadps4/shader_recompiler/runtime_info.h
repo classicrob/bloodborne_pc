@@ -262,6 +262,24 @@ struct HwComputeRuntimeInfo {
     }
 };
 
+/// bbport: Apple has no geometry stage. An ES/GS draw is emulated with the rings kept in memory, as
+/// on the PS4: the ES runs as a compute shader writing ESGS records, the GS runs as a compute
+/// shader writing GSVS records and a strip index list, and the copy shader runs as the vertex
+/// shader of the draw, reading GSVS records (Profile::emulate_geometry_stage, gs_emulation*.cpp).
+enum class GsEmulationRole : u8 {
+    None,
+    EsCompute,  ///< HwStage::Export as a compute shader
+    GsCompute,  ///< HwStage::Geometry as a compute shader
+    CopyVertex, ///< the copy shader (HwStage::Vertex) of a GS draw
+};
+
+/// Index buffer an EsCompute shader pulls VertexId from.
+enum class GsIndexType : u8 {
+    None, ///< non-indexed draw
+    U16,
+    U32,
+};
+
 /**
  * Stores information relevant to shader compilation sourced from liverpool registers.
  * It may potentially differ with the same shader module so must be checked.
@@ -270,6 +288,10 @@ struct HwComputeRuntimeInfo {
 struct RuntimeInfo {
     SwStage sw_stage;
     HwStage hw_stage;
+    GsEmulationRole gs_role;
+    GsIndexType gs_index_type; ///< EsCompute only
+    u32 gs_max_vert_out;  ///< GsCompute, CopyVertex: VGT_GS_MAX_VERT_OUT (the GSVS ring layout)
+    u32 gs_vertex_dwords; ///< GsCompute, CopyVertex: dwords per GSVS vertex record
     struct Properties {
         AmdGpu::FpDenormMode fp_denorm_mode32;
         AmdGpu::FpDenormMode fp_denorm_mode16_64;
@@ -304,8 +326,11 @@ struct RuntimeInfo {
     }
 
     bool operator==(const RuntimeInfo& other) const noexcept {
-        return hw_stage == other.hw_stage && sw_stage == other.sw_stage && props == other.props &&
-               HasSameSwInfo(other.sw) && HasSameHwInfo(other.hw);
+        return hw_stage == other.hw_stage && sw_stage == other.sw_stage &&
+               gs_role == other.gs_role && gs_index_type == other.gs_index_type &&
+               gs_max_vert_out == other.gs_max_vert_out &&
+               gs_vertex_dwords == other.gs_vertex_dwords &&
+               props == other.props && HasSameSwInfo(other.sw) && HasSameHwInfo(other.hw);
     }
 
     bool HasSameSwInfo(const SwInfo& other) const noexcept {

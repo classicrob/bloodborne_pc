@@ -3,6 +3,7 @@
 
 #include "common/assert.h"
 #include "common/div_ceil.h"
+#include "shader_recompiler/backend/spirv/emit_spirv_gs_emulation.h"
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
 #include "shader_recompiler/frontend/fetch_shader.h"
 #include "shader_recompiler/ir/attribute.h"
@@ -382,6 +383,10 @@ void EmitContext::DefineInputs() {
             DefineVariable(U32[4], spv::BuiltIn::SubgroupLtMask, spv::StorageClass::Input);
         Decorate(subgroup_lt_mask, spv::Decoration::Flat);
     }
+    if (IsGsComputeRole(runtime_info)) {
+        DefineGsEmulationInterface(*this);
+        return;
+    }
     switch (sw_stage) {
     case SwStage::Vertex: {
         vertex_index = DefineVariable(U32[1], spv::BuiltIn::VertexIndex, spv::StorageClass::Input);
@@ -685,6 +690,9 @@ void EmitContext::DefineVertexBlock() {
 }
 
 void EmitContext::DefineOutputs() {
+    if (IsGsComputeRole(runtime_info)) {
+        return;
+    }
     switch (sw_stage) {
     case SwStage::Vertex: {
         DefineVertexBlock();

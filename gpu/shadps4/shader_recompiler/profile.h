@@ -61,6 +61,9 @@ struct Profile {
     bool repair_mul_signed_zero{};
     /// Apple: GCN wave64 semantics emulated on 32-wide subgroups (lower_wave64_pass.cpp).
     bool emulate_wave64{};
+    /// Apple: no geometry stage; ES/GS draws run the ES and GS as compute shaders with the rings in
+    /// memory and the copy shader as the vertex shader (GsEmulationRole in runtime_info.h).
+    bool emulate_geometry_stage{};
 
     bool operator==(const Profile&) const = default;
 };

@@ -10,6 +10,7 @@
 #include "common/assert.h"
 #include "common/func_traits.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
+#include "shader_recompiler/backend/spirv/emit_spirv_gs_emulation.h"
 #include "shader_recompiler/backend/spirv/emit_spirv_instructions.h"
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
 #include "shader_recompiler/frontend/translate/translate.h"
@@ -164,6 +165,7 @@ void Traverse(EmitContext& ctx, const IR::Program& program) {
             current_block = node.data.block;
             ctx.AddLabel(label);
             if (first_block) {
+                EmitGsEmulationPrologue(ctx);
                 ctx.DefineDepthBoundsTest();
                 first_block = false;
             }
@@ -321,7 +323,7 @@ void SetupCapabilities(const Info& info, const Profile& profile, const RuntimeIn
                         " that your Vulkan instance does not advertise. Results may vary");
         }
     }
-    const auto stage = info.sw_stage;
+    const auto stage = IsGsComputeRole(runtime_info) ? SwStage::Compute : info.sw_stage;
     if (stage == SwStage::Vertex) {
         ctx.AddExtension("SPV_KHR_shader_draw_parameters");
         ctx.AddCapability(spv::Capability::DrawParameters);
@@ -395,6 +397,11 @@ void SetupCapabilities(const Info& info, const Profile& profile, const RuntimeIn
 void DefineEntryPoint(const Info& info, EmitContext& ctx, Id main) {
     const std::span interfaces(ctx.interfaces.data(), ctx.interfaces.size());
     spv::ExecutionModel execution_model{};
+    if (IsGsComputeRole(ctx.runtime_info)) {
+        DefineGsEmulationEntryPoint(ctx, main);
+        ctx.AddEntryPoint(spv::ExecutionModel::GLCompute, main, "main", interfaces);
+        return;
+    }
     switch (info.sw_stage) {
     case SwStage::Compute: {
         const std::array<u32, 3> workgroup_size{ctx.runtime_info.hw.cs.workgroup_size};

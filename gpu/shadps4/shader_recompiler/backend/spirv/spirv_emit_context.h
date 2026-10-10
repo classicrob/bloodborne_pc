@@ -519,6 +519,32 @@ public:
 
     std::optional<std::vector<bool>> live_buffer_accesses;
     size_t flatbuf_index{};
+
+    /// bbport: geometry-stage emulation state (emit_spirv_gs_emulation.cpp).
+    struct GsEmulationIds {
+        size_t scratch{};
+        size_t index_input{};
+        Id global_invocation_id{};
+        // EsCompute
+        Id record_base{};
+        Id vertex_id{};
+        Id instance_id{};
+        Id base_vertex{};
+        Id base_instance{};
+        // GsCompute
+        Id primitive_id{};
+        Id invocation_id{};
+        Id input_first_record{};
+        Id esgs_base{};
+        Id slot_first_vertex{};
+        Id run_base{};
+        Id emitted{};
+        Id run_pos{};
+        Id strip_start{};
+        Id strip_len{};
+        // GsCompute, CopyVertex
+        Id gsvs_base{};
+    } gs;
     size_t bda_pagetable_index{};
     size_t fault_buffer_index{};
     Id physical_pointer_type_u32;
