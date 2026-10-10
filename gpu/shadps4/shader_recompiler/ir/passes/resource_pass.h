@@ -36,6 +36,14 @@ inline bool IsBufferAtomic(const IR::Inst& inst) {
     switch (inst.GetOpcode()) {
     case IR::Opcode::BufferAtomicIAdd32:
     case IR::Opcode::BufferAtomicIAdd64:
+    case IR::Opcode::BufferAtomicISub64:
+    case IR::Opcode::BufferAtomicInc64:
+    case IR::Opcode::BufferAtomicDec64:
+    case IR::Opcode::BufferAtomicAnd64:
+    case IR::Opcode::BufferAtomicOr64:
+    case IR::Opcode::BufferAtomicXor64:
+    case IR::Opcode::BufferAtomicSwap64:
+    case IR::Opcode::BufferAtomicCmpSwap64:
     case IR::Opcode::BufferAtomicISub32:
     case IR::Opcode::BufferAtomicSMin32:
     case IR::Opcode::BufferAtomicSMin64:

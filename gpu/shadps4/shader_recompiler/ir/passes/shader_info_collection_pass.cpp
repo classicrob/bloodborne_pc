@@ -124,6 +124,14 @@ void Visit(Info& info, const IR::Inst& inst) {
         info.uses_buffer_atomic_float_min_max = true;
         break;
     case IR::Opcode::BufferAtomicIAdd64:
+    case IR::Opcode::BufferAtomicISub64:
+    case IR::Opcode::BufferAtomicInc64:
+    case IR::Opcode::BufferAtomicDec64:
+    case IR::Opcode::BufferAtomicAnd64:
+    case IR::Opcode::BufferAtomicOr64:
+    case IR::Opcode::BufferAtomicXor64:
+    case IR::Opcode::BufferAtomicSwap64:
+    case IR::Opcode::BufferAtomicCmpSwap64:
     case IR::Opcode::BufferAtomicSMax64:
     case IR::Opcode::BufferAtomicSMin64:
     case IR::Opcode::BufferAtomicUMax64:

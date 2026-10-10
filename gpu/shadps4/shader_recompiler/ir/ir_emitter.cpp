@@ -555,7 +555,14 @@ Value IREmitter::BufferAtomicIAdd(const Value& handle, const Value& address, con
 
 Value IREmitter::BufferAtomicISub(const Value& handle, const Value& address, const Value& value,
                                   BufferInstInfo info) {
-    return Inst(Opcode::BufferAtomicISub32, Flags{info}, handle, address, value);
+    switch (value.Type()) {
+    case Type::U32:
+        return Inst(Opcode::BufferAtomicISub32, Flags{info}, handle, address, value);
+    case Type::U64:
+        return Inst(Opcode::BufferAtomicISub64, Flags{info}, handle, address, value);
+    default:
+        ThrowInvalidType(value.Type());
+    }
 }
 
 Value IREmitter::BufferAtomicIMin(const Value& handle, const Value& address, const Value& value,
@@ -596,37 +603,88 @@ Value IREmitter::BufferAtomicFMax(const Value& handle, const Value& address, con
     return Inst(Opcode::BufferAtomicFMax32, Flags{info}, handle, address, value);
 }
 
-Value IREmitter::BufferAtomicInc(const Value& handle, const Value& address, BufferInstInfo info) {
-    return Inst(Opcode::BufferAtomicInc32, Flags{info}, handle, address);
+Value IREmitter::BufferAtomicInc(const Value& handle, const Value& address,
+                                     const Value& value, BufferInstInfo info) {
+    switch (value.Type()) {
+    case Type::U32:
+        return Inst(Opcode::BufferAtomicInc32, Flags{info}, handle, address, value);
+    case Type::U64:
+        return Inst(Opcode::BufferAtomicInc64, Flags{info}, handle, address, value);
+    default:
+        ThrowInvalidType(value.Type());
+    }
 }
 
-Value IREmitter::BufferAtomicDec(const Value& handle, const Value& address, BufferInstInfo info) {
-    return Inst(Opcode::BufferAtomicDec32, Flags{info}, handle, address);
+Value IREmitter::BufferAtomicDec(const Value& handle, const Value& address,
+                                     const Value& value, BufferInstInfo info) {
+    switch (value.Type()) {
+    case Type::U32:
+        return Inst(Opcode::BufferAtomicDec32, Flags{info}, handle, address, value);
+    case Type::U64:
+        return Inst(Opcode::BufferAtomicDec64, Flags{info}, handle, address, value);
+    default:
+        ThrowInvalidType(value.Type());
+    }
 }
 
 Value IREmitter::BufferAtomicAnd(const Value& handle, const Value& address, const Value& value,
                                  BufferInstInfo info) {
-    return Inst(Opcode::BufferAtomicAnd32, Flags{info}, handle, address, value);
+    switch (value.Type()) {
+    case Type::U32:
+        return Inst(Opcode::BufferAtomicAnd32, Flags{info}, handle, address, value);
+    case Type::U64:
+        return Inst(Opcode::BufferAtomicAnd64, Flags{info}, handle, address, value);
+    default:
+        ThrowInvalidType(value.Type());
+    }
 }
 
 Value IREmitter::BufferAtomicOr(const Value& handle, const Value& address, const Value& value,
                                 BufferInstInfo info) {
-    return Inst(Opcode::BufferAtomicOr32, Flags{info}, handle, address, value);
+    switch (value.Type()) {
+    case Type::U32:
+        return Inst(Opcode::BufferAtomicOr32, Flags{info}, handle, address, value);
+    case Type::U64:
+        return Inst(Opcode::BufferAtomicOr64, Flags{info}, handle, address, value);
+    default:
+        ThrowInvalidType(value.Type());
+    }
 }
 
 Value IREmitter::BufferAtomicXor(const Value& handle, const Value& address, const Value& value,
                                  BufferInstInfo info) {
-    return Inst(Opcode::BufferAtomicXor32, Flags{info}, handle, address, value);
+    switch (value.Type()) {
+    case Type::U32:
+        return Inst(Opcode::BufferAtomicXor32, Flags{info}, handle, address, value);
+    case Type::U64:
+        return Inst(Opcode::BufferAtomicXor64, Flags{info}, handle, address, value);
+    default:
+        ThrowInvalidType(value.Type());
+    }
 }
 
 Value IREmitter::BufferAtomicSwap(const Value& handle, const Value& address, const Value& value,
                                   BufferInstInfo info) {
-    return Inst(Opcode::BufferAtomicSwap32, Flags{info}, handle, address, value);
+    switch (value.Type()) {
+    case Type::U32:
+        return Inst(Opcode::BufferAtomicSwap32, Flags{info}, handle, address, value);
+    case Type::U64:
+        return Inst(Opcode::BufferAtomicSwap64, Flags{info}, handle, address, value);
+    default:
+        ThrowInvalidType(value.Type());
+    }
 }
 
 Value IREmitter::BufferAtomicCmpSwap(const Value& handle, const Value& address, const Value& vdata,
                                      const Value& cmp_value, BufferInstInfo info) {
-    return Inst(Opcode::BufferAtomicCmpSwap32, Flags{info}, handle, address, vdata, cmp_value);
+    switch (vdata.Type()) {
+    case Type::U32:
+        return Inst(Opcode::BufferAtomicCmpSwap32, Flags{info}, handle, address, vdata, cmp_value);
+    case Type::U64:
+        return Inst(Opcode::BufferAtomicCmpSwap64, Flags{info}, handle, address, vdata, cmp_value);
+    default:
+        ThrowInvalidType(vdata.Type());
+    }
 }
 
 Value IREmitter::BufferAtomicFCmpSwap(const Value& handle, const Value& address, const Value& vdata,

@@ -82,6 +82,26 @@ void Translator::EmitVectorMemory(const GcnInst& inst) {
         // Buffer atomic operations
     case Opcode::BUFFER_ATOMIC_ADD:
         return BUFFER_ATOMIC(AtomicOp::Add, inst);
+    case Opcode::BUFFER_ATOMIC_SUB:
+        return BUFFER_ATOMIC(AtomicOp::Sub, inst);
+    case Opcode::BUFFER_ATOMIC_ADD_X2:
+        return BUFFER_ATOMIC<IR::U64>(AtomicOp::Add, inst);
+    case Opcode::BUFFER_ATOMIC_SUB_X2:
+        return BUFFER_ATOMIC<IR::U64>(AtomicOp::Sub, inst);
+    case Opcode::BUFFER_ATOMIC_SWAP_X2:
+        return BUFFER_ATOMIC<IR::U64>(AtomicOp::Swap, inst);
+    case Opcode::BUFFER_ATOMIC_CMPSWAP_X2:
+        return BUFFER_ATOMIC<IR::U64>(AtomicOp::CmpSwap, inst);
+    case Opcode::BUFFER_ATOMIC_AND_X2:
+        return BUFFER_ATOMIC<IR::U64>(AtomicOp::And, inst);
+    case Opcode::BUFFER_ATOMIC_OR_X2:
+        return BUFFER_ATOMIC<IR::U64>(AtomicOp::Or, inst);
+    case Opcode::BUFFER_ATOMIC_XOR_X2:
+        return BUFFER_ATOMIC<IR::U64>(AtomicOp::Xor, inst);
+    case Opcode::BUFFER_ATOMIC_INC_X2:
+        return BUFFER_ATOMIC<IR::U64>(AtomicOp::Inc, inst);
+    case Opcode::BUFFER_ATOMIC_DEC_X2:
+        return BUFFER_ATOMIC<IR::U64>(AtomicOp::Dec, inst);
     case Opcode::BUFFER_ATOMIC_SWAP:
         return BUFFER_ATOMIC(AtomicOp::Swap, inst);
     case Opcode::BUFFER_ATOMIC_CMPSWAP:
@@ -382,7 +402,14 @@ void Translator::BUFFER_ATOMIC(AtomicOp op, const GcnInst& inst) {
         case AtomicOp::Swap:
             return ir.BufferAtomicSwap(handle, address, vdata_val, buffer_info);
         case AtomicOp::CmpSwap: {
-            const IR::Value cmp_val = ir.GetVectorReg(vdata + 1);
+            const IR::Value cmp_val = [&]() -> IR::Value {
+                if constexpr (std::is_same_v<T, IR::U64>) {
+                    return ir.PackUint2x32(ir.CompositeConstruct(ir.GetVectorReg(vdata + 2),
+                                                               ir.GetVectorReg(vdata + 3)));
+                } else {
+                    return ir.GetVectorReg(vdata + 1);
+                }
+            }();
             return ir.BufferAtomicCmpSwap(handle, address, vdata_val, cmp_val, buffer_info);
         }
         case AtomicOp::FCmpSwap: {
@@ -391,6 +418,8 @@ void Translator::BUFFER_ATOMIC(AtomicOp op, const GcnInst& inst) {
         }
         case AtomicOp::Add:
             return ir.BufferAtomicIAdd(handle, address, vdata_val, buffer_info);
+        case AtomicOp::Sub:
+            return ir.BufferAtomicISub(handle, address, vdata_val, buffer_info);
         case AtomicOp::Smin:
             return ir.BufferAtomicIMin(handle, address, vdata_val, true, buffer_info);
         case AtomicOp::Umin:
@@ -406,9 +435,9 @@ void Translator::BUFFER_ATOMIC(AtomicOp op, const GcnInst& inst) {
         case AtomicOp::Xor:
             return ir.BufferAtomicXor(handle, address, vdata_val, buffer_info);
         case AtomicOp::Inc:
-            return ir.BufferAtomicInc(handle, address, buffer_info);
+            return ir.BufferAtomicInc(handle, address, vdata_val, buffer_info);
         case AtomicOp::Dec:
-            return ir.BufferAtomicDec(handle, address, buffer_info);
+            return ir.BufferAtomicDec(handle, address, vdata_val, buffer_info);
         case AtomicOp::Fmin:
             return ir.BufferAtomicFMin(handle, address, vdata_val, buffer_info);
         case AtomicOp::Fmax:
@@ -420,7 +449,9 @@ void Translator::BUFFER_ATOMIC(AtomicOp op, const GcnInst& inst) {
 
     if (mubuf.glc) {
         if constexpr (std::is_same_v<T, IR::U64>) {
-            UNREACHABLE();
+            const IR::Value words = ir.UnpackUint2x32(IR::U64{original_val});
+            ir.SetVectorReg(vdata, IR::U32{ir.CompositeExtract(words, 0)});
+            ir.SetVectorReg(vdata + 1, IR::U32{ir.CompositeExtract(words, 1)});
         } else {
             ir.SetVectorReg(vdata, T{original_val});
         }

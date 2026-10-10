@@ -29,6 +29,14 @@ IR::Type BufferDataType(const IR::Inst& inst, const Profile& profile) {
     case IR::Opcode::LoadBufferU64:
     case IR::Opcode::StoreBufferU64:
     case IR::Opcode::BufferAtomicIAdd64:
+    case IR::Opcode::BufferAtomicISub64:
+    case IR::Opcode::BufferAtomicInc64:
+    case IR::Opcode::BufferAtomicDec64:
+    case IR::Opcode::BufferAtomicAnd64:
+    case IR::Opcode::BufferAtomicOr64:
+    case IR::Opcode::BufferAtomicXor64:
+    case IR::Opcode::BufferAtomicSwap64:
+    case IR::Opcode::BufferAtomicCmpSwap64:
     case IR::Opcode::BufferAtomicSMax64:
     case IR::Opcode::BufferAtomicSMin64:
     case IR::Opcode::BufferAtomicUMax64:
@@ -57,6 +65,14 @@ u32 BufferAddressShift(const IR::Inst& inst, AmdGpu::DataFormat data_format) {
     case IR::Opcode::LoadBufferU64:
     case IR::Opcode::StoreBufferU64:
     case IR::Opcode::BufferAtomicIAdd64:
+    case IR::Opcode::BufferAtomicISub64:
+    case IR::Opcode::BufferAtomicInc64:
+    case IR::Opcode::BufferAtomicDec64:
+    case IR::Opcode::BufferAtomicAnd64:
+    case IR::Opcode::BufferAtomicOr64:
+    case IR::Opcode::BufferAtomicXor64:
+    case IR::Opcode::BufferAtomicSwap64:
+    case IR::Opcode::BufferAtomicCmpSwap64:
     case IR::Opcode::BufferAtomicSMax64:
     case IR::Opcode::BufferAtomicSMin64:
     case IR::Opcode::BufferAtomicUMax64:
@@ -490,10 +506,10 @@ void PatchGlobalDataShareAccess(IR::Inst& inst, Info& info, Descriptors& descrip
         break;
     }
     case IR::Opcode::SharedAtomicInc32:
-        inst.ReplaceUsesWith(ir.BufferAtomicInc(handle, address_dwords, {}));
+        inst.ReplaceUsesWith(ir.BufferAtomicIAdd(handle, address_dwords, ir.Imm32(1u), {}));
         break;
     case IR::Opcode::SharedAtomicDec32:
-        inst.ReplaceUsesWith(ir.BufferAtomicDec(handle, address_dwords, {}));
+        inst.ReplaceUsesWith(ir.BufferAtomicISub(handle, address_dwords, ir.Imm32(1u), {}));
         break;
     case IR::Opcode::SharedAtomicAnd32:
         inst.ReplaceUsesWith(ir.BufferAtomicAnd(handle, address_dwords, inst.Arg(1), {}));

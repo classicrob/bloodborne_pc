@@ -167,10 +167,10 @@ void SharedMemoryToStoragePass(IR::Program& program, const RuntimeInfo& runtime_
                 continue;
             }
             case IR::Opcode::SharedAtomicInc32:
-                inst.ReplaceUsesWithAndRemove(ir.BufferAtomicInc(handle, address, {}));
+                inst.ReplaceUsesWithAndRemove(ir.BufferAtomicIAdd(handle, address, ir.Imm32(1u), {}));
                 continue;
             case IR::Opcode::SharedAtomicDec32:
-                inst.ReplaceUsesWithAndRemove(ir.BufferAtomicDec(handle, address, {}));
+                inst.ReplaceUsesWithAndRemove(ir.BufferAtomicISub(handle, address, ir.Imm32(1u), {}));
                 continue;
             case IR::Opcode::SharedAtomicAnd32:
             case IR::Opcode::SharedAtomicAnd64:
