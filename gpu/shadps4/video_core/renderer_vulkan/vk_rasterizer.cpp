@@ -467,6 +467,21 @@ void Rasterizer::NotePendingGpuWrite(VAddr address, u64 size) {
     pending_max = std::max(pending_max, end);
 }
 
+void Rasterizer::SyncParserRead(VAddr address, u64 size) {
+    if (PendingWriteOverlaps(address, size)) {
+        DrainDrawPipe(DrawPipe::ReasonCommands);
+        WaitDeferredSignals();
+    }
+    if (buffer_cache.IsRegionGpuModified(address, size)) {
+        static u64 waits = 0;
+        if (++waits <= 8 || (waits & 1023) == 0) {
+            LOG_INFO(Render, "Parser read of GPU-written {:#x}+{} waits for the GPU (#{})",
+                     address, size, waits);
+        }
+        Finish();
+    }
+}
+
 bool Rasterizer::PendingWriteOverlaps(VAddr address, u64 size) {
     if (pending_writes.empty() || address >= pending_max || address + size <= pending_min) {
         return false;

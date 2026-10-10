@@ -1425,7 +1425,14 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 if (cond_exec->command.Value() != 0) {
                     LOG_WARNING(Render, "IT_COND_EXEC used a reserved command");
                 }
-                const auto skip = *cond_exec->Address() == false;
+#ifdef __APPLE__
+                if (rasterizer) {
+                    rasterizer->SyncParserRead(reinterpret_cast<VAddr>(cond_exec->Address()),
+                                               sizeof(u32));
+                }
+#endif
+                // The CP tests the whole 32-bit value (this read one byte through a bool* before).
+                const bool skip = cond_exec->Predicate() == 0;
                 if (skip) {
                     dcb = NextPacket(dcb,
                                      header->type3.NumWords() + 1 + cond_exec->exec_count.Value());

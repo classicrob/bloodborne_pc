@@ -1238,9 +1238,13 @@ struct PM4CmdCondExec {
                                          ///< if bool pointed to is zero
     };
 
-    bool* Address() const {
-        return std::bit_cast<bool*>(u64(bool_addr_hi.Value()) << 32 | u64(bool_addr_lo.Value())
-                                                                          << 2);
+    /// The condition is a 32-bit value (BOOL_ADDR is dword-aligned); zero skips exec_count dwords.
+    const u32* Address() const {
+        return std::bit_cast<const u32*>(u64(bool_addr_hi.Value()) << 32 |
+                                         u64(bool_addr_lo.Value()) << 2);
+    }
+    [[nodiscard]] u32 Predicate() const {
+        return *Address();
     }
 };
 

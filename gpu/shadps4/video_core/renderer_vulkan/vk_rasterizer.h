@@ -126,6 +126,10 @@ public:
     /// Stage A: guest memory the recording thread will write for work handed to it (storage
     /// buffers, DMA, WriteData, fences); constants overlapping it are bound there, not copied here.
     void NotePendingGpuWrite(VAddr address, u64 size);
+    /// Stage A (macOS), before the command parser reads guest memory the GPU may write (COND_EXEC
+    /// predicates): stream writes handed to the recording thread land first, and if the GPU has
+    /// written the range, recorded work completes.
+    void SyncParserRead(VAddr address, u64 size);
     /// Before a guest-visible write: fences deferred earlier are written first.
     void WaitDeferredSignals() {
         scheduler.WaitDeferredSignals();
