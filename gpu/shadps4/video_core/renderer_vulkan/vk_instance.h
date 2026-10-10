@@ -116,6 +116,21 @@ public:
         return features.depthBounds;
     }
 
+    /// Returns true if lines can be rasterized wider than one pixel
+    bool IsWideLinesSupported() const {
+        return features.wideLines;
+    }
+
+    /// Returns true if multisampled images can be bound as storage images
+    bool IsStorageImageMultisampleSupported() const {
+        return features.shaderStorageImageMultisample;
+    }
+
+    /// Returns true if draws can take their count from a buffer (vkCmdDraw*IndirectCount)
+    bool IsDrawIndirectCountSupported() const {
+        return vk12_features.drawIndirectCount;
+    }
+
     /// Returns true if 16-bit floats are supported in shaders
     bool IsShaderFloat16Supported() const {
         return vk12_features.shaderFloat16;

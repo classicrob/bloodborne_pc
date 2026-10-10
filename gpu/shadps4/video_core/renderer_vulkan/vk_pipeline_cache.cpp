@@ -24,6 +24,7 @@
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/cache_storage.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
+#include "video_core/renderer_vulkan/vk_feature_checks.h"
 #include "video_core/renderer_vulkan/motion_history.h"
 #include "video_core/renderer_vulkan/vk_draw_prep.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -512,7 +513,18 @@ bool PipelineCache::RefreshGraphicsKey(PipelineSelection& sel) {
     key.clip_space = regs.clipper_control.clip_space;
     key.provoking_vtx_last = regs.polygon_control.provoking_vtx_last;
     key.prim_type = regs.primitive_type;
+#ifdef __APPLE__
+    // One Vulkan polygon mode: the visible faces' (vk_feature_checks.h; mismatches are errors).
+    {
+        const auto& poly = regs.polygon_control;
+        const bool culled = LiverpoolToVK::IsPrimitiveCulled(regs.primitive_type);
+        key.polygon_mode = FeatureChecks::VisiblePolygonMode(
+            poly.enable_polygon_mode != 0, poly.polygon_mode_front, poly.polygon_mode_back,
+            culled && poly.cull_front, culled && poly.cull_back);
+    }
+#else
     key.polygon_mode = regs.polygon_control.PolyMode();
+#endif
     key.patch_control_points =
         regs.stage_enable.hs_en ? regs.ls_hs_config.hs_input_control_points : 0;
     key.logic_op = regs.color_control.rop3;

@@ -19,6 +19,7 @@
 #include "video_core/renderer_vulkan/vk_null_resources.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
+#include "video_core/renderer_vulkan/vk_feature_checks.h"
 #include "video_core/renderer_vulkan/vk_gpu_profiler.h"
 #include "bbport_threads.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
@@ -1192,6 +1193,15 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
     const VAddr count_address = indirect.count;
     const u32 stride = indirect.stride;
     const u32 max_count = indirect.max_count;
+#ifdef __APPLE__
+    // Without the feature vkCmdDraw*IndirectCount is invalid. See docs/macos/feature-audit.md.
+    if (FeatureChecks::DrawIndirectCountUnsupported(count_address,
+                                                    instance.IsDrawIndirectCountSupported())) {
+        UNREACHABLE_MSG("macOS: indirect draw with a GPU count at {:#x} (max {} draws) needs "
+                        "drawIndirectCount, which this device lacks",
+                        count_address, max_count);
+    }
+#endif
 
     // Indirect arguments may be GPU-written: leave these draws on camera fallback.
     motion_draw = false;
@@ -3503,6 +3513,17 @@ void Rasterizer::UpdateDepthStencilState() const {
     }
 
     const auto depth_bounds_test_enabled = regs.depth_control.depth_bounds_enable;
+#ifdef __APPLE__
+    // Without the feature the test is skipped. That is exact only when it would always pass:
+    // no depth buffer, or bounds covering [0, 1], the range stored depth is clamped to.
+    if (FeatureChecks::DepthBoundsUnsupported(
+            depth_bounds_test_enabled, regs.depth_buffer.DepthValid(), regs.depth_bounds_min,
+            regs.depth_bounds_max, instance.IsDepthBoundsSupported())) {
+        UNREACHABLE_MSG("macOS: depth bounds test [{}, {}] needs depthBounds, which this device "
+                        "lacks",
+                        regs.depth_bounds_min, regs.depth_bounds_max);
+    }
+#endif
     dynamic_state.SetDepthBoundsTestEnabled(depth_bounds_test_enabled);
     if (depth_bounds_test_enabled) {
         dynamic_state.SetDepthBounds(regs.depth_bounds_min, regs.depth_bounds_max);
@@ -3613,6 +3634,41 @@ void Rasterizer::UpdatePrimitiveState(const bool is_indexed) const {
 void Rasterizer::UpdateRasterizationState() const {
     const auto& regs = Regs();
     auto& dynamic_state = scheduler.GetDynamicState();
+#ifdef __APPLE__
+    // Without wideLines only width 1 is valid. The width matters only when lines are rasterized.
+    const auto& poly = regs.polygon_control;
+    const auto raster = FeatureChecks::RasterizedPrimitive(
+        regs.primitive_type, regs.stage_enable.IsStageEnabled(u32(Shader::HwStage::Geometry)),
+        regs.vgt_gs_out_prim_type.GetPrimitiveType(0),
+        regs.stage_enable.IsStageEnabled(u32(Shader::HwStage::Hull)), regs.tess_config.topology);
+    const bool culled = LiverpoolToVK::IsPrimitiveCulled(regs.primitive_type);
+    const bool cull_front = culled && poly.cull_front;
+    const bool cull_back = culled && poly.cull_back;
+    if (FeatureChecks::PolygonModesDiffer(raster, poly.enable_polygon_mode != 0,
+                                          poly.polygon_mode_front, poly.polygon_mode_back,
+                                          cull_front, cull_back)) {
+        UNREACHABLE_MSG("macOS: visible front faces in polygon mode {} and back faces in mode {}; "
+                        "Vulkan has one polygon mode",
+                        u32(poly.polygon_mode_front), u32(poly.polygon_mode_back));
+    }
+    const auto visible_mode =
+        FeatureChecks::VisiblePolygonMode(poly.enable_polygon_mode != 0, poly.polygon_mode_front,
+                                          poly.polygon_mode_back, cull_front, cull_back);
+    if (FeatureChecks::PointPolygonModeInexact(raster, visible_mode)) {
+        UNREACHABLE_MSG("macOS: point polygon mode; MoltenVK draws a point list instead, without "
+                        "culling or per-triangle vertices");
+    }
+    if (!instance.IsWideLinesSupported()) {
+        if (FeatureChecks::WideLinesUnsupported(
+                FeatureChecks::RasterizesLines(raster, visible_mode),
+                regs.line_control.Width(), false)) {
+            UNREACHABLE_MSG("macOS: {}-pixel lines need wideLines, which this device lacks",
+                            regs.line_control.Width());
+        }
+        dynamic_state.SetLineWidth(1.0f);
+        return;
+    }
+#endif
     dynamic_state.SetLineWidth(regs.line_control.Width());
 }
 
