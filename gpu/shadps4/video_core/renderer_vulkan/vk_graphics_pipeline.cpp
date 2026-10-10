@@ -18,21 +18,6 @@ namespace Vulkan {
 
 using Shader::Backend::SPIRV::AuxShaderType;
 
-// Locations a VS or TES writes a vec4 to (bit N = Location N); see DefineOutputs.
-static u32 VertexOutputLocations(const Shader::Info& vs_info, const Shader::RuntimeInfo& vs_runtime) {
-    u32 locations = 0;
-    for (u32 i = 0; i < Shader::IR::NumParams; ++i) {
-        if (vs_info.stores.GetAny(Shader::IR::Attribute::Param0 + i)) {
-            locations |= 1U << i;
-        }
-    }
-    if (vs_runtime.hw.vs.motion_vectors && Shader::MotionVectors::positions_address != 0) {
-        locations |= (1U << Shader::MotionVectors::CurrentLocation) |
-                     (1U << Shader::MotionVectors::PreviousLocation);
-    }
-    return locations;
-}
-
 static constexpr std::array LogicalStageToStageBit = {
     vk::ShaderStageFlagBits::eFragment,
     vk::ShaderStageFlagBits::eTessellationControl,
@@ -218,8 +203,14 @@ GraphicsPipeline::GraphicsPipeline(
             const auto* vs = infos[u32(Shader::SwStage::Vertex)];
             const auto* fs = infos[u32(Shader::SwStage::Fragment)];
             ASSERT_MSG(vs, "RectList/QuadList emulation without a vertex stage");
+            // Clip-distance emulation (native NVIDIA only) shifts every parameter location and adds
+            // a clip vector at Location 0, which the location masks do not model: keep the
+            // auxiliary stages reading every fragment location there, as before.
             aux_vs_output_locations =
-                VertexOutputLocations(*vs, runtime_infos[u32(Shader::SwStage::Vertex)]);
+                profile.needs_clip_distance_emulation
+                    ? ~0U
+                    : Shader::Backend::SPIRV::PreRasterOutputLocations(
+                          *vs, runtime_infos[u32(Shader::SwStage::Vertex)]);
             const u32 fs_locations = Shader::Backend::SPIRV::AuxiliaryVaryingLocations(fs_info);
             if (const u32 unwritten = fs_locations & ~aux_vs_output_locations; unwritten != 0) {
                 // GCN leaves these undefined; the auxiliary TCS forwards zero.
@@ -291,10 +282,12 @@ GraphicsPipeline::GraphicsPipeline(
                                   : Shader::SwStage::Vertex;
         const auto* pre = infos[u32(producer)];
         ASSERT_MSG(pre, "graphics pipeline without a vertex stage");
+        ASSERT(!profile.needs_clip_distance_emulation);
         const u32 fs_locations = Shader::Backend::SPIRV::AuxiliaryVaryingLocations(
             runtime_infos[u32(Shader::SwStage::Fragment)].hw.fs);
         const u32 unwritten =
-            fs_locations & ~VertexOutputLocations(*pre, runtime_infos[u32(producer)]);
+            fs_locations &
+            ~Shader::Backend::SPIRV::PreRasterOutputLocations(*pre, runtime_infos[u32(producer)]);
         if (unwritten != 0) {
             UNREACHABLE_MSG("macOS: fragment shader {:#x} reads varying locations {:#010x} that "
                             "{} shader {:#x} never writes; zero-filling a direct pre-raster -> "

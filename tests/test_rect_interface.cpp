@@ -9,6 +9,7 @@
 #include <vulkan/vulkan.h>
 #include <sirit/sirit.h>
 #include "shader_recompiler/backend/spirv/emit_spirv_quad_rect.h"
+#include "shader_recompiler/info.h"
 #include "shader_recompiler/runtime_info.h"
 #include <array>
 #include <cmath>
@@ -34,6 +35,55 @@ constexpr float Clear = -7.0f;
 
 using Shader::Backend::SPIRV::AuxShaderType;
 using Shader::Backend::SPIRV::EmitAuxilaryTessShader;
+
+#ifndef BB_RECT_IFACE_BASELINE
+// Producer and consumer masks must equal what EmitContext declares: parameters as stored, motion
+// 30/31 only from a hardware vertex shader with motion on (EmitContext::VertexMotion), and from the
+// FS only when it has motion enabled.
+u32 CheckMasks() {
+    using Shader::HwStage;
+    using Shader::SwStage;
+    u32 failures = 0;
+    const auto expect = [&](const char* what, u32 got, u32 want) {
+        const bool ok = got == want;
+        std::fprintf(stderr, "mask: %-46s %#010x %s\n", what, got, ok ? "ok" : "MISMATCH");
+        failures += ok ? 0 : 1;
+    };
+    const auto producer = [](HwStage hw, SwStage sw, u32 params, bool motion) {
+        Shader::Info info{};
+        info.hw_stage = hw;
+        info.sw_stage = sw;
+        for (u32 i = 0; i < 32; ++i) {
+            if (params & (1U << i)) {
+                info.stores.Set(Shader::IR::Attribute::Param0 + i, 0);
+            }
+        }
+        Shader::RuntimeInfo runtime{};
+        runtime.hw.vs.motion_vectors = motion;
+        return Shader::Backend::SPIRV::PreRasterOutputLocations(info, runtime);
+    };
+    constexpr u32 Motion = 3U << 30;
+    Shader::MotionVectors::positions_address = 0x1000;
+    expect("VS params 0,2", producer(HwStage::Vertex, SwStage::Vertex, 0b101, false), 0b101);
+    expect("VS motion on", producer(HwStage::Vertex, SwStage::Vertex, 0b1, true), Motion | 1);
+    expect("TES with hw.vs.motion_vectors set: no motion",
+           producer(HwStage::Vertex, SwStage::TessellationEval, 0b11, true), 0b11);
+    expect("ES (hw Export) with motion flag: no motion",
+           producer(HwStage::Export, SwStage::Vertex, 0b1, true), 0b1);
+    Shader::MotionVectors::positions_address = 0;
+    expect("VS motion flag, no positions buffer: no motion",
+           producer(HwStage::Vertex, SwStage::Vertex, 0b1, true), 0b1);
+    Shader::HwFragmentRuntimeInfo fs{};
+    fs.num_inputs = 3;
+    fs.inputs[0] = {.param_index = 4};
+    fs.inputs[1] = {.param_index = 9, .is_default = true}; // default value, not an input
+    fs.inputs[2] = {.param_index = 9, .is_default = true, .is_flat = true}; // flat passthrough
+    expect("FS inputs: default skipped, flat kept", Shader::Backend::SPIRV::AuxiliaryVaryingLocations(fs), 1U << 4 | 1U << 9);
+    fs.motion_vectors = true;
+    expect("FS motion on", Shader::Backend::SPIRV::AuxiliaryVaryingLocations(fs), Motion | 1U << 4 | 1U << 9);
+    return failures;
+}
+#endif
 
 float VsValue(u32 location, u32 comp) {
     return float(location + 1) + 0.125f * float(comp + 1);
@@ -503,7 +553,11 @@ int main() {
         {"direct: FS reads location VS never wrote (Metal refuses)", P::TriangleList, 0b1, {0, 1},
          false, true},
     };
+#ifdef BB_RECT_IFACE_BASELINE // the pre-fix emitter has no mask helpers; render cases only
     u32 failures = 0;
+#else
+    u32 failures = CheckMasks();
+#endif
     for (const auto& c : cases) {
         std::fprintf(stderr, "%s\n", c.name);
         const Result r = Run(g, c);
@@ -533,7 +587,12 @@ int main() {
                      Size * Size, ok ? "PASS" : "FAIL");
         failures += ok ? 0 : 1;
     }
-    std::fprintf(stderr, "%s: %u/%zu cases failed\n", failures ? "FAIL" : "PASS", failures,
-                 cases.size());
+#ifdef BB_RECT_IFACE_BASELINE
+    constexpr const char* mask_checks = "";
+#else
+    constexpr const char* mask_checks = " + 7 mask checks";
+#endif
+    std::fprintf(stderr, "%s: %u failures (%zu render cases%s)\n", failures ? "FAIL" : "PASS",
+                 failures, cases.size(), mask_checks);
     return failures ? 1 : 0;
 }

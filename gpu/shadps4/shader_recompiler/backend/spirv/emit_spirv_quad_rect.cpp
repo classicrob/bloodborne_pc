@@ -5,6 +5,7 @@
 #include <optional>
 #include <sirit/sirit.h>
 #include "shader_recompiler/backend/spirv/emit_spirv_quad_rect.h"
+#include "shader_recompiler/info.h"
 #include "shader_recompiler/runtime_info.h"
 
 namespace Shader::Backend::SPIRV {
@@ -347,6 +348,20 @@ u32 AuxiliaryVaryingLocations(const HwFragmentRuntimeInfo& fs_info) {
         }
     }
     if (fs_info.motion_vectors) {
+        locations |= (1U << MotionVectors::CurrentLocation) | (1U << MotionVectors::PreviousLocation);
+    }
+    return locations;
+}
+
+u32 PreRasterOutputLocations(const Info& info, const RuntimeInfo& runtime) {
+    u32 locations = 0;
+    for (u32 i = 0; i < IR::NumParams; i++) {
+        if (info.stores.GetAny(IR::Attribute::Param0 + i)) {
+            locations |= 1U << i;
+        }
+    }
+    if (info.sw_stage == SwStage::Vertex && info.hw_stage == HwStage::Vertex &&
+        runtime.hw.vs.motion_vectors && MotionVectors::positions_address != 0) {
         locations |= (1U << MotionVectors::CurrentLocation) | (1U << MotionVectors::PreviousLocation);
     }
     return locations;
