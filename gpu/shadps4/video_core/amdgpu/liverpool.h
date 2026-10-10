@@ -7,6 +7,7 @@
 
 #include <condition_variable>
 #include <deque>
+#include <memory>
 #include <coroutine>
 #include <exception>
 #include <mutex>
@@ -21,6 +22,7 @@
 #include "common/types.h"
 #include "common/unique_function.h"
 #include "video_core/amdgpu/cb_db_extent.h"
+#include "video_core/amdgpu/cmd_snapshot.h"
 #include "video_core/amdgpu/regs.h"
 
 namespace Vulkan {
@@ -93,7 +95,15 @@ struct Liverpool {
     /// submitted while the previous ones were being retired.
     struct ParseLagStats {
         u64 frames{}, samples{}, queued_sum{}, queued_max{}, idle_held_back{};
+        u64 snapshot_bytes{}, snapshot_ns{}, snapshot_ns_max{};
     } parse_lag;
+    /// bbport (macOS): graphics submissions whose command memory is a submit-time copy and not
+    /// fully parsed yet (cmd_snapshot.h), in submission order.
+    std::mutex snapshots_mutex;
+    std::deque<std::shared_ptr<CmdSnapshot>> gfx_snapshots;
+    u64 snapshot_submits{};
+    /// A stream write the PS4 command processor would see in command memory a copy hides.
+    void CheckCommandMemoryWrite(VAddr address, u64 size, const char* writer);
     static u64 HashRegisterPacket(u64 checksum, const u32* words, u32 count);
     /// `dirty` (draw-preparation scanner) records the register blocks written.
     static void ApplyGraphicsRegisterPacket(Regs& regs, const PM4Header* header, u64& checksum,
@@ -227,8 +237,12 @@ private:
 
     using CmdBuffer = std::pair<std::span<const u32>, std::span<const u32>>;
     CmdBuffer CopyCmdBuffers(std::span<const u32> dcb, std::span<const u32> ccb);
-    Task ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb, u64 seq = NoSeq);
-    Task ProcessCeUpdate(std::span<const u32> ccb);
+    /// `snapshot`/`region` (macOS): the buffer is a submit-time copy (cmd_snapshot.h).
+    Task ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb, u64 seq = NoSeq,
+                         std::shared_ptr<CmdSnapshot> snapshot = {},
+                         CmdSnapshot::Region* region = nullptr);
+    Task ProcessCeUpdate(std::span<const u32> ccb, std::shared_ptr<CmdSnapshot> snapshot = {},
+                         CmdSnapshot::Region* region = nullptr);
     template <bool is_indirect = false>
     Task ProcessCompute(std::span<const u32> acb, u32 vqid);
 

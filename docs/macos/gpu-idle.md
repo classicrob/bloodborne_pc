@@ -38,8 +38,9 @@ there.
 
 ## Not the cause (kept for the record)
 
-- **Submit-time snapshots of command memory:** not needed once the guest is no longer released
-  early.
+- **Submit-time snapshots of command memory:** the GpuIdle fix alone was not enough. A later
+  run tore on a zeroed packet with the guest only about 2 submissions ahead. Snapshots were added
+  on top (`docs/macos/command-snapshots.md`).
 - **Stage A reading command memory or `COND_EXEC` predicates before stage B's `WRITE_DATA`/`DMA_DATA`
   land:** this ordering gap is real in principle, but no such write occurred at the tear points
   (9e79075 counted zero).

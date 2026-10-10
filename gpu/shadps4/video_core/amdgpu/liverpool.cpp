@@ -174,13 +174,17 @@ void Liverpool::Process(std::stop_token stoken) {
             {
                 std::scoped_lock lk{submit_mutex};
                 if (++parse_lag.frames == 600) {
+                    const double samples = parse_lag.samples ? double(parse_lag.samples) : 1.0;
                     LOG_INFO(Render,
                              "Parse lag, last 600 frames: {} graphics submissions, queued ahead of "
-                             "the parser at submit: mean {:.1f}, max {}; GpuIdle held back {} times",
-                             parse_lag.samples,
-                             parse_lag.samples ? double(parse_lag.queued_sum) / parse_lag.samples
-                                               : 0.0,
-                             parse_lag.queued_max, parse_lag.idle_held_back);
+                             "the parser at submit: mean {:.1f}, max {}; GpuIdle held back {} "
+                             "times; command snapshots {:.1f} KiB/frame, {:.1f} us/submit mean, "
+                             "{:.1f} us max",
+                             parse_lag.samples, parse_lag.queued_sum / samples,
+                             parse_lag.queued_max, parse_lag.idle_held_back,
+                             parse_lag.snapshot_bytes / 600.0 / 1024.0,
+                             parse_lag.snapshot_ns / samples / 1000.0,
+                             parse_lag.snapshot_ns_max / 1000.0);
                     parse_lag = {};
                 }
             }
@@ -421,6 +425,19 @@ void Liverpool::NotePendingWrite(const PM4CmdWriteData& write_data, u32 num_byte
         {write_data.Address<VAddr>(), data, num_bytes, rasterizer->DrawPipeHead()});
 }
 
+void Liverpool::CheckCommandMemoryWrite(VAddr address, u64 size, const char* writer) {
+#ifdef __APPLE__
+    std::scoped_lock lk{snapshots_mutex};
+    for (const auto& snapshot : gfx_snapshots) {
+        if (!snapshot->done && snapshot->OverlapsUnparsed(address, size)) {
+            UNREACHABLE_MSG("macOS: {} to {:#x}+{:#x} targets command memory of submission {} "
+                            "not parsed yet; the parser reads the copy taken at submit",
+                            writer, address, size, snapshot->submit_number);
+        }
+    }
+#endif
+}
+
 bool Liverpool::PendingFenceValue(VAddr address, u32& value) {
     for (auto it = pending_fences.rbegin(); it != pending_fences.rend(); ++it) {
         if (rasterizer->DrawPipeReached(it->position)) {
@@ -435,11 +452,16 @@ bool Liverpool::PendingFenceValue(VAddr address, u32& value) {
     return false;
 }
 
-Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
+Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb,
+                                           std::shared_ptr<CmdSnapshot> snapshot,
+                                           CmdSnapshot::Region* region) {
     FIBER_ENTER(ccb_task_name);
 
     while (!ccb.empty()) {
         ProcessCommands();
+        if (region) {
+            region->parsed_dw = region->size_dw - static_cast<u32>(ccb.size());
+        }
 
         const auto* header = reinterpret_cast<const PM4Header*>(ccb.data());
         const u32 type = header->type;
@@ -484,8 +506,14 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
         }
         case PM4ItOpcode::IndirectBufferConst: {
             const auto* indirect_buffer = reinterpret_cast<const PM4CmdIndirectBuffer*>(header);
-            auto task =
-                ProcessCeUpdate({indirect_buffer->Address<const u32>(), indirect_buffer->ib_size});
+            const u32* ib_address = indirect_buffer->Address<const u32>();
+            const u32 ib_size = indirect_buffer->ib_size;
+            auto* ib = snapshot ? snapshot->Find(ib_address, ib_size, true) : nullptr;
+            ASSERT_MSG(!snapshot || (ib && ib->copied),
+                       "macOS: constant IB {} ({} dwords) was not captured at submit",
+                       fmt::ptr(ib_address), ib_size);
+            auto task = ib ? ProcessCeUpdate(snapshot->Words(*ib), snapshot, ib)
+                           : ProcessCeUpdate({ib_address, ib_size});
             RESUME_CE(task);
 
             while (!task.handle.done()) {
@@ -500,6 +528,9 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
                             static_cast<u32>(opcode), count);
         }
         ccb = NextPacket(ccb, header->type3.NumWords() + 1);
+    }
+    if (region) {
+        region->parsed_dw = region->size_dw;
     }
 
     FIBER_EXIT;
@@ -742,8 +773,19 @@ void ScanDcb(std::span<const u32> dcb, int depth) {
 } // namespace
 
 Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb,
-                                           u64 seq) {
+                                           u64 seq, std::shared_ptr<CmdSnapshot> snapshot,
+                                           CmdSnapshot::Region* region) {
     FIBER_ENTER(dcb_task_name);
+#ifdef __APPLE__
+    static const bool snapshot_check = EmulatorSettingsImpl::Flag("BB_CMD_SNAPSHOT_CHECK", false);
+    if (region && snapshot_check) {
+        snapshot->ReportGuestRewrites(*region);
+        if (auto* ccb_region = seq != NoSeq ? snapshot->Ccb() : nullptr) {
+            snapshot->ReportGuestRewrites(*ccb_region);
+        }
+    }
+    const bool top_level = region && region == &snapshot->Dcb();
+#endif
     // Top-level buffers enqueued for the draw preparation workers (nested IBs are not).
     Vulkan::DrawPreparation* draw_prep =
         seq != NoSeq && rasterizer ? &rasterizer->GetDrawPreparation() : nullptr;
@@ -764,13 +806,16 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
 
     if (!ccb.empty()) {
         // In case of CCB provided kick off CE asap to have the constant heap ready to use
-        ce_task = ProcessCeUpdate(ccb);
+        ce_task = snapshot ? ProcessCeUpdate(ccb, snapshot, snapshot->Ccb()) : ProcessCeUpdate(ccb);
         RESUME_GFX(ce_task);
     }
 
     const auto base_addr = reinterpret_cast<uintptr_t>(dcb.data());
     while (!dcb.empty()) {
         ProcessCommands();
+        if (region) {
+            region->parsed_dw = region->size_dw - static_cast<u32>(dcb.size());
+        }
 
         const auto* header = reinterpret_cast<const PM4Header*>(dcb.data());
         const u32 type = header->type;
@@ -1190,6 +1235,11 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 if (dma_data->dst_addr_lo == 0x3022C || !rasterizer) {
                     break;
                 }
+                if (dma_data->dst_sel == DmaDataDst::Memory ||
+                    dma_data->dst_sel == DmaDataDst::MemoryUsingL2) {
+                    CheckCommandMemoryWrite(dma_data->DstAddress<VAddr>(), dma_data->NumBytes(),
+                                            "DMA_DATA");
+                }
                 if (rasterizer->RunInOrder(&RunDmaData, dma_data, sizeof(PM4DmaData),
                                            BbToggle::PipelinedMemoryWrites) &&
                     (dma_data->dst_sel == DmaDataDst::Memory ||
@@ -1208,6 +1258,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     BbWriteLog::NoteIntent(write_data->Address<u64>(), write_data->data,
                                            (count - 2) * sizeof(u32),
                                            BbWriteLog::WriteDataIntent);
+                    CheckCommandMemoryWrite(write_data->Address<VAddr>(), (count - 2) * sizeof(u32),
+                                            "WRITE_DATA");
                     if (rasterizer->RunInOrder(&RunWriteData, header, (count + 1) * sizeof(u32),
                                                BbToggle::PipelinedMemoryWrites)) {
                         NotePendingWrite(*write_data, (count - 2) * sizeof(u32));
@@ -1249,7 +1301,15 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 if (!rasterizer) {
                     break;
                 }
-                const PM4CmdRewind* rewind = reinterpret_cast<const PM4CmdRewind*>(header);
+                if (region) {
+                    // REWIND means "refetch from memory": the rest of this buffer, and the
+                    // indirect buffers it reaches, are parsed from live guest memory.
+                    const u32 at = region->size_dw - static_cast<u32>(dcb.size());
+                    dcb = std::span{region->guest + at, dcb.size()};
+                    region->parsed_dw = region->size_dw;
+                    region = nullptr;
+                }
+                const PM4CmdRewind* rewind = reinterpret_cast<const PM4CmdRewind*>(dcb.data());
                 while (!rewind->Valid()) {
                     YIELD_GFX();
                 }
@@ -1293,8 +1353,15 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
             case PM4ItOpcode::IndirectBuffer: {
                 const auto* indirect_buffer = reinterpret_cast<const PM4CmdIndirectBuffer*>(header);
-                auto task = ProcessGraphics(
-                    {indirect_buffer->Address<const u32>(), indirect_buffer->ib_size}, {});
+                const u32* ib_address = indirect_buffer->Address<const u32>();
+                const u32 ib_size = indirect_buffer->ib_size;
+                // Live after a REWIND (region cleared): the IB is fetched now, as on the PS4.
+                auto* ib = region ? snapshot->Find(ib_address, ib_size, false) : nullptr;
+                ASSERT_MSG(!region || (ib && ib->copied),
+                           "macOS: indirect buffer {} ({} dwords) was not captured at submit",
+                           fmt::ptr(ib_address), ib_size);
+                auto task = ib ? ProcessGraphics(snapshot->Words(*ib), {}, NoSeq, snapshot, ib)
+                               : ProcessGraphics({ib_address, ib_size}, {});
                 // Tasks start suspended: the nested body (and its scan) runs on this resume.
                 g_dcb_depth = dcb_depth + 1;
                 RESUME_GFX(task);
@@ -1361,6 +1428,18 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
         }
         ce_task.handle.destroy();
     }
+#ifdef __APPLE__
+    if (region) {
+        region->parsed_dw = region->size_dw;
+    }
+    if (top_level) {
+        snapshot->done = true;
+        std::scoped_lock lk{snapshots_mutex};
+        while (!gfx_snapshots.empty() && gfx_snapshots.front()->done) {
+            gfx_snapshots.pop_front();
+        }
+    }
+#endif
 
     if (rasterizer && seq != NoSeq) {
         rasterizer->RetireSubmission(); // prepared draws live until the recording thread is past
@@ -1717,9 +1796,21 @@ Liverpool::CmdBuffer Liverpool::CopyCmdBuffers(std::span<const u32> dcb, std::sp
 void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
     auto& queue = mapped_queues[GfxQueueId];
 
+#ifdef __APPLE__
+    // The parser reads what the guest submitted, whatever it does to the memory afterwards
+    // (cmd_snapshot.h). BB_COPY_GPU_BUFFERS (top-level only, breaks REWIND) is not used here.
+    ASSERT_MSG(!EmulatorSettings.IsCopyGpuBuffers(),
+               "macOS snapshots command buffers at submit; unset BB_COPY_GPU_BUFFERS");
+    auto snapshot = CmdSnapshot::Take(dcb, ccb);
+    dcb = snapshot->Words(snapshot->Dcb());
+    if (const auto* ccb_region = snapshot->Ccb()) {
+        ccb = snapshot->Words(*ccb_region);
+    }
+#else
     if (EmulatorSettings.IsCopyGpuBuffers()) {
         std::tie(dcb, ccb) = CopyCmdBuffers(dcb, ccb);
     }
+#endif
 
     // The copy for the draw preparation workers is made before taking the queue lock, which
     // the GPU thread needs to pick up work.
@@ -1733,7 +1824,16 @@ void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
             seq = gfx_submit_seq++;
             draw_prep->Enqueue(seq, std::move(prep_submission));
         }
+#ifdef __APPLE__
+        {
+            std::scoped_lock lk{snapshots_mutex};
+            snapshot->submit_number = ++snapshot_submits;
+            gfx_snapshots.push_back(snapshot);
+        }
+        auto task = ProcessGraphics(dcb, ccb, seq, snapshot, &snapshot->Dcb());
+#else
         auto task = ProcessGraphics(dcb, ccb, seq);
+#endif
         queue.submits.emplace(task.handle);
     }
 
@@ -1741,6 +1841,9 @@ void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
     ++num_submits;
     work_retired = false;
 #ifdef __APPLE__
+    parse_lag.snapshot_bytes += snapshot->copied_bytes;
+    parse_lag.snapshot_ns += snapshot->copy_ns;
+    parse_lag.snapshot_ns_max = std::max(parse_lag.snapshot_ns_max, snapshot->copy_ns);
     ++parse_lag.samples;
     parse_lag.queued_sum += num_submits;
     parse_lag.queued_max = std::max<u64>(parse_lag.queued_max, num_submits);
