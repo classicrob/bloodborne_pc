@@ -663,7 +663,8 @@ void PatchBufferArgs(IR::Inst& inst, Info& info, const Profile& profile) {
                                 ? AmdGpu::RemapDataFormat(flags.inst_data_fmt.Value())
                                 : buffer.GetDataFmt();
         const auto soffset = IR::GetBufferSOffsetArg(&inst);
-        ASSERT_MSG(!buffer.add_tid_enable || buffer.stride == 0 || profile.subgroup_size == 64,
+        ASSERT_MSG(!buffer.add_tid_enable || buffer.stride == 0 || profile.subgroup_size == 64 ||
+                       profile.emulate_wave64,
                    "Apple GCN wave64 add_tid is not implemented for this subgroup: "
                    "shader={:#x} base={:#x} stride={} num_records={} swizzle={} "
                    "index_stride={} element_size={} subgroup_size={} flags={:#x}",

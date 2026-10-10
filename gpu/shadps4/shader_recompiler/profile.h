@@ -59,6 +59,8 @@ struct Profile {
     bool emulate_robust_buffer_access{};
     bool emulate_vertex_fetch{};
     bool repair_mul_signed_zero{};
+    /// Apple: GCN wave64 semantics emulated on 32-wide subgroups (lower_wave64_pass.cpp).
+    bool emulate_wave64{};
 
     bool operator==(const Profile&) const = default;
 };

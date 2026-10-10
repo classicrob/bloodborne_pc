@@ -352,6 +352,8 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     profile.emulate_robust_buffer_access = true;
     profile.emulate_vertex_fetch = true;
     profile.repair_mul_signed_zero = true;
+    // 32-wide subgroups: GCN wave64 semantics are emulated (lower_wave64_pass.cpp).
+    profile.emulate_wave64 = true;
 #endif
     WarmUp();
 

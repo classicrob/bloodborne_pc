@@ -83,7 +83,7 @@ u8 CanaryByte(u64 va) { return u8(Hash32(va ^ 0xC0FFEE123ull) % 255 + 1); }
 enum class SoffSrc { Inline, Sgpr };
 enum class SmemSrc { None, Imm, Sgpr };
 // Wave64 lane-semantics programs (no buffer access under test).
-enum class Wave { None, Lane, MbcntMask, Readlane, Exec1, Exec2, LoopReadFirstLane, Lds, CtrlPhi };
+enum class Wave { None, Lane, MbcntMask, Readlane, Exec1, Exec2, LoopReadFirstLane, Lds, CtrlPhi, CtrlBreak };
 
 struct Template {
     std::string name;
@@ -421,6 +421,48 @@ void AssembleCtrlPhi(Template& t) {
     t.hash = 0xc791ull ^ (u64(t.wg[0]) << 16);
 }
 
+// Divergent exit through a uniform break (Sol-2's review case), compile-only: s21 =
+// readfirstlane(LII) >> 6 (wave 0: 0, wave 1: 1); in the loop, s20 > s21 jumps to a block that
+// leaves the loop with an unconditional s_branch (structured as `if (c) { ...; break; }`), else
+// a ballot. One wave: uniform; two waves: the waves leave after different trip counts.
+void AssembleCtrlBreak(Template& t) {
+    using namespace GcnAsm;
+    Code c;
+    c.SMovLiteral(VCC_HI, 0x5eed);
+    c.VReadfirstlane(21, 0);
+    c.Sop2(32, 21, 21, Inline(6));     // s_lshr_b32 s21, s21, 6
+    c.Sop1(3, 20, Inline(0));
+    c.Sop1(3, 24, Inline(0));
+    c.Sop1(3, 25, Inline(0));
+    const size_t loop = c.words.size();
+    c.SAddU32(20, 20, Inline(1));
+    c.words.push_back(0xBF000000u | (8u << 16) | (21u << 8) | 20); // s_cmp_gt_u32 s20, s21
+    const size_t br_inner = c.words.size();
+    c.Sopp(5, 0);                      // s_cbranch_scc1 INNER (patched)
+    c.VCmpNeU32(Inline(0), 0);
+    c.SBcnt1B64(23, VCC_LO);
+    c.SAddU32(24, 24, 23);
+    c.SCmpLtU32Literal(20, 8);
+    c.SCbranchScc1To(loop);
+    const size_t br_exit0 = c.words.size();
+    c.Sopp(2, 0);                      // s_branch EXIT (patched)
+    const size_t inner = c.words.size();
+    c.Sop1(3, 25, Inline(7));          // INNER: s_mov_b32 s25, 7
+    const size_t br_exit1 = c.words.size();
+    c.Sopp(2, 0);                      // s_branch EXIT (patched): leaves the loop
+    const size_t exit_at = c.words.size();
+    c.words[br_inner] |= u32(int32_t(inner) - int32_t(br_inner + 1)) & 0xFFFF;
+    c.words[br_exit0] |= u32(int32_t(exit_at) - int32_t(br_exit0 + 1)) & 0xFFFF;
+    c.words[br_exit1] |= u32(int32_t(exit_at) - int32_t(br_exit1 + 1)) & 0xFFFF;
+    c.SAddU32(24, 24, 25);
+    c.VMov(1, 24);
+    c.VLshlrevB32(2, Inline(2), 0);
+    c.Mubuf(BUFFER_STORE_DWORD, Code::BufFields{.offen = true, .vaddr = 2, .vdata = 1, .srsrc = 4});
+    c.SEndpgm();
+    t.code = std::move(c.words);
+    t.hash = 0xb4eaull ^ (u64(t.wg[0]) << 16);
+}
+
 void AssembleStage(Template& t) {
     using namespace GcnAsm;
     Code c;
@@ -548,6 +590,10 @@ void Assemble(Template& t) {
     }
     if (t.vertex && !t.compile_only) {
         AssembleVertex(t);
+        return;
+    }
+    if (t.compile_only && t.wave == Wave::CtrlBreak) {
+        AssembleCtrlBreak(t);
         return;
     }
     if (t.compile_only && t.wave == Wave::CtrlPhi) {
@@ -1379,6 +1425,31 @@ void AddWaveCases() {
             for (u32 l = 0; l < threads; ++l) SetLane(j, l, value(l), 0);
         }
     }
+    // Small and partial waves (1, 16, 32 threads; 65 = a full wave plus a 1-lane wave): a wave with
+    // 32 or fewer invocations has no lane in its high half, yet its ballot reads both mask words,
+    // which must still be zero. Only ballot/exec controls: v_readlane of a lane that was never
+    // launched reads an uninitialised VGPR on GCN.
+    for (u32 x : {1u, 16u, 32u, 65u}) {
+        const std::string shape = " [" + std::to_string(x) + "x1]";
+        for (auto [name, w] : {std::pair{"wave: v_mbcnt(-1) lane id + VOPC ballot + s_bcnt1", Wave::Lane},
+                               std::pair{"wave: v_mbcnt over VCC + s_mov_b64 vcc + v_cndmask", Wave::MbcntMask}}) {
+            Template t;
+            t.name = std::string(name) + shape;
+            t.op.kind = GCN_LOAD;
+            t.wave = w;
+            t.wg = {x, 1, 1};
+            const u32 tt = AddTemplate(t);
+            for (const M& m : masks) {
+                const std::string mn = m.name;
+                if (mn != "all" && mn != "upper32" && mn != "lanes5+40" && mn != "lower32") continue;
+                Job& j = NewJob("wave64", tt, RawV(64), 0);
+                j.label += " ballot=" + mn;
+                for (u32 l = 0; l < x; ++l) {
+                    SetLane(j, l, value(l), 0, {u32((l < 64 ? m.mask : rotl(m.mask, 7)) >> (l % 64) & 1), 0, 0, 0});
+                }
+            }
+        }
+    }
     // Loop-carried divergence: one wave -> exact; two waves -> the loop exit differs per wave, so a
     // ballot in the loop body cannot be exchanged between barriers (loud by design).
     for (const std::array<u32, 3>& wg : {std::array<u32, 3>{64, 1, 1}, std::array<u32, 3>{128, 1, 1}}) {
@@ -1489,6 +1560,21 @@ void AddWaveCases() {
                  std::to_string(x) + "x1] (compile)";
         t.op.kind = GCN_LOAD;
         t.wave = Wave::CtrlPhi;
+        t.compile_only = true;
+        t.wg = {x, 1, 1};
+        t.expect_loud = x > 64;
+        const u32 tt = AddTemplate(t);
+        NewJob("wave64", tt, RawV(64), 0);
+    }
+    // Divergent exit hidden behind a uniform break condition (if (c) { break; }), compile-only.
+    for (u32 x : {64u, 128u}) {
+#ifndef BB_MIRROR_PROFILE_WAVE64
+        if (x > 64) continue;
+#endif
+        Template t;
+        t.name = "wave: loop { if (s20 > readfirstlane(LII)>>6) { break } ballot } [" + std::to_string(x) + "x1] (compile)";
+        t.op.kind = GCN_LOAD;
+        t.wave = Wave::CtrlBreak;
         t.compile_only = true;
         t.wg = {x, 1, 1};
         t.expect_loud = x > 64;
