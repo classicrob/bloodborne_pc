@@ -453,22 +453,31 @@ void VideoOutDriver::Flip(const Request& req) {
             const double draws_per_frame = frames ? double(all_draws - window_draws) / frames : 0.0;
             window_draws = all_draws;
             window_gpu_us = gpu_us;
+            // Shared wait totals stay cumulative: BB_PERF independently samples them per flip.
+            static u64 previous_waits[7]{};
+            const auto wait_delta = [&](const auto& counter, unsigned index) {
+                const u64 current = counter.load(std::memory_order_relaxed);
+                const u64 delta = current - previous_waits[index];
+                previous_waits[index] = current;
+                return delta;
+            };
             std::printf("Frame stats: %.1f FPS, worst frame %.1f ms (vblank %u Hz); "
                         "%u shader/pipeline compiles, %.1f ms; %llu recorder syncs; "
                         "%.0f write faults/s, %lld hot pages; GPU thread %.2f us/draw, "
-                        "%.0f draws/frame, idle %.1f%%; blocked: recorder %.1f%%, host copies "
-                        "%.1f%% (%.0f/frame), copy threads %.1f%%, GPU ticks %.1f%%; "
+                        "%.0f draws/frame, idle %.1f%%; blocked: recorder %.1f%%, deferred signals "
+                        "%.1f%%, copy record %.1f%% (%.0f/frame), copy workers %.1f%%, GPU ticks %.1f%%; "
                         "reduced-size draws %.0f/frame of %.0f in the scene\n",
                         frames / window, worst_ms, EmulatorSettings.GetVblankFrequency(), compiles,
                         compile_ns / 1e6, static_cast<unsigned long long>(direct),
                         faults / window, static_cast<long long>(BbStats::hot_pages.load()),
                         us_per_draw, draws_per_frame,
-                        BbStats::gpu_idle_ns.exchange(0) / (window * 1e7),
-                        BbStats::sync_recording_ns.exchange(0) / (window * 1e7),
-                        BbStats::host_copies_wait_ns.exchange(0) / (window * 1e7),
-                        frames ? double(BbStats::host_copy_waits.exchange(0)) / frames : 0.0,
-                        BbStats::copy_threads_wait_ns.exchange(0) / (window * 1e7),
-                        BbStats::tick_wait_ns.exchange(0) / (window * 1e7),
+                        wait_delta(BbStats::gpu_idle_ns, 0) / (window * 1e7),
+                        wait_delta(BbStats::sync_recording_ns, 1) / (window * 1e7),
+                        wait_delta(BbStats::deferred_signals_wait_ns, 2) / (window * 1e7),
+                        wait_delta(BbStats::host_copy_record_wait_ns, 3) / (window * 1e7),
+                        frames ? double(wait_delta(BbStats::host_copy_waits, 4)) / frames : 0.0,
+                        wait_delta(BbStats::copy_threads_wait_ns, 5) / (window * 1e7),
+                        wait_delta(BbStats::tick_wait_ns, 6) / (window * 1e7),
                         frames ? double(BbStats::reduced_draws.exchange(0)) / frames : 0.0,
                         frames ? double(BbStats::scene_draws.exchange(0)) / frames : 0.0);
             // Frame pacing: spread of the guest flip intervals (judder that the mean hides).

@@ -50,7 +50,7 @@ bool Flag(const char* name) {
 std::atomic<uint64_t> recorder_cpu{0}, recorder_chunks{0}, import_ns{0}, import_count{0};
 struct Counters {
     uint64_t liverpool = 0, recorder = 0, chunks = 0, idle = 0, fences = 0,
-             copies = 0, copy_workers = 0, record_wait = 0, import = 0, imports = 0;
+             deferred_signals = 0, copy_record = 0, copy_workers = 0, record_wait = 0, import = 0, imports = 0;
 };
 Counters ReadCounters() {
     Counters c;
@@ -63,7 +63,8 @@ Counters ReadCounters() {
     c.chunks = recorder_chunks.load(std::memory_order_relaxed);
     c.idle = BbStats::gpu_idle_ns.load(std::memory_order_relaxed);
     c.fences = BbStats::tick_wait_ns.load(std::memory_order_relaxed);
-    c.copies = BbStats::host_copies_wait_ns.load(std::memory_order_relaxed);
+    c.deferred_signals = BbStats::deferred_signals_wait_ns.load(std::memory_order_relaxed);
+    c.copy_record = BbStats::host_copy_record_wait_ns.load(std::memory_order_relaxed);
     c.copy_workers = BbStats::copy_threads_wait_ns.load(std::memory_order_relaxed);
     c.record_wait = BbStats::sync_recording_ns.load(std::memory_order_relaxed);
     c.import = import_ns.load(std::memory_order_relaxed);
@@ -90,7 +91,7 @@ struct Reporter {
         if (!path || !*path) Fail("BB_PERF=1 requires BB_PERF_OUT (a new JSONL file)");
         file = std::fopen(path, "wx");
         if (!file) Fail("cannot create BB_PERF_OUT (it must not already exist)");
-        std::fprintf(file, "{\"type\":\"schema\",\"version\":2,\"window_seconds\":5,\"perturbed\":%s,"
+        std::fprintf(file, "{\"type\":\"schema\",\"version\":3,\"window_seconds\":5,\"perturbed\":%s,"
             "\"gpu_source\":\"first and last timestamp of each submission (tests/macos_perf/timestamps.sh)\","
             "\"gpu_busy_union\":\"union of submission spans on the GPU clock, both streams\","
             "\"phases\":\"%s\"}\n", phases ? "true" : "false",
@@ -354,17 +355,25 @@ void Flip() {
     ++report.flips;
     if (report.last_flip != Clock::time_point{}) {
         report.Add("guest_flip_interval_ms", std::chrono::duration<double, std::milli>(now - report.last_flip).count());
-        const auto delta = [](uint64_t now, uint64_t previous) { return double(now - previous) / 1e6; };
-        report.Add("liverpool_cpu_ms", delta(c.liverpool, report.previous.liverpool));
-        report.Add("recorder_chunk_cpu_ms", delta(c.recorder, report.previous.recorder));
-        report.Add("liverpool_idle_wall_ms", delta(c.idle, report.previous.idle));
-        report.Add("fence_wait_wall_ms", delta(c.fences, report.previous.fences));
-        report.Add("host_copy_wait_wall_ms", delta(c.copies, report.previous.copies));
-        report.Add("copy_worker_wait_wall_ms", delta(c.copy_workers, report.previous.copy_workers));
-        report.Add("record_sync_wait_wall_ms", delta(c.record_wait, report.previous.record_wait));
-        report.Add("import_growth_wait_wall_ms", delta(c.import, report.previous.import));
-        report.Add("import_growth_wait_count", double(c.imports - report.previous.imports));
-        report.Add("recorder_chunk_count", double(c.chunks - report.previous.chunks));
+        const auto delta = [](const char* name, uint64_t now, uint64_t previous) {
+            if (now < previous) {
+                std::fprintf(stderr, "macOS performance measurement: counter %s went backwards: "
+                                     "another consumer reset it\n", name);
+                std::abort();
+            }
+            return now - previous;
+        };
+        report.Add("liverpool_cpu_ms", delta("liverpool", c.liverpool, report.previous.liverpool) / 1e6);
+        report.Add("recorder_chunk_cpu_ms", delta("recorder", c.recorder, report.previous.recorder) / 1e6);
+        report.Add("liverpool_idle_wall_ms", delta("idle", c.idle, report.previous.idle) / 1e6);
+        report.Add("fence_wait_wall_ms", delta("fences", c.fences, report.previous.fences) / 1e6);
+        report.Add("deferred_signal_wait_wall_ms", delta("deferred_signals", c.deferred_signals, report.previous.deferred_signals) / 1e6);
+        report.Add("host_copy_record_wait_wall_ms", delta("copy_record", c.copy_record, report.previous.copy_record) / 1e6);
+        report.Add("copy_worker_wait_wall_ms", delta("copy_workers", c.copy_workers, report.previous.copy_workers) / 1e6);
+        report.Add("record_sync_wait_wall_ms", delta("record_wait", c.record_wait, report.previous.record_wait) / 1e6);
+        report.Add("import_growth_wait_wall_ms", delta("import", c.import, report.previous.import) / 1e6);
+        report.Add("import_growth_wait_count", delta("imports", c.imports, report.previous.imports));
+        report.Add("recorder_chunk_count", delta("chunks", c.chunks, report.previous.chunks));
     }
     report.previous = c;
     report.last_flip = now;

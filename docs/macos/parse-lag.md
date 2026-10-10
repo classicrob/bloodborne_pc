@@ -94,8 +94,15 @@ remove `GpuIdle` retirement checks to reduce a queue-depth number.
   load. Native host or Rosetta loop optimization comes after separating actual
   parser CPU from compilation and downstream waiting.
 
+The accompanying measurement change implements the wait-counter split and the
+stage-B label above. It adds no clock reads or waits. `BB_PERF` schema 3 reports
+deferred-signal and copy-record waits separately. Frame stats now take deltas
+without resetting these shared counters: resetting them corrupted simultaneous
+BB_PERF deltas. A backwards counter now fails loudly. The other proposed counters
+and scheduling changes remain future work.
+
 Source audit: `liverpool.cpp` Process/SubmitGfx/ProcessCeUpdate;
 `vk_rasterizer.cpp` Draw/OnSubmit/PrintPipeStats; `vk_draw_pipe.h` Drain/Run;
 `vk_pipeline_cache.cpp` GetProgram/GetGraphicsPipeline/GetComputePipeline;
 `vk_scheduler.cpp` WaitDeferredSignals/WaitHostCopies; Apple GetArena in
-`buffer_cache.cpp`. Analysis only: no renderer edits or new test/game launches.
+`buffer_cache.cpp`. The measurements above come from existing logs; no new game runs were made for this analysis.

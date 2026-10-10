@@ -119,8 +119,9 @@ inline std::atomic<std::uint64_t> gpu_idle_ns{0};
 /// Draws recorded into the reduced scene targets, and draws after the scene started.
 inline std::atomic<std::uint64_t> reduced_draws{0}, scene_draws{0};
 /// Wall time spent blocked in the scheduler (ns): waiting for the recording thread to drain,
-/// for host copies before a submission or fence, and for GPU ticks.
-inline std::atomic<std::uint64_t> sync_recording_ns{0}, host_copies_wait_ns{0}, tick_wait_ns{0},
+/// for deferred signals, host-copy recording, copy workers, and GPU ticks.
+inline std::atomic<std::uint64_t> sync_recording_ns{0}, deferred_signals_wait_ns{0},
+    host_copy_record_wait_ns{0}, tick_wait_ns{0},
     copy_threads_wait_ns{0}, host_copy_waits{0};
 struct WaitTimer {
     std::atomic<std::uint64_t>& total;

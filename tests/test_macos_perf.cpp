@@ -7,6 +7,7 @@
 #define NDEBUG
 #define BB_RESTORE_TEST_ASSERTS
 #endif
+#include "bbport_toggles.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #ifdef BB_RESTORE_TEST_ASSERTS
@@ -52,6 +53,7 @@ static void Env(const char* perf, const char* out, const char* phases) {
         else unsetenv(name);
     }
     unsetenv("BB_GPU_PROFILE");
+    setenv("BB_FRAME_STATS", "1", 1);
 }
 static std::vector<std::string> Lines(const std::string& path) {
     std::ifstream file(path);
@@ -82,6 +84,9 @@ static void Run(int frames) {
             Vulkan::Scheduler::PerfScope upscaler{scheduler, BbPerf::Phase::Upscaler};
         }
         scheduler.Flush();
+        BbStats::deferred_signals_wait_ns.fetch_add(2000000);
+        BbStats::host_copy_record_wait_ns.fetch_add(3000000);
+        BbStats::copy_threads_wait_ns.fetch_add(5000000);
         BbPerf::Flip();
     }
     scheduler.Finish();
@@ -120,6 +125,16 @@ int main() {
         setenv("BB_GPU_PROFILE", "1", 1);
         (void)BbPerf::Enabled();
     })));
+    // A consumer resetting a cumulative total must fail instead of producing an underflow.
+    const std::string reset = dir + "/reset.jsonl";
+    assert(Aborted(InChild([&] {
+        Env("1", reset.c_str(), nullptr);
+        BbStats::deferred_signals_wait_ns.store(1000000);
+        BbPerf::Flip();
+        BbStats::deferred_signals_wait_ns.store(0);
+        BbPerf::Flip();
+    })));
+    std::remove(reset.c_str());
     // Off: no file, no measurement, the hooks still run.
     assert(Passed(InChild([] { Env("0", nullptr, nullptr); assert(!BbPerf::Enabled()); Run(2); })));
 
@@ -130,6 +145,7 @@ int main() {
     auto lines = Lines(plain);
     assert(lines.size() == 3); // schema, queue, final window
     assert(Has(lines[0], "\"type\":\"schema\"") && Has(lines[0], "\"perturbed\":false"));
+    assert(Number(lines[0], "version") == 3);
     assert(Has(lines[1], "\"type\":\"queue\"") && Has(lines[1], "\"present\":false"));
     assert(Has(lines[2], "\"final\":true") && Has(lines[2], "\"perturbed\":false"));
     assert(Number(lines[2], "flips") == Frames);
@@ -139,6 +155,13 @@ int main() {
     assert(Has(lines[2], "\"gpu_main_submission_ms\":{\"n\":" + std::to_string(2 * Frames + 1)));
     assert(Has(lines[2], "\"guest_flip_interval_ms\":{\"n\":" + std::to_string(Frames - 1)));
     assert(!Has(lines[2], "gpu_scene_ms"));
+    for (const char* name : {"deferred_signal_wait_wall_ms", "host_copy_record_wait_wall_ms",
+                             "copy_worker_wait_wall_ms"})
+        assert(Has(lines[2], std::string("\"") + name + "\":{\"n\":" + std::to_string(Frames - 1)));
+    assert(!Has(lines[2], "\"host_copy_wait_wall_ms\""));
+    assert(Number(lines[2].substr(lines[2].find("\"deferred_signal_wait_wall_ms\"")), "mean") == 2);
+    assert(Number(lines[2].substr(lines[2].find("\"host_copy_record_wait_wall_ms\"")), "mean") == 3);
+    assert(Number(lines[2].substr(lines[2].find("\"copy_worker_wait_wall_ms\"")), "mean") >= 5);
 
     // Phases: each phase change submits. Per frame: Scene (mark + flush), Post, Upscaler,
     // back to Post on scope exit, then the explicit flush (nothing new): 4 submissions.

@@ -12,7 +12,9 @@ extra submissions, no file. `tools/macos/perf_run.sh` drives the tracked product
 | `BB_PERF_PHASES` | `0`/unset, `1` | One submission per phase (below). Requires `BB_PERF=1`. |
 
 `BB_PERF` together with `BB_GPU_PROFILE` aborts. `BB_GPU_PROFILE=1` alone aborts on macOS
-(see the next section).
+(see the next section). `BB_FRAME_STATS=1` can run alongside `BB_PERF`: both take
+their own deltas from cumulative wait counters. BB_PERF aborts if a counter goes
+backwards, so another consumer cannot silently corrupt these measurements.
 
 ## GPU timestamps on MoltenVK: what is valid
 
@@ -78,7 +80,7 @@ This is worth reporting to MoltenVK together with the push-descriptor `OpArrayLe
 
 `BB_PERF_OUT` is JSONL. Its records are:
 
-- `{"type":"schema","version":2,"perturbed":…}` is written once.
+- `{"type":"schema","version":3,"perturbed":…}` is written once.
 - `{"type":"queue","present":…,"timestamp_valid_bits":…,"timestamp_period_ns":…}` is written
   once per scheduler.
 - `{"type":"window",…}` is written every 5 s at a guest flip. A last record with
@@ -102,9 +104,18 @@ A window holds:
   - Per guest flip: `guest_flip_interval_ms` (includes pacing and blocking),
     `liverpool_cpu_ms` (Mach thread CPU of the GPU command thread), `recorder_chunk_cpu_ms`
     and `recorder_chunk_count`, and the wall time spent waiting:
-    `liverpool_idle_wall_ms`, `fence_wait_wall_ms`, `host_copy_wait_wall_ms`,
+    `liverpool_idle_wall_ms`, `fence_wait_wall_ms`, `deferred_signal_wait_wall_ms`,
+    `host_copy_record_wait_wall_ms`,
     `copy_worker_wait_wall_ms`, `record_sync_wait_wall_ms`, `import_growth_wait_wall_ms`
     and `import_growth_wait_count`.
+  - `deferred_signal_wait_wall_ms` measures `WaitDeferredSignals`: waiting for queued
+    guest signals to finish, including recording, prerequisite copies and the signal callback.
+    `host_copy_record_wait_wall_ms` measures only the first part of `WaitHostCopies`,
+    until the recording thread has issued the host-copy work. `copy_worker_wait_wall_ms`
+    measures the subsequent `BbCopy::WaitAsync` call in `WaitHostCopies`; worker waits
+    inside `WaitDeferredSignals` remain part of the deferred-signal total. These are wall
+    durations, not CPU time or isolated memcpy cost. Version 2 combined the first two
+    metrics as `host_copy_wait_wall_ms`; version 3 separates them.
   - Only with `BB_PERF_PHASES=1`: `gpu_scene_ms`, `gpu_post_ms`, `gpu_upscaler_ms` and
     `gpu_frame_work_ms`, one sample per guest frame. A frame's last phase is recorded when
     the next frame's first submission is read.

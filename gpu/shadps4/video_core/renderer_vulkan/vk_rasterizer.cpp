@@ -855,7 +855,7 @@ void Rasterizer::PrintPipeStats() {
     const double cycles = double(tsc - last_tsc);
     const u64 busy = draw_pipe->busy_cycles.load(std::memory_order_relaxed);
     std::printf("Draw pipe: %.0f draws/s pipelined, %.0f drains/s that waited, stage A waited "
-                "%.1f%%, stage B busy %.1f%%\n",
+                "%.1f%%, stage B handler elapsed %.1f%%\n",
                 (draw_pipe->packets - last_packets) / seconds,
                 (draw_pipe->drains - last_drains) / seconds,
                 100.0 * (draw_pipe->drain_cycles - last_drain_cycles) / cycles,

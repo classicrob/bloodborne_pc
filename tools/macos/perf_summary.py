@@ -24,8 +24,8 @@ def main():
     records = [json.loads(line) for line in lines]
     schema = [r for r in records if r.get('type') == 'schema']
     windows = [r for r in records[after:] if r.get('type') == 'window']
-    if len(schema) != 1 or schema[0].get('version') != 2:
-        sys.exit('perf_summary: expected exactly one version-2 schema record')
+    if len(schema) != 1 or schema[0].get('version') != 3:
+        sys.exit('perf_summary: expected exactly one version-3 schema record')
     if not windows:
         sys.exit('perf_summary: no window records (run shorter than 5 s, or killed before the first)')
     perturbed = schema[0]['perturbed']
