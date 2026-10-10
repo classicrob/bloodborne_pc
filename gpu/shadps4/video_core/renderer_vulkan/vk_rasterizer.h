@@ -126,12 +126,6 @@ public:
     /// Stage A: guest memory the recording thread will write for work handed to it (storage
     /// buffers, DMA, WriteData, fences); constants overlapping it are bound there, not copied here.
     void NotePendingGpuWrite(VAddr address, u64 size);
-    /// Stage A: whether a write noted above that the recording thread has not run yet overlaps.
-    bool PendingWriteOverlaps(VAddr address, u64 size);
-    /// Whether the GPU has finished the work of `tick` (a value Flush() returned).
-    [[nodiscard]] bool IsTickFree(u64 tick) {
-        return scheduler.IsFree(tick);
-    }
     /// Before a guest-visible write: fences deferred earlier are written first.
     void WaitDeferredSignals() {
         scheduler.WaitDeferredSignals();
@@ -517,6 +511,7 @@ private:
     u64 proxy_samples = 0; ///< texture bindings that read a scene proxy (statistics)
     float sampler_lod_bias = 0.0f; ///< bbport: extra bias of this draw's samplers
     bool scene_debug_frame = false; ///< BB_SCENE_DEBUG: this frame's passes are printed
+    bool PendingWriteOverlaps(VAddr address, u64 size);
     /// Stage B: the ring bindings of the stages of the packet being recorded.
     struct RingStage {
         const Shader::Info* info;

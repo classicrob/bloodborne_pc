@@ -82,25 +82,6 @@ struct Liverpool {
     void NotePendingFences(const auto& event);
     bool PendingFenceValue(VAddr address, u32& value);
     void NotePendingWrite(const struct PM4CmdWriteData& write_data, u32 num_bytes);
-    /// bbport (macOS): the GPU command thread reads command memory and COND_EXEC predicates
-    /// ahead of the draw recording thread, which performs the stream's memory writes. Like the
-    /// PS4 command processor it must see every write from earlier in the stream first
-    /// (docs/macos/pm4-write-ordering.md).
-    std::vector<const std::span<const u32>*> gfx_chain; ///< unparsed rest of each active buffer
-    struct PendingDma {
-        VAddr begin, end;
-        u64 tick; ///< flush holding it (0: not flushed yet); done once the GPU passed it
-    };
-    std::vector<PendingDma> pending_dma_writes; ///< DMA_DATA destinations the GPU may not have written
-    struct CommandMemorySyncStats {
-        u64 drains{}, gpu_waits{}, drain_ns{}, gpu_wait_ns{}, frames{};
-    } command_memory_syncs, command_memory_window;
-    /// Before the GPU command thread reads [address, address + size): lets pending stream
-    /// writes to it land (`reason`: PM4 opcode or DrawPipe reason, for the drain statistics).
-    void SyncCommandMemory(VAddr address, u64 size, u32 reason, const char* reader);
-    /// After handing a WRITE_DATA/DMA_DATA on: syncs at once if it targets unparsed commands.
-    void NoteCommandMemoryWrite(VAddr address, u64 size, bool dma, u32 reason, const char* writer);
-    void ReportCommandMemorySyncs();
     /// bbport: running checksum of graphics-register packets (see ApplyGraphicsRegisterPacket).
     u64 gfx_reg_checksum{};
     /// Top-level graphics submissions, numbered for the draw preparation workers.
