@@ -302,7 +302,12 @@ void Scheduler::RecorderThread(std::stop_token stoken) {
             recorder_busy = true;
         }
         // current_cmdbuf only changes after SyncRecording(), which waits for this thread.
-        chunk->Execute(current_cmdbuf);
+        {
+#ifdef __APPLE__
+            BbPerf::RecorderTimer perf_timer;
+#endif
+            chunk->Execute(current_cmdbuf);
+        }
         {
             std::scoped_lock lk{recorder_mutex};
             free_chunks.push_back(std::move(chunk));
@@ -380,6 +385,9 @@ void Scheduler::AllocateWorkerCommandBuffers() {
 
     current_cmdbuf = command_pool.Commit();
     Check(current_cmdbuf.begin(begin_info));
+#ifdef __APPLE__
+    if (perf) perf->Begin(current_cmdbuf, perf_phase, perf_frame);
+#endif
 
     // Invalidate dynamic state so it gets applied to the new command buffer.
     dynamic_state.Invalidate();
@@ -418,6 +426,9 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
     SyncRecording();
     // Guest memory copies into staging read by this submission (copy threads).
     WaitHostCopies();
+#ifdef __APPLE__
+    if (perf) perf->End(current_cmdbuf);
+#endif
     Check(current_cmdbuf.end());
 
     const vk::Semaphore timeline = work_semaphore.Handle();
@@ -449,6 +460,12 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
     ImGui::Core::TextureManager::Submit();
     auto submit_result = instance.GetGraphicsQueue().submit(submit_info, info.fence);
     ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost, "Device lost during submit");
+#ifdef __APPLE__
+    if (perf) {
+        Check(submit_result);
+        perf->Submitted(signal_value);
+    }
+#endif
 
     work_semaphore.Refresh();
     AllocateWorkerCommandBuffers();
@@ -456,6 +473,31 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
     // Apply pending operations
     PopPendingOperations();
 }
+
+#ifdef __APPLE__
+void Scheduler::InitPerf(bool present) {
+    if (!BbPerf::Enabled()) return;
+    ASSERT(!perf);
+    perf = std::make_unique<BbPerf::GpuStream>(instance.GetPhysicalDevice(), instance.GetDevice(),
+        instance.GetGraphicsQueueFamilyIndex(), work_semaphore.Handle(), present);
+    perf_phase = present ? BbPerf::Phase::Present : BbPerf::Phase::Scene;
+    perf->Begin(current_cmdbuf, perf_phase, perf_frame);
+}
+// Labels the following work. MoltenVK timestamps inside a command buffer do not attribute work,
+// so with BB_PERF_PHASES a new phase starts a new submission; otherwise only the label changes.
+// Called by the scheduler's current owner (draw-pipe stage B, or stage A after the drain), the
+// same thread that already submits from these hooks (the upscaler's Finish()).
+void Scheduler::PerfMark(BbPerf::Phase phase, u64 frame) {
+    if (!perf) return;
+    const bool boundary = phase != perf_phase || (frame && frame != perf_frame);
+    perf_phase = phase;
+    if (frame) perf_frame = frame;
+    if (boundary && BbPerf::Phases()) {
+        EndRendering();
+        Flush();
+    }
+}
+#endif
 
 void Scheduler::PriorityPendingOpsThread(std::stop_token stoken) {
     Common::SetCurrentThreadName("shadPS4:GpuSchedPriorityPendingOpsRunner");

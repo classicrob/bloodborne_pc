@@ -504,6 +504,7 @@ const Buffer* BufferCache::GetArena(u64 first_block, u64 last_block) {
             scheduler.Finish();
             const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
                 std::chrono::steady_clock::now() - begin).count();
+            BbPerf::ImportWait(static_cast<u64>(elapsed) * 1000);
             ++import_overlap_waits;
             std::fprintf(stderr,
                 "macOS host import overlap wait #%llu frame %llu range %#llx+%#llx, %lld us\n",

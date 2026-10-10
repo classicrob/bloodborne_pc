@@ -2,6 +2,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
+#ifdef __APPLE__
+#include "macos_perf.h"
+#endif
 
 #include <atomic>
 #include <chrono>
@@ -674,6 +677,21 @@ public:
     /// `threaded_recording`: Vulkan commands passed to Record() are recorded by a worker thread.
     explicit Scheduler(const Instance& instance, bool threaded_recording = false);
     ~Scheduler();
+#ifdef __APPLE__
+    void InitPerf(bool present);
+    void PerfMark(BbPerf::Phase phase, u64 frame = 0);
+    class PerfScope {
+        Scheduler& scheduler;
+        BbPerf::Phase previous;
+        bool active;
+    public:
+        PerfScope(Scheduler& scheduler, BbPerf::Phase phase)
+            : scheduler{scheduler}, previous{scheduler.perf_phase}, active{bool(scheduler.perf)} {
+            if (active) scheduler.PerfMark(phase);
+        }
+        ~PerfScope() { if (active) scheduler.PerfMark(previous); }
+    };
+#endif
 
     /// Sends the current execution context to the GPU
     /// and increments the scheduler timeline semaphore.
@@ -896,6 +914,11 @@ private:
     DynamicState dynamic_state;
     SubmitFunc on_submit{};
     vk::CommandBuffer current_cmdbuf;
+#ifdef __APPLE__
+    std::unique_ptr<BbPerf::GpuStream> perf;
+    BbPerf::Phase perf_phase = BbPerf::Phase::Scene;
+    u64 perf_frame = 0;
+#endif
     std::condition_variable_any event_cv;
     struct PendingOp {
         Common::UniqueFunction<void> callback;

@@ -350,6 +350,9 @@ bool TemporalUpscaler::OnFrameStart() {
 }
 
 void TemporalUpscaler::OnDispatch(u64 cs_hash) {
+#ifdef __APPLE__
+    if (cs_hash == trigger_hash) scheduler.PerfMark(BbPerf::Phase::Post);
+#endif
     if (cs_hash != trigger_hash || done_this_frame || failed || Scaled()) {
         return;
     }
@@ -986,6 +989,9 @@ bool TemporalUpscaler::RecordReactive(vk::ImageView color_view) {
 }
 
 void TemporalUpscaler::Run() {
+#ifdef __APPLE__
+    Scheduler::PerfScope perf_scope{scheduler, BbPerf::Phase::Upscaler};
+#endif
     if (auto* profiler = GpuProfiler::Get()) {
         const char* label = BbSettings::Get().upscaler == BbSettings::UpscalerTaa
             ? "upscaler Run (TAA)" : "upscaler Run (FSR)";
@@ -1511,6 +1517,9 @@ void TemporalUpscaler::RunUiOnly(VideoCore::ImageId color_id, VideoCore::ImageId
 }
 
 void TemporalUpscaler::RunScaled() {
+#ifdef __APPLE__
+    Scheduler::PerfScope perf_scope{scheduler, BbPerf::Phase::Upscaler};
+#endif
     if (auto* profiler = GpuProfiler::Get()) {
         const char* label = BbSettings::Get().upscaler == BbSettings::UpscalerTaa
             ? "upscaler RunScaled (TAA)" : "upscaler RunScaled (FSR)";
