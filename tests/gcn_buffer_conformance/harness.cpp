@@ -93,6 +93,7 @@ struct Template {
     u32 soff_inline = 0;
     SmemSrc smem = SmemSrc::None;
     u32 smem_imm = 0;      // dwords
+    std::array<u32, 4> smem_pick{0, 1, 2, 3}; // which SDST dwords are copied to v10..v13
     bool combo = false;    // s_buffer_load_dword (imm) + buffer_load_dword on the same V#
     Wave wave = Wave::None;
     bool vertex = false;   // vertex shader + fetch shader (s_swappc_b64), indexed draw
@@ -148,6 +149,7 @@ struct Job {
     u32 sgpr_soff = 0, smem_sgpr = 0;
     std::vector<u32> init_words; // written at the V# base after the pattern fill
     bool quarter = false;        // render: only the top-left 8x8 quarter is covered
+    bool force_push = false;     // moltenvk-push: bind with push descriptors whatever the default
     s32 vertex_offset = 0; // vertex jobs: drawIndexed vertexOffset (lanes hold index + offset)
     u32 start_unified = 0, start_buffer = 0; // Backend::Bindings at which this stage starts
     std::array<Lane, kLanes> lanes{};
@@ -255,6 +257,10 @@ void AssembleWave(GcnAsm::Code& c, Wave w) {
         c.Sop1(3, 20, Inline(0));
         c.Sop1(3, 24, Inline(0));
         c.VReadfirstlane(21, 3);
+        c.Sop2(14, 21, 21, LITERAL); // s_and_b32 s21, s21, 0xF000 | 0x1000 floor: never 0 (bounded loop)
+        c.words.push_back(0xF000u);
+        c.Sop2(16, 21, 21, LITERAL); // s_or_b32 s21, s21, 0x1000
+        c.words.push_back(0x1000u);
         const size_t loop = c.words.size();
         c.VCmpNeU32(Inline(0), 5);
         c.SBcnt1B64(22, VCC_LO);
@@ -445,13 +451,13 @@ void Assemble(Template& t) {
     } else if (t.wave != Wave::None) {
         AssembleWave(c, t.wave);
     } else if (smem || t.combo) {
-        for (u32 i = 0; i < 4; ++i) c.SMovLiteral(16 + i, SgprMarker + i);
+        for (u32 i = 0; i < std::max<u32>(4, smem ? t.op.ncomp : 1); ++i) c.SMovLiteral(16 + i, SgprMarker + i);
     }
     if (t.wave != Wave::None) {
     } else if (smem) {
         c.SBufferLoad(t.op.ncomp, 16, 0, t.smem == SmemSrc::Imm, t.smem == SmemSrc::Imm ? t.smem_imm : 13);
         c.SWaitcntAll();
-        for (u32 i = 0; i < 4; ++i) c.VMov(10 + i, 16 + i);
+        for (u32 i = 0; i < 4; ++i) c.VMov(10 + i, 16 + t.smem_pick[i]);
     } else {
         if (t.combo) {
             c.SBufferLoad(1, 16, 0, true, t.smem_imm);
@@ -569,6 +575,8 @@ u32 AtomicOp(const char* name, u32 opcode, gcn_atomic at, bool x2, const TArgs& 
 
 u32 SmemOp(u32 count, SmemSrc src, u32 imm) {
     Template t;
+    if (count == 8) t.smem_pick = {0, 3, 4, 7};
+    if (count == 16) t.smem_pick = {0, 7, 8, 15};
     t.name = "s_buffer_load_dword" + (count > 1 ? "x" + std::to_string(count) : std::string{}) +
              (src == SmemSrc::Imm ? " imm:" + std::to_string(imm) : std::string(" soff:s13"));
     t.op.kind = GCN_SLOAD;
@@ -946,6 +954,23 @@ void AddLoadCases() {
         for (const gcn_vsharp& v : {RawV(64), RawV(62), StructV(16, 4)}) {
             for (u32 off : {0u, 6u, 48u, 52u, 56u, 60u, 64u, 68u, 0xFFFFFFFCu}) {
                 Job& j = NewJob("smem", t4, v, 0);
+                j.smem_sgpr = off;
+                j.label += " s13=" + Hex(off);
+                for (u32 lane = 0; lane < 64; ++lane) SetLane(j, lane, 0, 0);
+            }
+        }
+        // Constant-buffer sized loads (x8/x16): last dword in range, first dword out, straddles.
+        for (u32 count : {8u, 16u}) {
+            for (u32 imm : {0u, 4u, 8u, 12u, 16u, 20u, 24u, 60u}) {
+                const u32 t = SmemOp(count, SmemSrc::Imm, imm);
+                for (const gcn_vsharp& v : {RawV(64), RawV(100), RawV(0x80), StructV(16, 4), StructV(16, 8)}) {
+                    Job& j = NewJob("smem", t, v, 0);
+                    for (u32 lane = 0; lane < 64; ++lane) SetLane(j, lane, 0, 0);
+                }
+            }
+            const u32 ts = SmemOp(count, SmemSrc::Sgpr, 0);
+            for (u32 off : {0u, 32u, 64u, 66u, 96u, 0x100u, 0xFFFFFFC0u}) {
+                Job& j = NewJob("smem", ts, RawV(128), 0);
                 j.smem_sgpr = off;
                 j.label += " s13=" + Hex(off);
                 for (u32 lane = 0; lane < 64; ++lane) SetLane(j, lane, 0, 0);
@@ -1407,6 +1432,26 @@ void AddRenderCases() {
             for (const auto& p4 : pos) for (float x : p4) j.init_words.push_back(std::bit_cast<u32>(x));
         }
         for (u32 l = 0; l < 3; ++l) SetLane(j, l, l, 0);
+    }
+}
+
+// Documents MoltenVK: with VK_KHR_push_descriptor, OpArrayLength of a storage buffer binding
+// reports the wrong size (a 36-byte range reads back as 1 byte / 0 dwords), so explicit bounds
+// checks zero in-range accesses. The renderer binds Apple guest pipelines with allocated sets;
+// these jobs bind with push descriptors on purpose. FAIL here is KNOWN-MOLTENVK; a PASS means
+// MoltenVK fixed it.
+void AddPushDescriptorCases() {
+    using namespace GcnAsm;
+    const u32 dw = RawOp("buffer_load_dword", GCN_LOAD, BUFFER_LOAD_DWORD, 4, 1, false, TArgs{});
+    const u32 ub = RawOp("buffer_load_ubyte", GCN_LOAD, BUFFER_LOAD_UBYTE, 1, 1, false, TArgs{});
+    for (u32 t : {dw, ub}) {
+        for (u32 nr : {36u, 64u, 7u}) {
+            Job& j = NewJob("moltenvk-push", t, RawV(nr), 0);
+            j.force_push = true;
+            j.label += " (push descriptors)";
+            const auto offs = Uniq({0, 4, nr >= 4 ? nr - 4ull : 0, nr - 1ull, nr, nr + 4ull});
+            for (u32 i = 0; i < offs.size(); ++i) SetLane(j, i, 0, offs[i]);
+        }
     }
 }
 
@@ -1898,6 +1943,10 @@ void CompileAll(const std::string& outdir) {
 // ---------------------------------------------------------------------------------------------
 // Vulkan phase
 
+// Push-descriptor state (set in InitGpu; see BindStorageBuffers).
+bool g_push_supported = false, g_force_sets = true; // Apple guest pipelines: allocated sets
+u32 g_max_push = 0;
+
 struct Mem {
     vk::UniqueBuffer buffer;
     vk::UniqueDeviceMemory memory;
@@ -1953,6 +2002,10 @@ void InitGpu(Gpu& g, bool rba) {
     std::vector<const char*> exts;
     for (const auto& e : g.physical.enumerateDeviceExtensionProperties().value) {
         if (std::strcmp(e.extensionName, "VK_KHR_portability_subset") == 0) exts.push_back("VK_KHR_portability_subset");
+        if (std::strcmp(e.extensionName, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME) == 0) {
+            exts.push_back(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME);
+            g_push_supported = true;
+        }
         if (std::strcmp(e.extensionName, VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME) == 0) {
             exts.push_back(VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME);
             g.dynamic_vertex_input = true;
@@ -1975,6 +2028,13 @@ void InitGpu(Gpu& g, bool rba) {
     VULKAN_HPP_DEFAULT_DISPATCHER.init(*g.device);
     g.queue = g.device->getQueue(g.family, 0);
     g.align = g.physical.getProperties().limits.minStorageBufferOffsetAlignment;
+    if (g_push_supported) {
+        auto props = g.physical.getProperties2<vk::PhysicalDeviceProperties2, vk::PhysicalDevicePushDescriptorPropertiesKHR>();
+        g_max_push = props.get<vk::PhysicalDevicePushDescriptorPropertiesKHR>().maxPushDescriptors;
+    }
+    std::printf("descriptors: %s (maxPushDescriptors %u)\n",
+                g_push_supported && !g_force_sets ? "pushed (vkCmdPushDescriptorSetKHR)"
+                                                  : "allocated sets (the Apple guest-pipeline path)", g_max_push);
     g.pool = g.device->createCommandPoolUnique({.flags = vk::CommandPoolCreateFlagBits::eResetCommandBuffer,
                                                 .queueFamilyIndex = g.family}).value;
     const vk::DescriptorPoolSize size{vk::DescriptorType::eStorageBuffer, MaxBatch * 8};
@@ -1996,11 +2056,40 @@ struct Pipe {
     vk::UniquePipelineLayout playout;
     vk::UniquePipeline pipeline;
     vk::Result result = vk::Result::eSuccess;
+    bool push = false; // descriptors pushed (VK_KHR_push_descriptor) like the renderer
 };
-std::map<std::pair<u32, u32>, Pipe> g_pipes;
+std::map<std::tuple<u32, u32, bool>, Pipe> g_pipes;
 
-Pipe& GetPipe(Gpu& g, u32 tmpl, u32 perm, u32 nbind) {
-    auto [it, fresh] = g_pipes.try_emplace({tmpl, perm});
+// Renderer: uses_push_descriptors = binding < instance.MaxPushDescriptors() (vk_*_pipeline.cpp),
+// then cmdbuf.pushDescriptorSetKHR (vk_pipeline_common.cpp). --descriptor-sets forces allocated sets.
+bool UsePushDescriptors(u32 nbind, bool force_push = false) {
+    return g_push_supported && (force_push || !g_force_sets) && nbind < g_max_push;
+}
+
+void BindStorageBuffers(Gpu& g, vk::CommandBuffer cmd, vk::PipelineBindPoint bp, const Pipe& p,
+                        const std::vector<vk::DescriptorBufferInfo>& infos) {
+    if (infos.empty()) return;
+    std::vector<vk::WriteDescriptorSet> writes;
+    vk::DescriptorSet set{};
+    if (!p.push) {
+        const vk::DescriptorSetLayout l = *p.layout;
+        set = g.device->allocateDescriptorSets({.descriptorPool = *g.dpool, .descriptorSetCount = 1, .pSetLayouts = &l})
+                  .value.front();
+    }
+    for (u32 b = 0; b < infos.size(); ++b) {
+        writes.push_back({.dstSet = set, .dstBinding = b, .descriptorCount = 1,
+                          .descriptorType = vk::DescriptorType::eStorageBuffer, .pBufferInfo = &infos[b]});
+    }
+    if (p.push) {
+        cmd.pushDescriptorSetKHR(bp, *p.playout, 0, writes);
+    } else {
+        g.device->updateDescriptorSets(writes, {});
+        cmd.bindDescriptorSets(bp, *p.playout, 0, set, {});
+    }
+}
+
+Pipe& GetPipe(Gpu& g, u32 tmpl, u32 perm, u32 nbind, bool force_push = false) {
+    auto [it, fresh] = g_pipes.try_emplace({tmpl, perm, force_push});
     Pipe& p = it->second;
     if (!fresh) return p;
     const auto& spv = g_spirv.at({tmpl, perm});
@@ -2015,7 +2104,8 @@ Pipe& GetPipe(Gpu& g, u32 tmpl, u32 perm, u32 nbind) {
         b.push_back({.binding = i, .descriptorType = vk::DescriptorType::eStorageBuffer, .descriptorCount = 1,
                      .stageFlags = vk::ShaderStageFlagBits::eCompute});
     }
-    p.layout = g.device->createDescriptorSetLayoutUnique({.bindingCount = nbind, .pBindings = b.data()}).value;
+    p.push = UsePushDescriptors(nbind, force_push);
+    p.layout = g.device->createDescriptorSetLayoutUnique({.flags = p.push ? vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR : vk::DescriptorSetLayoutCreateFlags{}, .bindingCount = nbind, .pBindings = b.data()}).value;
     const vk::PushConstantRange push{.stageFlags = vk::ShaderStageFlagBits::eCompute, .offset = 0,
                                      .size = sizeof(Shader::PushData)};
     const vk::DescriptorSetLayout l = *p.layout;
@@ -2058,7 +2148,8 @@ Pipe& GetGfxPipe(Gpu& g, const Job& j, u32 nbind, bool pulling) {
         b.push_back({.binding = i, .descriptorType = vk::DescriptorType::eStorageBuffer, .descriptorCount = 1,
                      .stageFlags = vk::ShaderStageFlagBits::eVertex});
     }
-    p.layout = g.device->createDescriptorSetLayoutUnique({.bindingCount = nbind, .pBindings = b.data()}).value;
+    p.push = UsePushDescriptors(nbind);
+    p.layout = g.device->createDescriptorSetLayoutUnique({.flags = p.push ? vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR : vk::DescriptorSetLayoutCreateFlags{}, .bindingCount = nbind, .pBindings = b.data()}).value;
     const vk::PushConstantRange push{.stageFlags = vk::ShaderStageFlagBits::eVertex, .offset = 0,
                                      .size = sizeof(Shader::PushData)};
     const vk::DescriptorSetLayout l = *p.layout;
@@ -2227,7 +2318,7 @@ std::vector<u32> WaveExpected(const Job& j) {
             if (exec >> lane & 1) r[2] = gcn_mbcnt(u32(exec >> 32), gcn_mbcnt(u32(exec), 0, lane, 0), lane, 1);
             break;
         case Wave::LoopReadFirstLane: {
-            const u32 step = j.lanes[w * 64].vindex; // first exec lane of the wave
+            const u32 step = (j.lanes[w * 64].vindex & 0xF000u) | 0x1000u; // first exec lane, as masked
             u32 s20 = 0, n = 0;
             do { s20 += step; ++n; } while (s20 < 0x3000u);
             r[0] = n * gcn_popcount64(ballot);
@@ -2295,7 +2386,8 @@ std::vector<Outcome> Expected(Gpu& g, const Job& j, std::vector<u8>& work, const
             if (res.touch_lo != res.touch_hi) o.touches.push_back({res.touch_lo, res.touch_hi});
             if (smem) {
                 for (u32 i = 0; i < 4; ++i) {
-                    o.regs[lane * 4 + i] = (i < op.ncomp && res.written[i]) ? res.value[i] : SgprMarker + i;
+                    const u32 k = t.smem_pick[i];
+                    o.regs[lane * 4 + i] = (k < op.ncomp && res.written[k]) ? res.value[k] : SgprMarker + k;
                 }
             } else if (op.kind == GCN_LOAD) {
                 for (u32 i = 0; i < op.ncomp; ++i) o.regs[lane * 4 + i] = res.value[i];
@@ -2366,12 +2458,13 @@ std::string DescribeReadings(const std::vector<u32>& rs) {
     return s.empty() ? "alternative" : s;
 }
 
-enum class Verdict { Strict, Ambiguous, Fail, InvalidSpirv, LoudRequired, LoudApproved, LoudUnneeded, Crash, HarnessError };
+enum class Verdict { Strict, Ambiguous, Fail, KnownMoltenVk, InvalidSpirv, LoudRequired, LoudApproved, LoudUnneeded, Crash, HarnessError };
 const char* VerdictName(Verdict v) {
     switch (v) {
     case Verdict::Strict: return "PASS(strict)";
     case Verdict::Ambiguous: return "PASS(ambiguous)";
     case Verdict::Fail: return "FAIL";
+    case Verdict::KnownMoltenVk: return "KNOWN-MOLTENVK";
     case Verdict::InvalidSpirv: return "INVALID-SPIRV";
     case Verdict::LoudRequired: return "LOUD(required)";
     case Verdict::LoudApproved: return "LOUD(approved)";
@@ -2563,15 +2656,6 @@ bool RecordDraw(Gpu& g, vk::CommandBuffer cmd, Job& j, const std::vector<vk::Des
         j.message = "graphics pipeline creation failed: " + vk::to_string(pipe.result);
         return false;
     }
-    const vk::DescriptorSetLayout l = *pipe.layout;
-    auto set = g.device->allocateDescriptorSets({.descriptorPool = *g.dpool, .descriptorSetCount = 1,
-                                                 .pSetLayouts = &l}).value.front();
-    std::vector<vk::WriteDescriptorSet> writes;
-    for (u32 b = 0; b < infos.size(); ++b) {
-        writes.push_back({.dstSet = set, .dstBinding = b, .descriptorCount = 1,
-                          .descriptorType = vk::DescriptorType::eStorageBuffer, .pBufferInfo = &infos[b]});
-    }
-    g.device->updateDescriptorSets(writes, {});
     std::vector<vk::Buffer> bufs;
     std::vector<vk::DeviceSize> offsets, sizes, strides;
     std::vector<vk::VertexInputBindingDescription2EXT> bind2;
@@ -2610,7 +2694,7 @@ bool RecordDraw(Gpu& g, vk::CommandBuffer cmd, Job& j, const std::vector<vk::Des
     }
     cmd.beginRendering({.renderArea = {.extent = {1, 1}}, .layerCount = 1});
     cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *pipe.pipeline);
-    cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *pipe.playout, 0, set, {});
+    BindStorageBuffers(g, cmd, vk::PipelineBindPoint::eGraphics, pipe, infos);
     cmd.pushConstants(*pipe.playout, vk::ShaderStageFlagBits::eVertex, 0, sizeof(push), &push);
     if (!pulling && !bufs.empty()) {
         if (g.dynamic_vertex_input) {
@@ -2689,7 +2773,8 @@ bool RecordRender(Gpu& g, vk::CommandBuffer cmd, Job& j, const std::vector<vk::D
         for (u32 i = 0; i < j.binds.size(); ++i) {
             b.push_back({.binding = i, .descriptorType = vk::DescriptorType::eStorageBuffer, .descriptorCount = 1, .stageFlags = all});
         }
-        p.layout = g.device->createDescriptorSetLayoutUnique({.bindingCount = u32(b.size()), .pBindings = b.data()}).value;
+        p.push = UsePushDescriptors(u32(b.size()));
+        p.layout = g.device->createDescriptorSetLayoutUnique({.flags = p.push ? vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR : vk::DescriptorSetLayoutCreateFlags{}, .bindingCount = u32(b.size()), .pBindings = b.data()}).value;
         const vk::PushConstantRange pr{.stageFlags = all, .offset = 0, .size = sizeof(Shader::PushData)};
         const vk::DescriptorSetLayout l = *p.layout;
         p.playout = g.device->createPipelineLayoutUnique({.setLayoutCount = 1, .pSetLayouts = &l,
@@ -2763,15 +2848,7 @@ bool RecordRender(Gpu& g, vk::CommandBuffer cmd, Job& j, const std::vector<vk::D
     cmd.beginRendering({.renderArea = {.extent = {RenderSize, RenderSize}}, .layerCount = 1, .colorAttachmentCount = 1, .pColorAttachments = &att});
     cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *p.pipeline);
     if (!infos.empty()) {
-        const vk::DescriptorSetLayout l = *p.layout;
-        auto set = g.device->allocateDescriptorSets({.descriptorPool = *g.dpool, .descriptorSetCount = 1, .pSetLayouts = &l}).value.front();
-        std::vector<vk::WriteDescriptorSet> writes;
-        for (u32 b = 0; b < infos.size(); ++b) {
-            writes.push_back({.dstSet = set, .dstBinding = b, .descriptorCount = 1,
-                              .descriptorType = vk::DescriptorType::eStorageBuffer, .pBufferInfo = &infos[b]});
-        }
-        g.device->updateDescriptorSets(writes, {});
-        cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *p.playout, 0, set, {});
+        BindStorageBuffers(g, cmd, vk::PipelineBindPoint::eGraphics, p, infos);
     }
     cmd.pushConstants(*p.playout, vk::ShaderStageFlagBits::eAllGraphics, 0, sizeof(push), &push);
     if (!pulling && !j.vattrs.empty()) {
@@ -2914,23 +2991,14 @@ std::map<u32, JobResult> RunBatch(Gpu& g, const std::vector<u32>& jobs) {
             if (RecordDraw(g, cmd, j, infos, push, tbound)) ran.push_back(ji);
             continue;
         }
-        Pipe& pipe = GetPipe(g, j.tmpl, j.perm, u32(j.binds.size()));
+        Pipe& pipe = GetPipe(g, j.tmpl, j.perm, u32(j.binds.size()), j.force_push);
         if (pipe.result != vk::Result::eSuccess) {
             j.status = Status::LoudPipeline;
             j.message = "pipeline creation failed: " + vk::to_string(pipe.result);
             continue;
         }
-        const vk::DescriptorSetLayout l = *pipe.layout;
-        auto set = g.device->allocateDescriptorSets({.descriptorPool = *g.dpool, .descriptorSetCount = 1,
-                                                     .pSetLayouts = &l}).value.front();
-        std::vector<vk::WriteDescriptorSet> writes;
-        for (u32 b = 0; b < infos.size(); ++b) {
-            writes.push_back({.dstSet = set, .dstBinding = b, .descriptorCount = 1,
-                              .descriptorType = vk::DescriptorType::eStorageBuffer, .pBufferInfo = &infos[b]});
-        }
-        g.device->updateDescriptorSets(writes, {});
         cmd.bindPipeline(vk::PipelineBindPoint::eCompute, *pipe.pipeline);
-        cmd.bindDescriptorSets(vk::PipelineBindPoint::eCompute, *pipe.playout, 0, set, {});
+        BindStorageBuffers(g, cmd, vk::PipelineBindPoint::eCompute, pipe, infos);
         cmd.pushConstants(*pipe.playout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
         cmd.dispatch(1, 1, 1);
         ran.push_back(ji);
@@ -3076,21 +3144,12 @@ int Bench(const Options& opt) {
         double best = 1e30;
         for (u32 rep = 0; rep < 5; ++rep) {
             assert(g.device->resetDescriptorPool(*g.dpool) == vk::Result::eSuccess);
-            const vk::DescriptorSetLayout l = *pipe.layout;
-            auto set = g.device->allocateDescriptorSets({.descriptorPool = *g.dpool, .descriptorSetCount = 1,
-                                                         .pSetLayouts = &l}).value.front();
-            std::vector<vk::WriteDescriptorSet> writes;
-            for (u32 b = 0; b < infos.size(); ++b) {
-                writes.push_back({.dstSet = set, .dstBinding = b, .descriptorCount = 1,
-                                  .descriptorType = vk::DescriptorType::eStorageBuffer, .pBufferInfo = &infos[b]});
-            }
-            g.device->updateDescriptorSets(writes, {});
             auto cmd = g.device->allocateCommandBuffers({.commandPool = *g.pool, .level = vk::CommandBufferLevel::ePrimary,
                                                          .commandBufferCount = 1}).value.front();
             (void)cmd.begin(vk::CommandBufferBeginInfo{.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit});
             cmd.resetQueryPool(*qpool, 0, 2);
             cmd.bindPipeline(vk::PipelineBindPoint::eCompute, *pipe.pipeline);
-            cmd.bindDescriptorSets(vk::PipelineBindPoint::eCompute, *pipe.playout, 0, set, {});
+            BindStorageBuffers(g, cmd, vk::PipelineBindPoint::eCompute, pipe, infos);
             cmd.pushConstants(*pipe.playout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
             cmd.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, *qpool, 0);
             cmd.dispatch(kWorkgroups * 64 / v.wg[0], 1, 1);
@@ -3175,6 +3234,8 @@ int main(int argc, char** argv) {
         else if (a == "--dump-spv" && i + 1 < argc) opt.dump_spv = argv[++i];
         else if (a == "--compile-only" && i + 1 < argc) opt.compile_only = argv[++i];
         else if (a == "--bench") opt.bench = true;
+        else if (a == "--descriptor-sets") g_force_sets = true;
+        else if (a == "--push-descriptors") g_force_sets = false;
         else if (a == "--stage" && i + 1 < argc) opt.stage = argv[++i];
         else if (a == "--fs-export" && i + 1 < argc) g_fs_export = u32(std::atoi(argv[++i]));
         else if (a == "--ud" && i + 1 < argc) {
@@ -3305,6 +3366,7 @@ int main(int argc, char** argv) {
     AddInternalCases();
     AddSpecReuseCases();
     AddRenderCases();
+    AddPushDescriptorCases();
     if (!opt.only.empty()) {
         std::vector<Job> kept;
         for (auto& j : g_jobs) {
@@ -3391,6 +3453,12 @@ int main(int argc, char** argv) {
             if (r.verdict != Verdict::Fail || (kind != GCN_STORE && kind != GCN_ATOMIC)) continue;
             auto alone = RunBatch(g, {ji});
             if (alone.count(ji)) r = alone[ji];
+        }
+    }
+    for (auto& [ji, r] : results) {
+        if (g_jobs[ji].force_push && r.verdict == Verdict::Fail) {
+            r.verdict = Verdict::KnownMoltenVk;
+            r.detail = "  MoltenVK OpArrayLength under push descriptors (renderer uses allocated sets on Apple)\n" + r.detail;
         }
     }
     // Compile-only jobs: a valid shader must compile; an abort blocks the game.

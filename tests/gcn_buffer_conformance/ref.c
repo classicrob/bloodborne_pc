@@ -145,7 +145,7 @@ static uint64_t atomic64(enum gcn_atomic op, uint64_t old, uint64_t src) {
 static void scalar_load(const gcn_vsharp* v, const gcn_op* op, unsigned r, gcn_mem* mem,
                         gcn_result* out) {
     /* §7.2.2: base, stride and num_records only; address truncated to a dword. */
-    for (uint32_t i = 0; i < op->ncomp && i < 4; i++) {
+    for (uint32_t i = 0; i < op->ncomp && i < 16; i++) {
         const uint64_t offset = m32((uint64_t)op->smem_offset + 4ull * i, r);
         int oob;
         if (v->stride == 0) {
