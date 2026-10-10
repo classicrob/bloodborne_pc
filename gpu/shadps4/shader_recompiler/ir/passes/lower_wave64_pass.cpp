@@ -137,15 +137,25 @@ public:
                 if (node.type == Type::If && !IsUniform(node.data.if_node.cond)) {
                     MarkMergePhis(node.data.if_node.merge, worklist);
                 } else if (node.type == Type::Loop) {
-                    // the loop body runs from this node to its Repeat
+                    // the loop body runs from this node to its Repeat. A break is divergent when its
+                    // condition is, or when it sits under a divergent if inside the loop (the
+                    // structurizer can move a break into an if: EliminateAsConditional,
+                    // MoveOutwardIf).
                     bool exit_divergent = false;
                     std::vector<const IR::Block*> body;
+                    std::vector<bool> ifs; // uniformity of the ifs open inside the body
                     size_t depth = 0, m = n + 1;
                     for (; m < list.size(); ++m) {
                         const auto& inner = list[m];
                         if (inner.type == Type::Loop) ++depth;
                         if (inner.type == Type::Block) body.push_back(inner.data.block);
-                        if (inner.type == Type::Break && !IsUniform(inner.data.break_node.cond)) exit_divergent = true;
+                        if (inner.type == Type::If) ifs.push_back(IsUniform(inner.data.if_node.cond));
+                        if (inner.type == Type::EndIf && !ifs.empty()) ifs.pop_back();
+                        if (inner.type == Type::Break &&
+                            (!IsUniform(inner.data.break_node.cond) ||
+                             !std::ranges::all_of(ifs, std::identity{}))) {
+                            exit_divergent = true;
+                        }
                         if (inner.type == Type::Repeat) {
                             if (depth == 0) {
                                 exit_divergent |= !IsUniform(inner.data.repeat.cond);
@@ -258,16 +268,25 @@ std::vector<IR::Block*> FindWorkgroupUniformBlocks(const IR::Program& program,
                                                    const WorkgroupUniformity& uniformity) {
     using Type = IR::AbstractSyntaxNode::Type;
     const auto& list = program.syntax_list;
-    // A loop is uniform when its continue condition and every break inside it are.
+    // A loop is uniform when its continue condition and every break inside it are. A break under
+    // a divergent if is divergent whatever its own condition (conservative for ifs outside the
+    // loop: their blocks are not uniform anyway).
     std::unordered_map<const IR::Block*, bool> loop_uniform;
     {
         std::vector<std::pair<const IR::Block*, bool>> open;
+        std::vector<bool> ifs;
         for (const auto& node : list) {
-            if (node.type == Type::Loop) {
+            if (node.type == Type::If) {
+                ifs.push_back(uniformity.IsUniform(node.data.if_node.cond));
+            } else if (node.type == Type::EndIf && !ifs.empty()) {
+                ifs.pop_back();
+            } else if (node.type == Type::Loop) {
                 open.push_back({node.data.loop.merge, true});
             } else if (node.type == Type::Break && !open.empty()) {
+                const bool uniform_break = uniformity.IsUniform(node.data.break_node.cond) &&
+                                           std::ranges::all_of(ifs, std::identity{});
                 for (auto& [merge, uniform] : open) {
-                    uniform = uniform && uniformity.IsUniform(node.data.break_node.cond);
+                    uniform = uniform && uniform_break;
                 }
             } else if (node.type == Type::Repeat && !open.empty()) {
                 auto [merge, uniform] = open.back();
@@ -518,11 +537,16 @@ void LowerWave64Compute(IR::Program& program, const RuntimeInfo& runtime_info, c
         }
     }
     if (uses_mask_words) {
-        // Workgroup memory starts undefined: clear the mask words once, before any ballot.
+        // Workgroup memory starts undefined: clear the mask words once, before any ballot. Every
+        // lane clears both words of its wave (atomic, idempotent): a wave with 32 or fewer
+        // invocations (small workgroups, a partial last wave) has no lane in its high half, yet
+        // every ballot reads both words.
         IR::Block* entry = program.syntax_list.front().data.block;
         IR::IREmitter ir{*entry, entry->begin()};
         const Lanes l = lanes(ir);
-        (void)ir.SharedAtomicAnd(word(ir, mask_base, l.half_word), ir.Imm32(0), false);
+        const IR::U32 lo_addr = word(ir, mask_base, ir.ShiftLeftLogical(l.wave, ir.Imm32(1)));
+        (void)ir.SharedAtomicAnd(lo_addr, ir.Imm32(0), false);
+        (void)ir.SharedAtomicAnd(ir.IAdd(lo_addr, ir.Imm32(4)), ir.Imm32(0), false);
         ir.Barrier();
     }
 }
