@@ -13,7 +13,7 @@
 namespace Serialization {
 /* You should increment versions below once corresponding serialization scheme is changed. */
 #ifdef __APPLE__
-static constexpr u32 ShaderBinaryVersion = 17u; // Apple wave64 emulation (16: LDS16).
+static constexpr u32 ShaderBinaryVersion = 18u; // Opcode-specific half conversion denorm and rounding modes.
 #else
 static constexpr u32 ShaderBinaryVersion = 13u; // Atomic masked stores preserve concurrent subword LDS writes.
 #endif
