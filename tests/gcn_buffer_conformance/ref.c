@@ -126,9 +126,12 @@ static uint32_t atomic32(enum gcn_atomic op, uint32_t old, uint32_t src, uint32_
     return old;
 }
 
-static uint64_t atomic64(enum gcn_atomic op, uint64_t old, uint64_t src) {
+static uint64_t atomic64(enum gcn_atomic op, uint64_t old, uint64_t src, uint64_t cmp) {
     switch (op) {
     case GCN_AT_SWAP: return src;
+    case GCN_AT_CMPSWAP: return old == cmp ? src : old;
+    case GCN_AT_INC: return old >= src ? 0 : old + 1;
+    case GCN_AT_DEC: return (old == 0 || old > src) ? src : old - 1;
     case GCN_AT_ADD: return old + src;
     case GCN_AT_SUB: return old - src;
     case GCN_AT_SMIN: return (int64_t)src < (int64_t)old ? src : old;
@@ -205,8 +208,10 @@ void gcn_execute(const gcn_vsharp* v, const gcn_addr* a, const gcn_op* op, const
         }
         if (op->comp_bytes == 8) {
             const uint64_t old = read_le(p, 8);
+            /* X2: DATA[0:1] is the source, DATA[2:3] the CMPSWAP compare value */
             const uint64_t src = data[0] | ((uint64_t)data[1] << 32);
-            write_le(p, atomic64(op->atomic, old, src), 8);
+            const uint64_t cmp = data[2] | ((uint64_t)data[3] << 32);
+            write_le(p, atomic64(op->atomic, old, src, cmp), 8);
             out->value[0] = (uint32_t)old;
             out->value[1] = (uint32_t)(old >> 32);
         } else {
