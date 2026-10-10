@@ -554,8 +554,8 @@ static Id EmitLoadBufferB32xN(EmitContext& ctx, IR::Inst* inst, u32 handle, Id a
     boost::container::static_vector<Id, N> ids;
     for (u32 i = 0; i < N; i++) {
         const Id index_i = i == 0 ? address : ctx.OpIAdd(ctx.U32[1], address, ctx.ConstU32(i));
-        const Id result_i = ctx.BufferRead(handle, alias, original_index, index_i, data_types[1], [&] {
-            const Id ptr_i = ctx.OpAccessChain(pointer_type, id, ctx.u32_zero_value, index_i);
+        const Id result_i = ctx.BufferLoad(handle, alias, original_index, index_i, data_types[1], [&](Id safe_index) {
+            const Id ptr_i = ctx.OpAccessChain(pointer_type, id, ctx.u32_zero_value, safe_index);
             return ctx.OpLoad(data_types[1], ptr_i);
         }, i);
         ids.push_back(result_i);
@@ -572,8 +572,8 @@ Id EmitLoadBufferU8(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address) {
         address = ctx.OpIAdd(ctx.U32[1], address, offset);
     }
     const auto [id, pointer_type] = spv_buffer.Alias(PointerType::U8);
-    return ctx.BufferRead(handle, PointerType::U8, original_index, address, ctx.U8, [&] {
-        const Id ptr{ctx.OpAccessChain(pointer_type, id, ctx.u32_zero_value, address)};
+    return ctx.BufferLoad(handle, PointerType::U8, original_index, address, ctx.U8, [&](Id safe_index) {
+        const Id ptr{ctx.OpAccessChain(pointer_type, id, ctx.u32_zero_value, safe_index)};
         return ctx.OpLoad(ctx.U8, ptr);
     });
 }
@@ -585,8 +585,8 @@ Id EmitLoadBufferU16(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address) {
         address = ctx.OpIAdd(ctx.U32[1], address, offset);
     }
     const auto [id, pointer_type] = spv_buffer.Alias(PointerType::U16);
-    return ctx.BufferRead(handle, PointerType::U16, original_index, address, ctx.U16, [&] {
-        const Id ptr{ctx.OpAccessChain(pointer_type, id, ctx.u32_zero_value, address)};
+    return ctx.BufferLoad(handle, PointerType::U16, original_index, address, ctx.U16, [&](Id safe_index) {
+        const Id ptr{ctx.OpAccessChain(pointer_type, id, ctx.u32_zero_value, safe_index)};
         return ctx.OpLoad(ctx.U16, ptr);
     });
 }
@@ -618,8 +618,8 @@ Id EmitLoadBufferU64(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address) {
         std::array<Id, 2> values;
         for (u32 c = 0; c < values.size(); ++c) {
             const Id index = ctx.OpIAdd(ctx.U32[1], address, ctx.ConstU32(c));
-            values[c] = ctx.BufferRead(handle, PointerType::U32, original, index, ctx.U32[1], [&] {
-                return ctx.OpLoad(ctx.U32[1], ctx.OpAccessChain(pointer_type, id, ctx.u32_zero_value, index));
+            values[c] = ctx.BufferLoad(handle, PointerType::U32, original, index, ctx.U32[1], [&](Id safe_index) {
+                return ctx.OpLoad(ctx.U32[1], ctx.OpAccessChain(pointer_type, id, ctx.u32_zero_value, safe_index));
             }, c);
         }
         return ctx.OpBitcast(ctx.U64, ctx.OpCompositeConstruct(ctx.U32[2], values));
@@ -630,8 +630,8 @@ Id EmitLoadBufferU64(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address) {
         address = ctx.OpIAdd(ctx.U32[1], address, offset);
     }
     const auto [id, pointer_type] = spv_buffer.Alias(PointerType::U64);
-    return ctx.BufferRead(handle, PointerType::U64, original_index, address, ctx.U64, [&] {
-        const Id ptr{ctx.OpAccessChain(pointer_type, id, ctx.u64_zero_value, address)};
+    return ctx.BufferLoad(handle, PointerType::U64, original_index, address, ctx.U64, [&](Id safe_index) {
+        const Id ptr{ctx.OpAccessChain(pointer_type, id, ctx.u64_zero_value, safe_index)};
         return ctx.OpLoad(ctx.U64, ptr);
     });
 }
