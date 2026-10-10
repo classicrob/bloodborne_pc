@@ -1570,6 +1570,18 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 YIELD_ASC(vqid);
                 RESUME_ASC(task, vqid);
             }
+#ifdef __APPLE__
+            if (indirect_buffer->chain.Value()) {
+                // A chained IB is a jump: the rest of the buffer holding it is never executed.
+                if constexpr (is_indirect) {
+                    acb = {};
+                    continue;
+                } else {
+                    UNREACHABLE_MSG("macOS: chained IB in compute ring {} at the ring level",
+                                    vqid);
+                }
+            }
+#endif
             break;
         }
         case PM4ItOpcode::DmaData: {
