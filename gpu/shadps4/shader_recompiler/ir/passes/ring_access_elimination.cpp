@@ -136,17 +136,19 @@ void RingAccessElimination(const IR::Program& program, const RuntimeInfo& runtim
         info.gs_copy_data = Shader::ParseCopyShader(gs_info.vs_copy);
 
         u32 dwords_per_vertex = gs_info.out_vertex_data_size;
+        if (runtime_info.gs_role == GsEmulationRole::GsCompute) {
+            ASSERT_MSG(info.gs_copy_data.num_comps <= dwords_per_vertex &&
+                           dwords_per_vertex == runtime_info.gs_vertex_dwords,
+                       "Geometry emulation: the copy shader reads {} GSVS dwords per vertex, "
+                       "VGT_GS_VERT_ITEMSIZE is {} (emulation stride {})",
+                       info.gs_copy_data.num_comps, dwords_per_vertex,
+                       runtime_info.gs_vertex_dwords);
+        }
         if (info.gs_copy_data.num_comps && info.gs_copy_data.num_comps > dwords_per_vertex) {
             LOG_WARNING(Render_Vulkan,
                         "VERT_ITEMSIZE {} is different than actual number of dwords per vertex {}",
                         dwords_per_vertex, info.gs_copy_data.num_comps);
             dwords_per_vertex = info.gs_copy_data.num_comps;
-        }
-        if (runtime_info.gs_role == GsEmulationRole::GsCompute) {
-            ASSERT_MSG(dwords_per_vertex == runtime_info.gs_vertex_dwords,
-                       "Geometry emulation: the copy shader reads {} GSVS dwords per vertex, "
-                       "VGT_GS_VERT_ITEMSIZE is {}",
-                       dwords_per_vertex, runtime_info.gs_vertex_dwords);
         }
 
         ForEachInstruction([&](IR::IREmitter& ir, IR::Inst& inst) {
@@ -183,10 +185,20 @@ void RingAccessElimination(const IR::Program& program, const RuntimeInfo& runtim
                 const auto offset = inst.Flags<IR::BufferInstInfo>().inst_offset.Value();
                 const auto data = ir.BitCast<IR::F32>(IR::U32{inst.Arg(2)});
                 if (runtime_info.gs_role == GsEmulationRole::GsCompute) {
-                    // GSVS record dword d = the GCN component index; the store belongs to the
-                    // next emitted vertex (as on the native path). Position and misc outputs
-                    // stay raw: the copy shader maps them.
-                    const u32 dword = (offset / (gs_info.output_vertices * 4u)) % dwords_per_vertex;
+                    // The GSVS byte offset is (component * N + vertex) * 4 (the vertex term may sit
+                    // in the instruction offset or in soffset). Record dword d = the component;
+                    // the store belongs to the next emitted vertex (as on the native path).
+                    // Components past the vertex size (other streams' rings) are not emulated.
+                    // Position and misc outputs stay raw: the copy shader maps them.
+                    const u32 component_bytes = gs_info.output_vertices * 4u;
+                    ASSERT_MSG(component_bytes != 0 && offset % 4 == 0,
+                               "Geometry emulation: GSVS store at {:#x} (max_vert_out {})", offset,
+                               gs_info.output_vertices);
+                    const u32 dword = offset / component_bytes;
+                    ASSERT_MSG(dword < dwords_per_vertex,
+                               "Geometry emulation: GSVS store at {:#x} is component {} of a "
+                               "{}-dword vertex (another stream's ring is not emulated)",
+                               offset, dword, dwords_per_vertex);
                     inst.Invalidate();
                     ir.SetAttribute(GsEmulation::RecordAttribute(dword), data, dword % 4);
                     break;

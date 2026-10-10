@@ -273,13 +273,6 @@ enum class GsEmulationRole : u8 {
     CopyVertex, ///< the copy shader (HwStage::Vertex) of a GS draw
 };
 
-/// Index buffer an EsCompute shader pulls VertexId from.
-enum class GsIndexType : u8 {
-    None, ///< non-indexed draw
-    U16,
-    U32,
-};
-
 /**
  * Stores information relevant to shader compilation sourced from liverpool registers.
  * It may potentially differ with the same shader module so must be checked.
@@ -289,7 +282,6 @@ struct RuntimeInfo {
     SwStage sw_stage;
     HwStage hw_stage;
     GsEmulationRole gs_role;
-    GsIndexType gs_index_type; ///< EsCompute only
     u32 gs_max_vert_out;  ///< GsCompute, CopyVertex: VGT_GS_MAX_VERT_OUT (the GSVS ring layout)
     u32 gs_vertex_dwords; ///< GsCompute, CopyVertex: dwords per GSVS vertex record
     struct Properties {
@@ -327,7 +319,7 @@ struct RuntimeInfo {
 
     bool operator==(const RuntimeInfo& other) const noexcept {
         return hw_stage == other.hw_stage && sw_stage == other.sw_stage &&
-               gs_role == other.gs_role && gs_index_type == other.gs_index_type &&
+               gs_role == other.gs_role &&
                gs_max_vert_out == other.gs_max_vert_out &&
                gs_vertex_dwords == other.gs_vertex_dwords &&
                props == other.props && HasSameSwInfo(other.sw) && HasSameHwInfo(other.hw);

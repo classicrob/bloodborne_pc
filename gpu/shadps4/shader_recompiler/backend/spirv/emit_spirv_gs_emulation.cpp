@@ -88,27 +88,36 @@ void ReturnUnless(EmitContext& ctx, Id in_range) {
     ctx.AddLabel(merge_label);
 }
 
-/// Pulled index i of the draw (u16 indices are unpacked from dwords, little endian).
-Id PullIndex(EmitContext& ctx, Id position) {
+/// Index element `position` of the guest index buffer (u16 indices are unpacked from dwords,
+/// little endian).
+Id LoadIndex(EmitContext& ctx, Id position, bool u16) {
     const auto& [id, pointer_type] =
         ctx.buffers[ctx.gs.index_input].Alias(EmitContext::PointerType::U32);
-    switch (ctx.runtime_info.gs_index_type) {
-    case GsIndexType::U32:
+    if (!u16) {
         return ctx.OpLoad(ctx.U32[1],
                           ctx.OpAccessChain(pointer_type, id, ctx.u32_zero_value, position));
-    case GsIndexType::U16: {
-        const Id word = ctx.OpLoad(
-            ctx.U32[1], ctx.OpAccessChain(pointer_type, id, ctx.u32_zero_value,
-                                          ctx.OpShiftRightLogical(ctx.U32[1], position,
-                                                                  ctx.ConstU32(1u))));
-        const Id shift = ctx.OpShiftLeftLogical(
-            ctx.U32[1], ctx.OpBitwiseAnd(ctx.U32[1], position, ctx.ConstU32(1u)),
-            ctx.ConstU32(4u));
-        return ctx.OpBitFieldUExtract(ctx.U32[1], word, shift, ctx.ConstU32(16u));
     }
-    default:
-        UNREACHABLE();
-    }
+    const Id word = ctx.OpLoad(
+        ctx.U32[1], ctx.OpAccessChain(pointer_type, id, ctx.u32_zero_value,
+                                      ctx.OpShiftRightLogical(ctx.U32[1], position,
+                                                              ctx.ConstU32(1u))));
+    const Id shift = ctx.OpShiftLeftLogical(
+        ctx.U32[1], ctx.OpBitwiseAnd(ctx.U32[1], position, ctx.ConstU32(1u)), ctx.ConstU32(4u));
+    return ctx.OpBitFieldUExtract(ctx.U32[1], word, shift, ctx.ConstU32(16u));
+}
+
+/// The draw's index for index position `position` (Header::IndexKind decides at run time, so one
+/// module serves indexed and non-indexed draws).
+Id PullIndex(EmitContext& ctx, Id position) {
+    const Id index = PrivateU32(ctx, "gs_pulled_index");
+    ctx.OpStore(index, position);
+    const Id kind = LoadHeader(ctx, GsEmu::IndexKind);
+    const Id element = IAdd(ctx, LoadHeader(ctx, GsEmu::FirstIndex), position);
+    If(ctx, ctx.OpIEqual(ctx.U1[1], kind, ctx.ConstU32(u32(GsEmu::IndexKind::U16))),
+       [&] { ctx.OpStore(index, LoadIndex(ctx, element, true)); });
+    If(ctx, ctx.OpIEqual(ctx.U1[1], kind, ctx.ConstU32(u32(GsEmu::IndexKind::U32))),
+       [&] { ctx.OpStore(index, LoadIndex(ctx, element, false)); });
+    return ctx.OpLoad(ctx.U32[1], index);
 }
 
 u32 InputVerticesPerPrimitive(AmdGpu::PrimitiveType type) {
@@ -135,10 +144,7 @@ void EsPrologue(EmitContext& ctx) {
 
     gs.base_vertex = LoadHeader(ctx, GsEmu::BaseVertex);
     gs.base_instance = LoadHeader(ctx, GsEmu::BaseInstance);
-    const Id index = ctx.runtime_info.gs_index_type == GsIndexType::None
-                         ? position
-                         : PullIndex(ctx, IAdd(ctx, LoadHeader(ctx, GsEmu::FirstIndex), position));
-    gs.vertex_id = IAdd(ctx, index, gs.base_vertex);
+    gs.vertex_id = IAdd(ctx, PullIndex(ctx, position), gs.base_vertex);
     gs.instance_id = IAdd(ctx, instance, gs.base_instance);
     const u32 stride = ctx.runtime_info.hw.es.vertex_data_size;
     ASSERT_MSG(stride != 0, "Geometry emulation: ESGS item size 0");
@@ -216,9 +222,7 @@ void EmitGsEmulationPrologue(EmitContext& ctx) {
     ctx.gs.scratch = FindBuffer(ctx, BufferType::GsScratch);
     switch (ctx.runtime_info.gs_role) {
     case GsEmulationRole::EsCompute:
-        if (ctx.runtime_info.gs_index_type != GsIndexType::None) {
-            ctx.gs.index_input = FindBuffer(ctx, BufferType::GsIndexInput);
-        }
+        ctx.gs.index_input = FindBuffer(ctx, BufferType::GsIndexInput);
         EsPrologue(ctx);
         break;
     case GsEmulationRole::GsCompute:

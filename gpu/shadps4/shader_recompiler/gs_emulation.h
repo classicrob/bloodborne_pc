@@ -64,11 +64,19 @@ inline u32 IndexRunLength(u32 max_vert_out, AmdGpu::GsOutputPrimitiveType type) 
     return max_vert_out + max_vert_out / MinStripVertices(type);
 }
 
+/// Header::IndexKind values.
+enum class IndexKind : u32 {
+    None = 0, ///< non-indexed: VertexId = position + BaseVertex
+    U16 = 1,
+    U32 = 2,
+};
+
 /// Dword layout of the header at the start of a draw's GsScratch binding.
 enum Header : u32 {
     RecordsPerInstance, ///< V: index positions (ES invocations) per instance
     PrimsPerInstance,   ///< P: input primitives per instance
     Instances,          ///< I: draw instances
+    IndexKind,          ///< IndexKind: how VertexId is pulled
     BaseVertex,         ///< added to the pulled index (vertexOffset / firstVertex)
     BaseInstance,       ///< firstInstance
     FirstIndex,         ///< first index element in the GsIndexInput binding

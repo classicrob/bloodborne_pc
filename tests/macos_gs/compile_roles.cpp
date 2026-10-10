@@ -5,9 +5,14 @@
 // build.sh. The configuration comes from the "Geometry configuration:" log line.
 //
 //   compile_roles DIR ES_HASH GS_HASH OUT_DIR prim=N out_prim=N max_vert_out=N esgs=N vert=N
-//                 [index=none|u16|u32] [instances=N]
+//                 [instances=N]
+//   compile_roles --negative DIR GS_HASH OUT_DIR
+//       compile-negative controls: hand-encoded ES/GS programs using what the compute roles cannot
+//       run must stop loudly (each in a child process), naming the feature.
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
+#include <sys/wait.h>
+#include <unistd.h>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -119,9 +124,104 @@ int Compile(const char* name, const std::vector<u32>& code, const std::array<u32
     return 0;
 }
 
+// Sea Islands encodings for the negative controls.
+constexpr u32 SBarrier = 0xBF8A0000u;
+constexpr u32 SEndpgm = 0xBF810000u;
+// ds_read_b32 v1, v0
+constexpr u32 DsReadB32[2] = {0xD8D80000u, 1u << 24};
+// v_writelane_b32 v1, s0, lane 0 (VOP2 op 2: vsrc1 field = lane select operand, inline 0)
+constexpr u32 VWritelane = (2u << 25) | (1u << 17) | (128u << 9) | 0u;
+// buffer_store_dword v1, s[0:3], offset, glc slc, soffset 0 (a ring store)
+std::array<u32, 2> RingStore(u32 offset) {
+    return {(0x38u << 26) | (28u << 18) | (1u << 14) | offset,
+            (0u) | (1u << 8) | (0u << 16) | (1u << 22) | (128u << 24)};
+}
+
+struct Negative {
+    const char* name;
+    bool gs;
+    std::vector<u32> code;
+    const char* expect;
+};
+
+int RunNegatives(const std::string& self, const std::filesystem::path& dir,
+                 const std::string& gs_hash, const std::filesystem::path& out, int only) {
+    std::vector<u32> copy_code;
+    std::array<u32, 16> copy_ud{};
+    copy_code = ReadWords(dir / ("copy_" + gs_hash + ".bin"));
+    const auto store = RingStore(0);
+    const auto bad_store = RingStore(28 * 8 * 4); // component 28 of a 28-dword vertex, N = 8
+    const std::vector<Negative> cases = {
+        {"ES s_barrier", false, {SBarrier, store[0], store[1], SEndpgm}, "uses s_barrier"},
+        {"GS s_barrier", true, {SBarrier, store[0], store[1], SEndpgm}, "uses s_barrier"},
+        {"ES LDS read", false, {DsReadB32[0], DsReadB32[1], store[0], store[1], SEndpgm},
+         "uses LDS"},
+        {"GS LDS read", true, {DsReadB32[0], DsReadB32[1], store[0], store[1], SEndpgm},
+         "uses LDS"},
+        {"ES v_writelane", false, {VWritelane, store[0], store[1], SEndpgm}, "v_writelane"},
+        {"GS store past the vertex", true, {bad_store[0], bad_store[1], SEndpgm},
+         "another stream"},
+    };
+    if (only >= 0) {
+        // One case, in this process (the GPU log is written by a thread fork() would drop).
+        const auto& c = cases.at(only);
+        std::array<u32, 16> ud{};
+        Shader::RuntimeInfo rt{};
+        if (c.gs) {
+            rt.Initialize(Shader::HwStage::Geometry, Shader::SwStage::Geometry);
+            rt.gs_role = Shader::GsEmulationRole::GsCompute;
+            rt.gs_max_vert_out = 8;
+            rt.gs_vertex_dwords = 28;
+            rt.hw.gs.output_vertices = 8;
+            rt.hw.gs.num_invocations = 1;
+            rt.hw.gs.in_vertex_data_size = 28;
+            rt.hw.gs.out_vertex_data_size = 28;
+            rt.hw.gs.in_primitive = AmdGpu::PrimitiveType::PointList;
+            rt.hw.gs.out_primitive.fill(AmdGpu::GsOutputPrimitiveType::TriangleStrip);
+            rt.hw.gs.vs_copy = copy_code;
+        } else {
+            rt.Initialize(Shader::HwStage::Export, Shader::SwStage::Vertex);
+            rt.gs_role = Shader::GsEmulationRole::EsCompute;
+            rt.hw.es.vertex_data_size = 28;
+        }
+        rt.props.num_user_data = 16;
+        rt.props.num_allocated_vgprs = 256;
+        Compile(c.gs ? "neg-gs" : "neg-es", c.code, ud, 0x1234, rt, out);
+        return 0;
+    }
+    int failures = 0;
+    for (size_t i = 0; i < cases.size(); ++i) {
+        const auto& c = cases[i];
+        const auto log = out / ("negative-" + std::to_string(i) + ".log");
+        const std::string command = "'" + self + "' --negative-case " + std::to_string(i) + " '" +
+                                    dir.string() + "' " + gs_hash + " '" + out.string() + "' > '" +
+                                    log.string() + "' 2>&1";
+        const int status = std::system(command.c_str());
+        std::ifstream f(log);
+        const std::string text((std::istreambuf_iterator<char>(f)), {});
+        const bool loud = !(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+        const bool named = text.find(c.expect) != std::string::npos;
+        std::printf("%-28s %s\n", c.name,
+                    loud && named ? "LOUD (expected)" : loud ? "LOUD, wrong message" : "COMPILED (FAIL)");
+        if (!(loud && named)) {
+            ++failures;
+            std::printf("%s\n", text.c_str());
+        }
+    }
+    (void)copy_ud;
+    return failures ? 1 : 0;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
+    if (argc == 5 && std::string(argv[1]) == "--negative") {
+        std::filesystem::create_directories(argv[4]);
+        return RunNegatives(argv[0], argv[2], argv[3], argv[4], -1);
+    }
+    if (argc == 6 && std::string(argv[1]) == "--negative-case") {
+        return RunNegatives(argv[0], argv[3], argv[4], argv[5], std::atoi(argv[2]));
+    }
     if (argc < 6) {
         std::fprintf(stderr, "usage: compile_roles DIR ES_HASH GS_HASH OUT_DIR key=value...\n");
         return 2;
@@ -153,14 +253,10 @@ int main(int argc, char** argv) {
 
     const u32 max_vert_out = cfg.Get("max_vert_out");
     const u32 vert_dwords = cfg.Get("vert");
-    const auto index = cfg.kv.count("index") ? cfg.kv["index"] : std::string("none");
 
     Shader::RuntimeInfo es{};
     es.Initialize(Shader::HwStage::Export, Shader::SwStage::Vertex);
     es.gs_role = Shader::GsEmulationRole::EsCompute;
-    es.gs_index_type = index == "u16"   ? Shader::GsIndexType::U16
-                       : index == "u32" ? Shader::GsIndexType::U32
-                                        : Shader::GsIndexType::None;
     es.props.num_user_data = 16;
     es.props.num_input_vgprs = cfg.Get("es_vgprs", 0);
     es.props.num_allocated_vgprs = 256;
