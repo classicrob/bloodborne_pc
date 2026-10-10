@@ -152,6 +152,20 @@ static void Lower(IR::Block& block, IR::Inst& inst) {
 }
 
 void LowerFp64ToFp32(IR::Program& program) {
+#ifdef __APPLE__
+    constexpr auto fp64 = IR::Type::F64 | IR::Type::F64x2 | IR::Type::F64x3 | IR::Type::F64x4;
+    for (const IR::Block* block : program.blocks) {
+        for (const IR::Inst& inst : block->Instructions()) {
+            bool uses_fp64 = (inst.Type() & fp64) != IR::Type::Void;
+            for (size_t i = 0; i < inst.NumArgs(); ++i) {
+                uses_fp64 |= (inst.Arg(i).Type() & fp64) != IR::Type::Void;
+            }
+            ASSERT_MSG(!uses_fp64,
+                       "Apple shader FP64 requires exact support; lossy FP32 lowering is "
+                       "disabled: shader={:#x} opcode={}", program.info.pgm_hash, inst.GetOpcode());
+        }
+    }
+#endif
     for (IR::Block* const block : program.blocks) {
         for (IR::Inst& inst : block->Instructions()) {
             Lower(*block, inst);
