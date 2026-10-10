@@ -7,6 +7,8 @@
 #include "shader_recompiler/frontend/fetch_shader.h"
 #include "shader_recompiler/ir/attribute.h"
 #include "shader_recompiler/ir/microinstruction.h"
+#include "shader_recompiler/ir/program.h"
+#include "shader_recompiler/ir/passes/resource_pass.h"
 #include "shader_recompiler/runtime_info.h"
 
 #include <boost/container/static_vector.hpp>
@@ -228,10 +230,45 @@ Id EmitContext::GetBufferSize(const u32 sharp_idx) {
     return OpSelect(U32[1], stride_zero, num_records, stride_size);
 }
 
+void EmitContext::CollectBufferUsage(const IR::Program& program) {
+    if (!profile.emulate_robust_buffer_access) return;
+    auto& live = live_buffer_accesses.emplace(buffers.size(), false);
+    const auto mark_special = [&](BufferType type) {
+        for (u32 i = 0; i < buffers.size(); ++i)
+            if (buffers[i].buffer_type == type) live[i] = true;
+    };
+    for (const IR::Block* block : program.blocks) {
+        for (const IR::Inst& inst : block->Instructions()) {
+            if (Optimization::IsBufferInstruction(inst) ||
+                inst.GetOpcode() == IR::Opcode::BufferAddress) {
+                const u32 handle = inst.Arg(0).U32();
+                ASSERT(handle < buffers.size());
+                live[handle] = true;
+                if (buffers[handle].buffer_type == BufferType::Guest &&
+                    (info.buffers[handle].sharp_fetch.load_mask & 4)) {
+                    mark_special(BufferType::Flatbuf);
+                }
+            } else if (inst.GetOpcode() == IR::Opcode::ReadConst) {
+                mark_special(BufferType::Flatbuf);
+                if (info.uses_dma && inst.Flags<u32>() == 0) {
+                    mark_special(BufferType::BdaPagetable);
+                    mark_special(BufferType::FaultBuffer);
+                }
+            }
+        }
+    }
+    if (VertexMotion()) {
+        mark_special(BufferType::BdaPagetable);
+        mark_special(BufferType::FaultBuffer);
+    }
+}
+
 void EmitContext::DefineBufferProperties() {
     if (profile.emulate_robust_buffer_access) {
         // The prologue dominates every guest access. Query each binding once per invocation.
-        for (auto& buffer : buffers) {
+        for (u32 handle = 0; handle < buffers.size(); ++handle) {
+            if (live_buffer_accesses && !(*live_buffer_accesses)[handle]) continue;
+            auto& buffer = buffers[handle];
             constexpr std::array shifts{0u, 1u, 2u, 2u, 3u, 3u};
             u32 source = u32(PointerType::NumAlias);
             for (u32 alias = 0; alias < buffer.aliases.size(); ++alias) {
@@ -248,6 +285,7 @@ void EmitContext::DefineBufferProperties() {
             }
         }
         for (u32 handle = 0; handle < buffers.size(); ++handle) {
+            if (live_buffer_accesses && !(*live_buffer_accesses)[handle]) continue;
             const auto& desc = info.buffers[handle];
             // Discovery retains descriptors whose accesses were eliminated later. A live
             // dynamic count creates the flat buffer during shader-info collection.
