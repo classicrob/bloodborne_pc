@@ -13,7 +13,7 @@
 namespace Serialization {
 /* You should increment versions below once corresponding serialization scheme is changed. */
 #ifdef __APPLE__
-static constexpr u32 ShaderBinaryVersion = 13u; // Reject cached lossy FP64 lowering on Apple.
+static constexpr u32 ShaderBinaryVersion = 14u; // Expanded Apple packed user-data push layout.
 #else
 static constexpr u32 ShaderBinaryVersion = 11u; // Live buffer-query hoists and exact internal binding specialization.
 #endif
