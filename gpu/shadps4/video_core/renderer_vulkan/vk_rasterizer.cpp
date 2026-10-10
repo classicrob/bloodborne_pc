@@ -496,7 +496,7 @@ void Rasterizer::CollectRingBindings(const Shader::Info& stage, const PreparedDr
     if (prepared && !BbToggle::Disabled(BbToggle::PreparedResources)) {
         for (u32 i = 0; i < prepared->num_stages; ++i) {
             const auto& candidate = prepared->stages[i];
-            if (&candidate.program->info == &stage &&
+            if (candidate.info == &stage &&
                 candidate.num_buffers == stage.buffers.size()) {
                 prepared_stage = &candidate;
                 break;
@@ -1423,7 +1423,7 @@ const PreparedStage* Rasterizer::FindPreparedStage(const Shader::Info& stage) co
     }
     for (u32 i = 0; i < bind_prepared->num_stages; ++i) {
         const auto& candidate = bind_prepared->stages[i];
-        if (&candidate.program->info == &stage &&
+        if (candidate.info == &stage &&
             candidate.num_images == stage.images.size() &&
             candidate.num_samplers == stage.samplers.size() &&
             candidate.num_buffers == stage.buffers.size()) {

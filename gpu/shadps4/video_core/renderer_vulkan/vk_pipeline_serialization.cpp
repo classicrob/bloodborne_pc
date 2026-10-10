@@ -17,7 +17,7 @@ static constexpr u32 ShaderBinaryVersion = 12u; // Preserve strict multiply's si
 #else
 static constexpr u32 ShaderBinaryVersion = 11u; // Live buffer-query hoists and exact internal binding specialization.
 #endif
-static constexpr u32 ShaderMetaVersion = 8u; // bbport: ImageResource::needs_native
+static constexpr u32 ShaderMetaVersion = 9u; // Each permutation stores its own translated resource metadata.
 static constexpr u32 PipelineKeyVersion = 8u; // MUBUF format validity and add-thread-ID specialization.
 } // namespace Serialization
 
@@ -259,17 +259,17 @@ bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
 }
 
 bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) {
-    auto program = std::make_unique<Program>();
+    Shader::Info info;
     Shader::StageSpecialization spec{};
-    spec.info = &program->info;
+    spec.info = &info;
     size_t perm_idx{};
-    if (!LoadShaderMeta(ar, program->info, sel.fetch_shader, spec, perm_idx)) {
+    if (!LoadShaderMeta(ar, info, sel.fetch_shader, spec, perm_idx)) {
         return false;
     }
 
     std::vector<u32> spv{};
     Storage::DataBase::Instance().Load(Storage::BlobType::ShaderBinary,
-                                       fmt::format("{:#018x}_{}", program->info.pgm_hash, perm_idx),
+                                       fmt::format("{:#018x}_{}", info.pgm_hash, perm_idx),
                                        spv);
     if (spv.empty()) {
         return false;
@@ -280,12 +280,14 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
 
     vk::ShaderModule module{};
 
-    auto [it_pgm, new_program] = program_cache.try_emplace(program->info.pgm_hash);
+    auto [it_pgm, new_program] = program_cache.try_emplace(info.pgm_hash);
     if (new_program) {
         module = CompileSPV(spv, instance.GetDevice());
-        it_pgm.value() = std::move(program);
+        it_pgm.value() = std::make_unique<Program>();
     } else {
-        const auto& it = std::ranges::find(it_pgm.value()->modules, spec, &Program::Module::spec);
+        const auto it = std::ranges::find_if(it_pgm.value()->modules, [&](const auto& entry) {
+            return entry.info && entry.spec == spec;
+        });
         if (it != it_pgm.value()->modules.end()) {
             // A matching permutation is valid only at its original index. A different index means
             // the store holds entries from more than one cache generation, so this pipeline is
@@ -295,7 +297,7 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
                 LOG_WARNING(Render_Vulkan,
                             "Cached permutation {} of {}_{:x} conflicts with index {}, skipping "
                             "preload",
-                            perm_idx, program->info.hw_stage, program->info.pgm_hash, idx);
+                            perm_idx, info.hw_stage, info.pgm_hash, idx);
                 return false;
             }
             module = it->module;
@@ -303,9 +305,9 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
             module = CompileSPV(spv, instance.GetDevice());
         }
     }
-    it_pgm.value()->InsertPermut(module, std::move(spec), perm_idx);
+    it_pgm.value()->InsertPermut(module, std::move(spec), std::move(info), perm_idx);
 
-    sel.infos[stage] = &it_pgm.value()->info;
+    sel.infos[stage] = it_pgm.value()->modules[perm_idx].info.get();
     sel.modules[stage] = module;
 
     return true;

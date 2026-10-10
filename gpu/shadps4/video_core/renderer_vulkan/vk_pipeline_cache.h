@@ -44,29 +44,36 @@ struct Program {
     struct Module {
         vk::ShaderModule module;
         Shader::StageSpecialization spec;
+        // Pipeline resource lists must match this module, and remain stable across vector growth.
+        std::unique_ptr<Shader::Info> info;
+        // Workers refresh private copies; the GPU thread alone updates live user data.
+        std::unique_ptr<const Shader::Info> info_template;
     };
     static constexpr size_t MaxPermutations = 8;
     using ModuleList = boost::container::small_vector<Module, MaxPermutations>;
 
-    Shader::Info info;
     ModuleList modules{};
     size_t last_used = 0; ///< bbport: permutation of the previous lookup, compared first
-    /// bbport: `info` as translated, for draw-preparation workers (they must not read `info`,
-    /// whose user data the GPU thread rewrites every draw). Guarded by programs_mutex.
-    std::unique_ptr<Shader::Info> info_template;
 
     Program() = default;
-    Program(Shader::HwStage stage, Shader::SwStage l_stage, Shader::ShaderParams params)
-        : info{stage, l_stage, params} {}
 
-    void AddPermut(vk::ShaderModule module, Shader::StageSpecialization&& spec) {
-        modules.emplace_back(module, std::move(spec));
+    void AddPermut(vk::ShaderModule module, Shader::StageSpecialization&& spec,
+                   Shader::Info&& metadata) {
+        InsertPermut(module, std::move(spec), std::move(metadata), modules.size());
     }
 
     void InsertPermut(vk::ShaderModule module, Shader::StageSpecialization&& spec,
-                      size_t perm_idx) {
-        modules.resize(std::max(modules.size(), perm_idx + 1)); // <-- beware of realloc
-        modules[perm_idx] = {module, std::move(spec)};
+                      Shader::Info&& metadata, size_t perm_idx) {
+        modules.resize(std::max(modules.size(), perm_idx + 1));
+        if (modules[perm_idx].info) {
+            ASSERT_MSG(modules[perm_idx].module == module && modules[perm_idx].spec == spec,
+                       "Shader permutation metadata conflicts with an existing cache slot");
+            return;
+        }
+        auto info = std::make_unique<Shader::Info>(std::move(metadata));
+        auto snapshot = std::make_unique<const Shader::Info>(*info);
+        spec.info = info.get();
+        modules[perm_idx] = {module, std::move(spec), std::move(info), std::move(snapshot)};
     }
 };
 
@@ -101,13 +108,14 @@ struct PipelineSelection {
 struct PrepWorker {
     struct Stage {
         const Program* program;
+        const Shader::Info* info;
         u64 hash;
         Shader::HwStage hw_stage;
         VAddr pgm_base;
         const std::vector<u32>* flat;
     };
     // Node-based: stages keep pointers to these Infos while later stages are inserted.
-    std::unordered_map<const Program*, Shader::Info> infos;
+    std::unordered_map<const Shader::Info*, Shader::Info> infos;
     boost::container::static_vector<Stage, MaxShaderStages> stages;
     bool failed = false;
 };
