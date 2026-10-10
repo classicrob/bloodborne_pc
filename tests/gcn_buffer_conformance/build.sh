@@ -70,12 +70,18 @@ if [[ -n $tree ]]; then
     while IFS= read -r f; do srcs+=("$f"); done < <(find "$tree/gpu/shadps4/shader_recompiler" -name '*.cpp' | sort)
     while IFS= read -r f; do srcs+=("$f"); done < <(find "$tree/gpu/third_party/sirit/src" -name '*.cpp' | sort)
     echo "compiling ${#srcs[@]} recompiler/sirit sources from $tree ($name)"
+    # Reuse an object only when its source content and flags are unchanged (a .key file next to
+    # it): timestamps miss an edit made while the compile ran, and archives carry commit times.
+    hdrkey=$(find "$tree/gpu/shadps4" "$tree/gpu/shim" "$tree/gpu/third_party/sirit" \( -name '*.h' -o -name '*.inc' -o -name '*.hpp' \) -type f | sort | xargs cat | shasum -a 256 | cut -c1-16)
+    flagkey=$(printf '%s\n' "${cxx[@]}" "${prod[@]}" "$hdrkey" | shasum -a 256 | cut -c1-16)
     pids=()
     for f in "${srcs[@]}"; do
         o="$obj/$(echo "${f#$tree/}" | tr / _).o"
         extra+=("$o")
-        if [[ -f $o && $o -nt $f ]]; then continue; fi
-        "${cxx[@]}" "${prod[@]}" -I"$tree/gpu/third_party/sirit/src" -c "$f" -o "$o" &
+        key="$flagkey $(shasum -a 256 < "$f" | cut -c1-64)"
+        if [[ -f $o && -f $o.key && "$(cat "$o.key")" == "$key" ]]; then continue; fi
+        rm -f "$o" "$o.key"
+        ( "${cxx[@]}" "${prod[@]}" -I"$tree/gpu/third_party/sirit/src" -c "$f" -o "$o" && echo "$key" > "$o.key" ) &
         pids+=($!)
         if (( ${#pids[@]} >= ${BB_BUILD_JOBS:-8} )); then
             wait "${pids[0]}" || { echo "compile failed" >&2; exit 1; }
