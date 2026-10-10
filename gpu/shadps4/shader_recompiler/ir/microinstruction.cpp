@@ -62,6 +62,14 @@ bool Inst::MayHaveSideEffects() const noexcept {
     case Opcode::StoreBufferFormatF32:
     case Opcode::BufferAtomicIAdd32:
     case Opcode::BufferAtomicIAdd64:
+    case Opcode::BufferAtomicISub64:
+    case Opcode::BufferAtomicInc64:
+    case Opcode::BufferAtomicDec64:
+    case Opcode::BufferAtomicAnd64:
+    case Opcode::BufferAtomicOr64:
+    case Opcode::BufferAtomicXor64:
+    case Opcode::BufferAtomicSwap64:
+    case Opcode::BufferAtomicCmpSwap64:
     case Opcode::BufferAtomicISub32:
     case Opcode::BufferAtomicSMin32:
     case Opcode::BufferAtomicSMin64:

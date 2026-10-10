@@ -152,9 +152,9 @@ public:
     [[nodiscard]] Value BufferAtomicFMax(const Value& handle, const Value& address,
                                          const Value& value, BufferInstInfo info);
     [[nodiscard]] Value BufferAtomicInc(const Value& handle, const Value& address,
-                                        BufferInstInfo info);
+                                        const Value& value, BufferInstInfo info);
     [[nodiscard]] Value BufferAtomicDec(const Value& handle, const Value& address,
-                                        BufferInstInfo info);
+                                        const Value& value, BufferInstInfo info);
     [[nodiscard]] Value BufferAtomicAnd(const Value& handle, const Value& address,
                                         const Value& value, BufferInstInfo info);
     [[nodiscard]] Value BufferAtomicOr(const Value& handle, const Value& address,

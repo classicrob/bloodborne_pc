@@ -87,18 +87,47 @@ Id BufferAtomicU32(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address, Id 
     });
 }
 
-Id BufferAtomicU32IncDec(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address,
-                         Id (Sirit::Module::*atomic_func)(Id, Id, Id, Id)) {
+template <bool is_64>
+Id BufferAtomicWrap(EmitContext& ctx, u32 handle, Id address, Id limit, bool decrement) {
     const Id original_index = address;
     const auto& buffer = ctx.buffers[handle];
-    if (const Id offset = buffer.Offset(PointerSize::B32); Sirit::ValidId(offset)) {
+    constexpr auto alias = is_64 ? PointerType::U64 : PointerType::U32;
+    constexpr auto size = is_64 ? PointerSize::B64 : PointerSize::B32;
+    const Id type = is_64 ? ctx.U64 : ctx.U32[1];
+    if (const Id offset = buffer.Offset(size); Sirit::ValidId(offset)) {
         address = ctx.OpIAdd(ctx.U32[1], address, offset);
     }
-    const auto [id, pointer_type] = buffer.Alias(PointerType::U32);
-    const auto [scope, semantics]{AtomicArgs(ctx)};
-    return ctx.BufferRead(handle, PointerType::U32, original_index, address, ctx.U32[1], [&] {
+    const auto [id, pointer_type] = buffer.Alias(alias);
+    const auto [scope, semantics] = AtomicArgs(ctx);
+    return ctx.BufferRead(handle, alias, original_index, address, type, [&] {
         const Id ptr = ctx.OpAccessChain(pointer_type, id, ctx.u32_zero_value, address);
-        return (ctx.*atomic_func)(ctx.U32[1], ptr, scope, semantics);
+        const Id zero = is_64 ? ctx.u64_zero_value : ctx.u32_zero_value;
+        const Id one = is_64 ? ctx.u64_one_value : ctx.u32_one_value;
+        const Id header = ctx.OpLabel();
+        const Id body = ctx.OpLabel();
+        const Id retry = ctx.OpLabel();
+        const Id done = ctx.OpLabel();
+        ctx.OpBranch(header);
+        ctx.AddLabel(header);
+        ctx.OpLoopMerge(done, retry, spv::LoopControlMask::MaskNone);
+        ctx.OpBranch(body);
+        ctx.AddLabel(body);
+        // Reload after contention; only a successful compare/exchange owns old.
+        const Id old = ctx.OpAtomicLoad(type, ptr, scope, semantics);
+        const Id wrap = decrement
+            ? ctx.OpLogicalOr(ctx.U1[1], ctx.OpIEqual(ctx.U1[1], old, zero),
+                              ctx.OpUGreaterThan(ctx.U1[1], old, limit))
+            : ctx.OpUGreaterThanEqual(ctx.U1[1], old, limit);
+        const Id stepped = decrement ? ctx.OpISub(type, old, one) : ctx.OpIAdd(type, old, one);
+        const Id next = ctx.OpSelect(type, wrap, decrement ? limit : zero, stepped);
+        const Id observed = ctx.OpAtomicCompareExchange(type, ptr, scope, semantics, semantics,
+                                                        next, old);
+        const Id succeeded = ctx.OpIEqual(ctx.U1[1], observed, old);
+        ctx.OpBranchConditional(succeeded, done, retry);
+        ctx.AddLabel(retry);
+        ctx.OpBranch(header);
+        ctx.AddLabel(done);
+        return old;
     });
 }
 
@@ -130,6 +159,20 @@ Id BufferAtomicU64(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address, Id 
     return ctx.BufferRead(handle, PointerType::U64, original_index, address, ctx.U64, [&] {
         const Id ptr = ctx.OpAccessChain(pointer_type, id, ctx.u32_zero_value, address);
         return (ctx.*atomic_func)(ctx.U64, ptr, scope, semantics, value);
+    });
+}
+
+Id BufferAtomicU64CmpSwap(EmitContext& ctx, u32 handle, Id address, Id value, Id compare) {
+    const Id original_index = address;
+    const auto& buffer = ctx.buffers[handle];
+    if (const Id offset = buffer.Offset(PointerSize::B64); Sirit::ValidId(offset)) {
+        address = ctx.OpIAdd(ctx.U32[1], address, offset);
+    }
+    const auto [id, pointer_type] = buffer.Alias(PointerType::U64);
+    const auto [scope, semantics] = AtomicArgs(ctx);
+    return ctx.BufferRead(handle, PointerType::U64, original_index, address, ctx.U64, [&] {
+        const Id ptr = ctx.OpAccessChain(pointer_type, id, ctx.u32_zero_value, address);
+        return ctx.OpAtomicCompareExchange(ctx.U64, ptr, scope, semantics, semantics, value, compare);
     });
 }
 
@@ -276,6 +319,10 @@ Id EmitBufferAtomicISub32(EmitContext& ctx, IR::Inst* inst, u32 handle, Id addre
     return BufferAtomicU32(ctx, inst, handle, address, value, &Sirit::Module::OpAtomicISub);
 }
 
+Id EmitBufferAtomicISub64(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address, Id value) {
+    return BufferAtomicU64(ctx, inst, handle, address, value, &Sirit::Module::OpAtomicISub);
+}
+
 Id EmitBufferAtomicSMin32(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address, Id value) {
     return BufferAtomicU32(ctx, inst, handle, address, value, &Sirit::Module::OpAtomicSMin);
 }
@@ -352,34 +399,63 @@ Id EmitBufferAtomicFMax32(EmitContext& ctx, IR::Inst* inst, u32 handle, Id addre
     return result;
 }
 
-Id EmitBufferAtomicInc32(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address) {
-    return BufferAtomicU32IncDec(ctx, inst, handle, address, &Sirit::Module::OpAtomicIIncrement);
+Id EmitBufferAtomicInc32(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address, Id value) {
+    return BufferAtomicWrap<false>(ctx, handle, address, value, false);
 }
 
-Id EmitBufferAtomicDec32(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address) {
-    return BufferAtomicU32IncDec(ctx, inst, handle, address, &Sirit::Module::OpAtomicIDecrement);
+Id EmitBufferAtomicInc64(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address, Id value) {
+    return BufferAtomicWrap<true>(ctx, handle, address, value, false);
+}
+
+Id EmitBufferAtomicDec32(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address, Id value) {
+    return BufferAtomicWrap<false>(ctx, handle, address, value, true);
+}
+
+Id EmitBufferAtomicDec64(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address, Id value) {
+    return BufferAtomicWrap<true>(ctx, handle, address, value, true);
 }
 
 Id EmitBufferAtomicAnd32(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address, Id value) {
     return BufferAtomicU32(ctx, inst, handle, address, value, &Sirit::Module::OpAtomicAnd);
 }
 
+Id EmitBufferAtomicAnd64(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address, Id value) {
+    return BufferAtomicU64(ctx, inst, handle, address, value, &Sirit::Module::OpAtomicAnd);
+}
+
 Id EmitBufferAtomicOr32(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address, Id value) {
     return BufferAtomicU32(ctx, inst, handle, address, value, &Sirit::Module::OpAtomicOr);
+}
+
+Id EmitBufferAtomicOr64(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address, Id value) {
+    return BufferAtomicU64(ctx, inst, handle, address, value, &Sirit::Module::OpAtomicOr);
 }
 
 Id EmitBufferAtomicXor32(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address, Id value) {
     return BufferAtomicU32(ctx, inst, handle, address, value, &Sirit::Module::OpAtomicXor);
 }
 
+Id EmitBufferAtomicXor64(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address, Id value) {
+    return BufferAtomicU64(ctx, inst, handle, address, value, &Sirit::Module::OpAtomicXor);
+}
+
 Id EmitBufferAtomicSwap32(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address, Id value) {
     return BufferAtomicU32(ctx, inst, handle, address, value, &Sirit::Module::OpAtomicExchange);
+}
+
+Id EmitBufferAtomicSwap64(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address, Id value) {
+    return BufferAtomicU64(ctx, inst, handle, address, value, &Sirit::Module::OpAtomicExchange);
 }
 
 Id EmitBufferAtomicCmpSwap32(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address, Id value,
                              Id cmp_value) {
     return BufferAtomicU32CmpSwap(ctx, inst, handle, address, value, cmp_value,
                                   &Sirit::Module::OpAtomicCompareExchange);
+}
+
+Id EmitBufferAtomicCmpSwap64(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address, Id value,
+                             Id cmp_value) {
+    return BufferAtomicU64CmpSwap(ctx, handle, address, value, cmp_value);
 }
 
 Id EmitBufferAtomicFCmpSwap32(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address, Id value,

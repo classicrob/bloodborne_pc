@@ -87,8 +87,8 @@ static std::vector<u32> shader(bool null_write) {
                          EmitBufferAtomicXor32, EmitBufferAtomicSwap32}) {
             results.push_back(emit(ctx,nullptr,0,address,value));
         }
-        results.push_back(EmitBufferAtomicInc32(ctx,nullptr,0,address));
-        results.push_back(EmitBufferAtomicDec32(ctx,nullptr,0,address));
+        results.push_back(EmitBufferAtomicInc32(ctx,nullptr,0,address,value));
+        results.push_back(EmitBufferAtomicDec32(ctx,nullptr,0,address,value));
         results.push_back(EmitBufferAtomicCmpSwap32(ctx,nullptr,0,address,value,address));
         results.push_back(ctx.OpBitcast(ctx.U32[1],EmitBufferAtomicFMin32(ctx,nullptr,0,address,f)));
         results.push_back(ctx.OpBitcast(ctx.U32[1],EmitBufferAtomicFMax32(ctx,nullptr,0,address,f)));
