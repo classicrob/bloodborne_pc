@@ -96,6 +96,13 @@ ImageView::ImageView(const Vulkan::Instance& instance, const ImageViewInfo& info
     if (!info.is_storage) {
         usage_ci.usage &= ~vk::ImageUsageFlagBits::eStorage;
     }
+#ifdef __APPLE__
+    // Image creation drops storage usage for formats that refuse it (image.cpp); a storage view
+    // of such an image is invalid. See docs/macos/format-support.md.
+    ASSERT_MSG(!info.is_storage || (image.usage_flags & vk::ImageUsageFlagBits::eStorage),
+               "macOS: storage view of format {} image at {:#x}, which cannot be a storage image",
+               vk::to_string(image.info.pixel_format), image.info.guest_address);
+#endif
     vk::ImageViewMinLodCreateInfoEXT min_lod_ci{};
     if (info.min_lod != 0 && instance.IsImageViewMinLodSupported()) {
         const float last_level =

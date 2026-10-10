@@ -264,6 +264,10 @@ GraphicsPipeline::GraphicsPipeline(
             instance.GetSupportedFormat(format, vk::FormatFeatureFlagBits2::eColorAttachment);
         if (!instance.IsFormatSupported(color_format,
                                         vk::FormatFeatureFlagBits2::eColorAttachment)) {
+#ifdef __APPLE__
+            UNREACHABLE_MSG("macOS: color buffer {} format {} cannot be a color attachment", i,
+                            vk::to_string(color_format));
+#endif
             LOG_WARNING(Render_Vulkan,
                         "color buffer format {} does not support COLOR_ATTACHMENT_BIT",
                         vk::to_string(color_format));

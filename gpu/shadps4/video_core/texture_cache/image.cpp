@@ -180,6 +180,14 @@ Image::Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime_,
         }
     }
     if (image_format_properties.result == vk::Result::eErrorFormatNotSupported) {
+#ifdef __APPLE__
+        // Creating it anyway is undefined behaviour in MoltenVK. See docs/macos/format-support.md.
+        UNREACHABLE_MSG("macOS: image format {} type {} {}x{} at {:#x} is not supported (flags "
+                        "{}, usage {})",
+                        vk::to_string(supported_format), vk::to_string(format_info.type),
+                        info.size.width, info.size.height, info.guest_address,
+                        vk::to_string(format_info.flags), vk::to_string(format_info.usage));
+#endif
         LOG_ERROR(Render_Vulkan, "image format {} type {} is not supported (flags {}, usage {})",
                   vk::to_string(supported_format), vk::to_string(format_info.type),
                   vk::to_string(format_info.flags), vk::to_string(format_info.usage));
