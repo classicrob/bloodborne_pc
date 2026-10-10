@@ -1308,8 +1308,8 @@ Id EmitContext::DefineGetBdaPointer() {
     const auto page32{OpUConvert(U32[1], page)};
     const auto& bda_buffer{buffers[bda_pagetable_index]};
     const auto [bda_buffer_id, bda_pointer_type] = bda_buffer.Alias(PointerType::U64);
-    const auto bda = BufferRead(bda_pagetable_index, PointerType::U64, page32, page32, U64, [&] {
-        const auto ptr = OpAccessChain(bda_pointer_type, bda_buffer_id, u32_zero_value, page32);
+    const auto bda = BufferLoad(bda_pagetable_index, PointerType::U64, page32, page32, U64, [&](Id index) {
+        const auto ptr = OpAccessChain(bda_pointer_type, bda_buffer_id, u32_zero_value, index);
         return OpLoad(U64, ptr);
     });
 

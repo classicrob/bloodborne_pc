@@ -2,6 +2,9 @@
 #include <cassert>
 #include <cstdio>
 #include <cstring>
+#include <algorithm>
+#include <fstream>
+#include <string>
 #include <vector>
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
 #include "shader_recompiler/backend/spirv/emit_spirv_instructions.h"
@@ -19,6 +22,9 @@ static std::vector<u32> shader(bool robust) {
         std::memcpy(resource.sharp_fetch.immediates.data(),&sharp,sizeof(sharp));
     }
     RuntimeInfo runtime{};Backend::Bindings bindings{};EmitContext ctx(profile,runtime,info,bindings);
+    ctx.AddCapability(spv::Capability::Int8);
+    ctx.AddCapability(spv::Capability::Int16);
+    ctx.AddCapability(spv::Capability::Int64);
     const auto gid=ctx.AddGlobalVariable(ctx.TypePointer(spv::StorageClass::Input,ctx.U32[3]),spv::StorageClass::Input);
     ctx.Decorate(gid,spv::Decoration::BuiltIn,u32(spv::BuiltIn::GlobalInvocationId));ctx.interfaces.push_back(gid);
     auto function=ctx.OpFunction(ctx.void_id,spv::FunctionControlMask::MaskNone,ctx.TypeFunction(ctx.void_id));
@@ -41,6 +47,17 @@ static std::vector<u32> shader(bool robust) {
     return ctx.Assemble();
 }
 int main(int argc, char** argv) {
+    if (argc > 2 && std::string(argv[2]) == "--emit-only") {
+        for (u32 mode = 0; mode < 2; ++mode) {
+            const auto code = shader(mode != 0);
+            std::ofstream file(std::string(argv[1]) + "/benchmark-" + std::to_string(mode) + ".spv",
+                               std::ios::binary);
+            file.write(reinterpret_cast<const char*>(code.data()), code.size() * 4);
+            assert(file.good());
+        }
+        std::puts("Bounds benchmark SPIR-V emitted without GPU execution");
+        return 0;
+    }
 
     std::fprintf(stderr, "buffer bounds test: Vulkan setup\n");
     vk::detail::DynamicLoader loader;
@@ -105,46 +122,79 @@ int main(int argc, char** argv) {
         {.dstSet=set,.dstBinding=1,.descriptorCount=1,.descriptorType=vk::DescriptorType::eStorageBuffer,.pBufferInfo=&dummy},
         {.dstSet=set,.dstBinding=2,.descriptorCount=1,.descriptorType=vk::DescriptorType::eStorageBuffer,.pBufferInfo=&buffer}}};
     device->updateDescriptorSets(writes, {});
-    const vk::PushConstantRange push{.stageFlags=vk::ShaderStageFlagBits::eCompute,.offset=0,.size=128};
+    const vk::PushConstantRange push{.stageFlags=vk::ShaderStageFlagBits::eCompute,.offset=0,.size=sizeof(PushData)};
     auto pipeline_layout = device->createPipelineLayoutUnique({.setLayoutCount=1,.pSetLayouts=&*descriptors,
         .pushConstantRangeCount=1,.pPushConstantRanges=&push}).value;
     std::vector<u32> reference;
     auto queries=device->createQueryPoolUnique({.queryType=vk::QueryType::eTimestamp,.queryCount=2}).value;
     assert(physical.getProperties().limits.timestampComputeAndGraphics);
     const double timestamp_period=physical.getProperties().limits.timestampPeriod;
-    for(bool robust : {false,true}) {
-        for(u32 i=0;i<Words;++i) backing_data[i]=(i*2654435761u)^0x98765432u;
-        auto code=shader(robust);
-        std::fprintf(stderr,"bounds benchmark: compile robust=%d\n",robust);
-        auto module=device->createShaderModuleUnique({.codeSize=code.size()*4,.pCode=code.data()}).value;
-        auto pipeline=device->createComputePipelineUnique({}, {
+    std::array<vk::UniquePipeline, 2> pipelines;
+    for (u32 mode = 0; mode < 2; ++mode) {
+        auto code = shader(mode != 0);
+        if (argc > 1) {
+            std::ofstream file(std::string(argv[1]) + "/benchmark-" + std::to_string(mode) + ".spv",
+                               std::ios::binary);
+            file.write(reinterpret_cast<const char*>(code.data()), code.size() * 4);
+            assert(file.good());
+        }
+        std::fprintf(stderr, "bounds benchmark: compile robust=%u\n", mode);
+        auto module = device->createShaderModuleUnique({.codeSize=code.size()*4,.pCode=code.data()}).value;
+        pipelines[mode] = device->createComputePipelineUnique({}, {
             .stage={.stage=vk::ShaderStageFlagBits::eCompute,.module=*module,.pName="main"},
             .layout=*pipeline_layout}).value;
-        assert(pipeline);
-        double total_ms=0;
-        for(int repetition=0;repetition<12;++repetition) {
-            command.resetQueryPool(*queries,0,2);
-            command.bindPipeline(vk::PipelineBindPoint::eCompute,*pipeline);
-            command.bindDescriptorSets(vk::PipelineBindPoint::eCompute,*pipeline_layout,0,set,{});
-            command.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe,*queries,0);
-            command.dispatch(Words/64,1,1);
-            command.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe,*queries,1);
-            const vk::MemoryBarrier barrier{.srcAccessMask=vk::AccessFlagBits::eShaderWrite,.dstAccessMask=vk::AccessFlagBits::eHostRead};
-            command.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,vk::PipelineStageFlagBits::eHost,{},barrier,{},{});
-            assert(command.end()==vk::Result::eSuccess);
+        assert(pipelines[mode]);
+    }
+    for (u32 i = 0; i < Words; ++i) backing_data[i] = (i * 2654435761u) ^ 0x98765432u;
+    std::array<std::vector<double>, 2> samples;
+    std::ofstream raw;
+    if (argc > 1) {
+        raw.open(std::string(argv[1]) + "/timestamps.csv");
+        assert(raw.good());
+        raw << "round,mode,gpu_ms\n";
+    }
+    constexpr u32 Warmup = 8, Measured = 60;
+    for (u32 repetition = 0; repetition < Warmup + Measured; ++repetition) {
+        for (u32 pass = 0; pass < 2; ++pass) {
+            const u32 mode = repetition % 2 == 0 ? pass : 1 - pass;
+            command.resetQueryPool(*queries, 0, 2);
+            command.bindPipeline(vk::PipelineBindPoint::eCompute, *pipelines[mode]);
+            command.bindDescriptorSets(vk::PipelineBindPoint::eCompute, *pipeline_layout, 0, set, {});
+            command.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, *queries, 0);
+            command.dispatch(Words / 64, 1, 1);
+            command.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, *queries, 1);
+            const vk::MemoryBarrier barrier{.srcAccessMask=vk::AccessFlagBits::eShaderWrite,
+                                            .dstAccessMask=vk::AccessFlagBits::eHostRead};
+            command.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
+                                    vk::PipelineStageFlagBits::eHost, {}, barrier, {}, {});
+            assert(command.end() == vk::Result::eSuccess);
             const vk::SubmitInfo submit{.commandBufferCount=1,.pCommandBuffers=&command};
-            assert(queue.submit(submit)==vk::Result::eSuccess);
-            assert(queue.waitIdle()==vk::Result::eSuccess);
-            std::array<uint64_t,2> ticks{};
-            assert(device->getQueryPoolResults(*queries,0,2,sizeof(ticks),ticks.data(),sizeof(uint64_t),vk::QueryResultFlagBits::e64|vk::QueryResultFlagBits::eWait)==vk::Result::eSuccess);
-            if(repetition>=2) total_ms+=(ticks[1]-ticks[0])*timestamp_period/1e6;
-            device->freeCommandBuffers(*pool,command);
-            command=device->allocateCommandBuffers({.commandPool=*pool,.level=vk::CommandBufferLevel::ePrimary,.commandBufferCount=1}).value.front();
-            assert(command.begin(vk::CommandBufferBeginInfo{})==vk::Result::eSuccess);
+            assert(queue.submit(submit) == vk::Result::eSuccess);
+            assert(queue.waitIdle() == vk::Result::eSuccess);
+            std::array<uint64_t, 2> ticks{};
+            assert(device->getQueryPoolResults(*queries, 0, 2, sizeof(ticks), ticks.data(),
+                sizeof(uint64_t), vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait) ==
+                vk::Result::eSuccess);
+            const double ms = (ticks[1] - ticks[0]) * timestamp_period / 1e6;
+            if (repetition >= Warmup) {
+                samples[mode].push_back(ms);
+                if (raw.is_open()) raw << repetition - Warmup << ',' << mode << ',' << ms << '\n';
+            }
+            if (reference.empty()) reference.assign(data, data + Words);
+            else assert(std::equal(reference.begin(), reference.end(), data));
+            device->freeCommandBuffers(*pool, command);
+            command = device->allocateCommandBuffers({.commandPool=*pool,
+                .level=vk::CommandBufferLevel::ePrimary,.commandBufferCount=1}).value.front();
+            assert(command.begin(vk::CommandBufferBeginInfo{}) == vk::Result::eSuccess);
         }
-        if(!robust) reference.assign(data,data+Words);
-        else assert(std::equal(reference.begin(),reference.end(),data));
-        std::fprintf(stderr,"bounds benchmark: robust=%d GPU mean %.3fms (10 samples, 8,388,608 loads, 65,536 invocations)\n",robust,total_ms/10);
+    }
+    for (u32 mode = 0; mode < 2; ++mode) {
+        std::sort(samples[mode].begin(), samples[mode].end());
+        const auto& values = samples[mode];
+        const double median = (values[29] + values[30]) / 2;
+        std::fprintf(stderr, "bounds benchmark: robust=%u median %.6fms IQR %.6f..%.6fms "
+                     "(60 alternating samples, 8,388,608 loads, 65,536 invocations)\n",
+                     mode, median, values[15], values[45]);
     }
     std::puts("Heavy compute checksum equivalence PASS");
 }

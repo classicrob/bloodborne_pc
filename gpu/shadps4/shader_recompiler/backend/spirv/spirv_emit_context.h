@@ -218,8 +218,8 @@ public:
         ASSERT(flatbuf_buffer.binding >= 0 && flatbuf_buffer.buffer_type == BufferType::Flatbuf);
         const auto [flatbuf_buffer_id, flatbuf_pointer_type] =
             flatbuf_buffer.aliases[u32(PointerType::U32)];
-        return BufferRead(flatbuf_index, PointerType::U32, flatbuf_offset, flatbuf_offset, U32[1], [&] {
-            const auto ptr{OpAccessChain(flatbuf_pointer_type, flatbuf_buffer_id, u32_zero_value, flatbuf_offset)};
+        return BufferLoad(flatbuf_index, PointerType::U32, flatbuf_offset, flatbuf_offset, U32[1], [&](Id index) {
+            const auto ptr{OpAccessChain(flatbuf_pointer_type, flatbuf_buffer_id, u32_zero_value, index)};
             return OpLoad(U32[1], ptr);
         });
     }
@@ -458,6 +458,31 @@ public:
         OpBranch(merge_label);
         AddLabel(merge_label);
         return OpPhi(type, value, value_label, ConstantNull(type), zero_label);
+    }
+
+    Id BufferLoad(u32 handle, PointerType alias, Id original_index, Id index,
+                  Id type, auto&& read, u32 component = 0) {
+        if (buffers[handle].is_null) return ConstantNull(type);
+        if (!profile.emulate_robust_buffer_access) return read(index);
+        const Id valid = BufferInBounds(handle, alias, original_index, index, component);
+        const Id length = BufferLength(handle, alias);
+        const Id access_label = OpLabel();
+        const Id empty_label = OpLabel();
+        const Id merge_label = OpLabel();
+        // Alias length is uniform. A tiny binding may have no complete element for this alias.
+        const Id nonempty = OpINotEqual(U1[1], length, u32_zero_value);
+        OpSelectionMerge(merge_label, spv::SelectionControlMask::MaskNone);
+        OpBranchConditional(nonempty, access_label, empty_label);
+        AddLabel(access_label);
+        // Invalid lanes read element zero of a nonempty binding; never form an invalid pointer.
+        const Id safe_index = OpSelect(U32[1], valid, index, u32_zero_value);
+        const Id value = OpSelect(type, valid, read(safe_index), ConstantNull(type));
+        const Id value_label = last_label;
+        OpBranch(merge_label);
+        AddLabel(empty_label);
+        OpBranch(merge_label);
+        AddLabel(merge_label);
+        return OpPhi(type, value, value_label, ConstantNull(type), empty_label);
     }
 
     void BufferWrite(u32 handle, PointerType alias, Id original_index, Id index,
