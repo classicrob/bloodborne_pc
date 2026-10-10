@@ -2,12 +2,14 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <ranges>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 
 #include "common/hash.h"
@@ -672,6 +674,69 @@ bool PipelineCache::RefreshGraphicsKey(PipelineSelection& sel) {
     return true;
 }
 
+#ifdef __APPLE__
+namespace {
+/// Apple has no geometry stage. Reports a draw's whole ES/GS configuration: the GS registers in
+/// the log, and the ES, GS and copy-shader binaries plus their user data under
+/// <shader dir>/gs_report. Stops the game, unless BB_GS_CENSUS=1 asks to record every distinct
+/// configuration and not draw them (a diagnostic run, which then renders incompletely and logs
+/// how many draws it dropped).
+bool ReportGeometryStages(const AmdGpu::Regs& regs) {
+    static const bool census = [] {
+        const char* value = std::getenv("BB_GS_CENSUS");
+        return value && value[0] == '1';
+    }();
+    const auto es = AmdGpu::GetParams(regs.es_program);
+    const auto gs = AmdGpu::GetParams(regs.gs_program);
+    const auto vs = AmdGpu::GetParams(regs.vs_program);
+    const u32 gs_mode = std::bit_cast<u32>(regs.vgt_gs_mode);
+    const u32 onchip = std::bit_cast<u32>(regs.vgt_gs_onchip_control);
+    const auto key = fmt::format(
+        "stages {:#x} es {:#018x} gs {:#018x} copy {:#018x} prim {} gs_mode {:#x} onchip {:#x} "
+        "out_prim {:#x} max_vert_out {} instance_cnt {:#x} esgs_itemsize {} gsvs_itemsize {} "
+        "vert_itemsize {}/{}/{}/{} gsvs_offsets {}/{}/{} strmout {:#x} vs_output_control {:#x}",
+        static_cast<u32>(regs.stage_enable.raw), es.hash, gs.hash, vs.hash,
+        static_cast<u32>(regs.primitive_type), gs_mode, onchip, regs.vgt_gs_out_prim_type.raw,
+        u32(regs.vgt_gs_max_vert_out), regs.vgt_gs_instance_cnt.raw, regs.vgt_esgs_ring_itemsize,
+        regs.vgt_gsvs_ring_itemsize, regs.vgt_gs_vert_itemsize[0], regs.vgt_gs_vert_itemsize[1],
+        regs.vgt_gs_vert_itemsize[2], regs.vgt_gs_vert_itemsize[3],
+        regs.vgt_gsvs_ring_offset_1.raw, regs.vgt_gsvs_ring_offset_2.raw,
+        regs.vgt_gsvs_ring_offset_3.raw, regs.vgt_strmout_config.raw,
+        std::bit_cast<u32>(regs.vs_output_control));
+
+    static std::mutex mutex;
+    static std::unordered_map<std::string, u64> seen;
+    u64 count;
+    {
+        std::scoped_lock lock{mutex};
+        count = ++seen[key];
+    }
+    if (count == 1) {
+        using namespace Common::FS;
+        const auto dir = GetUserPath(PathType::ShaderDir) / "gs_report";
+        std::filesystem::create_directories(dir);
+        const auto dump = [&](const char* stage, const Shader::ShaderParams& params) {
+            const auto name = fmt::format("{}_{:#018x}", stage, params.hash);
+            IOFile{dir / (name + ".bin"), FileAccessMode::Create}.WriteSpan(params.code);
+            IOFile{dir / (name + ".ud"), FileAccessMode::Create}.WriteSpan(
+                std::span<const u32>{params.user_data});
+        };
+        dump("es", es);
+        dump("gs", gs);
+        dump("copy", vs);
+        LOG_ERROR(Render_Vulkan, "Geometry configuration: {} (instances {}, indices {})", key,
+                  regs.num_instances.NumInstances(), regs.num_indices);
+    } else if (std::has_single_bit(count)) {
+        LOG_ERROR(Render_Vulkan, "Geometry configuration drawn {} times: {}", count, key);
+    }
+    if (!census) {
+        UNREACHABLE_MSG("macOS geometry shader emulation is not implemented: {}", key);
+    }
+    return false;
+}
+} // Anonymous namespace
+#endif
+
 bool PipelineCache::RefreshGraphicsStages(PipelineSelection& sel) {
     const auto& regs = (*sel.regs);
     auto& key = sel.graphics_key;
@@ -718,8 +783,7 @@ bool PipelineCache::RefreshGraphicsStages(PipelineSelection& sel) {
     case AmdGpu::ShaderStageEnable::VgtStages::EsGs:
         if (!instance.IsGeometryStageSupported()) {
 #ifdef __APPLE__
-            UNREACHABLE_MSG("macOS geometry shader emulation is not implemented: VGT stage mask {:#x}",
-                            static_cast<u32>(regs.stage_enable.raw));
+            return ReportGeometryStages(regs);
 #endif
             LOG_WARNING(Render_Vulkan, "Geometry shader stage unsupported, skipping");
             return false;
@@ -764,8 +828,7 @@ bool PipelineCache::RefreshGraphicsStages(PipelineSelection& sel) {
         }
         if (!instance.IsGeometryStageSupported()) {
 #ifdef __APPLE__
-            UNREACHABLE_MSG("macOS geometry shader emulation is not implemented: VGT stage mask {:#x}",
-                            static_cast<u32>(regs.stage_enable.raw));
+            return ReportGeometryStages(regs);
 #endif
             LOG_WARNING(Render_Vulkan, "Geometry shader stage unsupported, skipping");
             return false;
