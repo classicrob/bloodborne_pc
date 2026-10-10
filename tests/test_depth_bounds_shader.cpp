@@ -108,6 +108,59 @@ static void Compile(const std::string& output, bool enabled, u32 start, bool sto
     std::printf("PASS depth shader enabled=%u start=%u side_effect=%u\n", enabled, start, store);
 }
 
+static void EntryPhi(const std::string& output, bool enabled) {
+    Info info{};
+    info.hw_stage = HwStage::Fragment;
+    info.sw_stage = SwStage::Fragment;
+    info.loads.Set(IR::Attribute::FragCoord);
+    auto& resource = info.buffers.emplace_back();
+    resource.used_types = IR::Type::U32;
+    resource.is_written = true;
+    const auto sharp = AmdGpu::Buffer::Placeholder(64);
+    std::memcpy(resource.sharp_fetch.immediates.data(), &sharp, sizeof(sharp));
+    RuntimeInfo runtime{};
+    runtime.Initialize(HwStage::Fragment, SwStage::Fragment);
+    runtime.hw.fs.depth_bounds_test = enabled;
+    Profile profile{};
+    profile.supported_spirv = 0x00010500;
+    profile.support_fp32_denorm_flush = true;
+    profile.support_fp32_signed_zero_inf_nan_preserve = true;
+    Common::ObjectPool<IR::Inst> pool;
+    IR::Block entry(pool), body(pool), merge(pool);
+    IR::IREmitter first(entry), last(merge);
+    const auto condition = first.FPGreaterThan(first.GetAttribute(IR::Attribute::FragCoord),
+                                               first.Imm32(1.0f));
+    body.AppendNewInst(IR::Opcode::Void, {});
+    auto phi = merge.PrependNewInst(merge.begin(), IR::Opcode::Phi);
+    phi->SetFlags(IR::Type::U32);
+    phi->AddPhiOperand(&entry, first.Imm32(1u));
+    phi->AddPhiOperand(&body, first.Imm32(2u));
+    last.StoreBufferU32(1, last.Imm32(0), last.Imm32(0), IR::U32{IR::Value{&*phi}}, {});
+    last.Epilogue();
+    IR::Program program(info);
+    program.blocks = {&entry, &body, &merge};
+    using Node = IR::AbstractSyntaxNode;
+    program.syntax_list = {
+        {.data = {.block = &entry}, .type = Node::Type::Block},
+        {.data = {.if_node = {condition, &body, &merge}}, .type = Node::Type::If},
+        {.data = {.block = &body}, .type = Node::Type::Block},
+        {.data = {.end_if = {&merge}}, .type = Node::Type::EndIf},
+        {.data = {.block = &merge}, .type = Node::Type::Block},
+        {.type = Node::Type::Return},
+    };
+    Backend::Bindings bindings{};
+    const auto words = Backend::SPIRV::EmitSPIRV(profile, runtime, program, bindings);
+    bool found_phi = false;
+    for (size_t i = 5; i < words.size(); i += words[i] >> 16) {
+        found_phi |= (words[i] & 0xffff) == u32(spv::Op::OpPhi);
+    }
+    assert(found_phi);
+    std::ofstream file(output + "/depth-phi-" + std::to_string(enabled) + ".spv", std::ios::binary);
+    file.write(reinterpret_cast<const char*>(words.data()), words.size() * sizeof(u32));
+    assert(file.good());
+    std::printf("PASS depth entry-if/phi enabled=%u\n", enabled);
+}
+
 int main(int argc, char** argv) {
     assert(argc == 2 || argc == 3);
     if (argc == 3) {
@@ -118,4 +171,6 @@ int main(int argc, char** argv) {
         for (u32 start : {0u, 7u})
             for (bool store : {false, true})
                 Compile(argv[1], enabled, start, store, 1);
+    EntryPhi(argv[1], false);
+    EntryPhi(argv[1], true);
 }
