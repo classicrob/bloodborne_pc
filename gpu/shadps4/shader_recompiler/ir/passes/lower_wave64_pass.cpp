@@ -118,22 +118,52 @@ public:
         for (const IR::Block* block : program.blocks) {
             for (const IR::Inst& inst : block->Instructions()) {
                 if (IsDivergentSource(inst)) {
-                    divergent.insert(&inst);
-                    worklist.push_back(&inst);
+                    Mark(&inst, worklist);
                 }
             }
         }
-        while (!worklist.empty()) {
-            const IR::Inst* inst = worklist.back();
-            worklist.pop_back();
-            for (const IR::Use& use : inst->Uses()) {
-                const IR::Inst* user = use.user;
-                if (divergent.contains(user) || !PropagatesFrom(*user, use.operand)) {
-                    continue;
+        Propagate(worklist);
+        // Control dependence: a phi merging different values after a divergent branch, and
+        // anything defined in (or carried out of) a loop with a divergent exit, differs between
+        // invocations even when every input is uniform. Iterate with data propagation until stable.
+        using Type = IR::AbstractSyntaxNode::Type;
+        const auto& list = program.syntax_list;
+        bool changed = true;
+        while (changed) {
+            changed = false;
+            const size_t before = divergent.size();
+            for (size_t n = 0; n < list.size(); ++n) {
+                const auto& node = list[n];
+                if (node.type == Type::If && !IsUniform(node.data.if_node.cond)) {
+                    MarkMergePhis(node.data.if_node.merge, worklist);
+                } else if (node.type == Type::Loop) {
+                    // the loop body runs from this node to its Repeat
+                    bool exit_divergent = false;
+                    std::vector<const IR::Block*> body;
+                    size_t depth = 0, m = n + 1;
+                    for (; m < list.size(); ++m) {
+                        const auto& inner = list[m];
+                        if (inner.type == Type::Loop) ++depth;
+                        if (inner.type == Type::Block) body.push_back(inner.data.block);
+                        if (inner.type == Type::Break && !IsUniform(inner.data.break_node.cond)) exit_divergent = true;
+                        if (inner.type == Type::Repeat) {
+                            if (depth == 0) {
+                                exit_divergent |= !IsUniform(inner.data.repeat.cond);
+                                break;
+                            }
+                            --depth;
+                        }
+                    }
+                    if (exit_divergent) {
+                        for (const IR::Block* block : body) {
+                            for (const IR::Inst& inst : block->Instructions()) Mark(&inst, worklist);
+                        }
+                        MarkMergePhis(node.data.loop.merge, worklist);
+                    }
                 }
-                divergent.insert(user);
-                worklist.push_back(user);
             }
+            Propagate(worklist);
+            changed = divergent.size() != before;
         }
     }
 
@@ -161,10 +191,16 @@ private:
         default:
             break;
         }
+        const std::string_view name = IR::NameOf(inst.GetOpcode());
+        if (name.starts_with("Undef")) {
+            // SSA construction's value for a register on a path that does not define it (e.g.
+            // through the structurizer's goto variables). The guest never reads it there: no
+            // hardware-defined register is Undef, so a read would be of an uninitialised register.
+            return false;
+        }
         if (inst.NumArgs() == 0) {
             return inst.GetOpcode() != Opcode::Phi; // a source we do not know to be uniform
         }
-        const std::string_view name = IR::NameOf(inst.GetOpcode());
         return name.find("Load") != std::string_view::npos || name.find("Atomic") != std::string_view::npos ||
                name.find("Image") != std::string_view::npos || name.find("Attribute") != std::string_view::npos ||
                name.find("Lane") != std::string_view::npos || name.find("Shuffle") != std::string_view::npos ||
@@ -184,6 +220,31 @@ private:
             return operand == 1; // a divergent lane select makes the read divergent
         default:
             return true;
+        }
+    }
+
+    void Mark(const IR::Inst* inst, std::vector<const IR::Inst*>& worklist) {
+        if (divergent.insert(inst).second) worklist.push_back(inst);
+    }
+
+    void MarkMergePhis(const IR::Block* merge, std::vector<const IR::Inst*>& worklist) {
+        for (const IR::Inst& inst : merge->Instructions()) {
+            if (inst.GetOpcode() != IR::Opcode::Phi) continue;
+            bool same = true;
+            for (size_t i = 1; i < inst.NumArgs(); ++i) same &= inst.Arg(i) == inst.Arg(0);
+            if (!same) Mark(&inst, worklist);
+        }
+    }
+
+    void Propagate(std::vector<const IR::Inst*>& worklist) {
+        while (!worklist.empty()) {
+            const IR::Inst* inst = worklist.back();
+            worklist.pop_back();
+            for (const IR::Use& use : inst->Uses()) {
+                if (!divergent.contains(use.user) && PropagatesFrom(*use.user, use.operand)) {
+                    Mark(use.user, worklist);
+                }
+            }
         }
     }
 
