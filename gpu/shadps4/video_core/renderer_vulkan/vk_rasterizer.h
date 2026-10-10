@@ -518,6 +518,10 @@ private:
     std::vector<VideoCore::ImageId> sampled_dump_pending;
     std::vector<VAddr> sampled_dump_done;
     void NoteSampledForDump(VideoCore::ImageId image_id, VAddr address);
+    /// macOS depth-bounds emulation: binds the stored depth (set 1) for pipelines whose fragment
+    /// shader tests it (docs/macos/depth-bounds.md). After BeginRendering.
+    void BindDepthBoundsSource(const GraphicsPipeline* pipeline);
+    bool render_reduced = false; ///< the current pass renders into reduced-size scene proxies
     void DumpSampledImages();
     bool PendingWriteOverlaps(VAddr address, u64 size);
     /// Stage B: the ring bindings of the stages of the packet being recorded.

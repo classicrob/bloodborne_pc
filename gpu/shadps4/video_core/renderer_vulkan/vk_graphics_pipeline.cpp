@@ -48,10 +48,31 @@ GraphicsPipeline::GraphicsPipeline(
         .size = sizeof(Shader::PushData),
     };
 
-    const vk::DescriptorSetLayout set_layout = *desc_layout;
+    std::array<vk::DescriptorSetLayout, 2> set_layouts{*desc_layout};
+    u32 num_set_layouts = 1;
+#ifdef __APPLE__
+    // Depth-bounds emulation: set 1, binding 0 is the stored depth the fragment shader tests
+    // (docs/macos/depth-bounds.md).
+    if (runtime_infos[u32(Shader::SwStage::Fragment)].hw.fs.depth_bounds_test) {
+        const vk::DescriptorSetLayoutBinding depth_binding = {
+            .binding = 0,
+            .descriptorType = vk::DescriptorType::eSampledImage,
+            .descriptorCount = 1,
+            .stageFlags = vk::ShaderStageFlagBits::eFragment,
+        };
+        auto [result, depth_layout] = device.createDescriptorSetLayoutUnique({
+            .bindingCount = 1,
+            .pBindings = &depth_binding,
+        });
+        ASSERT_MSG(result == vk::Result::eSuccess, "Failed to create depth-bounds set layout: {}",
+                   vk::to_string(result));
+        depth_bounds_layout = std::move(depth_layout);
+        set_layouts[num_set_layouts++] = *depth_bounds_layout;
+    }
+#endif
     const vk::PipelineLayoutCreateInfo layout_info = {
-        .setLayoutCount = 1U,
-        .pSetLayouts = &set_layout,
+        .setLayoutCount = num_set_layouts,
+        .pSetLayouts = set_layouts.data(),
         .pushConstantRangeCount = 1,
         .pPushConstantRanges = &push_constants,
     };
@@ -506,6 +527,21 @@ GraphicsPipeline::GraphicsPipeline(
 }
 
 GraphicsPipeline::~GraphicsPipeline() = default;
+
+void GraphicsPipeline::BindDepthBoundsImage(vk::ImageView view, vk::ImageLayout layout) const {
+    const vk::DescriptorSet set = desc_heap.Commit(*depth_bounds_layout);
+    const vk::DescriptorImageInfo image_info{.imageView = view, .imageLayout = layout};
+    instance.GetDevice().updateDescriptorSets(
+        vk::WriteDescriptorSet{.dstSet = set,
+                               .dstBinding = 0,
+                               .descriptorCount = 1,
+                               .descriptorType = vk::DescriptorType::eSampledImage,
+                               .pImageInfo = &image_info},
+        {});
+    scheduler.Record([layout = *pipeline_layout, set](vk::CommandBuffer cmdbuf) {
+        cmdbuf.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, layout, 1, set, {});
+    });
+}
 
 template <typename Attribute, typename Binding>
 void GraphicsPipeline::GetVertexInputs(
