@@ -83,7 +83,7 @@ ImageViewInfo::ImageViewInfo(const AmdGpu::DepthBuffer& depth_buffer, AmdGpu::De
                              AmdGpu::DepthControl ctl) {
     format = Vulkan::LiverpoolToVK::DepthFormat(depth_buffer.z_info.format,
                                                 depth_buffer.stencil_info.format);
-    is_storage = ctl.depth_write_enable;
+    is_depth_write = ctl.depth_write_enable;
     range.base.layer = view.slice_start;
     range.extent.layers = view.NumSlices() - range.base.layer;
     type = range.extent.layers > 1 ? AmdGpu::ImageType::Color2DArray : AmdGpu::ImageType::Color2D;
@@ -93,13 +93,13 @@ ImageView::ImageView(const Vulkan::Instance& instance, const ImageViewInfo& info
                      const Image& image)
     : info{info_} {
     vk::ImageViewUsageCreateInfo usage_ci{.usage = image.usage_flags};
-    if (!info.is_storage) {
+    if (!info.is_storage && !info.is_depth_write) {
         usage_ci.usage &= ~vk::ImageUsageFlagBits::eStorage;
     }
 #ifdef __APPLE__
     // Image creation drops storage usage for formats that refuse it (image.cpp); a storage view
     // of such an image is invalid. See docs/macos/format-support.md.
-    ASSERT_MSG(!info.is_storage || (image.usage_flags & vk::ImageUsageFlagBits::eStorage),
+    ASSERT_MSG(!StorageUsageMissing(info, image.usage_flags),
                "macOS: storage view of format {} image at {:#x}, which cannot be a storage image",
                vk::to_string(image.info.pixel_format), image.info.guest_address);
 #endif

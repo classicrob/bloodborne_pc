@@ -35,10 +35,18 @@ struct ImageViewInfo {
     SubresourceRange range;
     vk::ComponentMapping mapping{};
     u32 min_lod = 0;
-    bool is_storage = false;
+    bool is_storage = false;     ///< bound as a storage image descriptor
+    bool is_depth_write = false; ///< depth attachment with depth writes enabled
 
     auto operator<=>(const ImageViewInfo&) const = default;
 };
+
+/// A storage descriptor view of an image created without storage usage (image creation drops it
+/// for formats that refuse storage). Depth attachments are not storage views.
+[[nodiscard]] inline bool StorageUsageMissing(const ImageViewInfo& info,
+                                              vk::ImageUsageFlags image_usage) {
+    return info.is_storage && !(image_usage & vk::ImageUsageFlagBits::eStorage);
+}
 
 struct Image;
 
