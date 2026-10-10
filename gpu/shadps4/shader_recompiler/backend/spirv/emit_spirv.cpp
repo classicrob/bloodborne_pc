@@ -463,6 +463,11 @@ void SetupDenormFlushMode(EmitContext& ctx, const Profile& profile, const Runtim
         LOG_WARNING(Render_Vulkan, "Unknown FP denorm mode {}", u32(fp32_denorm_mode));
     }
 
+#ifdef __APPLE__
+    // Half conversions implement input/output flushing per opcode; bitcasts need no float mode.
+    // Actual FP64 operations are rejected before emission on Apple.
+    return;
+#endif
     if (!ctx.info.uses_fp16 && !ctx.info.uses_fp64) {
         return;
     }
@@ -539,6 +544,10 @@ void SetupRoundingMode(EmitContext& ctx, const Profile& profile, const RuntimeIn
                     magic_enum::enum_name(fp_round_mode));
     }
 
+#ifdef __APPLE__
+    // Narrowing checks its requested rounding; widening and half bitcasts are exact.
+    return;
+#endif
     if (ctx.info.uses_fp16 || ctx.info.uses_fp64) {
         const auto fp16_64_round_mode = runtime_info.props.fp_round_mode16_64;
         const auto same_round_mode = fp16_64_round_mode == fp_round_mode;

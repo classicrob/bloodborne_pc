@@ -932,6 +932,10 @@ void Translator::V_CVT_I32_F32(const GcnInst& inst) {
 }
 
 void Translator::V_CVT_F16_F32(const GcnInst& inst) {
+#ifdef __APPLE__
+    ASSERT_MSG(profile.support_float16,
+               "macOS V_CVT_F16_F32 requires native Float16: shader={:#x}", info.pgm_hash);
+#endif
     const IR::F32 src0 = GetSrc<IR::F32>(inst.src[0]);
 
     IR::U32 src0fp16;
@@ -948,6 +952,10 @@ void Translator::V_CVT_F16_F32(const GcnInst& inst) {
 }
 
 void Translator::V_CVT_F32_F16(const GcnInst& inst) {
+#ifdef __APPLE__
+    ASSERT_MSG(profile.support_float16,
+               "macOS V_CVT_F32_F16 requires native Float16: shader={:#x}", info.pgm_hash);
+#endif
     const IR::U32 src0 = GetSrc(inst.src[0]);
 
     IR::F32 src0l;

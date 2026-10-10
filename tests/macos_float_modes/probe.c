@@ -15,6 +15,9 @@ static VkPipeline pipeline;
 static VkPipelineLayout layout;
 static VkPhysicalDeviceMemoryProperties memory_properties;
 typedef struct { const char *name; uint32_t op,a,b,c; } Case;
+#ifdef BB_FP16_CASES
+#include "../macos_fp16/cases.h"
+#else
 static const Case cases[]={
     {"add_smallest_subnormals",0,0x00000001,0x00000001,0},
     {"add_subnormals_to_normal",0,0x007fffff,0x00000001,0},
@@ -77,9 +80,16 @@ static const Case cases[]={
     {"mul_double_negative_zero",2,0x80000000,0xbf800000,0},
     {"fma_negative_zero_positive_addend",3,0x80000000,0x3f800000,0},
 };
+#endif
 int main(int argc,char **argv) {
+#ifdef BB_FP16_CASES
+    assert(argc==3);
+    const int mode=atoi(argv[2]); assert(mode>=0 && mode<4);
+    const int benchmark=0;
+#else
     assert(argc==2 || (argc==3 && !strcmp(argv[2],"--benchmark")));
     const int benchmark=argc==3;
+#endif
     alarm(45); setbuf(stdout,NULL); puts("float modes probe: start");
     VkApplicationInfo app={.sType=VK_STRUCTURE_TYPE_APPLICATION_INFO,.pApplicationName="Float modes probe",.apiVersion=VK_API_VERSION_1_3};
     VkInstanceCreateInfo ic={.sType=VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,.pApplicationInfo=&app};
@@ -104,6 +114,9 @@ int main(int argc,char **argv) {
     VkPhysicalDeviceFeatures2 f2={.sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,.pNext=&f12}; vkGetPhysicalDeviceFeatures2(physical,&f2);
     printf("features BDA=%u shaderInt64=%u shaderFloat16=%u shaderFloat64=%u\n",f12.bufferDeviceAddress,f2.features.shaderInt64,f12.shaderFloat16,f2.features.shaderFloat64); assert(f12.bufferDeviceAddress && f2.features.shaderInt64);
     f12=(VkPhysicalDeviceVulkan12Features){.sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,.bufferDeviceAddress=VK_TRUE,.shaderInt8=VK_TRUE};
+#ifdef BB_FP16_CASES
+    f12.shaderFloat16=VK_TRUE;
+#endif
     VkQueueFamilyProperties families[32]; count=32; vkGetPhysicalDeviceQueueFamilyProperties(physical,&count,families);
     uint32_t family=0; while (family<count && !(families[family].queueFlags&VK_QUEUE_COMPUTE_BIT)) ++family; assert(family<count);
     float priority=1; VkDeviceQueueCreateInfo qi={.sType=VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,.queueFamilyIndex=family,.queueCount=1,.pQueuePriorities=&priority};
@@ -146,6 +159,11 @@ int main(int argc,char **argv) {
         words[8*i+2]=benchmark ? 0x3f800001u | ((i&2)?0x80000000u:0) : cases[i].b;
         words[8*i+3]=benchmark ? 0 : cases[i].c;
         words[8*i+4]=0xdeadbeef;
+#ifdef BB_FP16_CASES
+        words[8*i+5]=0xcdcdcdcd;
+        words[8*i+6]=0xa5a5a5a5;
+        words[8*i+7]=0x5a5a5a5a;
+#endif
     }
     VkQueryPool queries=VK_NULL_HANDLE;
     if(benchmark) {
@@ -196,6 +214,21 @@ int main(int argc,char **argv) {
         }
         uint32_t actual=words[8*i+4]; assert(actual!=0xdeadbeef);
         printf("%-44s %08x\n",cases[i].name,actual);
+#ifdef BB_FP16_CASES
+        const Case *c=cases+i;
+        uint32_t expected=c->c;
+        if(c->op==0 && (mode==0 || mode==1) && (expected&0x7fffu)>0 && (expected&0x7fffu)<0x400u)
+            expected&=0x8000u;
+        if(c->op==1 && (mode==0 || mode==2) && (c->a&0x7fffu)>0 && (c->a&0x7fffu)<0x400u)
+            expected=(c->a&0x8000u)<<16;
+        const uint32_t magnitude=c->op==0 ? 0x7fffu : 0x7fffffffu;
+        const uint32_t infinity=c->op==0 ? 0x7c00u : 0x7f800000u;
+        const int match=c->op!=2 && (expected&magnitude)>infinity
+            ? (actual&magnitude)>infinity : actual==expected;
+        if(!match) { printf("MISMATCH mode=%d op=%u input=%08x expected=%08x actual=%08x\n",mode,c->op,c->a,expected,actual); ++differences; }
+        assert(words[8*i]==c->op && words[8*i+1]==c->a && words[8*i+2]==c->b && words[8*i+3]==c->c);
+        assert(words[8*i+5]==0xcdcdcdcd && words[8*i+6]==0xa5a5a5a5 && words[8*i+7]==0x5a5a5a5a);
+#else
         if ((!strcmp(cases[i].name,"mul_positive_zero_negative_one") ||
              !strcmp(cases[i].name,"mul_negative_zero_positive_one")) && actual!=0x80000000) ++differences;
         if (!strcmp(cases[i].name,"nonfused_mul_add_cancellation") && actual!=0) ++differences;
@@ -203,12 +236,17 @@ int main(int argc,char **argv) {
             if(strstr(cases[i].name,"zero_inf")) assert((actual&0x7fffffff)>0x7f800000);
             else assert(actual==0x80000000);
         }
+#endif
     }
     vkUnmapMemory(device,memory); vkDestroyBuffer(device,buffer,NULL); vkFreeMemory(device,memory,NULL);
     vkDestroyPipeline(device,pipeline,NULL); vkDestroyPipelineLayout(device,layout,NULL); vkDestroyShaderModule(device,shader,NULL);
     if(queries) vkDestroyQueryPool(device,queries,NULL);
     vkDestroyCommandPool(device,commands,NULL); vkDestroyDevice(device,NULL); vkDestroyInstance(instance,NULL);
     if(benchmark) { puts("BENCHMARK: 8,388,608 production multiplies; 65,536 CPU/GPU bitwise results PASS"); return 0; }
+#ifdef BB_FP16_CASES
+    printf("MEASURED: OpFConvert mode=%d; %zu cases; differences=%u; input/tail canaries PASS\n",mode,n,differences);
+#else
     printf("MEASURED: %zu cases; signed-zero/nonfused semantic differences=%u; candidate sign repair passed\n",n,differences);
+#endif
     return differences ? 2 : 0;
 }

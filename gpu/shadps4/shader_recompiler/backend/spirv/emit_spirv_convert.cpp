@@ -21,6 +21,22 @@ Id ExtractU8(EmitContext& ctx, Id value) {
 Id ExtractS8(EmitContext& ctx, Id value) {
     return ctx.OpSConvert(ctx.S8, value);
 }
+
+#ifdef __APPLE__
+Id FlushHalfSubnormal(EmitContext& ctx, Id value) {
+    const Id bits = ctx.OpBitcast(ctx.U16, value);
+    const Id magnitude = ctx.OpBitwiseAnd(ctx.U16, bits, ctx.Constant(ctx.U16, u16{0x7fff}));
+    const Id subnormal = ctx.OpULessThan(ctx.U1[1], magnitude, ctx.Constant(ctx.U16, u16{0x0400}));
+    const Id sign = ctx.OpBitwiseAnd(ctx.U16, bits, ctx.Constant(ctx.U16, u16{0x8000}));
+    return ctx.OpBitcast(ctx.F16[1], ctx.OpSelect(ctx.U16, subnormal, sign, bits));
+}
+
+void RequireHalfConversion(EmitContext& ctx, const char* opcode) {
+    ASSERT_MSG(ctx.profile.support_float16 && ctx.profile.support_fp16_signed_zero_inf_nan_preserve,
+               "macOS {} requires native Float16 and signed-zero/Inf/NaN preservation: shader={:#x}",
+               opcode, ctx.info.pgm_hash);
+}
+#endif
 } // Anonymous namespace
 
 Id EmitConvertS16F32(EmitContext& ctx, Id value) {
@@ -80,10 +96,31 @@ Id EmitConvertU32U64(EmitContext& ctx, Id value) {
 }
 
 Id EmitConvertF16F32(EmitContext& ctx, Id value) {
+#ifdef __APPLE__
+    RequireHalfConversion(ctx, "V_CVT_F16_F32");
+    ASSERT_MSG(ctx.runtime_info.props.fp_round_mode16_64 == AmdGpu::FpRoundMode::NearestEven,
+               "macOS V_CVT_F16_F32 rounding mode is not implemented: shader={:#x} round16_64={} denorm16_64={}",
+               ctx.info.pgm_hash, u32(ctx.runtime_info.props.fp_round_mode16_64),
+               u32(ctx.runtime_info.props.fp_denorm_mode16_64));
+    const auto mode = ctx.runtime_info.props.fp_denorm_mode16_64;
+    const Id converted = ctx.OpFConvert(ctx.F16[1], value);
+    if (mode == AmdGpu::FpDenormMode::InOutFlush || mode == AmdGpu::FpDenormMode::InAllowOutFlush) {
+        return FlushHalfSubnormal(ctx, converted);
+    }
+    return converted;
+#else
     return ctx.OpFConvert(ctx.F16[1], value);
+#endif
 }
 
 Id EmitConvertF32F16(EmitContext& ctx, Id value) {
+#ifdef __APPLE__
+    RequireHalfConversion(ctx, "V_CVT_F32_F16");
+    const auto mode = ctx.runtime_info.props.fp_denorm_mode16_64;
+    if (mode == AmdGpu::FpDenormMode::InOutFlush || mode == AmdGpu::FpDenormMode::InFlushOutAllow) {
+        value = FlushHalfSubnormal(ctx, value);
+    }
+#endif
     return ctx.OpFConvert(ctx.F32[1], value);
 }
 
