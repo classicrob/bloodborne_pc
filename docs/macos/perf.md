@@ -104,8 +104,12 @@ the previous phase on exit. The present scheduler is its own stream.
 ## Running
 
 ```sh
-tools/macos/perf_run.sh --probe <shared>/out/bb-probe --output 4k [--phases] [--label NAME]
+tools/macos/perf_run.sh --probe <shared>/out/bb-probe --output 4k [--phases] [--label NAME] \
+    [--until STAGE --hold SECONDS]
 ```
+
+`--hold` keeps the game at the route's last stage for that long and then stops it. The summary
+then covers only the windows completed during the hold, so loading on the way is excluded.
 
 The script refuses to run while another `bb-probe` is running: the run needs the GPU to
 itself, and that also keeps within the team's limit on translated processes. It records `uptime`, the other translated processes, the commit, and the
