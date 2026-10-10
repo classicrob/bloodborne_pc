@@ -18,7 +18,7 @@ static constexpr u32 ShaderBinaryVersion = 14u; // Expanded Apple packed user-da
 static constexpr u32 ShaderBinaryVersion = 11u; // Live buffer-query hoists and exact internal binding specialization.
 #endif
 static constexpr u32 ShaderMetaVersion = 9u; // Each permutation stores its own translated resource metadata.
-static constexpr u32 PipelineKeyVersion = 8u; // MUBUF format validity and add-thread-ID specialization.
+static constexpr u32 PipelineKeyVersion = 9u; // Aux RectList/QuadList stages read only VS-written locations.
 } // namespace Serialization
 
 namespace Vulkan {
