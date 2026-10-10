@@ -1456,7 +1456,10 @@ void AddWaveCases() {
                 SetLane(j, l, 0x51000u + l * 0x101u, 0xABC00u + l);
                 continue;
             }
-            if (l >= 63) continue;
+            if (l == 63) { // wave tests run every lane: the last one writes dword 21 alone
+                SetLane(j, l, 0x7E15u, 21 * 4);
+                continue;
+            }
             const u32 g = l / 3, r = l % 3;
             const u32 value = r == 0 ? (0xA5A5u ^ g) : (r == 1 ? (0x5A5Au ^ g) : (0x3C00u | g));
             SetLane(j, l, value, g * 4 + (r == 2 ? 2 : 0));
@@ -3393,6 +3396,11 @@ JobResult EvaluateLdsContend(const Job& j, const u32* res) {
             std::snprintf(buf, sizeof(buf), "    dword %u: neighbour halfword read %#x want %#x\n", g, r2, c);
             if (bad++ < 8) d += buf;
         }
+    }
+    if (res[63 * 4] != j.lanes[63].vindex) {
+        char buf[200];
+        std::snprintf(buf, sizeof(buf), "    dword 21 (single writer): read %#x want %#x\n", res[63 * 4], j.lanes[63].vindex);
+        if (bad++ < 8) d += buf;
     }
     if (!bad) return {Verdict::Strict, ""};
     return {Verdict::Fail, "  " + std::to_string(bad) + " contention checks wrong (a mix of both writers or a lost neighbour)\n" + d};
