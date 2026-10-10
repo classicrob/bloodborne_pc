@@ -7,6 +7,7 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/texture_cache/image.h"
 #include "video_core/texture_cache/image_view.h"
+#include "video_core/renderer_vulkan/vk_feature_checks.h"
 
 #include <magic_enum/magic_enum.hpp>
 
@@ -102,8 +103,9 @@ ImageView::ImageView(const Vulkan::Instance& instance, const ImageViewInfo& info
     ASSERT_MSG(!StorageUsageMissing(info, image.usage_flags),
                "macOS: storage view of format {} image at {:#x}, which cannot be a storage image",
                vk::to_string(image.info.pixel_format), image.info.guest_address);
-    ASSERT_MSG(!info.is_storage || image.info.num_samples == 1 ||
-                   instance.IsStorageImageMultisampleSupported(),
+    ASSERT_MSG(!Vulkan::FeatureChecks::StorageMultisampleUnsupported(
+                   info.is_storage, image.info.num_samples,
+                   instance.IsStorageImageMultisampleSupported()),
                "macOS: storage view of a {}-sample image at {:#x} needs "
                "shaderStorageImageMultisample, which this device lacks",
                image.info.num_samples, image.info.guest_address);

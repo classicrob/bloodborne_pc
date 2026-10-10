@@ -9,6 +9,7 @@
 #include "shader_recompiler/backend/spirv/emit_spirv_discard_frag.h"
 #include "shader_recompiler/backend/spirv/emit_spirv_quad_rect.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
+#include "video_core/renderer_vulkan/vk_feature_checks.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -453,8 +454,8 @@ GraphicsPipeline::GraphicsPipeline(
 
 #ifdef __APPLE__
     // Without the feature a guest ROP would be dropped and the draw blended normally.
-    if (key.logic_op != AmdGpu::ColorControl::LogicOp::Copy && key.num_color_attachments > 0 &&
-        !instance.IsLogicOpSupported()) {
+    if (FeatureChecks::LogicOpUnsupported(key.logic_op, key.num_color_attachments,
+                                          instance.IsLogicOpSupported())) {
         UNREACHABLE_MSG("macOS: color logic op {} needs logicOp, which this device lacks",
                         static_cast<u32>(key.logic_op));
     }

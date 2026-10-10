@@ -19,6 +19,7 @@
 #include "video_core/renderer_vulkan/vk_null_resources.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
+#include "video_core/renderer_vulkan/vk_feature_checks.h"
 #include "video_core/renderer_vulkan/vk_gpu_profiler.h"
 #include "bbport_threads.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
@@ -1194,7 +1195,8 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
     const u32 max_count = indirect.max_count;
 #ifdef __APPLE__
     // Without the feature vkCmdDraw*IndirectCount is invalid. See docs/macos/feature-audit.md.
-    if (count_address != 0 && !instance.IsDrawIndirectCountSupported()) {
+    if (FeatureChecks::DrawIndirectCountUnsupported(count_address,
+                                                    instance.IsDrawIndirectCountSupported())) {
         UNREACHABLE_MSG("macOS: indirect draw with a GPU count at {:#x} (max {} draws) needs "
                         "drawIndirectCount, which this device lacks",
                         count_address, max_count);
@@ -3514,9 +3516,9 @@ void Rasterizer::UpdateDepthStencilState() const {
 #ifdef __APPLE__
     // Without the feature the test is skipped. That is exact only when it would always pass:
     // no depth buffer, or bounds covering [0, 1], the range stored depth is clamped to.
-    if (depth_bounds_test_enabled && !instance.IsDepthBoundsSupported() &&
-        regs.depth_buffer.DepthValid() &&
-        !(regs.depth_bounds_min <= 0.0f && regs.depth_bounds_max >= 1.0f)) {
+    if (FeatureChecks::DepthBoundsUnsupported(
+            depth_bounds_test_enabled, regs.depth_buffer.DepthValid(), regs.depth_bounds_min,
+            regs.depth_bounds_max, instance.IsDepthBoundsSupported())) {
         UNREACHABLE_MSG("macOS: depth bounds test [{}, {}] needs depthBounds, which this device "
                         "lacks",
                         regs.depth_bounds_min, regs.depth_bounds_max);
@@ -3635,13 +3637,9 @@ void Rasterizer::UpdateRasterizationState() const {
 #ifdef __APPLE__
     // Without wideLines only width 1 is valid. The width matters only when lines are rasterized.
     if (!instance.IsWideLinesSupported()) {
-        using AmdGpu::PrimitiveType;
-        const auto prim = regs.primitive_type;
-        const bool lines = prim == PrimitiveType::LineList || prim == PrimitiveType::LineStrip ||
-                           prim == PrimitiveType::LineLoop || prim == PrimitiveType::AdjLineList ||
-                           prim == PrimitiveType::AdjLineStrip ||
-                           regs.polygon_control.PolyMode() == AmdGpu::PolygonMode::Line;
-        if (lines && regs.line_control.Width() != 1.0f) {
+        if (FeatureChecks::WideLinesUnsupported(regs.primitive_type,
+                                                regs.polygon_control.PolyMode(),
+                                                regs.line_control.Width(), false)) {
             UNREACHABLE_MSG("macOS: {}-pixel lines need wideLines, which this device lacks",
                             regs.line_control.Width());
         }
