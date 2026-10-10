@@ -998,6 +998,10 @@ Value IREmitter::UnpackDouble2x32(const F64& value) {
     return Inst<Value>(Opcode::UnpackDouble2x32, value);
 }
 
+U32 IREmitter::PackHalf2x16Rtz(const Value& vector) {
+    return Inst<U32>(Opcode::PackHalf2x16, Flags{true}, vector);
+}
+
 U32 IREmitter::Pack2x16(const AmdGpu::NumberFormat number_format, const Value& vector) {
     switch (number_format) {
     case AmdGpu::NumberFormat::Unorm:

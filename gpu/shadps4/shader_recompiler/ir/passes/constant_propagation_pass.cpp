@@ -374,8 +374,20 @@ void ConstantPropagation(IR::Block& block, IR::Inst& inst) {
     case IR::Opcode::UnpackSint2x16:
         return FoldInverseFunc(inst, IR::Opcode::PackSint2x16);
     case IR::Opcode::PackHalf2x16:
+#ifdef __APPLE__
+        if (inst.Flags<bool>()) {
+            return;
+        }
+#endif
         return FoldInverseFunc(inst, IR::Opcode::UnpackHalf2x16);
     case IR::Opcode::UnpackHalf2x16:
+#ifdef __APPLE__
+        if (!inst.Arg(0).IsImmediate() &&
+            inst.Arg(0).Inst()->GetOpcode() == IR::Opcode::PackHalf2x16 &&
+            inst.Arg(0).Inst()->Flags<bool>()) {
+            return;
+        }
+#endif
         return FoldInverseFunc(inst, IR::Opcode::PackHalf2x16);
     // 4x8
     case IR::Opcode::PackUnorm4x8:
