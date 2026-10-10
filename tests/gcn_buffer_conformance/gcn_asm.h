@@ -58,6 +58,26 @@ struct Code {
         words.push_back((v3 << 24) | (v2 << 16) | (v1 << 8) | v0);
     }
     void SSwappcB64(uint32_t sdst, uint32_t ssrc0) { Sop1(33, sdst, ssrc0); }
+    void Sop2(uint32_t op, uint32_t sdst, uint32_t ssrc0, uint32_t ssrc1) {
+        words.push_back(0x80000000u | (op << 23) | (sdst << 16) | (ssrc1 << 8) | ssrc0);
+    }
+    void SAddU32(uint32_t sdst, uint32_t ssrc0, uint32_t ssrc1) { Sop2(0, sdst, ssrc0, ssrc1); }
+    // SOPC s_cmp_lt_u32 with a literal second operand
+    void SCmpLtU32Literal(uint32_t ssrc0, uint32_t literal) {
+        words.push_back(0xBF000000u | (10u << 16) | (LITERAL << 8) | ssrc0);
+        words.push_back(literal);
+    }
+    // s_cbranch_scc1 to the instruction at word index `target` (relative to the next instruction)
+    void SCbranchScc1To(size_t target) {
+        const int32_t delta = int32_t(target) - int32_t(words.size() + 1);
+        Sopp(5, uint32_t(delta) & 0xFFFF);
+    }
+    void SBarrier() { Sopp(10, 0); }
+    // DS: ds_write_b16/b32/b64 (ops 31/13/77), ds_read_u16/b32/b64 (ops 60/54/118)
+    void Ds(uint32_t op, uint32_t addr, uint32_t data0, uint32_t vdst) {
+        words.push_back(0xD8000000u | (op << 18));
+        words.push_back((vdst << 24) | (data0 << 8) | addr);
+    }
     void SSetpcB64(uint32_t ssrc0) { Sop1(32, 0, ssrc0); }
     void SLoadDword(uint32_t sdst, uint32_t sbase, uint32_t dword_offset) {
         words.push_back(0xC0000000u | (0u << 22) | (sdst << 15) | ((sbase >> 1) << 9) | (1u << 8) | dword_offset);
