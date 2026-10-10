@@ -64,8 +64,8 @@ STEPS = {
     'back': ['circle'],
 }
 # The unattended route, as observed on c436893 (1080p, 2026-10-10). Operations:
-#   ('wait_log', regex, timeout)              a new log line matches
-#   ('wait_draws', minimum, windows, timeout) that many new frame-stats windows with at least
+#   ('wait_log', regex, timeout)              a log line since the last press matches
+#   ('wait_draws', minimum, windows, timeout) that many frame-stats windows since the last press with at least
 #                                             minimum draws/frame in a row
 #   ('press', tokens) / ('sleep', seconds)
 #   ('capture', stage, min_nonblack)          screenshot; fails when the window is darker
@@ -83,6 +83,13 @@ ROUTE = [
     ('movie-end', [('wait_log', r'DemuxerThread: Demuxer Thread exited normally', 300), ('sleep', 5),
                    ('capture', 'after-movie', None)]),
     ('character-creation', [('wait_draws', 100, 2, 300), ('sleep', 5), ('capture', 'character-creation', 0.05)]),
+    # The cursor starts on Enter Name; BB_IME_TEXT fills the dialog without a keyboard.
+    ('name', [('press', 'cross'), ('wait_log', r'^Runtime: ImeDialog text: ', 30), ('sleep', 2),
+              ('capture', 'name-entered', 0.05)]),
+    # Up wraps to Finish; the confirmation highlights NO, so left selects YES.
+    ('finish', [('press', 'up'), ('capture', 'finish-selected', 0.05), ('press', 'cross'), ('sleep', 2),
+                ('capture', 'finalise-prompt', 0.05), ('press', 'left'), ('press', 'cross'), ('sleep', 10),
+                ('capture', 'contract-finalised', None)]),
 ]
 
 
@@ -245,6 +252,8 @@ def translated_games():
 
 
 def launch(args):
+    if args.perf_phases and not args.perf:
+        die('--perf-phases requires --perf')
     dyld = sorted(k for k in os.environ if k.startswith('DYLD_'))
     if dyld:
         die('refusing to launch with library overrides (unset them): ' + ', '.join(dyld))
@@ -280,8 +289,21 @@ def launch(args):
                BB_FRAME_STATS='1', BB_MODS_ENABLED='0', BB_TIMEOUT=str(args.timeout))
     if args.gpu_log:
         env['BB_GPU_LOG'] = args.gpu_log
+    if args.perf:
+        env.update(BB_PERF='1', BB_PERF_OUT=str(run / 'perf.jsonl'))  # the library creates it (fails if present)
+    if args.perf_phases:
+        env['BB_PERF_PHASES'] = '1'  # one submit per phase: perturbs timing, never an FPS measurement
     if args.dump_shaders:
         env['BB_DUMP_SHADERS'] = '1'
+    for item in args.diag_env:
+        key, sep, value = item.partition('=')
+        if not sep or not key.startswith('BB_') or key in env:
+            die(f'--diag-env needs a new BB_ name and a value: {item}')
+        env[key] = value
+    if args.disable_optimizations is not None:
+        # Diagnostic A/B: optimizations switched off from the start (src/runtime_memory.c bits).
+        (run / 'toggles').write_text(f'{args.disable_optimizations}\n')
+        env['BB_TOGGLE_FILE'] = str(run / 'toggles')
     if args.frame_capture:
         (run / 'captures').mkdir()
         env.update(BB_CAPTURE_TRIGGER=str(run / 'capture.trigger'), BB_CAPTURE_DIR=str(run / 'captures'))
@@ -290,7 +312,11 @@ def launch(args):
                   ['git', '-C', str(ROOT), 'rev-parse', 'HEAD'], capture_output=True, text=True).stdout.strip(),
               'env': {k: v for k, v in env.items() if k.startswith(('BB_', 'DYLD_'))}, 'env_removed': removed,
               'diagnostics': [n for n, on in (('BB_DUMP_SHADERS', args.dump_shaders),
-                                              ('BB_CAPTURE_TRIGGER', args.frame_capture)) if on],
+                                              ('BB_CAPTURE_TRIGGER', args.frame_capture),
+                                              ('BB_TOGGLE_FILE', args.disable_optimizations is not None)) if on]
+                             + args.diag_env,
+              'disabled_optimizations': args.disable_optimizations,
+              'perf': args.perf, 'perf_phases': args.perf_phases,
               'shader_cache': 'empty (fresh user directory)', 'saves': 'none (fresh user directory)',
               'host': {'load_average': os.getloadavg(), 'other_bb_probe': running}}
     (run / 'manifest.json').write_text(json.dumps(record, indent=2) + '\n')
@@ -392,8 +418,7 @@ def check_running(run, since):
         die(f'fatal log line {bad[0][0]}: {bad[0][1]}')
 
 
-def wait_until(run, timeout, what, done):
-    start_line = len(log_lines(run))
+def wait_until(run, timeout, what, done, start_line):
     deadline = time.time() + timeout
     while time.time() < deadline:
         lines = log_lines(run)
@@ -408,13 +433,14 @@ def route(run, until):
     names = [name for name, _ in ROUTE]
     if until and until not in names:
         die('known stages: ' + ', '.join(names))
+    mark = len(log_lines(run))  # waits look at log lines from here: set before every press
     for name, ops in ROUTE:
         event(run, 'stage', stage=name)
         print(f'play_route: stage {name}', file=sys.stderr, flush=True)
         for op in ops:
             if op[0] == 'wait_log':
                 pattern = re.compile(op[1])
-                wait_until(run, op[2], op[1], lambda lines, since: any(pattern.search(l) for l in lines[since:]))
+                wait_until(run, op[2], op[1], lambda lines, since: any(pattern.search(l) for l in lines[since:]), mark)
             elif op[0] == 'wait_draws':
                 def enough(lines, since, minimum=op[1], count=op[2]):
                     streak = 0
@@ -422,8 +448,9 @@ def route(run, until):
                         if sample['line'] > since:
                             streak = streak + 1 if sample['draws'] >= minimum else 0
                     return streak >= count
-                wait_until(run, op[3], f'{op[2]} windows with >= {op[1]} draws/frame', enough)
+                wait_until(run, op[3], f'{op[2]} windows with >= {op[1]} draws/frame', enough, mark)
             elif op[0] == 'press':
+                mark = len(log_lines(run))
                 press(run, op[1])
             elif op[0] == 'sleep':
                 time.sleep(op[1])
@@ -458,6 +485,13 @@ def main():
         p.add_argument('--gpu-log', help='BB_GPU_LOG level (default: the build default)')
         p.add_argument('--frame-capture', action='store_true', help='arm BB_CAPTURE_TRIGGER (frame analyzer)')
         p.add_argument('--dump-shaders', action='store_true', help='BB_DUMP_SHADERS=1 (diagnostic: writes every shader)')
+        p.add_argument('--diag-env', action='append', default=[], metavar='BB_NAME=VALUE',
+                       help='extra diagnostic BB_ variable (recorded; repeatable)')
+        p.add_argument('--disable-optimizations', type=int, metavar='MASK',
+                       help='BB_TOGGLE_FILE with this decimal mask from the start (diagnostic A/B)')
+        p.add_argument('--perf', action='store_true', help='BB_PERF=1, BB_PERF_OUT=<run>/perf.jsonl')
+        p.add_argument('--perf-phases', action='store_true',
+                       help='BB_PERF_PHASES=1 (needs --perf; perturbed timing, not for FPS claims)')
         if command == 'route':
             p.add_argument('--until', help='last stage to run: ' + ', '.join(name for name, _ in ROUTE))
             p.add_argument('--keep', action='store_true', help='leave the game running after the route')
