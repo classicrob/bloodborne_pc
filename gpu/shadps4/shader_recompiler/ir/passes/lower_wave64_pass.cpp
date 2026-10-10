@@ -13,6 +13,7 @@
 #include <functional>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace Shader::Optimization {
 
@@ -105,77 +106,95 @@ static std::vector<IR::Block*> FindUniformBlocks(const IR::Program& program) {
 // subgroup semantics are kept, except reading a lane that may be >= 32, which stops compilation.
 namespace {
 
+// Workgroup uniformity as a fixed point: every value starts uniform, divergence enters at sources
+// (per-invocation attributes, memory, lane data, and wave-level results when the workgroup holds
+// several waves) and is propagated to users until nothing changes. No result is cached before the
+// propagation is complete, so loop-carried phis are handled exactly.
 class WorkgroupUniformity {
 public:
-    explicit WorkgroupUniformity(bool wave_values_uniform) : wave_uniform{wave_values_uniform} {}
+    WorkgroupUniformity(const IR::Program& program, bool wave_values_uniform)
+        : wave_uniform{wave_values_uniform} {
+        std::vector<const IR::Inst*> worklist;
+        for (const IR::Block* block : program.blocks) {
+            for (const IR::Inst& inst : block->Instructions()) {
+                if (IsDivergentSource(inst)) {
+                    divergent.insert(&inst);
+                    worklist.push_back(&inst);
+                }
+            }
+        }
+        while (!worklist.empty()) {
+            const IR::Inst* inst = worklist.back();
+            worklist.pop_back();
+            for (const IR::Use& use : inst->Uses()) {
+                const IR::Inst* user = use.user;
+                if (divergent.contains(user) || !PropagatesFrom(*user, use.operand)) {
+                    continue;
+                }
+                divergent.insert(user);
+                worklist.push_back(user);
+            }
+        }
+    }
 
-    bool IsUniform(const IR::Value& value) {
-        IR::Inst* const inst = value.TryInst();
-        if (!inst) {
-            return true; // immediates, attributes, registers as operands
-        }
-        if (const auto it = memo.find(inst); it != memo.end()) {
-            return it->second;
-        }
-        memo[inst] = true; // optimistic for loop-carried phis; refined below
-        const bool result = Compute(*inst);
-        memo[inst] = result;
-        return result;
+    bool IsUniform(const IR::Value& value) const {
+        const IR::Inst* inst = value.TryInst();
+        return !inst || !divergent.contains(inst);
     }
 
 private:
-    bool ArgsUniform(const IR::Inst& inst) {
-        for (size_t i = 0; i < inst.NumArgs(); ++i) {
-            if (!IsUniform(inst.Arg(i))) {
-                return false;
-            }
-        }
-        return true;
-    }
-
-    bool Compute(const IR::Inst& inst) {
+    bool IsDivergentSource(const IR::Inst& inst) const {
         using IR::Opcode;
         switch (inst.GetOpcode()) {
         case Opcode::GetUserData:
-            return true;
-        case Opcode::GetAttributeU32:
-            return inst.Arg(0).Attribute() == IR::Attribute::WorkgroupId ||
-                   inst.Arg(0).Attribute() == IR::Attribute::WorkgroupIndex;
         case Opcode::ReadConst:
         case Opcode::ReadConstBuffer:
-            return ArgsUniform(inst);
+            return false; // uniform unless an argument is divergent (propagated)
+        case Opcode::GetAttributeU32:
+            return inst.Arg(0).Attribute() != IR::Attribute::WorkgroupId &&
+                   inst.Arg(0).Attribute() != IR::Attribute::WorkgroupIndex;
         case Opcode::Ballot:
         case Opcode::GroupAny:
         case Opcode::ReadFirstLane:
-            // the same for every lane of a wave: workgroup-uniform when the workgroup is one wave
-            return wave_uniform && ArgsUniform(inst) ? true : wave_uniform;
         case Opcode::ReadLane:
-            return wave_uniform && IsUniform(inst.Arg(1));
+            return !wave_uniform; // one value per wave; workgroup-uniform only for one wave
         default:
             break;
         }
         if (inst.NumArgs() == 0) {
-            return false; // a source we do not know to be uniform
+            return inst.GetOpcode() != Opcode::Phi; // a source we do not know to be uniform
         }
         const std::string_view name = IR::NameOf(inst.GetOpcode());
-        if (name.find("Load") != std::string_view::npos || name.find("Atomic") != std::string_view::npos ||
-            name.find("Image") != std::string_view::npos || name.find("Attribute") != std::string_view::npos ||
-            name.find("Lane") != std::string_view::npos || name.find("Shuffle") != std::string_view::npos ||
-            name.find("Quad") != std::string_view::npos || name.find("InverseBallot") != std::string_view::npos ||
-            name.find("Exec") != std::string_view::npos || name.find("Data") != std::string_view::npos) {
-            return false; // per-invocation memory, attributes and lane data
+        return name.find("Load") != std::string_view::npos || name.find("Atomic") != std::string_view::npos ||
+               name.find("Image") != std::string_view::npos || name.find("Attribute") != std::string_view::npos ||
+               name.find("Lane") != std::string_view::npos || name.find("Shuffle") != std::string_view::npos ||
+               name.find("Quad") != std::string_view::npos || name.find("InverseBallot") != std::string_view::npos ||
+               name.find("Exec") != std::string_view::npos || name.find("Data") != std::string_view::npos;
+    }
+
+    // Whether a divergent operand makes `user` divergent.
+    bool PropagatesFrom(const IR::Inst& user, u32 operand) const {
+        using IR::Opcode;
+        switch (user.GetOpcode()) {
+        case Opcode::Ballot:
+        case Opcode::GroupAny:
+        case Opcode::ReadFirstLane:
+            return false; // the same for every lane of the wave whatever the operand
+        case Opcode::ReadLane:
+            return operand == 1; // a divergent lane select makes the read divergent
+        default:
+            return true;
         }
-        return ArgsUniform(inst);
     }
 
     bool wave_uniform;
-    std::unordered_map<const IR::Inst*, bool> memo;
+    std::unordered_set<const IR::Inst*> divergent;
 };
 
 // Blocks where every invocation of the workgroup arrives together: all enclosing conditions and
 // loop exits are workgroup-uniform, and no invocation has returned early.
 std::vector<IR::Block*> FindWorkgroupUniformBlocks(const IR::Program& program,
-                                                   WorkgroupUniformity& uniformity) {
+                                                   const WorkgroupUniformity& uniformity) {
     using Type = IR::AbstractSyntaxNode::Type;
     const auto& list = program.syntax_list;
     // A loop is uniform when its continue condition and every break inside it are.
@@ -247,12 +266,12 @@ void LowerWave64Graphics(IR::Program& program) {
     }
 }
 
-void LowerWave64Compute(IR::Program& program, const RuntimeInfo& runtime_info) {
+void LowerWave64Compute(IR::Program& program, const RuntimeInfo& runtime_info, const Profile& profile) {
     auto& info = program.info;
     const auto [size_x, size_y, size_z] = runtime_info.hw.cs.workgroup_size;
     const u32 num_threads = size_x * size_y * size_z;
     const u32 num_waves = (num_threads + 63) / 64;
-    WorkgroupUniformity uniformity{num_waves <= 1};
+    const WorkgroupUniformity uniformity{program, num_waves <= 1};
     const auto uniform_blocks = FindWorkgroupUniformBlocks(program, uniformity);
 
     std::vector<IR::Inst*> cross_lane, per_lane;
@@ -291,6 +310,24 @@ void LowerWave64Compute(IR::Program& program, const RuntimeInfo& runtime_info) {
     const u32 lane_base = value_base + num_waves * 4;
     const u32 end = lane_base + (needs_lane_values ? num_waves * 64 * 4 : 0);
     if (!cross_lane.empty()) {
+        // The scratch is accessed as 32-bit words. Guest LDS of another single type would make a
+        // second workgroup type, which needs VK_KHR_workgroup_memory_explicit_layout.
+        bool guest_non_u32 = false;
+        for (const IR::Block* block : program.blocks) {
+            for (const IR::Inst& inst : block->Instructions()) {
+                const std::string_view name = IR::NameOf(inst.GetOpcode());
+                const bool shared = name.find("Shared") != std::string_view::npos;
+                guest_non_u32 |= shared && (name.ends_with("U16") || name.ends_with("U64") || name.ends_with("64"));
+            }
+        }
+        ASSERT_MSG(!guest_non_u32 || profile.supports_workgroup_explicit_memory_layout,
+                   "Apple wave64: guest LDS with 16/64-bit accesses plus 32-bit wave scratch needs "
+                   "workgroup explicit layout: shader={:#x}",
+                   info.pgm_hash);
+        ASSERT_MSG(end <= profile.max_shared_memory_size,
+                   "Apple wave64: guest LDS ({} bytes) plus wave scratch exceeds shared memory ({} "
+                   "of {} bytes): shader={:#x}",
+                   runtime_info.hw.cs.shared_memory_size, end, profile.max_shared_memory_size, info.pgm_hash);
         info.shared_memory_scratch_size = end - runtime_info.hw.cs.shared_memory_size;
     }
 
@@ -327,7 +364,7 @@ void LowerWave64Compute(IR::Program& program, const RuntimeInfo& runtime_info) {
     const auto wave_read_lane = [&](IR::IREmitter& ir, const Lanes& l, const IR::U32& value,
                                     const IR::U32& target) -> IR::U32 {
         const IR::U32 addr = word(ir, value_base, l.wave);
-        ir.WriteShared(32, ir.Imm32(0), addr);
+        (void)ir.SharedAtomicAnd(addr, ir.Imm32(0), false); // every lane clears: atomic, race-free
         ir.Barrier();
         (void)ir.SharedAtomicOr(addr, IR::U32{ir.Select(ir.IEqual(l.lane, target), value, ir.Imm32(0))},
                                 false);
@@ -424,7 +461,7 @@ void LowerWave64Compute(IR::Program& program, const RuntimeInfo& runtime_info) {
         IR::Block* entry = program.syntax_list.front().data.block;
         IR::IREmitter ir{*entry, entry->begin()};
         const Lanes l = lanes(ir);
-        ir.WriteShared(32, ir.Imm32(0), word(ir, mask_base, l.half_word));
+        (void)ir.SharedAtomicAnd(word(ir, mask_base, l.half_word), ir.Imm32(0), false);
         ir.Barrier();
     }
 }
@@ -435,7 +472,7 @@ void LowerWave64BallotPass(IR::Program& program, const RuntimeInfo& runtime_info
                            const Profile& profile) {
     if (profile.emulate_wave64) {
         if (program.info.hw_stage == HwStage::Compute) {
-            LowerWave64Compute(program, runtime_info);
+            LowerWave64Compute(program, runtime_info, profile);
         } else {
             LowerWave64Graphics(program);
         }
