@@ -188,6 +188,7 @@ GraphicsPipeline::GraphicsPipeline(
             .pName = "main",
         });
     }
+    u32 aux_vs_output_locations = 0;
     stage = u32(Shader::SwStage::TessellationControl);
     if (infos[stage]) {
         shader_stages.emplace_back(vk::PipelineShaderStageCreateInfo{
@@ -199,7 +200,28 @@ GraphicsPipeline::GraphicsPipeline(
         const auto type = is_quad_list ? AuxShaderType::QuadListTCS : AuxShaderType::RectListTCS;
         if (!preloading) {
             const auto& fs_info = runtime_infos[u32(Shader::SwStage::Fragment)].hw.fs;
-            sdata.tcs = Shader::Backend::SPIRV::EmitAuxilaryTessShader(type, fs_info);
+            const auto* vs = infos[u32(Shader::SwStage::Vertex)];
+            const auto* fs = infos[u32(Shader::SwStage::Fragment)];
+            ASSERT_MSG(vs, "RectList/QuadList emulation without a vertex stage");
+            // Clip-distance emulation (native NVIDIA only) shifts every parameter location and adds
+            // a clip vector at Location 0, which the location masks do not model: keep the
+            // auxiliary stages reading every fragment location there, as before.
+            aux_vs_output_locations =
+                profile.needs_clip_distance_emulation
+                    ? ~0U
+                    : Shader::Backend::SPIRV::PreRasterOutputLocations(
+                          *vs, runtime_infos[u32(Shader::SwStage::Vertex)]);
+            const u32 fs_locations = Shader::Backend::SPIRV::AuxiliaryVaryingLocations(fs_info);
+            if (const u32 unwritten = fs_locations & ~aux_vs_output_locations; unwritten != 0) {
+                // GCN leaves these undefined; the auxiliary TCS forwards zero.
+                LOG_WARNING(Render_Vulkan,
+                            "{} pipeline: fragment shader {:#x} reads locations {:#010x} that "
+                            "vertex shader {:#x} never writes; forwarding zero",
+                            is_quad_list ? "QuadList" : "RectList", fs ? fs->pgm_hash : 0,
+                            unwritten, vs->pgm_hash);
+            }
+            sdata.tcs = Shader::Backend::SPIRV::EmitAuxilaryTessShader(type, fs_info,
+                                                                       aux_vs_output_locations);
         }
         shader_stages.emplace_back(vk::PipelineShaderStageCreateInfo{
             .stage = vk::ShaderStageFlagBits::eTessellationControl,
@@ -218,7 +240,7 @@ GraphicsPipeline::GraphicsPipeline(
         if (!preloading) {
             const auto& fs_info = runtime_infos[u32(Shader::SwStage::Fragment)].hw.fs;
             sdata.tes = Shader::Backend::SPIRV::EmitAuxilaryTessShader(
-                AuxShaderType::PassthroughTES, fs_info);
+                AuxShaderType::PassthroughTES, fs_info, aux_vs_output_locations);
         }
         shader_stages.emplace_back(vk::PipelineShaderStageCreateInfo{
             .stage = vk::ShaderStageFlagBits::eTessellationEvaluation,
@@ -245,6 +267,37 @@ GraphicsPipeline::GraphicsPipeline(
             .pName = "main",
         });
     }
+
+#ifdef __APPLE__
+    // GCN lets the pixel shader read a parameter the last pre-rasterization stage never exported
+    // (value undefined); Metal refuses to link such a pipeline. The auxiliary RectList/QuadList
+    // stages forward zero for these. A direct VS/TES -> FS pipeline cannot yet: the producing
+    // stage is compiled after the FS and would need the FS input locations in its key.
+    const bool aux_tes = (is_rect_list || is_quad_list) &&
+                         !infos[u32(Shader::SwStage::TessellationEval)];
+    if (const auto* fs = infos[u32(Shader::SwStage::Fragment)];
+        fs && !aux_tes && !infos[u32(Shader::SwStage::Geometry)]) {
+        const auto producer = infos[u32(Shader::SwStage::TessellationEval)]
+                                  ? Shader::SwStage::TessellationEval
+                                  : Shader::SwStage::Vertex;
+        const auto* pre = infos[u32(producer)];
+        ASSERT_MSG(pre, "graphics pipeline without a vertex stage");
+        ASSERT(!profile.needs_clip_distance_emulation);
+        const u32 fs_locations = Shader::Backend::SPIRV::AuxiliaryVaryingLocations(
+            runtime_infos[u32(Shader::SwStage::Fragment)].hw.fs);
+        const u32 unwritten =
+            fs_locations &
+            ~Shader::Backend::SPIRV::PreRasterOutputLocations(*pre, runtime_infos[u32(producer)]);
+        if (unwritten != 0) {
+            UNREACHABLE_MSG("macOS: fragment shader {:#x} reads varying locations {:#010x} that "
+                            "{} shader {:#x} never writes; zero-filling a direct pre-raster -> "
+                            "fragment interface is not implemented",
+                            fs->pgm_hash, unwritten,
+                            producer == Shader::SwStage::Vertex ? "vertex" : "tess-eval",
+                            pre->pgm_hash);
+        }
+    }
+#endif
 
     const vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo subgroup_size_ci = {
         .requiredSubgroupSize = 64,
