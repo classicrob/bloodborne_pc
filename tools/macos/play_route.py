@@ -389,6 +389,29 @@ def capture(run, stage, min_nonblack=None):
     return data
 
 
+REPORT = {
+    'pm4_tears': r'NextPacket|Unimplemented PM4|Wrong PM4',
+    'flip_irq': r'Out of order flip IRQ',
+    'cmd_snapshot': r'CMD-SNAPSHOT',
+    'gpuidle_held_back': r'GpuIdle held back:',
+    'sync_einval': r'Runtime sync EINVAL',
+    'guest_panic': r'Dantelion2 Panic|Guest fault',
+}
+
+
+def report(run):
+    """Counts of the known diagnostic lines, the periodic parse-lag summaries and the stop reason."""
+    lines = log_lines(run)
+    counts = {name: [i + 1 for i, l in enumerate(lines) if re.search(rx, l)] for name, rx in REPORT.items()}
+    stop_at = next((i for i, l in enumerate(lines) if l.startswith('STOP:')), None)
+    print(json.dumps({
+        'run': str(run), 'exit': json.loads((run / 'exit.json').read_text()) if (run / 'exit.json').exists() else None,
+        'counts': {k: len(v) for k, v in counts.items()}, 'first_lines': {k: v[:5] for k, v in counts.items() if v},
+        'parse_lag': [l.split('Parse lag, ', 1)[1] for l in lines if 'Parse lag, ' in l],
+        'stop': lines[max(stop_at - 2, 0):stop_at + 1] if stop_at is not None else None,
+        'frame_stats': summarize(frame_stats(lines))}, indent=1))
+
+
 def stop(run):
     info = manifest(run)
     pid = info.get('pid')
@@ -521,6 +544,7 @@ def main():
     sub.add_parser('frame-capture')
     sub.add_parser('stats')
     sub.add_parser('status')
+    sub.add_parser('report')
     sub.add_parser('stop')
     p = sub.add_parser('_supervise')
     p.add_argument('dir')
@@ -557,6 +581,8 @@ def main():
             print(json.dumps(summarize(frame_stats(log_lines(run))), indent=2))
         elif args.command == 'status':
             status(run)
+        elif args.command == 'report':
+            report(run)
         elif args.command == 'stop':
             stop(run)
 
