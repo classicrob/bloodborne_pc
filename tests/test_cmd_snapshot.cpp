@@ -125,6 +125,20 @@ int main() {
     Expect("unreadable region never protected",
            !snap->OverlapsUnparsed(reinterpret_cast<VAddr>(hole), 32));
 
+    // A chained IB is a jump: words after it in the same buffer are never walked.
+    std::vector<u32> chain_target, chained, decoy;
+    AppendNop(chain_target, 0x7777);
+    AppendNop(decoy, 0x8888);
+    AppendIb(chained, PM4ItOpcode::IndirectBuffer, chain_target.data(), u32(chain_target.size()));
+    chained[3] |= 1u << 20; // CHAIN
+    AppendIb(chained, PM4ItOpcode::IndirectBuffer, decoy.data(), u32(decoy.size())); // dead tail
+    chained.insert(chained.end(), {0u, 0u}); // zeroed chunk tail
+    auto chain_snap = CmdSnapshot::Take(chained, {});
+    Expect("chain target captured",
+           chain_snap->Find(chain_target.data(), u32(chain_target.size()), false) != nullptr);
+    Expect("IB after a chain (dead tail) not walked",
+           chain_snap->Find(decoy.data(), u32(decoy.size()), false) == nullptr);
+
     // A truncated packet ends the walk without reading past the buffer.
     std::vector<u32> truncated{Header(PM4ItOpcode::IndirectBuffer, 3), 0};
     auto partial = CmdSnapshot::Take(truncated, {});

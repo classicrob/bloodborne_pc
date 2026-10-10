@@ -520,6 +520,12 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb,
                 YIELD_CE();
                 RESUME_CE(task);
             }
+#ifdef __APPLE__
+            if (indirect_buffer->chain.Value()) {
+                ccb = {}; // a chained IB is a jump; the rest of this buffer is never executed
+                continue;
+            }
+#endif
             break;
         }
         default:
@@ -1371,6 +1377,20 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     YIELD_GFX();
                     RESUME_GFX(task);
                 }
+#ifdef __APPLE__
+                if (indirect_buffer->chain.Value()) {
+                    // A chained IB is a jump: the CP does not return to this buffer, whose rest
+                    // (typically an unused chunk tail) is never executed.
+                    static u64 chained = 0;
+                    if (++chained <= 8 || (chained & 1023) == 0) {
+                        LOG_INFO(Render, "Chained IB #{} to {} ({} dwords): skipping {} dwords after it",
+                                 chained, fmt::ptr(ib_address), ib_size,
+                                 dcb.size() - (header->type3.NumWords() + 1));
+                    }
+                    dcb = {};
+                    continue;
+                }
+#endif
                 break;
             }
             case PM4ItOpcode::IncrementDeCounter: {

@@ -90,12 +90,16 @@ std::shared_ptr<CmdSnapshot> CmdSnapshot::Take(std::span<const u32> dcb,
                 const auto* ib = reinterpret_cast<const PM4CmdIndirectBuffer*>(header);
                 const u32* target = ib->Address<const u32>();
                 const u32 ib_size = ib->ib_size;
+                const bool chain = ib->chain.Value();
                 if (!snapshot->Find(target, ib_size, constant)) {
                     ASSERT_MSG(regions.size() < MaxRegions && words.size() + ib_size <= MaxWords,
                                "macOS: command snapshot of submission at {} exceeds {} buffers / "
                                "{} MiB",
                                fmt::ptr(dcb.data()), MaxRegions, (MaxWords * 4) >> 20);
                     add(target, ib_size, constant, false); // `header` is stale from here on
+                }
+                if (chain) {
+                    break; // a chained IB is a jump: the rest of this buffer is never executed
                 }
             }
             at += length;
