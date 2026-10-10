@@ -120,6 +120,8 @@ struct Template {
     std::vector<u32> fetch;
     std::array<u32, 3> wg{64, 1, 1}; // compute workgroup shape (power-of-two x)
     u32 lds_bits = 0;                // Wave::Lds: guest LDS access width (16, 32, 64)
+    bool lds_only = false;           // Wave::Lds without the VOPC ballot (no wave-level operation)
+    u32 pushud_mask = 0;             // pushud: user-data SGPRs the stage reads (s[0:3] = its V#)
     u32 Threads() const { return wg[0] * wg[1] * wg[2]; }
     std::vector<u32> code;
     u64 hash = 0;
@@ -167,7 +169,10 @@ struct Job {
     std::string message;
     u32 perm = 0;
     std::vector<BindPlan> binds;
-    std::array<u32, 16> ud_regs{};
+    decltype(Shader::PushData{}.ud_regs) ud_regs{}; // the pipeline's packed user data
+    bool pushud_vs = false;    // pushud: the draw job; its fragment job follows it
+    bool pushud_chain = false; // pushud: fragment job, bound after the preceding vertex job
+    u32 fs_perm = 0;           // pushud: the fragment module permutation
     std::vector<VertexAttr> vattrs; // fixed-function vertex inputs of the permutation
     std::array<u32, 8> vtable{};    // vertex/srt jobs: table at s[2:3] (V# in dwords 0..3, constant in 4)
 };
@@ -283,7 +288,7 @@ void AssembleWave(GcnAsm::Code& c, Wave w) {
 }
 
 // Guest LDS of one width (each lane writes and reads its own slot) next to a VOPC ballot.
-void AssembleLds(GcnAsm::Code& c, u32 bits) {
+void AssembleLds(GcnAsm::Code& c, u32 bits, bool lds_only) {
     using namespace GcnAsm;
     const u32 shift = bits == 64 ? 3 : (bits == 32 ? 2 : 1);
     c.VLshlrevB32(16, Inline(shift), 15);
@@ -292,6 +297,7 @@ void AssembleLds(GcnAsm::Code& c, u32 bits) {
     c.SBarrier();
     c.Ds(bits == 64 ? 118 : (bits == 32 ? 54 : 60), 16, 0, 10); // ds_read -> v10 (v[10:11] for b64)
     c.SWaitcntAll();
+    if (lds_only) return;
     c.VCmpNeU32(Inline(0), 5);
     c.VMov(12, VCC_LO);
     c.VMov(13, VCC_HI);
@@ -453,8 +459,46 @@ void AssembleColorFs(Template& t) {
     t.hash = 0xf5c0104ull;
 }
 
+// pushud stage: stores every user-data SGPR s4..s15 in its mask to the V# in s[0:3] at byte
+// offset 4*k, then the VS exports a full-screen triangle position / the FS a constant color.
+void AssemblePushUd(Template& t) {
+    using namespace GcnAsm;
+    Code c;
+    c.SMovLiteral(VCC_HI, 0x5eed);
+    for (u32 k = 4; k < 16; ++k) {
+        if (!(t.pushud_mask >> k & 1)) continue;
+        c.VMov(8, k); // v_mov_b32 v8, s[k]
+        c.Mubuf(BUFFER_STORE_DWORD, Code::BufFields{.offset = k * 4, .vaddr = 0, .vdata = 8, .srsrc = 0});
+    }
+    if (t.fragment) {
+        for (u32 i = 0; i < 4; ++i) c.VMovLiteral(i, std::bit_cast<u32>(RenderColor[i]));
+        c.Exp(0, 0xF, true, 0, 1, 2, 3, true);
+    } else {
+        c.Vop2(27, 1, 0, Inline(1)); // positions from the vertex id, as AssembleRender
+        c.Vop2(22, 2, 0, Inline(1));
+        c.Vop1(6, 1, Vgpr(1));
+        c.Vop1(6, 2, Vgpr(2));
+        c.Vop2(8, 1, 1, 246);
+        c.Vop2(8, 2, 2, 246);
+        c.Vop2(5, 1, 1, 242);
+        c.Vop2(5, 2, 2, 242);
+        c.VMov(3, Inline(0));
+        c.VMov(4, 242);
+        c.Exp(12, 0xF, true, 1, 2, 3, 4);
+    }
+    c.SEndpgm();
+    t.code = std::move(c.words);
+    u64 h = 0xcbf29ce484222325ull ^ (t.fragment ? 0xf5u : 0x75u) ^ (u64(t.pushud_mask) << 8);
+    for (u32 w : t.code) h = (h ^ w) * 0x100000001b3ull;
+    t.hash = h;
+}
+
 void Assemble(Template& t) {
     using namespace GcnAsm;
+    if (t.pushud_mask) {
+        AssemblePushUd(t);
+        return;
+    }
     if (t.render) {
         AssembleRender(t);
         return;
@@ -492,7 +536,7 @@ void Assemble(Template& t) {
     for (u32 i = 0; i < 4; ++i) c.VMovLiteral(10 + i, VgprMarker + i);
     const bool smem = t.smem != SmemSrc::None;
     if (t.wave == Wave::Lds) {
-        AssembleLds(c, t.lds_bits);
+        AssembleLds(c, t.lds_bits, t.lds_only);
     } else if (t.wave != Wave::None) {
         AssembleWave(c, t.wave);
     } else if (smem || t.combo) {
@@ -1322,6 +1366,19 @@ void AddWaveCases() {
         Job& j = NewJob("wave64", tt, RawV(64), 0);
         for (u32 l = 0; l < 64; ++l) SetLane(j, l, 0x51000u + l * 0x101u, 0xABC00u + l, {u32(l % 5 == 1), 0, 0, 0});
     }
+    // The same guest LDS accesses with no wave-level operation: independent of the wave64
+    // emulation (runs on every tree). Each lane writes and reads back its own slot.
+    for (u32 bits : {16u, 32u, 64u}) {
+        Template t;
+        t.name = "lds: guest LDS " + std::to_string(bits) + "-bit, own slot, no wave ops";
+        t.op.kind = GCN_LOAD;
+        t.wave = Wave::Lds;
+        t.lds_bits = bits;
+        t.lds_only = true;
+        const u32 tt = AddTemplate(t);
+        Job& j = NewJob("lds", tt, RawV(64), 0);
+        for (u32 l = 0; l < 64; ++l) SetLane(j, l, 0x51000u + l * 0x101u, 0xABC00u + l);
+    }
     // Control-dependent phi feeding a loop bound (Sol-2's review case), compile-only.
     for (u32 x : {64u, 128u}) {
 #ifndef BB_MIRROR_PROFILE_WAVE64
@@ -1548,6 +1605,94 @@ void AddRenderCases() {
             for (const auto& p4 : pos) for (float x : p4) j.init_words.push_back(std::bit_cast<u32>(x));
         }
         for (u32 l = 0; l < 3; ++l) SetLane(j, l, l, 0);
+    }
+}
+
+// Tiny bound ranges: 1-3 bytes leave no whole dword (a U32 view of the binding has length 0)
+// and 4-7 bytes no whole qword (U64 view length 0). Every access must still be exact: the bytes
+// in range are read or written, nothing past them, out-of-range reads are 0.
+void AddTinyCases() {
+    using namespace GcnAsm;
+    struct L { const char* name; u32 op, bytes, n; bool sign; };
+    const L loads[] = {{"buffer_load_ubyte", BUFFER_LOAD_UBYTE, 1, 1, false},
+                       {"buffer_load_sshort", BUFFER_LOAD_SSHORT, 2, 1, true},
+                       {"buffer_load_ushort", BUFFER_LOAD_USHORT, 2, 1, false},
+                       {"buffer_load_dword", BUFFER_LOAD_DWORD, 4, 1, false},
+                       {"buffer_load_dwordx2", BUFFER_LOAD_DWORDX2, 4, 2, false},
+                       {"buffer_load_dwordx3", BUFFER_LOAD_DWORDX3, 4, 3, false},
+                       {"buffer_load_dwordx4", BUFFER_LOAD_DWORDX4, 4, 4, false}};
+    for (const auto& l : loads) {
+        const u32 t = RawOp(l.name, GCN_LOAD, l.op, l.bytes, l.n, l.sign, TArgs{});
+        for (u32 nr : {1u, 2u, 3u, 4u, 5u}) {
+            for (u64 mis : {0ull, 4ull, 2ull}) {
+                if (mis == 2 && l.bytes == 4) continue; // dword access needs a 4-aligned base
+                Job& j = NewJob("raw-tiny", t, RawV(nr), mis);
+                const auto offs = Uniq(RawProbe(nr));
+                for (u32 i = 0; i < offs.size(); ++i) SetLane(j, i, 0, offs[i]);
+            }
+        }
+        // structured: one element of 1-4 bytes, idxen
+        const u32 ts = RawOp(l.name, GCN_LOAD, l.op, l.bytes, l.n, l.sign, TArgs{.idxen = true});
+        for (u32 stride : {1u, 2u, 3u, 4u}) {
+            Job& j = NewJob("raw-tiny", ts, StructV(stride, 1), 0);
+            for (u32 i = 0; i < 3; ++i) SetLane(j, i, i, 0);
+        }
+    }
+    struct S { const char* name; u32 op, bytes, n; };
+    const S stores[] = {{"buffer_store_byte", BUFFER_STORE_BYTE, 1, 1},
+                        {"buffer_store_short", BUFFER_STORE_SHORT, 2, 1},
+                        {"buffer_store_dword", BUFFER_STORE_DWORD, 4, 1},
+                        {"buffer_store_dwordx2", BUFFER_STORE_DWORDX2, 4, 2}};
+    u32 salt = 0x7100;
+    for (const auto& st : stores) {
+        const u32 t = RawOp(st.name, GCN_STORE, st.op, st.bytes, st.n, false, TArgs{});
+        for (u32 nr : {1u, 2u, 3u, 4u, 5u}) {
+            for (u32 b : {0u, 1u, 2u, 3u, 4u}) {
+                Job& j = NewJob("raw-tiny", t, RawV(nr), 0);
+                SetLane(j, 0, 0, b, StoreData(salt++));
+                j.label += " voff=" + Hex(b);
+            }
+        }
+    }
+}
+
+constexpr u32 PushUdRegion = 0x1000; // per stage: VS at the V# base, FS right after it
+u32 PushUdValue(bool fs, u32 k) { return (fs ? 0xF5000000u : 0x75000000u) | (k << 12) | 0x0A5Bu; }
+
+// One push block for the whole pipeline (Rasterizer: each stage's ud_mask registers in stage
+// order, Bindings chained across stages as GetProgram does). Each stage stores the user data it
+// reads; the readback must hold every value at its register's slot, for both stages.
+void AddPushUdCases() {
+    struct C { const char* name; u32 vs, fs; };
+    const C cases[] = {
+        {"real-shape pair: VS s0-s11 (12) + FS s0-s3,s12,s13 (6) = 18 > 16", 0x0FFFu, 0x300Fu},
+        {"VS 16 + FS 16 = 32", 0xFFFFu, 0xFFFFu},
+        {"sparse: VS s0-s3,s9 + FS s0-s3,s5,s15", 0x020Fu, 0x802Fu},
+        {"VS 4 (V# only) + FS 16", 0x000Fu, 0xFFFFu},
+    };
+    for (const C& c : cases) {
+        Template fs;
+        fs.name = std::string("pushud fs: ") + c.name;
+        fs.fragment = true;
+        fs.helper = true;
+        fs.pushud_mask = c.fs;
+        fs.op.kind = GCN_STORE;
+        const u32 ft = AddTemplate(fs);
+        Template vs;
+        vs.name = std::string("pushud: ") + c.name;
+        vs.vertex = true;
+        vs.render = true;
+        vs.pushud_mask = c.vs;
+        vs.fs_tmpl = ft;
+        vs.op.kind = GCN_STORE;
+        const u32 vt = AddTemplate(vs);
+        Job& j = NewJob("pushud", vt, RawV(PushUdRegion), 0);
+        j.pushud_vs = true;
+        for (u32 l = 0; l < 3; ++l) SetLane(j, l, l, 0);
+        const std::string label = j.label;
+        Job& f = NewJob("pushud", ft, RawV(PushUdRegion), PushUdRegion);
+        f.label = label + " (fs)";
+        f.pushud_chain = true;
     }
 }
 
@@ -1810,6 +1955,20 @@ void CompileJob(std::vector<ProgramState>& programs, Shader::Pools& pools, u32 i
     const auto sw = t.fragment ? Shader::SwStage::Fragment
                                : (t.vertex ? Shader::SwStage::Vertex : Shader::SwStage::Compute);
     Shader::Backend::Bindings binding{.unified = job.start_unified, .buffer = job.start_buffer};
+    const Job* chain_vs = nullptr;
+    if (job.pushud_chain) {
+        // GetProgram: the next stage starts where the previous one's bindings end.
+        if (index == 0 || !g_jobs[index - 1].pushud_vs || !programs[g_jobs[index - 1].tmpl].info) {
+            std::fprintf(stderr, "pushud: fragment job %u has no compiled vertex stage before it\n", index);
+            _exit(91);
+        }
+        chain_vs = &g_jobs[index - 1];
+        binding = {.unified = chain_vs->start_unified, .buffer = chain_vs->start_buffer};
+        programs[chain_vs->tmpl].info->AddBindings(binding);
+        // Negative control: BB_PUSHUD_UNCHAINED=1 compiles the fragment stage's user data at slot
+        // 0 (buffers still chained), so it reads the vertex stage's values and must FAIL.
+        if (std::getenv("BB_PUSHUD_UNCHAINED")) binding.user_data = 0;
+    }
     std::vector<u32> spv;
     u32 perm = 0;
     if (!ps.info) {
@@ -1873,8 +2032,15 @@ void CompileJob(std::vector<ProgramState>& programs, Shader::Pools& pools, u32 i
     }
     Shader::PushData push{};
     Shader::Backend::Bindings ud_binding{};
+    if (chain_vs) {
+        // Rasterizer: every stage's user data in one push block, in stage order.
+        auto& vinfo = *programs[chain_vs->tmpl].info;
+        vinfo.user_data = std::span<const u32, 16>(chain_vs->ud);
+        vinfo.PushUd(ud_binding, push);
+    }
     info.PushUd(ud_binding, push);
-    for (u32 i = 0; i < 16; ++i) w.Put(push.ud_regs[i]);
+    w.Put(u32(push.ud_regs.size()));
+    for (u32 x : push.ud_regs) w.Put(x);
     // Vertex inputs the graphics pipeline would declare (GraphicsPipeline::GetVertexInputs).
     const auto& fetch = ps.specs[perm].fetch_shader_data;
     const u32 nattr = (t.vertex && fetch) ? u32(fetch->attributes.size()) : 0;
@@ -2027,12 +2193,13 @@ void CompileAll(const std::string& outdir) {
                 binds.push_back(std::move(bp));
             }
             auto other = get();
-            if (!ok || !other || p + 16 > w.size()) break;
+            auto nud = get();
             Job& job = g_jobs[*idx];
+            if (!ok || !other || !nud || *nud != job.ud_regs.size() || p + *nud > w.size()) break;
             job.perm = *perm;
             job.binds = std::move(binds);
-            std::copy_n(w.begin() + p, 16, job.ud_regs.begin());
-            p += 16;
+            std::copy_n(w.begin() + p, *nud, job.ud_regs.begin());
+            p += *nud;
             if (p >= w.size()) break;
             const u32 nattr = w[p++];
             if (p + nattr * 6 > w.size()) break;
@@ -2462,8 +2629,10 @@ std::vector<u32> WaveExpected(const Job& j) {
             const Lane& L = j.lanes[l];
             r[0] = t.lds_bits == 16 ? (L.vindex & 0xFFFF) : L.vindex;
             if (t.lds_bits == 64) r[1] = L.voffset;
-            r[2] = blo;
-            r[3] = bhi;
+            if (!t.lds_only) {
+                r[2] = blo;
+                r[3] = bhi;
+            }
             break;
         }
         case Wave::None:
@@ -2888,7 +3057,7 @@ bool RecordRender(Gpu& g, vk::CommandBuffer cmd, Job& j, const std::vector<vk::D
                               .module = module(AuxTess(AuxShaderType::PassthroughTES, fs_rt.hw.fs)),
                               .pName = "main"});
         }
-        stages.push_back({.stage = vk::ShaderStageFlagBits::eFragment, .module = module(g_spirv.at({t.fs_tmpl, 0})), .pName = "main"});
+        stages.push_back({.stage = vk::ShaderStageFlagBits::eFragment, .module = module(g_spirv.at({t.fs_tmpl, j.fs_perm})), .pName = "main"});
         if (const char* dir = std::getenv("BB_DUMP_RENDER")) { // debugging aid: the exact stage SPIR-V
             auto dump = [&](const std::string& n, const std::vector<u32>& spv) {
                 if (FILE* f = std::fopen((std::string(dir) + "/" + key.substr(0, key.find('/')) + "-" + n + ".spv").c_str(), "wb")) {
@@ -2898,7 +3067,7 @@ bool RecordRender(Gpu& g, vk::CommandBuffer cmd, Job& j, const std::vector<vk::D
             };
             using Shader::Backend::SPIRV::AuxShaderType;
             dump("vs", g_spirv.at({j.tmpl, j.perm}));
-            dump("fs", g_spirv.at({t.fs_tmpl, 0}));
+            dump("fs", g_spirv.at({t.fs_tmpl, j.fs_perm}));
             if (t.rect_list) {
                 dump("tcs", AuxTess(AuxShaderType::RectListTCS, fs_rt.hw.fs));
                 dump("tes", AuxTess(AuxShaderType::PassthroughTES, fs_rt.hw.fs));
@@ -3047,6 +3216,38 @@ JobResult EvaluateRender(Gpu& g, const Job& j) {
                                " pixels wrong (" + (j.quarter ? "quarter" : "full") + " coverage expected)\n" + d};
 }
 
+// pushud: the draw covered the target, and each stage stored exactly its user-data values (all
+// other bytes of both regions unchanged).
+JobResult EvaluatePushUd(Gpu& g, const Job& j) {
+    JobResult r = EvaluateRender(g, j);
+    const Job& f = g_jobs[size_t(&j - g_jobs.data()) + 1];
+    const u64 base = SlotBase(j.slot) + BaseInArena;
+    u32 bad = 0;
+    std::string d;
+    for (u32 stage = 0; stage < 2; ++stage) {
+        const Job& sj = stage ? f : j;
+        const u32 mask = g_templates[sj.tmpl].pushud_mask;
+        for (u32 off = 0; off < PushUdRegion; off += 4) {
+            const u64 k = base + stage * PushUdRegion + off - GuestVa;
+            const u32 reg = off / 4;
+            const bool stored = reg >= 4 && reg < 16 && (mask >> reg & 1);
+            u32 got, want;
+            std::memcpy(&got, g.guest.data + k, 4);
+            if (stored) want = sj.ud[reg];
+            else std::memcpy(&want, g.pristine.data() + k, 4);
+            if (got != want && bad++ < 8) {
+                char b[160];
+                std::snprintf(b, sizeof(b), "    %s +%#x (s%u): got %#010x want %#010x%s\n", stage ? "FS" : "VS", off, reg,
+                              got, want, stored ? "" : " (unchanged)");
+                d += b;
+            }
+        }
+    }
+    if (!bad) return r;
+    return {Verdict::Fail, (r.verdict == Verdict::Strict ? std::string() : r.detail) + "  " + std::to_string(bad) +
+                               " stored user-data dwords wrong\n" + d};
+}
+
 // Run one batch of jobs; returns per-job results (jobs that cannot run get loud/error verdicts).
 std::map<u32, JobResult> RunBatch(Gpu& g, const std::vector<u32>& jobs) {
     std::map<u32, JobResult> out;
@@ -3157,6 +3358,10 @@ std::map<u32, JobResult> RunBatch(Gpu& g, const std::vector<u32>& jobs) {
     for (u32 ji : ran) {
         const Job& j = g_jobs[ji];
         Bound tb = tbound.count(ji) ? tbound[ji] : Bound{.is_null = true};
+        if (j.pushud_vs) {
+            out[ji] = EvaluatePushUd(g, j);
+            continue;
+        }
         if (g_templates[j.tmpl].render) {
             out[ji] = EvaluateRender(g, j);
             continue;
@@ -3510,6 +3715,8 @@ int main(int argc, char** argv) {
     AddInternalCases();
     AddSpecReuseCases();
     AddRenderCases();
+    AddPushUdCases();
+    AddTinyCases();
     AddPushDescriptorCases();
     if (!opt.only.empty()) {
         std::vector<Job> kept;
@@ -3535,7 +3742,16 @@ int main(int argc, char** argv) {
         }
         j.ud[12] = j.sgpr_soff;
         j.ud[13] = j.smem_sgpr;
-        if (g_templates[j.tmpl].compile_only) {
+        if (g_templates[j.tmpl].pushud_mask) {
+            // V# in s[0:3] into the draw job's arena (the fragment job follows its vertex job)
+            const Job& draw = j.pushud_chain && i > 0 ? g_jobs[i - 1] : j;
+            gcn_vsharp pv2 = RawV(PushUdRegion);
+            pv2.base = SlotBase(draw.slot) + BaseInArena + (j.pushud_chain ? PushUdRegion : 0);
+            const auto pk = Pack(pv2);
+            j.ud = {};
+            for (u32 k = 0; k < 4; ++k) j.ud[k] = pk[k];
+            for (u32 k = 4; k < 16; ++k) j.ud[k] = PushUdValue(j.pushud_chain, k);
+        } else if (g_templates[j.tmpl].compile_only) {
             j.ud = {};
             for (u32 k = 0; k < 4; ++k) j.ud[4 + k] = t[k];
             j.ud[8] = 0x1234;
@@ -3564,6 +3780,25 @@ int main(int argc, char** argv) {
 
     // Phase 1: compile in child processes (loud aborts are recorded per job).
     CompileAll(opt.outdir);
+    for (u32 i = 0; i < g_jobs.size(); ++i) {
+        Job& j = g_jobs[i];
+        if (!j.pushud_vs) continue;
+        if (i + 1 >= g_jobs.size() || !g_jobs[i + 1].pushud_chain) {
+            j.status = Status::HarnessError;
+            j.message = "pushud: the fragment job was filtered out (--only)";
+            continue;
+        }
+        const Job& f = g_jobs[i + 1];
+        if (j.status != Status::Ok) continue;
+        if (f.status != Status::Ok) {
+            j.status = f.status;
+            j.message = "fragment stage: " + f.message;
+            continue;
+        }
+        j.binds.insert(j.binds.end(), f.binds.begin(), f.binds.end()); // FS bindings follow the VS's
+        j.ud_regs = f.ud_regs; // the pipeline push block (VS then FS)
+        j.fs_perm = f.perm;
+    }
     size_t perms = g_spirv.size();
     std::printf("compiled: %zu modules\n", perms);
     ValidateModules(opt.outdir);
