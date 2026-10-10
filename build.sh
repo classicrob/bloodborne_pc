@@ -144,8 +144,11 @@ fi
 sign_darwin out/bb-gpu-capabilities
 if [[ ${1:-} == --test ]]; then
     if [[ $(uname -s) == Darwin ]]; then
-        ninja -C out/gpu "${ninja_jobs[@]}" null-descriptor-test upscaler-support-test buffer-bounds-test buffer-dead-resources-test host-import-arena-test
-        sign_darwin out/gpu/null-descriptor-test out/gpu/upscaler-support-test out/gpu/buffer-bounds-test out/gpu/buffer-dead-resources-test out/gpu/host-import-arena-test
+        # The GPU library has no default user directory on macOS: fixtures get a scratch one.
+        export BB_GPU_USER_DIR="$PWD/out/gpu-test-user"
+        ninja -C out/gpu "${ninja_jobs[@]}" null-descriptor-test upscaler-support-test buffer-bounds-test buffer-dead-resources-test host-import-arena-test vertex-pulling-pipeline-test shader-permutation-info-test gpu-user-dir-test
+        sign_darwin out/gpu/null-descriptor-test out/gpu/upscaler-support-test out/gpu/buffer-bounds-test out/gpu/buffer-dead-resources-test out/gpu/host-import-arena-test out/gpu/vertex-pulling-pipeline-test out/gpu/shader-permutation-info-test out/gpu/gpu-user-dir-test
+        out/gpu/gpu-user-dir-test
         out/gpu/null-descriptor-test
         out/gpu/upscaler-support-test
         mkdir -p out/macos-buffer-bounds
@@ -153,6 +156,11 @@ if [[ ${1:-} == --test ]]; then
         mkdir -p out/mac-inventory
         out/gpu/buffer-dead-resources-test
         out/gpu/host-import-arena-test
+        out/gpu/vertex-pulling-pipeline-test
+        out/gpu/shader-permutation-info-test
+        # Default allocated descriptor sets only; --push reproduces a MoltenVK bug and exits 2.
+        BB_DEPS_PREFIX="$deps" bash tests/macos_descriptor_sizes/run.sh
+        BB_DEPS_PREFIX="$deps" bash tests/test_fp64_policy.sh
         BB_GPU_BUILD="$PWD/out/gpu" sh tests/macos_float_modes/production.sh
         "$CC" "${platform_flags[@]}" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread -Isrc \
             tests/test_compat_mac.c src/compat_mac.c -o out/compat-mac-test

@@ -9,6 +9,9 @@
 #include "common/types.h"
 
 #ifdef __APPLE__
+#include <cstdio>
+#include <cstdlib>
+#include <system_error>
 #include <CoreFoundation/CFBundle.h>
 #include <dlfcn.h>
 #include <sys/param.h>
@@ -84,17 +87,31 @@ static std::optional<std::filesystem::path> GetBundleParentDirectory() {
 }
 #endif
 
-static auto UserPaths = [] {
+static std::unordered_map<PathType, fs::path> ResolveUserPaths() {
     // bbport: the port keeps GPU caches where BB_GPU_USER_DIR points.
     const char* port_dir = std::getenv("BB_GPU_USER_DIR");
+#ifdef __APPLE__
+    // Resolved on first use, after bbgpu_init sets BB_GPU_USER_DIR from --user. There is no
+    // other macOS location: a missing directory is configuration error, not a default.
+    if (!port_dir || !*port_dir) {
+        std::fprintf(stderr, "macOS GPU user directory is not configured: set BB_GPU_USER_DIR or "
+                             "pass --user before the GPU library uses its cache/log paths\n");
+        std::abort();
+    }
+    std::error_code error;
+    const auto user_dir = std::filesystem::absolute(port_dir, error);
+    if (!error) std::filesystem::create_directories(user_dir, error);
+    if (error || !std::filesystem::is_directory(user_dir)) {
+        std::fprintf(stderr, "macOS GPU user directory %s cannot be created: %s\n", port_dir,
+                     error ? error.message().c_str() : "not a directory");
+        std::abort();
+    }
+#else
     auto user_dir = port_dir ? std::filesystem::path(port_dir) : std::filesystem::current_path() / PORTABLE_DIR;
     if (!std::filesystem::exists(user_dir)) {
         // If it doesn't exist, use the standard path for the platform instead.
         // NOTE: On Windows we currently just create the portable directory instead.
-#ifdef __APPLE__
-        user_dir =
-            std::filesystem::path(getenv("HOME")) / "Library" / "Application Support" / "shadPS4";
-#elif defined(__linux__)
+#if defined(__linux__)
         const char* xdg_data_home = getenv("XDG_DATA_HOME");
         if (xdg_data_home != nullptr && strlen(xdg_data_home) > 0) {
             user_dir = std::filesystem::path(xdg_data_home) / "shadPS4";
@@ -107,6 +124,7 @@ static auto UserPaths = [] {
         std::filesystem::create_directories(user_dir);
 #endif
     }
+#endif
 
     std::unordered_map<PathType, fs::path> paths;
 
@@ -151,7 +169,19 @@ static auto UserPaths = [] {
     }
 
     return paths;
-}();
+}
+
+#ifdef __APPLE__
+static std::unordered_map<PathType, fs::path>& UserPaths() {
+    static auto paths = ResolveUserPaths();
+    return paths;
+}
+#else
+static auto UserPathsStatic = ResolveUserPaths();
+static std::unordered_map<PathType, fs::path>& UserPaths() {
+    return UserPathsStatic;
+}
+#endif
 
 bool ValidatePath(const fs::path& path) {
     if (path.empty()) {
@@ -180,7 +210,7 @@ std::string PathToUTF8String(const std::filesystem::path& path) {
 }
 
 const fs::path& GetUserPath(PathType shad_path) {
-    return UserPaths.at(shad_path);
+    return UserPaths().at(shad_path);
 }
 
 std::string GetUserPathString(PathType shad_path) {
@@ -194,7 +224,7 @@ void SetUserPath(PathType shad_path, const fs::path& new_path) {
         return;
     }
 
-    UserPaths.insert_or_assign(shad_path, new_path);
+    UserPaths().insert_or_assign(shad_path, new_path);
 }
 
 std::optional<fs::path> FindGameByID(const fs::path& dir, const std::string& game_id,
