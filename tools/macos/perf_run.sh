@@ -2,9 +2,12 @@
 # BB_PERF run of the tracked production route (docs/macos/perf.md): the route itself is
 # tools/macos/play_route.py; this records the host state around it and summarizes perf.jsonl.
 #   tools/macos/perf_run.sh --probe PATH [--output 1080p|4k] [--phases] [--label NAME] [--until STAGE]
+#                           [--hold SECONDS]
+# --hold keeps the game at the last stage for SECONDS, then stops it; the summary then covers
+# only the windows completed during the hold (the stage itself, not loading on the way).
 set -euo pipefail
 cd -- "$(dirname -- "$0")/../.."
-probe='' output=4k phases=0 label=perf until=()
+probe='' output=4k phases=0 label=perf until=() hold=0
 while (($#)); do
     case $1 in
     --probe) probe=$2; shift 2 ;;
@@ -12,6 +15,7 @@ while (($#)); do
     --phases) phases=1; shift ;;
     --label) label=$2; shift 2 ;;
     --until) until=(--until "$2"); shift 2 ;;
+    --hold) hold=$2; shift 2 ;;
     *) echo "perf_run: unknown argument $1" >&2; exit 2 ;;
     esac
 done
@@ -48,13 +52,27 @@ trap 'rm -rf "$scratch"' EXIT
 host_state "$scratch/host-before.json"
 flags=(--perf)
 if ((phases)); then flags+=(--perf-phases); fi
+[[ $hold =~ ^[0-9]+$ ]] || fail "--hold must be a whole number of seconds"
+if ((hold)); then flags+=(--keep); fi
 status=0
 python3 tools/macos/play_route.py route --probe "$probe" --output "$output" "${flags[@]}" \
-    --label "$label" "${until[@]}" || status=$?
+    --label "$label" ${until[@]+"${until[@]}"} || status=$?
 run=$(cd out/macos_route && cd "$(readlink current)" && pwd)
+summary=()
+if ((hold && status != 0)); then
+    python3 tools/macos/play_route.py stop || true # the route failed; don't leave the game running
+fi
+if ((hold && status == 0)); then
+    [[ -f $run/perf.jsonl ]] || fail "no $run/perf.jsonl after the route: BB_PERF is not active in this build"
+    first=$(wc -l < "$run/perf.jsonl")
+    echo "perf_run: holding the last stage for $hold s (records after line $first)"
+    sleep "$hold"
+    python3 tools/macos/play_route.py stop || status=$?
+    summary=(--after-line "$first")
+fi
 cp "$scratch/host-before.json" "$run/host-before.json"
 host_state "$run/host-after.json"
 ((status == 0)) || fail "route failed (exit $status); see $run"
 [[ -s $run/perf.jsonl ]] || fail "no $run/perf.jsonl: the game did not record BB_PERF windows"
-python3 tools/macos/perf_summary.py "$run/perf.jsonl" | tee "$run/perf-summary.txt"
+python3 tools/macos/perf_summary.py ${summary[@]+"${summary[@]}"} "$run/perf.jsonl" | tee "$run/perf-summary.txt"
 echo "perf_run: $run"
