@@ -4862,6 +4862,24 @@ bool Rasterizer::QuiesceForCapture(std::string& why) {
     return scheduler.WaitQuiescentForCapture(std::chrono::seconds(2), why);
 }
 
+bool Rasterizer::CaptureImages(const std::function<void(VideoCore::CapturedImage&&)>& sink,
+                               VideoCore::CapturedMetadata& metadata, std::string& why) {
+    if (!OnStageA()) {
+        why = "not on the GPU command thread";
+        return false;
+    }
+    return texture_cache.CaptureForReplay(sink, metadata, why);
+}
+
+bool Rasterizer::RestoreImages(const std::function<bool(VideoCore::CapturedImage&)>& next,
+                               const VideoCore::CapturedMetadata& metadata, std::string& why) {
+    if (!OnStageA()) {
+        why = "not on the GPU command thread";
+        return false;
+    }
+    return texture_cache.RestoreForReplay(next, metadata, why);
+}
+
 std::string Rasterizer::CaptureSettingsRefusal() const {
     std::string on;
     const auto add = [&](const char* name) {

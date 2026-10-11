@@ -52,6 +52,11 @@ public:
             return &vector[slot];
         }
 
+        /// bbport: the slot this iterator is at.
+        SlotId Id() const {
+            return slot;
+        }
+
         Iterator& operator++() {
             ++slot.index;
             AdvanceToValid();

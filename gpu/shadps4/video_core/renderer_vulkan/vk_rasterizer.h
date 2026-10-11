@@ -135,6 +135,15 @@ public:
     /// depend on host-side history or redirect it (upscaler incl. TAA, reduced scene / live
     /// resolution, camera or object motion vectors).
     [[nodiscard]] std::string CaptureSettingsRefusal() const;
+    /// Perf replay (capture_images.h): every GPU-modified image, streamed to `sink`, and the
+    /// metadata surfaces. GPU command thread, after QuiesceForCapture succeeded. False with
+    /// `why` on an image it cannot capture exactly.
+    bool CaptureImages(const std::function<void(VideoCore::CapturedImage&&)>& sink,
+                       VideoCore::CapturedMetadata& metadata, std::string& why);
+    /// Perf replay: recreates the captured images in a fresh cache, before the first replayed
+    /// packet (GPU command thread, guest memory and registers already restored).
+    bool RestoreImages(const std::function<bool(VideoCore::CapturedImage&)>& next,
+                       const VideoCore::CapturedMetadata& metadata, std::string& why);
 #endif
     bool RunInOrder(OrderedTask task, const void* data, u32 size,
                     u64 toggle = BbToggle::PipelinedTasks);
