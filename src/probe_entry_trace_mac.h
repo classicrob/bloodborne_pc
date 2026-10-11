@@ -2,6 +2,8 @@
 #define BB_PROBE_ENTRY_TRACE_MAC_H
 #include <stdatomic.h>
 #include <mach/mach_time.h>
+#include <mach/thread_info.h>
+#include <pthread.h>
 
 /* Startup-only installation. A retained INT3 redirects to an immutable trampoline
  * which executes the displaced push rbp and jumps back without register scratch.
@@ -38,6 +40,34 @@ static char *entry_words(char *out,const char *name,uintptr_t address) {
     else for (unsigned i=0;i<8;++i) { out=entry_hex(out,words[i]); *out++=','; }
     *out++=']'; *out++=' '; return out;
 }
+static char *entry_host_thread(char *out) {
+    out=entry_field(out,"pthread",(uintptr_t)pthread_self());
+    thread_extended_info_data_t info;
+    mach_msg_type_number_t count=THREAD_EXTENDED_INFO_COUNT;
+    mach_port_t port=mach_thread_self();
+    kern_return_t error=KERN_INVALID_NAME,release=KERN_SUCCESS;
+    if (MACH_PORT_VALID(port)) {
+        error=thread_info(port,THREAD_EXTENDED_INFO,(thread_info_t)&info,&count);
+        release=mach_port_deallocate(entry_trace_task,port);
+    }
+    if (error || count!=THREAD_EXTENDED_INFO_COUNT) {
+        out=entry_field(out,"name-unreadable-mach",error ? (unsigned)error : KERN_FAILURE);
+    } else {
+        out=entry_text(out,"name=\"");
+        for (size_t i=0;i<sizeof(info.pth_name) && info.pth_name[i];++i) {
+            unsigned char c=(unsigned char)info.pth_name[i];
+            if (c=='\\' || c=='\"') *out++='\\';
+            if (c>=32 && c<127) *out++=(char)c;
+            else {
+                static const char hex[]="0123456789abcdef";
+                *out++='\\'; *out++='x'; *out++=hex[c>>4]; *out++=hex[c&15];
+            }
+        }
+        out=entry_text(out,"\" ");
+    }
+    if (release) out=entry_field(out,"thread-port-release-mach",(unsigned)release);
+    return out;
+}
 static int entry_trace_handle(int sig,const siginfo_t *info,void *context) {
     if (sig!=SIGTRAP || !entry_trace_count) return 0;
     ucontext_t *uc=context;
@@ -61,6 +91,7 @@ static int entry_trace_handle(int sig,const siginfo_t *info,void *context) {
     end=entry_field(end,"seq",seq); end=entry_field(end,"ticks",mach_absolute_time());
     end=entry_field(end,"site",entry_trace_sites[i].address);
     end=entry_field(end,"thread",thread);
+    end=entry_host_thread(end);
     if (thread_error) end=entry_field(end,"thread-unreadable",(unsigned)thread_error);
     end=entry_field(end,"caller",caller);
     if (caller_error) end=entry_field(end,"caller-unreadable",(unsigned)caller_error);
@@ -123,6 +154,8 @@ static const char *entry_trace_install(const char *setting,unsigned char *base,
     }
     if (mprotect(code,page,PROT_READ|PROT_EXEC)) return "BB_GUEST_ENTRY_TRACE cannot protect trampoline";
     entry_trace_task=mach_task_self(); entry_trace_tcb_offset=runtime_thread_tcb_offset();
+    /* Resolve the identity-query calls outside the signal path before patching. */
+    char identity[512]; (void)entry_host_thread(identity);
     memcpy(entry_trace_sites,sites,used*sizeof(sites[0])); entry_trace_count=(sig_atomic_t)used;
     for (unsigned i=0;i<used;++i) {
         void *start=(void *)(sites[i].address&~(uintptr_t)(page-1));

@@ -20,11 +20,23 @@ RDI is destination and RSI source; qwords 0/1/2/3/4 are begin/end/cmdptr/callbac
 userdata. For initialization from a parent, RDX names the parent. An unreadable
 pointer is recorded with a Mach error instead of being dereferenced.
 
+`pthread` is the host pthread identity and `name` is the current kernel thread
+name, allowing records to be joined to the PM4 builder trace. They are distinct
+from the guest `thread` handle. The name is read through
+`thread_info(THREAD_EXTENDED_INFO)` on the current thread's Mach send right;
+each right is released, including on query failure. An empty name is printed
+as `name=""`; failed queries print `name-unreadable-mach`. Output is bounded by
+the returned structure's name array and escapes nonprintable characters.
+The query entry points are called once before installing any breakpoint to
+resolve lazy bindings outside the handler.
+
 Sequence numbers order handler entry, not object mutations by other threads.
 The three object reads are not a coherent cross-thread snapshot. Treat them as
 observations, not ownership or race-free evidence. Sort concurrent output by
-sequence if the writes reach stderr in a different order. Thread names and
-builder call chains are provided separately by the PM4 builder diagnostic.
+sequence if the writes reach stderr in a different order. Builder call chains
+are provided separately by the PM4 builder diagnostic. A name can change
+between these observations; the pthread identity is the join key while the
+thread lives.
 
 ## Supported patch and safety constraints
 
@@ -49,8 +61,14 @@ back to site+1. It neither unpatches the entry nor single-steps, so concurrent
 entries cannot bypass a temporary patch gap. It does not use register scratch
 or alter flags to resume. The handler uses per-invocation bounded stack buffers,
 a lock-free sequence counter, cached GS displacement, safe Mach reads and
-write(2). It preserves errno. No allocation, printf, pthread lock, name lookup,
-or debugger API runs in the handler.
+write(2). It preserves errno. No allocation, printf, pthread lock, userspace
+name lookup, or debugger API runs in the handler. The identity query uses
+Darwin Mach RPCs and is a platform-specific signal-path implementation, not a
+claim of portable POSIX async-signal safety. Apple's
+[pthread implementation](https://github.com/apple-oss-distributions/libpthread/blob/main/src/pthread.c)
+updates the kernel name before its userspace cache. Reading kernel state avoids
+an interrupted userspace name copy; it also sees HLE worker renames that are
+not reflected in the guest thread record.
 
 This is an observation tool, not a scheduling-neutral trace: every selected
 entry incurs a signal, bounded kernel reads and log output. Keep the site list
@@ -71,3 +89,6 @@ invalid/non-executable/duplicate sites, safe invalid data reads and absent TCB,
 rejects user/trace provenance even at a matching PC, and verifies an unrelated
 SIGTRAP reaches the fatal handler. No guest game
 bytes are included in the fixture.
+The identity checks compare pthread pointers and names against the pthread
+API outside the handler, including renames and an empty name, and check errno
+preservation and balanced Mach send-right references.

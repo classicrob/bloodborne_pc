@@ -17,5 +17,12 @@ assert {int(re.search(r'seq=0x([0-9a-f]+)',s)[1],16) for s in lines}==set(range(
 assert {int(re.search(r'thread=0x([0-9a-f]+)',s)[1],16) for s in lines}=={0,42,100,101,102,103}
 caller=re.search(r'caller=([0-9a-f]+)',result)[1]
 assert all('caller=0x'+caller in s and 'rsi-words[unreadable-mach=' in s for s in lines)
+assert not any('name-unreadable' in s or 'thread-port-release' in s for s in lines)
+identities=re.findall(r'IDENTITY thread=(\d+) pthread=([0-9a-f]+) name=(.*)',result)
+assert len(identities)==10
+for thread, host, name in identities:
+    matching=[s for s in lines if f'thread=0x{int(thread):016x} ' in s and
+              f'pthread=0x{host} ' in s and f'name="{name}" ' in s]
+    assert len(matching)==(1 if int(thread)<100 else 4), (thread,host,name,matching)
 print(result,end='')
 PY
