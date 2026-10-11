@@ -504,7 +504,8 @@ void VideoOutDriver::Flip(const Request& req) {
                 // Every draw the renderer did not draw, by reason (none: no line).
                 static constexpr const char* names[] = {
                     "stage disabled", "stage without program", "stage combination",
-                    "ES/GS reported", "primitive None", "FMASK decompress"};
+                    "ES/GS reported", "primitive None", "FMASK decompress",
+                    "BB_DRAW_BISECT skip"};
                 static_assert(std::size(names) == size_t(Vulkan::DrawDrop::Count));
                 std::string drops;
                 for (size_t i = 0; i < std::size(names); ++i) {

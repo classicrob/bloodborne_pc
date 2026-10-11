@@ -116,6 +116,11 @@ public:
     /// thread while the draw pipeline is in use (PipelinedTasks), else here after a drain.
     using OrderedTask = void (*)(Rasterizer& rasterizer, const u8* data);
     /// Returns true when the task was handed to the recording thread (not run yet).
+#ifdef __APPLE__
+    /// BB_DRAW_BISECT (diagnostic): a flip ends the frame and re-reads the control file. Runs
+    /// in stream order with the draws (SignalFlip).
+    void DrawBisectOnFlip();
+#endif
     bool RunInOrder(OrderedTask task, const void* data, u32 size,
                     u64 toggle = BbToggle::PipelinedTasks);
     /// Stage A: the draw pipe position after the last handed-over packet, and whether the
@@ -259,6 +264,12 @@ private:
         u32 max_count;
     };
     /// Everything of an indirect draw after the pipeline selection (GPU thread or stage B).
+#ifdef __APPLE__
+    /// BB_DRAW_BISECT (diagnostic): numbers the draw within its frame, lists it when asked and
+    /// returns whether the control file skips it.
+    bool DrawBisectSkip(const GraphicsPipeline* pipeline, bool is_indexed, u32 index_offset,
+                        const IndirectDraw* indirect);
+#endif
     void DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_indexed,
                             const IndirectDraw& indirect);
     /// Everything of an indirect dispatch after the pipeline selection.
