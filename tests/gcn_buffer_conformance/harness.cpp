@@ -2602,9 +2602,14 @@ std::map<std::pair<u32, u32>, std::string> g_spirv_invalid; // spirv-val finding
 void ValidateModules(const std::string& outdir) {
     const char* env = std::getenv("BB_SPIRV_VAL");
     const std::string tool = env ? env : "/opt/homebrew/bin/spirv-val";
-    if (access(tool.c_str(), X_OK) != 0) {
-        std::printf("spirv-val: not found at %s (set BB_SPIRV_VAL); modules NOT validated\n", tool.c_str());
+    if (tool == "none") { // explicit opt-out only
+        std::printf("spirv-val: disabled (BB_SPIRV_VAL=none); modules NOT validated\n");
         return;
+    }
+    if (access(tool.c_str(), X_OK) != 0) {
+        std::fprintf(stderr, "gcn-conformance: spirv-val not found at %s (install it, set BB_SPIRV_VAL, or "
+                             "BB_SPIRV_VAL=none to skip validation explicitly)\n", tool.c_str());
+        std::exit(2);
     }
     const std::string path = outdir + "/validate.spv";
     for (const auto& [key, spv] : g_spirv) {
