@@ -92,6 +92,59 @@ static void exercise(void* opaque) {
     assert(state.eof == unsigned(run.natural));
     assert(allocations == frees);
 }
+struct Poller {
+    AvPlayerSource* source;
+    std::atomic<bool>* stopped;
+    std::atomic<unsigned>* calls;
+    bool audio;
+};
+static void poll_frames(void* opaque) {
+    auto& p = *static_cast<Poller*>(opaque);
+    while (!p.stopped->load()) {
+        AvPlayerFrameInfo info{};
+        if (p.audio) p.source->GetAudioData(info);
+        else p.source->GetVideoData(info);
+        p.source->CurrentTime();
+        p.source->IsActive();
+        ++*p.calls;
+        std::this_thread::yield();
+    }
+    // No frame/clock state survives a completed Stop; failure preserves output.
+    for (unsigned i = 0; i < 128; ++i) {
+        AvPlayerFrameInfo info{};
+        info.timestamp = 0x12345678;
+        assert(!(p.audio ? p.source->GetAudioData(info) : p.source->GetVideoData(info)));
+        assert(info.timestamp == 0x12345678);
+        AvPlayerFrameInfoEx ex{};
+        ex.timestamp = 0x12345678;
+        assert(!p.source->GetVideoData(ex) && ex.timestamp == 0x12345678);
+        assert(p.source->CurrentTime() == 0 && !p.source->IsActive());
+    }
+}
+static void polling_stop(void* path) {
+    State state;
+    AvPlayerSource source(state);
+    AvPlayerInitData init{};
+    init.memory_replacement = {nullptr, allocate, deallocate, allocate, deallocate};
+    init.num_output_video_framebuffers = 2;
+    assert(source.Init(init, static_cast<const char*>(path)));
+    assert(source.FindStreams());
+    for (int i = 0; i < source.GetStreamCount(); ++i) assert(source.EnableStream(i));
+    assert(source.Start());
+    std::atomic<bool> stopped{};
+    std::atomic<unsigned> calls{};
+    Poller a{&source, &stopped, &calls, true}, v{&source, &stopped, &calls, false};
+    std::jthread audio([&] { runtime_thread_run_host(poll_frames, &a); });
+    std::jthread video([&] { runtime_thread_run_host(poll_frames, &v); });
+    while (calls < 128) std::this_thread::yield();
+    std::this_thread::sleep_for(5ms);
+    assert(source.Stop());
+    stopped = true;
+    audio.join(); video.join();
+    assert(source.Stop());
+    assert(state.errors == 0 && allocations == frees);
+}
+
 int main(int argc, char** argv) {
     assert(argc == 2);
     alarm(45);
@@ -100,5 +153,8 @@ int main(int argc, char** argv) {
         Run run{argv[1], i % 3 == 0, i % 3 == 2};
         runtime_thread_run_host(exercise, &run);
     }
+    for (unsigned i = 0; i < 32; ++i)
+        runtime_thread_run_host(polling_stop, argv[1]);
+    std::puts("PASS: concurrent audio/video pollers versus Stop, stopped output/clock, atomic queues");
     std::puts("PASS: actual AvPlayer natural EOF, concurrent/repeated Stop, full-buffer cancellation, destruction, low callbacks");
 }
