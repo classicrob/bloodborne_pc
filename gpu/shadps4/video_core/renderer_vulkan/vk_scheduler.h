@@ -70,16 +70,24 @@ static_assert(std::has_unique_object_representations_v<RenderState>);
 struct SubmitInfo {
     std::array<vk::Semaphore, 4> wait_semas;
     std::array<u64, 4> wait_ticks;
+    /// Stages each wait blocks. Without an explicit stage: AllCommands, except
+    /// ColorAttachmentOutput for the second wait (the presenter's frame-ready wait).
+    std::array<vk::PipelineStageFlags, 4> wait_stages;
     std::array<vk::Semaphore, 4> signal_semas;
     std::array<u64, 4> signal_ticks;
     vk::Fence fence;
     u32 num_wait_semas;
     u32 num_signal_semas;
 
-    void AddWait(vk::Semaphore semaphore, u64 tick = 1) {
+    void AddWait(vk::Semaphore semaphore, u64 tick = 1, vk::PipelineStageFlags stage = {}) {
         ASSERT_MSG(num_wait_semas < wait_semas.size(), "SubmitInfo holds at most {} waits",
                    wait_semas.size());
+        if (!stage) {
+            stage = num_wait_semas == 1 ? vk::PipelineStageFlagBits::eColorAttachmentOutput
+                                        : vk::PipelineStageFlagBits::eAllCommands;
+        }
         wait_semas[num_wait_semas] = semaphore;
+        wait_stages[num_wait_semas] = stage;
         wait_ticks[num_wait_semas++] = tick;
     }
 
@@ -697,6 +705,11 @@ public:
     /// and increments the scheduler timeline semaphore.
     void Flush(SubmitInfo& info);
 
+    /// The next submission waits for `semaphore` to reach `value` before any of its commands
+    /// (MetalFX: its output is consumed after the Metal queue signals; docs/macos/
+    /// metalfx-integration.md). Waits added this way are consumed by that one submission.
+    void WaitBeforeNextSubmit(vk::Semaphore semaphore, u64 value);
+
     /// Sends the current execution context to the GPU
     /// and increments the scheduler timeline semaphore.
     void Flush();
@@ -952,6 +965,8 @@ private:
     bool direct_mode = false; ///< the command buffer is recorded on the caller's thread
     u64 host_copies_issued = 0;
     std::atomic<u64> host_copies_done{0};
+    /// WaitBeforeNextSubmit, consumed by SubmitExecution (both under submit_mutex).
+    std::vector<std::pair<vk::Semaphore, u64>> next_submit_waits;
     std::atomic<u64> deferred_signals_issued{0}; ///< by the thread recording (A or B)
     std::shared_ptr<std::atomic<u64>> deferred_signals_done =
         std::make_shared<std::atomic<u64>>(0);

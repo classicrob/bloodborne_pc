@@ -329,6 +329,11 @@ void Scheduler::Flush() {
     Flush(info);
 }
 
+void Scheduler::WaitBeforeNextSubmit(vk::Semaphore semaphore, u64 value) {
+    std::scoped_lock lk{submit_mutex};
+    next_submit_waits.emplace_back(semaphore, value);
+}
+
 void Scheduler::Finish() {
     // When finishing, we need to wait for the submission to have executed on the device.
     const u64 presubmit_tick = CurrentTick();
@@ -417,6 +422,10 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
     if (on_submit) {
         on_submit(info);
     }
+    for (const auto& [semaphore, value] : next_submit_waits) {
+        info.AddWait(semaphore, value, vk::PipelineStageFlagBits::eAllCommands);
+    }
+    next_submit_waits.clear();
 
     EndRendering();
     if (auto* profiler = GpuProfiler::Get(); profiler && profiler->Records(this)) {
@@ -434,11 +443,6 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
     const vk::Semaphore timeline = work_semaphore.Handle();
     info.AddSignal(timeline, signal_value);
 
-    static constexpr std::array<vk::PipelineStageFlags, 2> wait_stage_masks = {
-        vk::PipelineStageFlagBits::eAllCommands,
-        vk::PipelineStageFlagBits::eColorAttachmentOutput,
-    };
-
     const vk::TimelineSemaphoreSubmitInfo timeline_si = {
         .waitSemaphoreValueCount = info.num_wait_semas,
         .pWaitSemaphoreValues = info.wait_ticks.data(),
@@ -450,7 +454,7 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
         .pNext = &timeline_si,
         .waitSemaphoreCount = info.num_wait_semas,
         .pWaitSemaphores = info.wait_semas.data(),
-        .pWaitDstStageMask = wait_stage_masks.data(),
+        .pWaitDstStageMask = info.wait_stages.data(),
         .commandBufferCount = 1U,
         .pCommandBuffers = &current_cmdbuf,
         .signalSemaphoreCount = info.num_signal_semas,
