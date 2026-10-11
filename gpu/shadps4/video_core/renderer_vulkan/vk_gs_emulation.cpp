@@ -158,14 +158,15 @@ GsEmulationDraw Rasterizer::RecordGsEmulation(const GraphicsPipeline* pipeline,
     if (prims == 0) {
         return {};
     }
+    std::optional<RenderState> ended_pass;
     if (scheduler.IsRendering()) {
-        gs_stats.splits.fetch_add(1, std::memory_order_relaxed);
+        ended_pass = scheduler.GetRenderState();
     }
 
     const auto dispatch = [&](const ComputePipeline& compute, u32 groups_x, u32 groups_y) {
         const bool bound = BindResources(&compute);
         ASSERT_MSG(bound, "macOS geometry emulation: binding the {} stage failed",
-                   &compute == stages.es.get() ? "ES" : "GS");
+                   &compute == stages.es ? "ES" : "GS");
         if (needs_barrier) {
             runtime.FlushBarriers();
         }
@@ -203,7 +204,8 @@ GsEmulationDraw Rasterizer::RecordGsEmulation(const GraphicsPipeline* pipeline,
 
     return {.index_buffer = stream.Handle(),
             .index_offset = scratch_offset + index_base * 4,
-            .index_count = u32(slots * stages.run_length)};
+            .index_count = u32(slots * stages.run_length),
+            .ended_pass = ended_pass};
 }
 
 } // namespace Vulkan

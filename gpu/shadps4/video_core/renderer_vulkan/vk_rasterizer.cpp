@@ -1034,6 +1034,13 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
         return;
     }
     const auto state = BeginRendering(pipeline);
+#ifdef __APPLE__
+    if (gs_draw.ended_pass && *gs_draw.ended_pass == state) {
+        // The compute passes ended the pass this draw continues (not counted when the draw
+        // begins a different pass, which ends the open one anyway).
+        gs_stats.splits.fetch_add(1, std::memory_order_relaxed);
+    }
+#endif
 
     if (!inputs_resolved) {
         ResolveVertexBuffers(pipeline, draw_prepared);

@@ -6,7 +6,9 @@
 
 #include <memory>
 #include "shader_recompiler/gs_emulation.h"
+#include <optional>
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
+#include "video_core/renderer_vulkan/vk_scheduler.h"
 
 namespace AmdGpu {
 union Regs;
@@ -14,10 +16,11 @@ union Regs;
 
 namespace Vulkan {
 
-/// The compute half of an emulated ES/GS pipeline, owned by its GraphicsPipeline.
+/// The compute half of an emulated ES/GS pipeline, owned by its GraphicsPipeline. The compute
+/// pipelines are shared through the PipelineCache (keyed by stage permutation), which outlives it.
 struct GsEmulationStages {
-    std::unique_ptr<ComputePipeline> es;
-    std::unique_ptr<ComputePipeline> gs;
+    const ComputePipeline* es;
+    const ComputePipeline* gs;
     u32 verts_per_prim; ///< input vertices per primitive (list topologies)
     u32 invocations;    ///< GS instances
     u32 max_vert_out;   ///< VGT_GS_MAX_VERT_OUT
@@ -47,6 +50,9 @@ struct GsEmulationDraw {
     vk::Buffer index_buffer{};
     u64 index_offset{};
     u32 index_count{};
+    /// The render pass the compute passes ended, if one was open: a split only if the draw then
+    /// begins the same pass again.
+    std::optional<RenderState> ended_pass{};
 };
 
 } // namespace Vulkan
