@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-// Execute production camera motion SPIR-V: distant geometry, sky and stale object vectors.
+// Execute production camera motion SPIR-V: distant geometry, sky, stale object vectors, and
+// vertical motion (pitch, vertical translation) against a reference projection.
 #include <array>
 #include <cassert>
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -68,8 +70,23 @@ int main() {
                                   .dstStageMask=dst,.dstAccessMask=dst_access};
         cmd.pipelineBarrier2({.memoryBarrierCount=1,.pMemoryBarriers=&b},d);
     };
+    // Reference projection, written independently of the shader: the game's view space has +x
+    // right and +y DOWN the screen (pixel rows), Vulkan-style: pixel = (ndc * 0.5 + 0.5) * size,
+    // ndc = proj.xy * view.xy / view.z; view z from depth = proj.z + proj.w / z.
+    const auto reference_motion=[&](u32 px,u32 py,float depth,const std::array<float,12>& r) {
+        const float proj_x=1,proj_y=1,proj_z=1,proj_w=-0.05f;
+        const float u=(px+0.5f)/W,v=(py+0.5f)/H;
+        const float z=proj_w/(depth-proj_z);
+        const float x=(u*2-1)*z/proj_x,y=(v*2-1)*z/proj_y;
+        const float prev[3]={r[0]*x+r[1]*y+r[2]*z+r[3],r[4]*x+r[5]*y+r[6]*z+r[7],
+                             r[8]*x+r[9]*y+r[10]*z+r[11]};
+        const float prev_u=(prev[0]*proj_x/prev[2])*0.5f+0.5f;
+        const float prev_v=(prev[1]*proj_y/prev[2])*0.5f+0.5f;
+        return std::array<float,2>{(prev_u-u)*W,(prev_v-v)*H};
+    };
     const auto run=[&](const char* label,float depth,float translation,float rotation,
-                       float object_depth,u32 mode,float expected,bool jitter=false) {
+                       float object_depth,u32 mode,float expected,bool jitter=false,
+                       float rotation_y=0,float translation_y=0,float expected_y=0) {
         auto* pixels=static_cast<float*>(ai.pMappedData);
         for (u32 p=0;p<N;++p) {
             pixels[p*4]=depth;
@@ -99,7 +116,7 @@ int main() {
             writes[i]={.dstBinding=i,.descriptorCount=1,.descriptorType=bindings[i].descriptorType,
                 .pImageInfo=&infos[i]};
         }
-        Params params{{1,0,rotation,translation,0,1,0,0,0,0,1,0},
+        Params params{{1,0,rotation,translation,0,1,rotation_y,translation_y,0,0,1,0},
             {1,1,1,-0.05f},{1,1,1,-0.05f},{W,H},
             {jitter ? 0.37f : 0.f,jitter ? -0.29f : 0.f},{0,0},mode};
         cmd.bindPipeline(vk::PipelineBindPoint::eCompute,*pipeline,d);
@@ -121,8 +138,9 @@ int main() {
                 std::ldexp(1.f+float(v&1023)/1024.f,e-15));
         };
         assert(std::abs(half(result[0])-expected)<0.002f);
-        assert(std::abs(half(result[1]))<0.001f);
-        std::printf("Camera motion: %s PASS (%.5f)\n",label,half(result[0]));
+        assert(std::abs(half(result[1])-expected_y)<std::max(0.002f,std::abs(expected_y)*0.002f));
+        std::printf("Camera motion: %s PASS (%.5f, %.5f)\n",label,half(result[0]),
+                    half(result[1]));
     };
     constexpr float distant=0.999995f;
     run("distant geometry moves",distant,1000,0,0,0,4.5f*1000*(1-distant)/0.05f);
@@ -131,5 +149,21 @@ int main() {
     run("static camera cancels jitter",distant,0,0,0,0,0,true);
     run("matching object vector",distant,0,0,distant,1,2);
     run("stale distant object vector",distant,0,0,0.9999f,1,0);
+    // Vertical motion: the sampled pixel (4,3) is the image centre, so the old y-up convention
+    // gives the opposite sign of the reference and fails these. View y' = y + pitch * z, or
+    // y + translation (both down the screen in the reference).
+    const float near=0.99f; // view z 5 (not sky: the reference uses a finite z)
+    {
+        const std::array<float,12> pitch{1,0,0,0,0,1,0.2f,0,0,0,1,0};
+        const auto expected=reference_motion(4,3,near,pitch);
+        assert(std::abs(expected[1])>0.1f); // a real vertical move, rows down
+        run("camera pitch moves rows",near,0,0,0,0,expected[0],false,0.2f,0,expected[1]);
+    }
+    {
+        const std::array<float,12> lift{1,0,0,0,0,1,0,0.5f,0,0,1,0};
+        const auto expected=reference_motion(4,3,near,lift);
+        assert(std::abs(expected[1])>0.1f);
+        run("vertical translation moves rows",near,0,0,0,0,expected[0],false,0,0.5f,expected[1]);
+    }
     vmaDestroyBuffer(instance.GetAllocator(),staging,allocation);
 }
