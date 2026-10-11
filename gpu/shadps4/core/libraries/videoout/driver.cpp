@@ -720,10 +720,15 @@ void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_
     Vulkan::Frame* frame;
 #ifdef __APPLE__
     // A Close since the flip was admitted reset (or reopened) the port: drop the flip before
-    // reading its buffers. Prepare from a copy taken under port_mutex.
+    // reading its buffers. Prepare from a copy taken under port_mutex. A buffer unregistered in
+    // the same lifetime is fatal, as on the other platforms: the flip is counted pending and
+    // nothing could ever publish it.
     BufferAttributeGroup group{};
     uintptr_t address = 0;
-    if (!PortLifecycle::Snapshot(*port, generation, index, group, address)) {
+    const auto snapshot = PortLifecycle::Snapshot(*port, generation, index, group, address);
+    ASSERT_MSG(snapshot != PortLifecycle::SnapshotResult::Unregistered,
+               "Trying to flip an unregistered buffer! (index {})", index);
+    if (snapshot == PortLifecycle::SnapshotResult::Closed) {
         static std::atomic<u64> dropped{0};
         std::fprintf(stderr, "Flip: a flip of a closed port dropped before preparing (%llu)\n",
                      static_cast<unsigned long long>(++dropped));

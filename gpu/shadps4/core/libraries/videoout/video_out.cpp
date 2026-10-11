@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
+#include <cstdio>
 #include "common/assert.h"
 #include "common/elf_info.h"
 #include "common/logging/log.h"
@@ -351,8 +353,18 @@ s32 sceVideoOutSubmitEopFlip(s32 handle, u32 buf_id, u32 mode, s64 flip_arg, voi
     Platform::IrqC::Instance()->RegisterOnce(
         Platform::InterruptId::GfxFlip, [=](Platform::InterruptId irq) {
             ASSERT_MSG(irq == Platform::InterruptId::GfxFlip, "An unexpected IRQ occured");
+#ifndef __APPLE__
             ASSERT_MSG(port->buffer_labels[buf_id] == 1, "Out of order flip IRQ");
+#endif
+            // macOS: SubmitFlip checks the label once it knows the port is open.
             const auto result = driver->SubmitFlip(port, buf_id, flip_arg, true);
+            if (result == ORBIS_VIDEO_OUT_ERROR_INVALID_HANDLE) {
+                // The guest closed the port before the GPU reached the EOP: the flip is dropped.
+                static std::atomic<u64> dropped{0};
+                std::fprintf(stderr, "Flip: EOP flip of a closed port dropped (%llu)\n",
+                             static_cast<unsigned long long>(++dropped));
+                return;
+            }
             ASSERT_MSG(result == ORBIS_OK, "EOP flip submission failed: {:#x}",
                        static_cast<u32>(result));
         });

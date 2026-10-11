@@ -268,8 +268,10 @@ published by `BbFlip::Publisher` (`gpu/shim/bbport_flip_publish.h`, test `flip-p
   queue behind them, so order holds across a live switch.
 - The port's flip lifecycle is shared code (`core/libraries/videoout/port_lifecycle.h`, test
   `videoout-lifecycle-test`):
-  - A flip is admitted only to an open port, together with its pending count and generation. A
-    closed port gives the guest invalid handle.
+  - A flip is admitted only to an open port and a registered buffer, together with its pending
+    count and generation. Otherwise the guest gets its error (invalid handle, invalid index) and
+    nothing is counted. An EOP flip that reaches a closed port is dropped and reported. A buffer
+    unregistered while its flip is pending stops the run, as on the other platforms.
   - Close resets the port and bumps the generation in one step under port_mutex, and holds the
     lifecycle lock across its whole reset. A publication holds the same lock for its check and
     all three effects.

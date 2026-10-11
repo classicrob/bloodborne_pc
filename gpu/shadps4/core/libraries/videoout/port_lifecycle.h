@@ -9,6 +9,7 @@
 #pragma once
 #include <cstring>
 #include <mutex>
+#include "common/assert.h"
 #include "core/libraries/kernel/time.h"
 #include "core/libraries/videoout/driver.h"
 #include "core/libraries/videoout/videoout_error.h"
@@ -16,13 +17,20 @@
 
 namespace Libraries::VideoOut::PortLifecycle {
 
-/// Admits a flip: ORBIS_OK and its generation, or the guest's error (closed port: invalid handle;
-/// more than 16 flips pending for a buffer: flip queue full).
+/// Admits a flip: ORBIS_OK and its generation, or the guest's error, with nothing counted (closed
+/// port: invalid handle; no such or no registered buffer: invalid index; more than 16 flips
+/// pending: flip queue full). An EOP flip's label must already be 1 (checked here, after the open
+/// check: Close clears the labels).
 inline s32 Admit(VideoOutPort& port, s32 index, bool is_eop, u64& generation) {
     std::unique_lock lock{port.port_mutex};
     if (!port.is_open) {
         return ORBIS_VIDEO_OUT_ERROR_INVALID_HANDLE;
     }
+    if (index < -1 || index >= static_cast<s32>(port.buffer_slots.size()) ||
+        (index != -1 && port.buffer_slots[index].group_index < 0)) {
+        return ORBIS_VIDEO_OUT_ERROR_INVALID_INDEX;
+    }
+    ASSERT_MSG(!is_eop || port.buffer_labels[index] == 1, "Out of order flip IRQ");
     if (index != -1 && port.flip_status.flip_pending_num > 16) {
         return ORBIS_VIDEO_OUT_ERROR_FLIP_QUEUE_FULL;
     }
@@ -35,23 +43,28 @@ inline s32 Admit(VideoOutPort& port, s32 index, bool is_eop, u64& generation) {
     return ORBIS_OK;
 }
 
-/// Before preparing the frame: false if the port was closed since the flip was admitted (the flip
-/// is dropped). Else copies what preparing needs (none for a blank flip, index -1).
-inline bool Snapshot(VideoOutPort& port, u64 generation, s32 index, BufferAttributeGroup& group,
-                     uintptr_t& address) {
+enum class SnapshotResult {
+    Ready,        ///< group and address copied (nothing for a blank flip, index -1)
+    Closed,       ///< the port was closed since the flip was admitted: the flip is dropped
+    Unregistered, ///< same port lifetime, but the guest unregistered the buffer after admission
+};
+
+/// Before preparing the frame: copies what preparing needs, under port_mutex.
+inline SnapshotResult Snapshot(VideoOutPort& port, u64 generation, s32 index,
+                               BufferAttributeGroup& group, uintptr_t& address) {
     std::unique_lock lock{port.port_mutex};
     if (port.generation != generation) {
-        return false;
+        return SnapshotResult::Closed;
     }
     if (index != -1) {
         const auto& buffer = port.buffer_slots[index];
         if (buffer.group_index < 0) {
-            return false;
+            return SnapshotResult::Unregistered;
         }
         group = port.groups[buffer.group_index];
         address = buffer.address_left;
     }
-    return true;
+    return SnapshotResult::Ready;
 }
 
 /// Close's reset of everything a flip reads or writes, in one step with the generation bump.
