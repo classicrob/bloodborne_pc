@@ -104,13 +104,15 @@ existing race protection), once:
    never wait for a later frame's submission that the throttle holds back.
 
 **Host cap (enforced, part of R1).** The submission after `SubmitDone(N)` also waits until:
-- frame N-1's completion labels are all **written** (the GPU has completed them), so at most
-  two frames are outstanding on the GPU;
+- **frame N-1 has retired on the GPU timeline**, so at most two frames are outstanding on the GPU.
+  At frame N-1's GpuIdle admission, after the flush SubmitDone already causes, record the draw
+  scheduler tick its last submission signals. The cap then waits for `IsFree(that tick)`.
+  - This is exact without labels: a frame that issued no completion label would otherwise meet a
+    label-count cap at once (Opus-Renderer).
+  - It covers the tail after a frame's last label (Sol-2 point 1).
+  - A completion label is written only after its own tick, so the tick also bounds the labels.
 - the queued snapshot bytes are below 64 MiB. That figure is a starting point, to be set from
   R0's numbers.
-
-The labels are written in issue order (the sequencer), so one monotonic `labels_written` counter
-compared with frame N-1's `labels_issued` at its SubmitDone is exact.
 
 **Accounting.** Two separate monotonic pairs:
 - `recorder_issued`/`recorder_done`;
