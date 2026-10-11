@@ -142,7 +142,7 @@ struct Template {
     u32 workgroups = 1;              // compute dispatch width (spilled LDS: one region per workgroup)
     u32 pushud_mask = 0;             // pushud: user-data SGPRs the stage reads (s[0:3] = its V#)
     bool fs_count = false;           // pushud-style FS: buffer_atomic_add 1 at its V# (side-effect count)
-    u32 smemfb = 0;                  // SmemFallback: 0 in range, 1 mask also stored, 2 mask also a branch, 3 OOB too,
+    u32 smemfb = 0;                  // SmemFallback: 0 in range, 1 mask also stored, 2 mask also a branch, 3 OOB too, 5 OOB through bitwise ops,
                                      // 4 in range with the mask carried around a uniform loop (phi cycle)
     u32 Threads() const { return wg[0] * wg[1] * wg[2]; }
     std::vector<u32> code;
@@ -247,6 +247,10 @@ void AssembleSmemFallback(GcnAsm::Code& c, u32 variant) {
     c.SAndSaveexecB64(22, VCC_LO);
     c.words.push_back(0xD0000000u | (197u << 17) | 30u); // v_cmp_ne_u32 s[30:31], 0, v3 (VOP3)
     c.words.push_back(Inline(0) | (Vgpr(3) << 9));
+    if (variant == 5) { // the mask through pure 64-bit bitwise ops, still only the load destination
+        c.Sop2(15, 30, 30, EXEC_LO); // s_and_b64 s[30:31], s[30:31], exec
+        c.Sop1(8, 30, 30);           // s_not_b64 s[30:31], s[30:31]
+    }
     if (variant == 1) c.VMov(12, 30);
     if (variant == 2) {
         c.words.push_back(0xBF000000u | (6u << 16) | (Inline(0) << 8) | 30u); // s_cmp_eq_u32 s30, 0
@@ -259,7 +263,7 @@ void AssembleSmemFallback(GcnAsm::Code& c, u32 variant) {
         c.SCmpLtU32Literal(20, 2);
         c.SCbranchScc1To(loop);
     }
-    c.SBufferLoad(1, 30, 0, true, variant == 3 ? 100 : 2); // s30 <- dword 2 (in range) or 100
+    c.SBufferLoad(1, 30, 0, true, variant == 3 || variant == 5 ? 100 : 2); // s30 <- dword 2 (in range) or 100
     c.SBufferLoad(1, 40, 0, true, 100);                    // s40 <- dword 100: out of range
     c.SWaitcntAll();
     c.VMov(10, 30);
@@ -1877,10 +1881,11 @@ void AddWaveCases() {
     // only matters if the load is out of range, so production reads out-of-range scalar dwords as
     // 0 for the whole shader (SMEM_ZERO reading); any other use of the mask stays loud.
     for (u32 x : {64u, 128u}) {
-        for (u32 variant : {0u, 3u, 4u, 1u, 2u}) {
+        for (u32 variant : {0u, 3u, 4u, 5u, 1u, 2u}) {
             Template t;
             static const char* vn[] = {"s30 in range", "mask also stored (must be loud)", "mask also a branch (must be loud)",
-                                       "s30 out of range", "s30 in range, mask loop-carried"};
+                                       "s30 out of range", "s30 in range, mask loop-carried",
+                                       "s30 out of range, mask through s_and_b64 + s_not_b64"};
             t.name = std::string("wave: divergent VOP3 compare into s[30:31], s_buffer_load s30/s40: ") + vn[variant] + " [" +
                      std::to_string(x) + "x1]";
             t.op.kind = GCN_LOAD;
@@ -4407,7 +4412,7 @@ JobResult EvaluateSmemFallback(Gpu& g, const Job& j, const u32* res) {
     const Template& t = g_templates[j.tmpl];
     u32 in_range;
     std::memcpy(&in_range, g.pristine.data() + (ActualV(j).base + 8 - GuestVa), 4);
-    const u32 want0 = t.smemfb == 3 ? 0u : in_range;
+    const u32 want0 = t.smemfb == 3 || t.smemfb == 5 ? 0u : in_range;
     u32 bad = 0;
     std::string d;
     for (u32 l = 0; l < t.Threads(); ++l) {
