@@ -119,6 +119,7 @@ struct Template {
     bool force_int64_atomics = false; // compile with Profile::supports_buffer_int64_atomics forced on
     bool compile_only = false; // translate + EmitSPIRV + spirv-val only; an abort is a FAIL
     bool srt = false;      // V# and a constant read through an extended-user-data pointer (s[2:3])
+    bool srt_extra = false; // srt: also the table's last dword (imm 7) and dword 6 via an SGPR byte offset
     u32 sdst = 16;         // stage-compile: SDST of the s_buffer_load (0 overlaps user data)
     bool dead = false;     // the access under test is dead (its result is never used)
     bool wave_divergent = false; // wave: cross-lane ops in divergent flow (loud by design on Apple)
@@ -659,6 +660,11 @@ void Assemble(Template& t) {
         if (t.srt) {
             c.SLoadDwordx4(16, 2, 0); // V# from the table at s[2:3]
             c.SLoadDword(20, 2, 4);   // a constant from the same table
+            if (t.srt_extra) {
+                c.SLoadDword(24, 2, 7);           // the table's last dword (constant offset)
+                c.Sop1(3, 26, Inline(24));         // s_mov_b32 s26, 24
+                c.words.push_back(0xC0000000u | (27u << 15) | (1u << 9) | 26u); // s_load_dword s27, s[2:3], s26 (byte offset)
+            }
             c.SWaitcntAll();
         }
         c.VCmpNeU32(Inline(0), 2);
@@ -680,6 +686,10 @@ void Assemble(Template& t) {
         c.SMovB64(EXEC_LO, t.srt ? 22 : 20);
     }
     if (t.srt) c.VMov(11, 20);
+    if (t.srt_extra) {
+        c.VMov(12, 24);
+        c.VMov(13, 27);
+    }
     c.VLshlrevB32(14, Inline(4), 15);
     Code::BufFields o{.offen = true, .vaddr = 14, .vdata = 10, .srsrc = 8};
     c.Mubuf(BUFFER_STORE_DWORDX4, o);
@@ -1713,6 +1723,18 @@ void AddInternalCases() {
     };
     const u32 raw = srt("s_load_dwordx4 V# + s_load_dword const + buffer_load_dword", BUFFER_LOAD_DWORD, false);
     const u32 st = srt("s_load_dwordx4 V# + s_load_dword const + buffer_load_dword", BUFFER_LOAD_DWORD, true);
+    // Flattened-buffer constants at the table's last dword and through a dynamic (SGPR) offset.
+    {
+        Template t = Base("srt: + s_load_dword table[7] (constant) + s_load_dword table[s26=24 bytes] (dynamic)", GCN_LOAD,
+                          BUFFER_LOAD_DWORD, TArgs{.offen = true});
+        t.op.comp_bytes = 4;
+        t.op.ncomp = 1;
+        t.srt = true;
+        t.srt_extra = true;
+        const u32 ex = AddTemplate(t);
+        Job& j = NewJob("srt", ex, RawV(64), 0);
+        for (u32 i = 0; i < 8; ++i) SetLane(j, i, 0, i * 4);
+    }
     for (u32 nr : {8u, 64u}) {
         Job& j = NewJob("srt", raw, RawV(nr), 0);
         const auto offs = Uniq(RawProbe(nr));
@@ -3047,7 +3069,13 @@ std::vector<Outcome> Expected(Gpu& g, const Job& j, std::vector<u8>& work, const
             }
         }
         if (t.srt) {
-            for (u32 lane = 0; lane < t.Threads(); ++lane) o.regs[lane * 4 + 1] = j.vtable[4];
+            for (u32 lane = 0; lane < t.Threads(); ++lane) {
+                o.regs[lane * 4 + 1] = j.vtable[4];
+                if (t.srt_extra) {
+                    o.regs[lane * 4 + 2] = j.vtable[7];
+                    o.regs[lane * 4 + 3] = j.vtable[6];
+                }
+            }
         }
         if (t.dead) { // the load's destination is never stored: only the markers come back
             for (u32 lane = 0; lane < t.Threads(); ++lane) {
@@ -4370,6 +4398,7 @@ int main(int argc, char** argv) {
         } else if (g_templates[j.tmpl].srt) {
             std::copy_n(t.begin(), 4, j.vtable.begin());
             j.vtable[4] = 0x5A17C0DEu ^ i;
+            for (u32 k = 5; k < 8; ++k) j.vtable[k] = 0xC0DE0000u + k * 0x111u + i;
             const u64 table = reinterpret_cast<u64>(j.vtable.data());
             for (u32 k = 0; k < 4; ++k) j.ud[k] = 0;
             j.ud[2] = u32(table);
