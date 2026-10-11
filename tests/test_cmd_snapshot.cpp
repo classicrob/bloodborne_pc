@@ -17,7 +17,8 @@
 #include "video_core/amdgpu/pm4_cmds.h"
 
 extern "C" {
-__thread sigjmp_buf* runtime_fault_recover = nullptr;
+// Defined by tests/test_gpu_runtime_stubs.cpp (the host symbol the GPU library imports).
+extern __thread sigjmp_buf* runtime_fault_recover;
 }
 
 namespace {

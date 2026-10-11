@@ -187,6 +187,58 @@ if [[ ${1:-} == --test ]]; then
         BB_DEPS_PREFIX="$deps" BB_GPU_BUILD="$PWD/out/gpu" sh tests/macos_pkrtz/run.sh
         BB_DEPS_PREFIX="$deps" BB_GPU_BUILD="$PWD/out/gpu" BB_GPU_THIRD_PARTY="$PWD/gpu/third_party" \
             bash tests/macos_gs/run.sh
+        # GPU library unit tests: Apple paths (PM4 parsing, feature checks, views, scheduler,
+        # vertex fetch, null buffers, rect interface, overlay) and the renderer's cross-platform
+        # tests (motion, UI composition, scene resolution, TAA, camera motion).
+        unit_tests=(cmd-snapshot-test cond-exec-test feature-checks-test image-view-storage-test
+            submit-info-bounds-test vertex-fetch-translation-test buffer-null-test rect-interface-test
+            fence-address-test overlay-concurrency-test depth-bounds-probe-test motion-history-test
+            motion-shader-test
+            ui-composition-test scene-resolution-test taa-shader-test camera-motion-test)
+        ninja -C out/gpu "${ninja_jobs[@]}" "${unit_tests[@]}"
+        for unit_test in "${unit_tests[@]}"; do sign_darwin "out/gpu/$unit_test"; done
+        out/gpu/cmd-snapshot-test
+        out/gpu/cond-exec-test
+        out/gpu/feature-checks-test
+        out/gpu/image-view-storage-test
+        out/gpu/submit-info-bounds-test
+        out/gpu/vertex-fetch-translation-test
+        out/gpu/fence-address-test
+        out/gpu/overlay-concurrency-test
+        out/gpu/rect-interface-test
+        out/gpu/depth-bounds-probe-test
+        rm -rf out/buffer-null && mkdir -p out/buffer-null
+        out/gpu/buffer-null-test out/buffer-null
+        spirv-val --target-env vulkan1.3 out/buffer-null/null-buffer.spv
+        spirv-val --target-env vulkan1.3 out/buffer-null/valid-buffer.spv
+        out/gpu/motion-history-test
+        rm -rf out/motion-shaders && mkdir -p out/motion-shaders
+        out/gpu/motion-shader-test out/motion-shaders
+        for spv in out/motion-shaders/*.spv; do spirv-val --target-env vulkan1.3 "$spv"; done
+        out/gpu/ui-composition-test
+        out/gpu/scene-resolution-test
+        out/gpu/taa-shader-test
+        out/gpu/camera-motion-test
+        # GCN2 buffer conformance (Opus verification's suite) against this tree's GPU library:
+        # exit 0 only (FAIL, INVALID-SPIRV, CRASH and harness errors exit non-zero).
+        BB_GPU_BUILD="$PWD/out/gpu" BB_GPU_THIRD_PARTY="$PWD/gpu/third_party" \
+            bash tests/gcn_buffer_conformance/build.sh --out "$PWD/out/gcnconf"
+        BB_GPU_USER_DIR="$PWD/out/gcnconf/user" "$PWD/out/gcnconf/gcn-conformance-dylib" \
+            --out "$PWD/out/gcnconf" --label shared
+        # Standalone qualification probes and runtime pieces.
+        sh tests/test_guest_alloc_macos.sh
+        sh tests/test_memory_clamp.sh
+        sh tests/test_memory_cpu_alias_macos.sh
+        sh tests/test_audio_macos.sh
+        sh tests/test_guest_heap_lock_macos.sh
+        sh tests/test_low_map_trace_macos.sh
+        sh tests/test_guest_entry_macos.sh
+        BB_DEPS_PREFIX="$deps" bash tests/macos_external_host/run.sh
+        BB_DEPS_PREFIX="$deps" bash tests/macos_metalfx/signature.sh
+        BB_DEPS_PREFIX="$deps" bash tests/macos_metalfx/run.sh
+        BB_DEPS_PREFIX="$deps" bash tests/macos_metalfx/jitter.sh
+        # Every tests/test_*.py (a skipped test fails).
+        bash tests/run_python_tests.sh
         # BB_PERF's GPU numbers rely on per-submission timestamps; qualify them on this device.
         BB_DEPS_PREFIX="$deps" bash tests/macos_perf/timestamps.sh
         out/gpu/macos-perf-test
@@ -229,6 +281,8 @@ if [[ ${1:-} == --test ]]; then
         bash tests/test_heavy.sh
         sh tests/test_sync_diagnostics_macos.sh
         python3 tests/test_restart_macos.py
+        # Last: every test file under tests/ is run above or excluded with a reason.
+        python3 tools/macos/check_test_wiring.py
     fi
     "$CC" "${platform_flags[@]}" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread "${includes[@]}" -I. -Isrc tests/test_pad.c "${libraries[@]}" "${caps_link[@]}" -o out/pad-test
     sign_darwin out/pad-test
