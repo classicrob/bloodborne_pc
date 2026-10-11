@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <memory>
@@ -334,6 +335,11 @@ extern "C" int bbgpu_replay_run(const char* dir, unsigned iterations) {
     AmdGpu::Liverpool* lp = liverpool.get();
     if (!lp) {
         std::fprintf(stderr, "STOP: perf replay: the GPU library has no Liverpool\n");
+        return 2;
+    }
+    if (!std::getenv("BB_SPLIT_WINDOW") || std::strcmp(std::getenv("BB_SPLIT_WINDOW"), "1")) {
+        std::fprintf(stderr, "STOP: perf replay: set BB_SPLIT_WINDOW=1 (a Parse split block per "
+                             "iteration)\n");
         return 2;
     }
     fmt::print("Perf replay: {} ({} submissions, {} reset ranges), {} iterations; pixel output not "

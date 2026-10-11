@@ -17,6 +17,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <x86intrin.h>
 
@@ -323,8 +324,33 @@ inline std::uint64_t window_cycles = 0, window_frames = 0, window_draws = 0;
 inline std::chrono::steady_clock::time_point window_start{};
 } // namespace detail
 
-/// On stage A at each frame end: every 600, prints the split per frame and starts a new window.
-/// `draws`: the running draw count (for draws per frame).
+/// Frame ends per window: BB_SPLIT_WINDOW (1..100000, default 600; the perf replay uses 1 for a
+/// line per iteration). A malformed value stops.
+inline std::uint64_t WindowFrames() {
+    static const std::uint64_t frames = [] {
+        const char* env = std::getenv("BB_SPLIT_WINDOW");
+        if (!env || !*env) {
+            return std::uint64_t{600};
+        }
+        std::uint64_t value = 0;
+        for (const char* c = env; *c; ++c) {
+            if (*c < '0' || *c > '9' || value > 100000) {
+                value = 0;
+                break;
+            }
+            value = value * 10 + std::uint64_t(*c - '0');
+        }
+        if (value < 1 || value > 100000) {
+            std::fprintf(stderr, "STOP: BB_SPLIT_WINDOW=%s: decimal digits, 1..100000\n", env);
+            std::abort();
+        }
+        return value;
+    }();
+    return frames;
+}
+
+/// On stage A at each frame end: every WindowFrames() (600), prints the split per frame and
+/// starts a new window. `draws`: the running draw count (for draws per frame).
 inline void NoteFrameEnd(std::uint64_t draws) {
     using namespace detail;
     const std::uint64_t now_cycles = __rdtsc();
@@ -345,7 +371,7 @@ inline void NoteFrameEnd(std::uint64_t draws) {
         window_frames = 0;
         return;
     }
-    if (++window_frames < 600) {
+    if (++window_frames < WindowFrames()) {
         return;
     }
     Flush(); // stage A: its open interval belongs to this window
@@ -374,14 +400,15 @@ inline void NoteFrameEnd(std::uint64_t draws) {
         Line(recorder, previous_r, r_names, RCount, ms_per_cycle, frames, r_cycles);
     const double frame_ms = wall_ms / frames;
     // Printed like the Stall lines: Info-level logging is filtered in perf runs.
-    std::printf("Parse split, last 600 frame ends: %.2f ms per frame, %.0f draws per frame; "
+    std::printf("Parse split, last %llu frame ends: %.2f ms per frame, %.0f draws per frame; "
                 "ms per frame by thread (accounted / wall)\n"
                 "  stage A (GPU command thread, %.0f%%): %s\n"
                 "    deferred-signal waits during: %s\n"
                 "    stage B drains at other packets during: %s\n"
                 "  stage B (draw recording thread, %.0f%%): %s\n"
                 "  Vulkan recording thread (%.0f%%): %s\n",
-                frame_ms, double(draws - window_draws) / frames,
+                static_cast<unsigned long long>(window_frames), frame_ms,
+                double(draws - window_draws) / frames,
                 100.0 * a_cycles * ms_per_cycle / wall_ms, a_line.c_str(), a_deferred.c_str(),
                 a_drain.c_str(), 100.0 * b_cycles * ms_per_cycle / wall_ms, b_line.c_str(),
                 100.0 * r_cycles * ms_per_cycle / wall_ms, r_line.c_str());
