@@ -6,6 +6,7 @@
 #define VK_USE_PLATFORM_METAL_EXT
 #include "macos_metalfx.h"
 #include <vulkan/vulkan_metal.h>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -53,16 +54,26 @@ struct TemporalScaler::Impl {
     id<MTLCommandQueue> queue;
     id<MTLSharedEvent> producer, consumer;
     id<MTLFXTemporalScaler> scaler;
-    std::thread::id owner = std::this_thread::get_id();
+    /// Set while a public call is running: the provider may be driven from different threads
+    /// over time (the scheduler's owner moves between the draw-pipe thread and its caller), but
+    /// never from two at once.
+    mutable std::atomic<bool> busy{false};
     std::shared_ptr<const unsigned char> binding_owner = std::make_shared<const unsigned char>(0);
     std::deque<id<MTLCommandBuffer>> pending;
     uint64_t last_producer = 0, last_consumer = 0, last_frame = 0, last_epoch = 0;
     bool dispatched = false;
     double last_gpu_ms = 0;
 
-    void CheckOwner() const {
-        Require(owner == std::this_thread::get_id(), "provider must have one encoding thread");
-    }
+    /// Held for the duration of a public call; a second, overlapping call aborts.
+    class Exclusive {
+        const Impl& impl;
+    public:
+        explicit Exclusive(const Impl& value) : impl{value} {
+            Require(!impl.busy.exchange(true, std::memory_order_acquire),
+                    "provider used from two threads at once");
+        }
+        ~Exclusive() { impl.busy.store(false, std::memory_order_release); }
+    };
     /// Waits for every submitted MetalFX command buffer (thread-safe: waitUntilCompleted).
     void WaitAll();
     id<MTLTexture> ExportImage(VkImage image, VkImageAspectFlagBits aspect) const {
@@ -165,8 +176,7 @@ TemporalScaler::TemporalScaler(VkDevice device, PFN_vkGetDeviceProcAddr get_proc
 }
 
 // The destructor is the scaler's last user, so it may run on any thread (the renderer may be torn
-// down after the encoding thread has stopped): it waits for the pending work without the owner
-// check that guards concurrent encoding.
+// down after the encoding thread has stopped): it waits for the pending work.
 TemporalScaler::~TemporalScaler() {
     @autoreleasepool {
         impl->WaitAll();
@@ -175,7 +185,7 @@ TemporalScaler::~TemporalScaler() {
 
 std::shared_ptr<Textures> TemporalScaler::Register(Images images) {
     @autoreleasepool {
-        impl->CheckOwner();
+        const Impl::Exclusive exclusive{*impl};
         auto textures = std::make_shared<Textures::Impl>();
         textures->owner = impl->binding_owner;
         textures->color = impl->ExportImage(images.color, VK_IMAGE_ASPECT_COLOR_BIT);
@@ -205,7 +215,7 @@ std::shared_ptr<Textures> TemporalScaler::Register(Images images) {
 
 void TemporalScaler::Submit(const std::shared_ptr<Textures>& textures, Frame frame) {
     @autoreleasepool {
-        impl->CheckOwner();
+        const Impl::Exclusive exclusive{*impl};
         Require(textures && textures->impl->owner == impl->binding_owner,
                 "binding belongs to another provider");
         Require(frame.producer_value > impl->last_producer && frame.consumer_value > impl->last_consumer,
@@ -261,12 +271,12 @@ void TemporalScaler::Impl::WaitAll() {
 
 void TemporalScaler::Drain() {
     @autoreleasepool {
-        impl->CheckOwner();
+        const Impl::Exclusive exclusive{*impl};
         impl->WaitAll();
     }
 }
 double TemporalScaler::LastGpuMilliseconds() const {
-    impl->CheckOwner();
+    const Impl::Exclusive exclusive{*impl};
     return impl->last_gpu_ms;
 }
 } // namespace BbMetalFX
