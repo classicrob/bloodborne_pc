@@ -65,7 +65,7 @@ static void check_null_clock(void) {
         assert(audio_outputs(outputs,2)==512);
         assert(virtual_ns==start+i*period);
     }
-    virtual_ns+=9*period;start=virtual_ns;
+    virtual_ns+=10*period;start=virtual_ns;
     assert(audio_outputs(outputs,2)==512 && virtual_ns==start);
     assert(audio_outputs(outputs,2)==512 && virtual_ns==start+period);
     assert(!audio_close(a) && !audio_close(b));
