@@ -11,6 +11,9 @@
 #include <deque>
 #include <mutex>
 #ifndef _WIN32
+#include <dlfcn.h>
+#endif
+#ifndef _WIN32
 #include <pthread.h>
 #endif
 #include <vector>
@@ -233,6 +236,17 @@ void BuilderTrace::Report(const u32* at) {
         std::string chain;
         for (u32 i = 0; i < call.depth; ++i) {
             chain += fmt::format(" {:#x}", call.chain[i]);
+#ifndef _WIN32
+            // Host frames (the HLE code that called into the guest) by library and symbol.
+            // Offsets resolve exactly offline; the nearest exported symbol is only a hint.
+            if (Dl_info where{}; dladdr(reinterpret_cast<void*>(call.chain[i]), &where) &&
+                where.dli_fname) {
+                const char* file = std::strrchr(where.dli_fname, '/');
+                chain += fmt::format("={}+{:#x}({})", file ? file + 1 : where.dli_fname,
+                                     call.chain[i] - reinterpret_cast<uintptr_t>(where.dli_fbase),
+                                     where.dli_sname ? where.dli_sname : "?");
+            }
+#endif
         }
         LOG_CRITICAL(Render,
                      "  #{} thread {} \"{}\" {} cmdbuf {} ({:+} dwords from the packet) size {}, "
