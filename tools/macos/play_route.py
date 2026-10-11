@@ -488,7 +488,7 @@ def report_window(run, wait=60):
     ignore the flags and open a full-size window, which is reported, not hidden."""
     deadline = time.time() + wait
     while time.time() < deadline and not (run / 'exit.json').exists():
-        lines = log_lines(run)
+        lines = log_lines(run, full=True)  # never the incremental reader: the route's waits read after this
         window = [l for l in lines if l.startswith('Window: ')]
         if window:
             print(f'play_route: {window[0].strip()}', file=sys.stderr)
