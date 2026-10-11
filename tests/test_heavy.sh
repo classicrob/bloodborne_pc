@@ -8,7 +8,7 @@ cd "$(dirname "$0")/.."
 heavy=tools/macos/heavy.sh
 dir=$(mktemp -d)
 trap 'rm -rf "$dir"; kill $(jobs -p) 2>/dev/null || true' EXIT
-export BB_HEAVY_DIR=$dir BB_HEAVY_BUILD_SLOTS=1 BB_HEAVY_PLAYTEST_SLOTS=2 BB_HEAVY_QUICK_SLOTS=2
+export BB_HEAVY_DIR=$dir BB_HEAVY_BUILD_SLOTS=1 BB_HEAVY_PLAYTEST_SLOTS=2 BB_HEAVY_QUICK_SLOTS=2 BB_HEAVY_SWEEP_SLOTS=1
 unset BB_HEAVY_HELD
 fail() { echo "heavy test FAILED: $*" >&2; exit 1; }
 until_held() { for _ in $(seq 100); do "$heavy" status | grep -q "$1: held by $2" && return; sleep 0.1; done; fail "$1 never held by $2"; }
@@ -159,6 +159,19 @@ else
 fi
 echo "heavy.sh scheduling: niceness and parallelism checked; QoS $qos"
 
+# The sweep lane: a sweep runs while a long build job holds the build slot; a sweep started
+# inside a build job runs in that slot and says so.
+"$heavy" LONG -- sleep 30 &
+long=$!
+until_held build0 LONG
+start=$(date +%s)
+"$heavy" --pool sweep SW1 -- true
+(( $(date +%s) - start < 10 )) || fail "sweep waited for the build slot"  # the holder sleeps 30 s
+"$heavy" status | grep -q '^sweep0: free' || fail "sweep slot not listed or not freed"
+kill -9 "$long"; wait "$long" 2>/dev/null || true
+err=$("$heavy" B9 -- "$heavy" --pool sweep SW2 -- true 2>&1 >/dev/null)
+[[ $err == *'SW2: started inside build0'* ]] || fail "a sweep nested in a build job was not reported ('$err')"
+
 # Bad usage is an error, not a silent no-op.
 if "$heavy" G true 2>/dev/null; then fail "missing -- accepted"; fi
 if BB_HEAVY_BUILD_SLOTS=0 "$heavy" H -- true 2>/dev/null; then fail "zero slots accepted"; fi
@@ -175,4 +188,4 @@ assert any(l['label'] == 'B' and l['waited_s'] >= 1 for l in starts), 'B waited'
 assert all({'pool', 'slot', 'waited_s', 'load', 'held'} <= set(l) for l in starts)
 assert any(l['label'] == 'Q4' and l['status'] == 124 for l in ends), 'Q4 killed'
 PY
-echo "heavy.sh: history log, build/playtest/quick pools, quick hints and time limit, waiting, priority slot, GPU shared/exclusive lock with gate, start announcement, polite scheduling, release on SIGKILL, nesting, exit status, usage errors PASS"
+echo "heavy.sh: history log, build/playtest/quick pools, quick hints and time limit, waiting, priority slot, GPU shared/exclusive lock with gate, start announcement, polite scheduling, sweep lane, release on SIGKILL, nesting, exit status, usage errors PASS"

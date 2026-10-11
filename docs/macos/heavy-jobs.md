@@ -5,7 +5,7 @@ GPU build took 8 to 11 minutes and no timing meant anything. `tools/macos/heavy.
 work machine-wide.
 
 ```sh
-tools/macos/heavy.sh [--pool build|playtest|quick] [--priority] [--gpu shared|exclusive] LABEL -- COMMAND [ARG...]
+tools/macos/heavy.sh [--pool build|playtest|quick|sweep] [--priority] [--gpu shared|exclusive] LABEL -- COMMAND [ARG...]
 tools/macos/heavy.sh status
 ```
 
@@ -13,7 +13,8 @@ tools/macos/heavy.sh status
 |---|---|---|
 | `build` | 1 (`BB_HEAVY_BUILD_SLOTS`) + 1 priority-only | builds, test suites, conformance runs, benchmarks, standalone GPU probes; `--priority` (shared builds) may also take the reserved slot |
 | `playtest` | 2 (`BB_HEAVY_PLAYTEST_SLOTS`) | game runs through play_route.py: parallel correctness runs, each with its own user dir and window |
-| `quick` | 2 (`BB_HEAVY_QUICK_SLOTS`) | short jobs: a one-TU compile check, a single test link or run, a driver-only build, a sweep step. Never a full GPU build |
+| `quick` | 2 (`BB_HEAVY_QUICK_SLOTS`) | short jobs: a one-TU compile check, a single test target built and run, a driver-only build. Never a full GPU build. A small test target does not wait behind a long build-pool job |
+| `sweep` | 1 (`BB_HEAVY_SWEEP_SLOTS`) | the long shader-sweep phase, as its own heavy.sh call after the build (see below) |
 
 A quick job gets a parallelism hint (`BB_BUILD_JOBS=4`, `CMAKE_BUILD_PARALLEL_LEVEL=4`,
 `MAKEFLAGS=-j4`; honour it). It prints a warning after 5 min (`BB_HEAVY_QUICK_WARN`). After
@@ -24,13 +25,29 @@ pool exists so one-minute jobs don't wait behind fifteen-minute builds.
 That is at most 4 translated (Rosetta) processes from game runs and one build-pool test, which is
 the team limit. Parallel runs are for correctness only; their FPS numbers mean nothing.
 
+## Long jobs: build, then sweep
+
+A slot is held by the whole job: its locked descriptor is inherited by every process the job
+starts, and heavy.sh cannot hand it back halfway. A job that builds for 20 minutes and then
+sweeps shaders for 2 hours therefore holds the only build slot for both. Run the two as separate
+calls instead:
+
+```sh
+tools/macos/heavy.sh "sweep build" -- <build and test the sweep driver>
+tools/macos/heavy.sh --pool sweep "sweep" -- <run the sweep>
+```
+
+A sweep started inside a build job runs in that build slot and heavy.sh reports it on stderr.
+Sweep jobs get the same scheduling as builds (background QoS, capped parallelism), so the extra
+lane adds no load on the performance cores.
+
 ## Sharing the Mac with the user
 
 The user works on this Mac while the team runs. Heavy jobs yield to them by default:
 
 | Jobs | Scheduling |
 |---|---|
-| build and quick pools (builds, tests, sweeps) | background QoS (`taskpolicy -b`: lowest CPU priority, efficiency cores, throttled I/O) and compile parallelism capped at `BB_HEAVY_BUILD_JOBS` (8) through `BB_BUILD_JOBS`, `CMAKE_BUILD_PARALLEL_LEVEL` and `MAKEFLAGS` (a lower hint is kept) |
+| build, quick and sweep pools (builds, tests, sweeps) | background QoS (`taskpolicy -b`: lowest CPU priority, efficiency cores, throttled I/O) and compile parallelism capped at `BB_HEAVY_BUILD_JOBS` (8) through `BB_BUILD_JOBS`, `CMAKE_BUILD_PARALLEL_LEVEL` and `MAKEFLAGS` (a lower hint is kept) |
 | `--priority` (P0 previews, shared builds) | nice 5 and a utility QoS clamp, parallelism capped as above (background QoS made a preview take 37 min) |
 | playtest pool (correctness games) | nice 5 and a utility QoS clamp |
 | `--gpu exclusive` (perf_run, timing) | unchanged: the user approved perf runs separately |
