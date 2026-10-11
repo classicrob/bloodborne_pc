@@ -41,6 +41,7 @@
 #include "video_core/texture_cache/image_view.h"
 #include "video_core/texture_cache/texture_cache.h"
 #include "bbport_parse_split.h"
+#include <optional>
 #include <vk_mem_alloc.h>
 
 namespace Vulkan {
@@ -445,7 +446,11 @@ void Rasterizer::DrainDrawPipe(u32 reason, u32 line, const char* function) {
                                       ? BbSplit::KDrainSubmitEnd
                                   : reason == DrawPipe::ReasonRasterizer ? BbSplit::KDrainRasterizer
                                                                          : BbSplit::KDrainPacket;
-    BbSplit::Scope split_scope{split_kind};
+    // Timed only when it can wait: a drain of an idle pipe returns at once.
+    std::optional<BbSplit::Scope> split_scope;
+    if (!draw_pipe->Idle()) {
+        split_scope.emplace(split_kind);
+    }
 #endif
     static const bool stats = std::getenv("BB_FRAME_STATS") != nullptr;
     if (!stats) {

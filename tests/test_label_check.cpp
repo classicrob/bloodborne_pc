@@ -404,8 +404,8 @@ int main() {
                    calls.load() == 1);
     }
 
-    // Parse split (bbport_parse_split.h): marks partition a thread's time exactly; nested scopes
-    // are charged their own time; a section for another thread's account does nothing.
+    // Parse split (bbport_parse_split.h): every transition charges the owner of the time since
+    // the previous one, so a thread's time is partitioned exactly, whatever the nesting.
     std::thread([] {
         using namespace BbSplit;
         const auto spin = [] {
@@ -413,34 +413,91 @@ int main() {
             while (__rdtsc() < until) {
             }
         };
+        const auto total = [] {
+            std::uint64_t sum = 0;
+            for (const auto& c : stage_a.bucket) sum += c.load();
+            for (const auto& c : stage_a.scope) sum += c.load();
+            return sum;
+        };
+        const auto in = [](K kind, std::uint32_t bucket) {
+            return stage_a.scope_in[kind * MaxBuckets + bucket].load();
+        };
         Attach(stage_a, ALoop);
+        const std::uint64_t attached = stage_a.last;
         spin();
-        Mark(ADraw);
-        const std::uint64_t draw_from = stage_a.mark_at;
-        spin();
+        bool scope_ok = true;
         {
-            Scope deferred{KDeferred};
+            Scope deferred{KDeferred}; // Sol-2's case: a mark while a scope is open
+            spin();
+            Mark(ADraw);
             spin();
             {
                 Scope tick{KGpuTick};
                 spin();
             }
             spin();
+            scope_ok = Open() == ADraw;
         }
+        spin();
+        bool section_ok = true;
         {
-            Section other{stage_b, BBind}; // stage B's: inactive here
+            Section active{stage_a, AHostCmds};
+            section_ok = Open() == AHostCmds;
             spin();
+            {
+                Section other{stage_b, BBind}; // stage B's: inactive here
+                section_ok = section_ok && Open() == AHostCmds;
+                spin();
+            }
         }
-        const bool still_draw = Open() == ADraw;
+        section_ok = section_ok && Open() == ADraw;
+        // A packet yields; the scheduler loop and a child task run; the packet resumes.
+        Mark(AWaitRegMem);
+        spin();
+        const std::uint32_t saved = Suspend();
         Mark(ALoop);
-        const std::uint64_t span = stage_a.mark_at - draw_from;
-        const std::uint64_t draw = stage_a.bucket[ADraw].load(), def = stage_a.scope[KDeferred].load(),
-                            tick = stage_a.scope[KGpuTick].load();
-        Expect("parse split: bucket + nested scopes = the marked interval, each scope its own time",
-               still_draw && draw + def + tick == span && def > 0 && tick > 0 && draw > 0 &&
-                   stage_a.scope_in[KDeferred * MaxBuckets + ADraw].load() == def &&
-                   stage_a.bucket[ALoop].load() > 0 && stage_b.bucket[BBind].load() == 0);
+        spin();
+        {
+            const std::uint32_t parent = Suspend(); // RESUME of a CE child from the loop's task
+            Mark(AConstEng);
+            spin();
+            Resume(parent);
+        }
+        const bool child_ok = Open() == ALoop;
+        Resume(saved);
+        const bool resumed_ok = Open() == AWaitRegMem;
+        spin();
+        Mark(ALoop);
+        Flush();
+        Expect("parse split: buckets and scopes partition the thread's time exactly",
+               total() == stage_a.last - attached);
+        Expect("  ... a mark inside a scope moves only the bucket its time is listed under; inner "
+               "scopes take their own time",
+               scope_ok && in(KDeferred, ALoop) > 0 && in(KDeferred, ADraw) > 0 &&
+                   in(KDeferred, ALoop) + in(KDeferred, ADraw) == stage_a.scope[KDeferred].load() &&
+                   in(KGpuTick, ADraw) == stage_a.scope[KGpuTick].load() &&
+                   stage_a.scope[KGpuTick].load() > 0);
+        Expect("  ... an active section reopens the previous bucket; another thread's does nothing",
+               section_ok && stage_a.bucket[AHostCmds].load() > 0 &&
+                   stage_b.bucket[BBind].load() == 0);
+        Expect("  ... a yielded packet and a resumed child each get back their bucket",
+               child_ok && resumed_ok && stage_a.bucket[AConstEng].load() > 0 &&
+                   stage_a.bucket[AWaitRegMem].load() > 0);
     }).join();
+    {
+        const pid_t child = fork();
+        if (child == 0) {
+            std::freopen("/dev/null", "w", stderr);
+            BbSplit::Attach(BbSplit::stage_a, BbSplit::ALoop);
+            BbSplit::Scope open{BbSplit::KDeferred};
+            BbSplit::Suspend(); // a scope across a yield
+            std::_Exit(0);
+        }
+        int status = 0;
+        waitpid(child, &status, 0);
+        Expect("  ... a scope open across a yield stops",
+               WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT);
+    }
 
     std::fprintf(stderr, "%s: %u failures\n", failures ? "FAIL" : "PASS", failures);
     return failures ? 1 : 0;

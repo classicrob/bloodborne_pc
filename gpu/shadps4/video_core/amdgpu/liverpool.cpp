@@ -56,19 +56,43 @@ static_assert(Liverpool::NumComputeRings <= MAX_NAMES);
 
 static const char* acb_task_name[] = NAME_ARRAY(ACB_TASK, MAX_NAMES);
 
+#ifdef __APPLE__
+// Parse split (bbport_parse_split.h): a yielding packet's bucket is reopened when it resumes,
+// and a parent's after the child it resumed returns.
+#define YIELD(name)                                                                                \
+    {                                                                                              \
+        const u32 bb_split_open = BbSplit::Suspend();                                              \
+        FIBER_EXIT;                                                                                \
+        co_yield {};                                                                               \
+        FIBER_ENTER(name);                                                                         \
+        BbSplit::Resume(bb_split_open);                                                            \
+    }
+#else
 #define YIELD(name)                                                                                \
     FIBER_EXIT;                                                                                    \
     co_yield {};                                                                                   \
     FIBER_ENTER(name);
+#endif
 
 #define YIELD_CE() YIELD(ccb_task_name)
 #define YIELD_GFX() YIELD(dcb_task_name)
 #define YIELD_ASC(id) YIELD(acb_task_name[id])
 
+#ifdef __APPLE__
+#define RESUME(task, name)                                                                         \
+    {                                                                                              \
+        const u32 bb_split_open = BbSplit::Suspend();                                              \
+        FIBER_EXIT;                                                                                \
+        task.handle.resume();                                                                      \
+        FIBER_ENTER(name);                                                                         \
+        BbSplit::Resume(bb_split_open);                                                            \
+    }
+#else
 #define RESUME(task, name)                                                                         \
     FIBER_EXIT;                                                                                    \
     task.handle.resume();                                                                          \
     FIBER_ENTER(name);
+#endif
 
 #define RESUME_CE(task) RESUME(task, ccb_task_name)
 #define RESUME_GFX(task) RESUME(task, dcb_task_name)
@@ -389,6 +413,12 @@ void Liverpool::Process(std::stop_token stoken) {
                 task = queue.submits.front();
             }
             task.resume();
+#ifdef __APPLE__
+            if (BbSplit::current && BbSplit::current->depth) {
+                BbSplit::Stop("a scope is open after a queue task returned");
+            }
+            BbSplit::Mark(BbSplit::ALoop); // the task yielded or finished
+#endif
 
             if (task.done()) {
                 task.destroy();

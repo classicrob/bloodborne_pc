@@ -1,13 +1,15 @@
 // bbport (macOS): where the GPU-side threads' time goes. "Parse split" lines, every 600 frame
 // ends (docs/macos/parse-split.md).
 //
-// Each instrumented thread's time is partitioned. Mark(bucket) closes the interval since the
-// previous mark and charges it to the bucket that mark named, less the scopes (Scope) inside it,
-// which are charged to their own kinds. Scopes nest; each is charged its own time without its
-// inner scopes. A thread with no account (current == nullptr) records nothing.
+// Each instrumented thread's time is partitioned exactly. Every transition (a mark, a scope's
+// start or end) first charges the time since the previous one to its owner: the innermost open
+// scope (listed under the bucket open meanwhile), else the open bucket. Coroutine yields save and
+// restore the open bucket (Suspend/Resume). A thread with no account (current == nullptr)
+// records nothing.
 //
-// One writer per account (its thread); the reporter reads with relaxed loads. Always on: a mark
-// or scope costs two counter reads and a few stores.
+// One writer per account (its thread); the reporter reads with relaxed loads, so a window is
+// approximate at its edges (see Report below). Always on: a mark is one counter read and a few
+// stores (none when the bucket is already open); a scope two reads.
 #pragma once
 #ifdef __APPLE__
 #include <array>
@@ -94,15 +96,17 @@ inline constexpr const char* k_names[KCount] = {
     "queue submit"};
 
 constexpr std::uint32_t MaxBuckets = 16;
+constexpr std::uint32_t MaxDepth = 8; ///< nested scopes
 
 struct Account {
     std::array<std::atomic<std::uint64_t>, MaxBuckets> bucket{};
     std::array<std::atomic<std::uint64_t>, KCount> scope{};
-    /// Scope time by the bucket open when it ran (e.g. deferred-signal waits by packet class).
+    /// Scope time by the bucket open while it ran (e.g. deferred-signal waits by packet class).
     std::array<std::atomic<std::uint64_t>, KCount * MaxBuckets> scope_in{};
-    // Writer only:
-    std::uint64_t mark_at = 0, scoped_total = 0, scoped_at_mark = 0;
-    std::uint32_t open = 0;
+    // Writer only: the last transition, the open bucket and the open scopes (innermost last).
+    std::uint64_t last = 0;
+    std::uint32_t open = 0, depth = 0;
+    std::array<K, MaxDepth> stack{};
 };
 
 inline Account stage_a, stage_b, recorder;
@@ -112,62 +116,70 @@ inline void Add(std::atomic<std::uint64_t>& counter, std::uint64_t value) {
     counter.store(counter.load(std::memory_order_relaxed) + value, std::memory_order_relaxed);
 }
 
+[[noreturn]] inline void Stop(const char* why) {
+    std::fprintf(stderr, "STOP: parse split: %s\n", why);
+    std::abort();
+}
+
+/// Charges the time since the last transition to whatever owned it: the innermost open scope
+/// (and, per bucket, the bucket open meanwhile), else the open bucket. Every transition calls
+/// this first, so a thread's time is partitioned exactly.
+inline void Charge(Account& a, std::uint64_t now) {
+    const std::uint64_t span = now - a.last;
+    if (a.depth) {
+        const K kind = a.stack[a.depth - 1];
+        Add(a.scope[kind], span);
+        Add(a.scope_in[kind * MaxBuckets + a.open], span);
+    } else {
+        Add(a.bucket[a.open], span);
+    }
+    a.last = now;
+}
+
 /// Starts accounting this thread in `account`, in `bucket`.
 inline void Attach(Account& account, std::uint32_t bucket) {
     current = &account;
-    account.mark_at = __rdtsc();
-    account.scoped_at_mark = account.scoped_total;
+    account.last = __rdtsc();
     account.open = bucket;
+    account.depth = 0;
 }
 
-/// Charges the time since the previous mark to its bucket; `bucket` is open from now.
+/// Opens `bucket` from now (a no-op when it is already open: charging can wait).
 inline void Mark(std::uint32_t bucket) {
     Account* const a = current;
-    if (!a) {
+    if (!a || a->open == bucket) {
         return;
     }
-    const std::uint64_t now = __rdtsc();
-    const std::uint64_t span = now - a->mark_at;
-    const std::uint64_t scoped = a->scoped_total - a->scoped_at_mark;
-    Add(a->bucket[a->open], span > scoped ? span - scoped : 0);
-    a->mark_at = now;
-    a->scoped_at_mark = a->scoped_total;
+    Charge(*a, __rdtsc());
     a->open = bucket;
 }
 
-/// The bucket currently open on this thread (for restoring it after a nested mark).
+/// Charges this thread's time up to now (before a report).
+inline void Flush() {
+    if (Account* const a = current) {
+        Charge(*a, __rdtsc());
+    }
+}
+
+/// The bucket currently open on this thread.
 inline std::uint32_t Open() {
     return current ? current->open : 0;
 }
 
-/// A wait or named piece of work; charged its own time, without inner scopes.
-class Scope {
-public:
-    explicit Scope(K kind) : account{current}, kind{kind} {
-        if (account) {
-            inner_before = account->scoped_total;
-            start = __rdtsc();
-        }
+/// Before a coroutine yields: its open bucket, for Resume. A scope must not span a yield (other
+/// tasks run meanwhile): that stops.
+inline std::uint32_t Suspend() {
+    if (current && current->depth) {
+        Stop("a scope is open across a coroutine yield");
     }
-    ~Scope() {
-        if (!account) {
-            return;
-        }
-        const std::uint64_t span = __rdtsc() - start;
-        const std::uint64_t inner = account->scoped_total - inner_before;
-        const std::uint64_t own = span > inner ? span - inner : 0;
-        Add(account->scope[kind], own);
-        Add(account->scope_in[kind * MaxBuckets + account->open], own);
-        account->scoped_total += own;
-    }
-    Scope(const Scope&) = delete;
-    Scope& operator=(const Scope&) = delete;
+    return Open();
+}
 
-private:
-    Account* account;
-    K kind;
-    std::uint64_t start = 0, inner_before = 0;
-};
+/// After the coroutine resumes: reopens its bucket (the time it was suspended stays with
+/// whatever ran meanwhile).
+inline void Resume(std::uint32_t bucket) {
+    Mark(bucket);
+}
 
 /// Marks `bucket` only on `account`'s thread (code shared by stage A and stage B).
 inline void MarkOn(const Account& account, std::uint32_t bucket) {
@@ -175,6 +187,34 @@ inline void MarkOn(const Account& account, std::uint32_t bucket) {
         Mark(bucket);
     }
 }
+
+/// A wait or named piece of work. While open it owns its thread's time (inner scopes take their
+/// own); marks inside it change only the bucket its time is listed under.
+class Scope {
+public:
+    explicit Scope(K kind) : account{current} {
+        if (!account) {
+            return;
+        }
+        if (account->depth == MaxDepth) {
+            Stop("scopes nested too deeply");
+        }
+        Charge(*account, __rdtsc());
+        account->stack[account->depth++] = kind;
+    }
+    ~Scope() {
+        if (!account) {
+            return;
+        }
+        Charge(*account, __rdtsc());
+        --account->depth;
+    }
+    Scope(const Scope&) = delete;
+    Scope& operator=(const Scope&) = delete;
+
+private:
+    Account* account;
+};
 
 /// On `account`'s thread: marks `bucket` for the life of the object, then reopens the bucket
 /// open before.
@@ -272,6 +312,7 @@ inline void NoteFrameEnd(std::uint64_t draws) {
     const std::uint64_t now_cycles = __rdtsc();
     const auto now = std::chrono::steady_clock::now();
     if (window_cycles == 0) {
+        Flush();
         window_cycles = now_cycles;
         window_start = now;
         window_draws = draws;
@@ -289,6 +330,7 @@ inline void NoteFrameEnd(std::uint64_t draws) {
     if (++window_frames < 600) {
         return;
     }
+    Flush(); // stage A: its open interval belongs to this window
     const double wall_ms =
         std::chrono::duration<double, std::milli>(now - window_start).count();
     const double ms_per_cycle = wall_ms / double(now_cycles - window_cycles);

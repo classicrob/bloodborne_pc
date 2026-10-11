@@ -7,21 +7,37 @@ thread (stage B). These counters split each of the three threads' wall time.
 
 ## How it counts (gpu/shim/bbport_parse_split.h)
 
-Each thread's time is partitioned:
-- `BbSplit::Mark(bucket)` charges the interval since the previous mark to the bucket open then.
-- `BbSplit::Scope{kind}` (RAII) charges its own time to its kind and takes it out of the
-  enclosing bucket. Scopes nest, and each is charged without its inner scopes. Its time is also
-  kept per bucket, so you can see, for example, deferred-signal waits by stage A packet class.
+Each thread's time is partitioned exactly. Every transition first charges the time since the
+previous transition to its owner, then changes state. Transitions are a mark, or a scope's start
+or end.
+- `BbSplit::Mark(bucket)` opens a bucket. It does nothing when that bucket is already open.
+- `BbSplit::Scope{kind}` (RAII) is a wait or a named piece of work. While it is open it owns the
+  thread's time, and inner scopes take their own. A mark inside a scope only changes the bucket its
+  time is listed under (per-bucket scope time, e.g. deferred-signal waits by stage A packet class).
 - `BbSplit::Section{account, bucket}` opens a bucket for its lifetime on that account's thread
   only, then reopens the previous one. This is for code that both stages run.
-
-Mechanics:
-- Counts use `__rdtsc`; there are no clock calls and no locked instructions. Each thread is the
-  only writer of its account, and the reporter reads it with relaxed loads.
+- Coroutines: liverpool.cpp's YIELD and RESUME save the open bucket and reopen it afterwards
+  (`Suspend`/`Resume`). A packet that yields gets its class back when it resumes, and a parent
+  gets its bucket back after a CE or nested IB child it resumed returns. The time a coroutine is
+  suspended stays with whatever ran meanwhile. A scope open across a yield stops, as does a scope
+  still open when a queue task returns to the scheduler loop. No scope spans a yield today.
+- A drain of an idle draw pipe is not timed: it returns at once.
+- Counts use `__rdtsc`, with no locked instructions. Each thread is the only writer of its
+  account, and the reporter reads it with relaxed loads.
 - A thread without an account records nothing. For example, the texture helper and the
   preparation workers are not counted.
 - The macros `BB_SPLIT_SCOPE`, `BB_SPLIT_SECTION` and `BB_SPLIT_MARK_ON` compile to nothing off
   Apple.
+
+**Overhead** (`tests/bench_parse_split.sh`, process CPU time, x86_64 under Rosetta on the M4 Max,
+accounting on vs off):
+- one `__rdtsc` costs about 11 ns under Rosetta;
+- stage A: 0.6-1.4 ns per packet (same-bucket marks are free), about 6-11 µs per frame at 800
+  draws;
+- stage B with these marks: about 135 ns per draw (11 transitions), so 0.11 ms per frame at 800
+  draws;
+- every further scope per draw adds about 22 ns. Fifteen more add about 320 ns per draw, or 0.26
+  ms per frame at 800 draws.
 
 ## Accounts and buckets
 
@@ -64,7 +80,9 @@ Parse split, last 600 frame ends: <ms> ms per frame, <n> draws per frame; ms per
 ```
 
 How to read it:
-- The accounted percentage should be close to 100%. Only the interval still open at the report
-  is missing.
+- Stage A charges its open interval before each report, so its window is complete. The other
+  threads' counters are sampled as they stand, so their windows are approximate at both edges.
+  An interval open at a report is charged to the next window, which therefore has carry-in as
+  well as carry-out. Their accounted percentage is close to 100%, not exactly 100%.
 - Waits overlap across threads. For example, stage A waits in a drain while stage B waits on the
   recorder. Read each thread's line on its own.
