@@ -282,11 +282,12 @@ int main() {
                parsed && same.where == Where::Inside && same.matches == 2 &&
                    same.differing == 1 && same.current && same.submission == 9 &&
                    !newest.current && newest.submission == 9);
-        Expect("  ... the selected copy differing is told apart from only an older one differing",
+        Expect("  ... the selected copy differing is told apart from another copy differing",
                same.selected_differs && // current 9 (copy_b) vs the read of copy_a
                    Describe(same).find("DIFFERS") != std::string::npos &&
                    !reused.selected_differs && reused.differing == 1 && // only 7 (copy_a) differs
-                   Describe(reused).find("reused by a newer submission") != std::string::npos);
+                   Describe(reused).find("matches the read; 1 other held copy, 1 of them differ") !=
+                       std::string::npos);
         // A containing region is never renamed by a straddling one, in either order (Astra-2).
         bool kept = true;
         for (const std::uint64_t cur : {std::uint64_t{7}, std::uint64_t{0}}) {

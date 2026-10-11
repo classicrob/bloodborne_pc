@@ -67,8 +67,8 @@ snapshots' own copies and reads no guest memory. Each read falls into one of the
     one of them is the parser's current submission (recorded per packet on the GPU thread; reads
     on the draw thread have none).
   - The selected region is the current submission's, else the newest. The line says first
-    whether the **selected** copy matches the read. If it differs, the bytes changed after that
-    submission. If only older copies differ, the chunk was reused by a newer submission (legal).
+    whether the **selected** copy matches the read, then how many other held copies differ. This
+    is a byte comparison, not an order: it does not say which copy was written last.
   - A resubmitted chunk shows up as several copies. A difference shows that a held copy differs
     from the read, not by itself which submission's bytes the PS4 would have used.
 - **Straddling** a held region's boundary, when no held region contains the range (a containing

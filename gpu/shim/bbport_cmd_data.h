@@ -160,8 +160,8 @@ struct Result {
     bool compared = false;       ///< size <= MaxCompared
     std::uint32_t matches = 0;   ///< held regions containing the range
     std::uint32_t differing = 0; ///< of those, copies that differ from the bytes read
-    /// The selected copy (current, else newest) differs: the bytes read are not what that
-    /// submission submitted. Only older copies differing is a chunk reused by a newer submission.
+    /// The selected copy (current, else newest) differs from the bytes read. A mismatch only, not
+    /// an order: with the current one selected, other differing copies need not be older.
     bool selected_differs = false;
     bool current = false;        ///< one of them is the parser's current submission
     std::uint64_t submission = 0, region_start = 0, region_bytes = 0; ///< a selected region
@@ -354,15 +354,12 @@ inline std::string Describe(const Result& r) {
         } else {
             std::snprintf(text, sizeof(text),
                           "the %s copy (submission %llu, region %#llx) %s the read; %u other "
-                          "held cop%s, %u of them differ%s",
+                          "held cop%s, %u of them differ",
                           r.current ? "current submission's" : "newest held",
                           static_cast<unsigned long long>(r.submission),
                           static_cast<unsigned long long>(r.region_start),
                           r.selected_differs ? "DIFFERS from" : "matches", r.matches - 1,
-                          r.matches - 1 == 1 ? "y" : "ies", others_differing,
-                          r.selected_differs ? " (rewritten after that submission)"
-                          : others_differing ? " (the chunk reused by a newer submission)"
-                                             : "");
+                          r.matches - 1 == 1 ? "y" : "ies", others_differing);
         }
         break;
     }
@@ -403,7 +400,7 @@ inline void PrintSummaryLocked() {
                 static_cast<unsigned long long>(reads), static_cast<unsigned long long>(logged));
     for (const auto& [key, t] : tallies) {
         std::printf("  %s shader %#llx: not located %llu, inside %llu (selected copy differs %llu, "
-                    "only older copies differ %llu, several held copies %llu), straddling %llu, "
+                    "only other copies differ %llu, several held copies %llu), straddling %llu, "
                     "candidate chunk tail %llu\n",
                     key.first.c_str(), static_cast<unsigned long long>(key.second),
                     static_cast<unsigned long long>(t.outside),
