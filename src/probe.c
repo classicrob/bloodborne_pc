@@ -228,8 +228,12 @@ static uint64_t patch_tcb_loads(const Segment *segments, uint64_t count) {
 #endif
 #ifdef __APPLE__
 #include "probe_fault_dump_mac.h"
+#include "probe_entry_trace_mac.h"
 #endif
 static void fault(int sig, siginfo_t *info, void *context) {
+#ifdef __APPLE__
+    if (entry_trace_handle(sig,info,context)) return;
+#endif
     /* GPU page tracking (write-protected guest pages) is resolved first. */
     if (gpu_enabled && (sig == SIGSEGV || sig == SIGBUS) && bbgpu_handle_fault(context, info->si_addr)) return;
     /* A speculative guest memory read (runtime_memory.c) failed: resume its recovery point. */
@@ -699,6 +703,15 @@ static int probe_main(int argc, char **argv) {
     if (patch_file) apply_patches(patch_file, segments, ns, relocs, nr);
 #if defined(_WIN32) || defined(__APPLE__)
     printf("Guest TCB loads redirected to the host TLS slot: %" PRIu64 "\n", patch_tcb_loads(segments, ns));
+#endif
+#ifdef __APPLE__
+    const char *entry_error=entry_trace_install(getenv("BB_GUEST_ENTRY_TRACE"),image,segments,ns);
+    if (entry_error) fail(entry_error);
+    if (entry_trace_count) {
+        struct sigaction trace_action={0}; trace_action.sa_sigaction=fault; trace_action.sa_flags=SA_SIGINFO;
+        sigemptyset(&trace_action.sa_mask);
+        if (sigaction(SIGTRAP,&trace_action,NULL)) fail("BB_GUEST_ENTRY_TRACE cannot install SIGTRAP handler");
+    }
 #endif
     protect(traps, round_host_page((import_count + 1) * 32), 5);
     protect(image, round_host_page(size), 0);
