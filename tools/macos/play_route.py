@@ -532,6 +532,8 @@ REPORT = {
     'cmd_overlap': r'CMD-OVERLAP',
     'audio_health_failure': r'AUDIO HEALTH FAILURE',  # software input health, not audibility
     'gs_skip_diagnostic': r'BB_GS_SKIP_DRAWS=1: DIAGNOSTIC MODE|GS draws SKIPPED',  # rendering wrong by design
+    'device_lost': r'Invalid Resource|VK_ERROR_DEVICE_LOST|DEVICE_LOST|GPU hang',
+    'staging_ring_reuse': r'Staging ring range at',  # backstop: a staging range used across a submission
 }
 
 
