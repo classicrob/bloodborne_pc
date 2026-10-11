@@ -1,0 +1,3 @@
+#!/bin/sh
+# Machine-wide heavy-job limiter (tools/macos/heavy.py): heavy.sh [--pool build|playtest] [--priority] LABEL -- COMMAND...
+exec python3 "$(dirname -- "$0")/heavy.py" "$@"

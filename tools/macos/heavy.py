@@ -1,0 +1,134 @@
+#!/usr/bin/env python3
+"""Machine-wide limit on heavy jobs (GPU builds, test suites, game runs, benchmarks).
+
+  tools/macos/heavy.sh [--pool build|playtest] [--priority] LABEL -- COMMAND [ARG...]
+  tools/macos/heavy.sh status
+
+Two pools of slots, each slot an flock on a file in BB_HEAVY_DIR (default ~/bbport-deps/locks):
+  build     BB_HEAVY_BUILD_SLOTS (1) for builds, test suites, benchmarks and probes, plus one
+            slot that only --priority jobs (shared builds, the critical lane) may take;
+  playtest  BB_HEAVY_PLAYTEST_SLOTS (3) for game runs (play_route.py), parallel correctness runs.
+A job takes a slot of its pool, then execs COMMAND with the locked descriptor inherited: the slot
+stays held by the job and every process it starts, and the kernel releases it when the last of
+them exits or is killed. There is no lease to expire and nothing to clean up. A command started
+inside a slot (BB_HEAVY_HELD is set) runs directly, so build.sh under heavy.sh does not wait for
+itself.
+"""
+import datetime
+import fcntl
+import json
+import os
+import sys
+import time
+
+WAIT_REPORT_SECONDS = 30
+
+
+def fail(message, status=2):
+    print(f'heavy: {message}', file=sys.stderr)
+    sys.exit(status)
+
+
+def lock_dir():
+    path = os.environ.get('BB_HEAVY_DIR') or os.path.expanduser('~/bbport-deps/locks')
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+POOLS = {'build': ('BB_HEAVY_BUILD_SLOTS', 1), 'playtest': ('BB_HEAVY_PLAYTEST_SLOTS', 3)}
+
+
+def slot_names(pool):
+    variable, default = POOLS[pool]
+    value = os.environ.get(variable, str(default))
+    if not value.isdigit() or int(value) < 1:
+        fail(f'{variable} must be a positive whole number')
+    return [f'{pool}{i}' for i in range(int(value))]
+
+
+def try_lock(name):
+    """An open descriptor holding the slot's lock, or None when another job holds it."""
+    fd = os.open(os.path.join(lock_dir(), name), os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return fd
+    except BlockingIOError:
+        os.close(fd)
+        return None
+
+
+def holder(name):
+    """What the slot file says about its current holder (written after locking)."""
+    try:
+        with open(os.path.join(lock_dir(), name)) as file:
+            return json.loads(file.read() or '{}')
+    except (OSError, ValueError):
+        return {}
+
+
+def describe(info):
+    return f"{info.get('label', '?')} (pid {info.get('pid', '?')}, since {info.get('since', '?')})"
+
+
+def status():
+    for name in ['build-priority'] + slot_names('build') + slot_names('playtest'):
+        fd = try_lock(name)
+        if fd is not None:
+            os.close(fd)
+            print(f'{name}: free')
+        else:
+            print(f'{name}: held by {describe(holder(name))}')
+
+
+def run(pool, priority, label, command):
+    if os.environ.get('BB_HEAVY_HELD'):
+        os.execvp(command[0], command)
+    names = (['build-priority'] if priority else []) + slot_names(pool)
+    started, reported = time.monotonic(), time.monotonic()
+    while True:
+        for name in names:
+            fd = try_lock(name)
+            if fd is None:
+                continue
+            info = {'label': label, 'pid': os.getpid(), 'pool': pool, 'priority': priority,
+                    'since': datetime.datetime.now().isoformat(timespec='seconds'),
+                    'command': command}
+            os.ftruncate(fd, 0)
+            os.pwrite(fd, json.dumps(info).encode(), 0)
+            os.fsync(fd)
+            waited = time.monotonic() - started
+            if waited >= 1:
+                print(f'heavy: {label}: got {name} after {waited:.0f} s', file=sys.stderr, flush=True)
+            os.set_inheritable(fd, True)
+            os.environ['BB_HEAVY_HELD'] = f'{name}:{label}'
+            try:
+                os.execvp(command[0], command)
+            except OSError as error:
+                fail(f'cannot run {command[0]}: {error}', 127)
+        if time.monotonic() - reported >= WAIT_REPORT_SECONDS:
+            held = '; '.join(f'{name}: {describe(holder(name))}' for name in names)
+            print(f'heavy: {label}: waiting for a slot ({held})', file=sys.stderr, flush=True)
+            reported = time.monotonic()
+        time.sleep(1)
+
+
+def main(argv):
+    if argv == ['status']:
+        return status()
+    pool, priority = 'build', False
+    while argv and argv[0].startswith('--') and argv[0] != '--':
+        if argv[0] == '--priority':
+            priority, argv = True, argv[1:]
+        elif argv[0] == '--pool' and len(argv) > 1 and argv[1] in POOLS:
+            pool, argv = argv[1], argv[2:]
+        else:
+            fail(f'unknown option {argv[0]} (--pool build|playtest, --priority)')
+    if priority and pool != 'build':
+        fail('--priority is for the build pool (shared builds); the playtest pool is dedicated already')
+    if len(argv) < 3 or argv[1] != '--' or not argv[0]:
+        fail('usage: heavy.sh [--pool build|playtest] [--priority] LABEL -- COMMAND [ARG...] | heavy.sh status')
+    run(pool, priority, argv[0], argv[2:])
+
+
+if __name__ == '__main__':
+    main(sys.argv[1:])
