@@ -1,5 +1,6 @@
 #ifndef BB_RUNTIME_MEMORY_H
 #define BB_RUNTIME_MEMORY_H
+#include <stddef.h>
 #include <stdint.h>
 #ifdef __cplusplus
 extern "C" {
@@ -31,6 +32,32 @@ void runtime_memory_set_gpu_lifetime_hooks(void (*begin)(void),
  */
 int runtime_memory_backing_region(uintptr_t address,uintptr_t *start,
     uintptr_t *end,uint64_t *offset);
+
+typedef struct {
+    uintptr_t start, end, address;
+    uint64_t backing_offset; /* pool offset at start */
+    int prot; /* guest protection, not temporary GPU tracking restrictions */
+} RuntimeMemoryAlias;
+typedef struct {
+    uint64_t generation, backing_byte;
+    uintptr_t start, end; /* queried VMA */
+    int prot;
+    size_t total, copied; /* other guest VMAs mapping backing_byte */
+    int truncated;
+} RuntimeMemoryAliasSnapshot;
+/* Failure-path diagnostic: one VMA read lock, no allocation, GPU wait or logging.
+ * Returns 1 for tracked committed memory (total==0 means no other guest alias),
+ * 0 for a reservation/gap/untracked address, -1 for invalid output arguments.
+ * On 0, snapshot is zero except generation. capacity==0 allows aliases==NULL.
+ * Caller-owned writable outputs receive at most capacity rows, in VA order;
+ * address in each row is the VA of the exact queried byte in that other view.
+ * Host pool/import mirrors are not guest VMAs and are intentionally excluded.
+ * This is a current-table snapshot, not mutation history or a lifetime pin.
+ * generation can be odd when called within this thread's existing mutation.
+ * Not signal-safe: do not call from a fault handler. Log only after it returns.
+ */
+int runtime_memory_alias_snapshot(uintptr_t address,RuntimeMemoryAlias *aliases,
+    size_t capacity,RuntimeMemoryAliasSnapshot *snapshot);
 #endif
 #ifdef __cplusplus
 }
