@@ -1,36 +1,48 @@
-# Relaxing the GpuIdle submit throttle (design, for review; no code yet)
+# Relaxing the GpuIdle submit throttle (design, for review; R0 diagnostic only, no R1 code yet)
 
 The GpuIdle throttle's wait has been 70-96% of the frame at the clinic pose. This note:
 1. states what the throttle does now;
 2. lists what it still protects, assuming labels at GPU completion are the default
    (46fe3e6, `bb/macos-opus-pm4-labels-default`) and flips publish at GPU retirement
    (toggle bit 60, merged);
-3. proposes the smallest rule that keeps that protection;
-4. says how to measure it.
+3. proposes a measurement (R0) and an **explicitly unsafe opt-in experiment** (R1), plus later
+   steps;
+4. says how to measure them.
 
 Facts come from the code (macos 9c2ead2) and Astra-2's guest lifetime audit
 (docs/macos/gpu-idle.md, "Guest lifetime audit"). Hypotheses are marked as such.
 
+R1 stays opt-in and unsafe until Astra-2's RE closes the teardown and chunk-status unknowns
+(section 2). Sol-2 reviewed revision 1. Opus-Renderer reviewed it too; their notes are folded in.
+
 ## 1. What the throttle does now
 
 - **`sceGnmSubmitDone`** sets `submission_lock` unless `Liverpool::IsGpuIdle()`.
+  `sceGnmSubmitDone` is IsGpuIdle's only caller.
 - **Every submission waits for the lock to clear** (`sceGnmSubmitCommandBuffers`,
   `SubmitAndFlip`, the compute submits: `WaitGpuIdleToSubmit`), and so does the next
   `sceGnmSubmitDone`.
-- **The GpuIdle interrupt clears the lock** (`ResetSubmissionLock`). `Liverpool::Process`
-  raises it, under `submit_mutex` and only with no submission queued, after:
+- **The GpuIdle interrupt clears the lock.** Its only listener is `ResetSubmissionLock`.
+  `Liverpool::Process` raises it, under `submit_mutex` and only with no submission queued,
+  after:
   1. the parser has consumed every queued submission;
   2. the draw recording thread (stage B) has drained;
-  3. `WaitDeferredSignals()` has returned. That means every deferred label has been written.
+  3. `WaitDeferredSignals()` has returned.
 
-So the guest's first submission of frame N+1 cannot start until frame N is fully processed.
+**With labels at GPU completion (the new default), step 3 introduces a completion-label
+retirement dependency.** GpuIdle waits until every completion label issued so far has been
+written. The label writer writes each one only after its submission's timeline tick, so the GPU
+has completed the work up to and including each label's submission.
 
-**With labels at GPU completion (the new default), step 3 waits for Metal to complete the work.**
-The labels are written by the GpuLabelWriter only after their submission's timeline tick. So
-the throttle has become a **full GPU drain per frame**. Guest CPU time, our parse and record, and
-Metal execution run back to back, never in parallel. The 70-96% wait is therefore our parse,
-record and GPU time seen from the guest. It should be re-measured with bit 59 on to split it
-(section 5).
+This is **not necessarily a full drain**:
+- GPU work after a frame's last label (its tail) is not waited for. A frame without any label is
+  the extreme case.
+- Guest CPU work before its next submitting call, and our parse/record of earlier submissions,
+  can overlap Metal execution.
+
+How much serialization this adds is for R0 to measure (section 5). The observed wait also
+includes writer scheduling and host-copy waits, so it is not a rigorous bound on what relaxing
+could gain.
 
 ## 2. What it still protects
 
@@ -41,118 +53,164 @@ What the guest can see of GPU progress:
   done.
 
 `sceGnmAreSubmitsAllowed` is not called directly (audit: no caller of its wrapper 0x1089b60).
-Removing the throttle removes only the third. So what matters is which guest actions rely on it.
 
-| Guest reuse | What gates it (audit / evidence) | Safe without the throttle? |
+**The throttle blocks submissions, not guest CPU writes.** Even under R0 (today), between
+`SubmitDone(N)` and frame N+1's first submission, the guest CPU writes N+1's data while Metal
+may still be executing N. Examples are constants and the dynamic vertex ring around
+0x7043..0x704b. Zero-copy binding makes those writes visible to the GPU.
+- **R0 is not a safety baseline for the frame ring.** Whole-frame corruption from ring reuse can
+  happen under R0. Labels and flips (bits 59/60) gate it, not the throttle.
+- **R1 widens the guest's exposure by about one frame of CPU work** while GPU N runs: N+1's
+  post-submit work and N+2's pre-submit work (Opus-Renderer).
+
+| Guest reuse | What gates it (audit / evidence) | Without the throttle |
 | --- | --- | --- |
-| 48-byte resource-range nodes (they own GPU-read data such as index buffers) | Normal reclaimer 0x26aa860, at frame end and on allocation failure. It frees only nodes whose completion label reads 4. | **Yes**, with labels at GPU completion: 4 is written only after the GPU work before it completes. |
-| Display slot / per-frame data selected by `F % B` | Frame gate at 0x26d6e50: `flip_arg >= F + 1 - B` before SubmitAndFlip. | **Yes**, with flips at retire: flip_arg advances only once the frame's copy retired, which is after its draws (same scheduler). |
-| Submitted command memory (DCB/CCB/IBs) rewritten by the guest | C1 (no throttle) logged 5600 "guest rewrote submitted command memory before it was parsed". One buffer was resubmitted every frame with a counter in dword 373. The guest evidently reuses some command memory about one frame later, without a label. | **Yes for the parser.** It reads the snapshot taken at submit (docs/macos/command-snapshots.md), and Metal never reads guest command memory. Leftover case: a WRITE_DATA/DMA_DATA into command memory of a submission not yet parsed, already a loud stop (docs/macos/command-snapshots.md). |
-| Immediate frees without a completion test: 0x26aa2e0/0x26aa440, from context teardown 0x26aec40/0x26af3f0 | Preconditions not established (audit). | **Unknown.** These are teardown paths (loading, scene changes). If they free memory the GPU still reads, the throttle's full drain was hiding it. |
-| The command-chunk allocator 0x26d3b80 (status 0/1/2) | Not audited. | **Unknown** for the chunk contents, which the snapshot covers. The status word protocol is not covered. |
-| Anything the guest does on wall time or call order alone (e.g. the movie step's 20 ms) | None. | The throttle never protected these. The title-idle A/B/C runs collided with any throttle placement. |
+| 48-byte resource-range nodes (they own GPU-read data such as index buffers) | Normal reclaimer 0x26aa860, at frame end and on allocation failure. It frees only nodes whose completion label reads 4. For an external label (node[0] = pointer \| 1), that label's producer must also be GPU-complete. | Gated, **for the audited path**, by labels at GPU completion. External-label producers are not yet audited. |
+| Display slot and per-frame data selected by `F % B` | Frame gate at 0x26d6e50: `flip_arg >= F + 1 - B` before SubmitAndFlip. | Bounds the **audited frame-end path** with flips at retire. It does not prove every payload write or allocation happens after the gate, and it does not bound compute (ASC) or non-flip submissions. |
+| Submitted command memory (DCB/CCB/IBs) rewritten by the guest | C1 (no throttle) logged 5600 "guest rewrote submitted command memory before it was parsed": one per-frame buffer with a counter in dword 373. | The parser reads the snapshot taken at submit (docs/macos/command-snapshots.md), and Metal never reads guest command memory. A WRITE_DATA/DMA_DATA into command memory not yet parsed is a loud stop. |
+| Immediate range coalescers 0x26aa2e0/0x26aa440 (instruction-identical), from context teardown 0x26aec40/0x26af3f0; direct CPU-zero helper 0x26d3d30 from 0x26af3f0 and 0x26b131a/0x26b1399 | Astra-2: their local wait is allocator mutual exclusion, not a GPU completion test. Callers' preconditions are being traced. | **Unknown.** Teardown paths (loading, scene changes). If they free or zero memory the GPU still reads, the throttle was hiding it. |
+| Command-chunk allocator 0x26d3b80 | Claim 0x207ebc0 is a `lock cmpxchg` 0 to 1; a normal release sets qword2, then emits the qword0 completion (Astra-2, in progress). | **Unknown** until the release-to-reuse condition is known. The chunk contents are covered by the snapshots. |
+| Anything done on wall time or call order alone (e.g. the movie step's 20 ms) | None. | The throttle never protected these (title-idle arms A/B/C). |
 
 Host-side reasons, not guest semantics:
-- **Bounded run-ahead.** Snapshot memory, the draw-prep queue, recorder chunks, staging and
+- **Bounded run-ahead.** Snapshot bytes, the draw-prep queue, recorder chunks, staging and
   input latency all grow with frames in flight.
-- **The GpuIdle interrupt.** The guest never observes it directly; only `ResetSubmissionLock`
-  uses it.
 
-**So the throttle still protects the two unknown rows, and our host resources. Everything we
-know the guest gates by labels or flips is protected by those once they are exact (bits 59/60).**
+## 3. Steps
 
-## 3. The rule
+### R0: the wait split (diagnostic, no behaviour change)
 
-The guest's own frame gate already bounds how far it runs ahead: at most B frames past the last
-retired flip. That is the PS4 mechanism. So the smallest change is to stop the throttle from
-also waiting for GPU completion, and to keep a host bound.
+R0 keeps the throttle as it is and splits each GpuIdle into:
+- the parse;
+- the stage-B drain;
+- the recorder-side deferred writes (host copies, RecorderFences);
+- the completion labels.
 
-**Rule R1: release at "recorded", not "completed".** GpuIdle, and with it the lock, is raised
-once:
+It also records whether the last GPU submission before GpuIdle came after the last completion
+label (a tail that is not waited for), and by how many ticks.
+- **Output:** one stdout line every 600 frames.
+- **First run:** at the clinic, once coreaudiod is healthy (this is a perf measurement).
+
+### R1: release at "recorded" (opt-in, UNSAFE experiment)
+
+**Admission.** Frame N's GpuIdle is raised under `submit_mutex` with no submission queued (the
+existing race protection), once:
 1. every queued submission is parsed;
 2. stage B has drained;
-3. every **recorder-side** deferred write has landed (host copies and RecorderFences).
+3. every recorder-side write issued so far has completed;
+4. every completion label issued so far has been **issued and flushed** to Metal. It is not
+   necessarily written. At GpuIdle we assert that no stage-B batched label is left unflushed
+   (`labels_unflushed` is false), rather than relying on the flush order. A batched label must
+   never wait for a later frame's submission that the throttle holds back.
 
-Labels issued at GPU completion are **issued** by then (sequenced, their submissions flushed to
-Metal). They are written later by the label writer, when the GPU completes them.
-- Exactness argument: a guest that reuses only on labels or flips still waits for GPU
-  completion through them. Only guest actions that relied on "the next submission returned, so
-  the GPU is done" lose protection, which is the two unknown rows.
-- What it buys: Metal executes frame N while the guest builds N+1 and we parse it.
+**Host cap (enforced, part of R1).** The submission after `SubmitDone(N)` also waits until:
+- frame N-1's completion labels are all **written** (the GPU has completed them), so at most
+  two frames are outstanding on the GPU;
+- the queued snapshot bytes are below 64 MiB. That figure is a starting point, to be set from
+  R0's numbers.
 
-**Rule R2: depth K.** The first submission after `SubmitDone(N+K-1)` waits for frame N to reach
-"recorded" (K=1 is R1). This lets our parse and record of N overlap the guest's CPU work for
-N+1..N+K-1. It needs per-frame accounting (section 6). K is bounded by B in practice: the guest
-blocks on its own flip gate first.
+The labels are written in issue order (the sequencer), so one monotonic `labels_written` counter
+compared with frame N-1's `labels_issued` at its SubmitDone is exact.
 
-**Rule R3: capacity only.** No guest-visible wait unless the host holds more than M unrecorded
-frames or more than X MB of snapshots. PS4-like (a full ring). Only after R1/R2 show no
-reuse-before-read.
+**Accounting.** Two separate monotonic pairs:
+- `recorder_issued`/`recorder_done`;
+- `labels_issued`/`labels_written`.
 
-Order: R1, then R2 with K=2, then R3. Each one is a live toggle, like bits 59/60, so one run can
-alternate. The current full drain stays available as R0.
+In-flight callbacks count as issued until they complete. Today's single
+`deferred_signals_issued/done` remains their sum.
 
-## 4. Evidence that would block a step
+**Live switching** (a new toggle bit, 56, and `BB_SUBMIT_THROTTLE=recorded|idle` for the whole
+run):
+- **Latched at a frame boundary** (`sceGnmSubmitDone`), never mid-frame.
+- **R1 to R0:** before raising the first R0 GpuIdle, wait until every completion label issued
+  so far is written. That is a completion fence through all previously admitted work.
+- **R0 to R1:** pending obligations carry over. R1 is refused (loud log, stays R0) unless labels
+  at GPU completion and flips at retire are both on at that boundary.
+- **A/B statistics** exclude the frame containing a switch and the fence or drain it causes.
 
-- **Reuse before GPU read.** Opus-Renderer's draw-data check (hash a draw's index, vertex and
-  constant data at record time and at GPU execution; log mismatches) is the direct detector for
-  the two unknown rows. **Required before R1 ships by default.** `BB_LABEL_CHECK` only catches a
-  label holder freed before its write; it cannot see payload reuse after a correct write.
-- **Teardown.** Entry probes on 0x26aa2e0/0x26aa440 (RDI allocator, RSI node) during loading
-  and area changes, correlated with GPU-read-check mismatches and with the parse/GPU ticks in
-  flight at the time. If those frees overlap GPU reads, R1 needs a teardown condition: hold the
-  throttle (R0) across context teardown, detected by its entry.
-- **Chunk status.** RE of 0x26d3b80's 0/1/2 protocol: what moves a chunk back to 0, and is it a
-  label?
-- **Detectors that must stay at zero:**
-  - CMD-INTERLEAVE outside the known movie race (the handoff covers that);
-  - parser stops;
-  - BB_LABEL_CHECK reports;
-  - draw-data check mismatches;
-  - Playtest's corruption detector;
-  - CMD-SNAPSHOT rewrites: expected, counted, and harmless by the table above, provided parse
-    correctness holds.
+**Teardown.** An R0 switch at the entry of a teardown free would be too late: the freeing thread
+may already be past the submit throttle. Real protection has to:
+- block that free before it changes any storage;
+- wait for the GPU reads issued before it;
+- come with a lock-order proof. The freeing thread may hold the guest allocator lock while
+  waiting, and GPU progress must not need that lock or a CPU write from that thread (WAIT_REG_MEM
+  on CPU-written memory).
+
+Until Astra-2's RE establishes the callers' preconditions, the teardown paths remain a stated risk
+of the R1 experiment, and R1 is not a default candidate.
+
+### R2: depth K (later)
+
+The first submission after `SubmitDone(N+K-1)` waits for frame N's admission. Tickets must
+cover:
+- **every queue SubmitDone covers** (graphics and ASC): `snapshot_submits` counts graphics only;
+- **exact stage-B and recorder prefixes** up to frame N's last submission.
+
+Changing GpuIdle from "queue empty" to per-frame completion must be shown equivalent for
+`ResetSubmissionLock` and `IsGpuIdle`, the only listener and caller today.
+
+### R3: capacity only (later)
+
+Only after R1/R2 evidence and the lifetime RE.
+
+## 4. Evidence
+
+**Zero-error list.** Each of these must stay at zero:
+- CMD-INTERLEAVE outside the known movie race (run with `BB_MOVIE_HANDOFF=1`);
+- parser stops;
+- `BB_LABEL_CHECK` reports;
+- Playtest's corruption detector.
+
+**Expected and counted, not errors:** CMD-SNAPSHOT guest rewrites. The snapshots make them
+harmless to the parse (section 2). Report their rate per half; a change between halves is
+informative.
+
+**Supporting evidence, not proof: Opus-Renderer's `BB_GPU_READ_CHECK`.**
+- **What it does:** it hashes each draw's read-only buffer ranges at record time and again after
+  the GPU has retired the work.
+  - `=1`: up to 64 KB, plus index ranges.
+  - `=2`: up to 1 MB, including vertex buffers. Use `=2` on the gate runs.
+- **What it misses:**
+  - written ranges, and ranges marked GPU-modified at record;
+  - buffers over 1 MB, for example whole vertex pools of about 3.8 MB;
+  - pointer and BDA reads;
+  - textures. Those are safe by construction: the texture cache copies them at record.
+- **Why it can be wrong either way:** a safe reuse after retirement can mismatch, and a
+  mutate-then-restore can match.
+- **How to use it:** compare its counts, together with its coverage and drop counters, between
+  R0 and R1 halves at the same pose. An R1 increase is the signal.
+- **What it cannot do:** zero reports cannot discharge the teardown or chunk-status rows.
+
+**Default-on requires** the lifetime preconditions of section 2 to be established, or an
+enforceable protection to be retained for each unknown row.
+
+**Teardown probes.** Run entry probes on 0x26aa2e0/0x26aa440/0x26d3d30 during loading and area
+changes, in the same run as `BB_GPU_READ_CHECK=2`. That run correlates the probes with read-check
+changes on that context's ranges, and with the GPU ticks in flight at the time.
 
 ## 5. Measurement
 
-**Arms**, alternated live every 60 s (6+6 periods per pair), with bits 59 and 60 on throughout:
+**Arms**, alternated live every 60 s (6+6 periods), with bits 59 and 60 on throughout:
 - R0 vs R1, at the clinic idle pose and on a short walking route;
-- then R1 vs R2 (K=2);
 - title idle with `BB_MOVIE_HANDOFF=1`, so the movie race doesn't confound.
 
 **Per half:**
-- FPS and frame-time p50/p95/p99 (`BB_FPS` and present timestamps);
-- the throttle wait: Submit pacing, i.e. the in-submission and submitDone waits, count and ms;
+- FPS and frame-time p50/p95/p99;
+- the throttle wait: Submit pacing, i.e. the in-submission and submitDone waits;
+- R0's split, and the tail-after-last-label count and ticks;
 - parse lag: queued ahead at submit, mean and max;
-- **GPU busy %**: the sum of per-submission GPU time (MoltenVK per-submission timestamps only;
-  in-buffer timestamps misattribute on M4) over wall time;
+- **GPU busy %**: the sum of per-submission GPU time over wall time. MoltenVK per-submission
+  timestamps only; in-buffer timestamps misattribute on M4;
+- **submissions per frame**. Label batching and R1 change it, and each submission carries a
+  fixed GPU overhead;
 - frames in flight: the guest's F minus the retired flip_arg, sampled at each SubmitAndFlip;
-- every detector in section 4.
+- R1's host-cap waits (count and ms) and the queued snapshot bytes;
+- every section 4 counter.
 
-**Before R1, one run with R0** splits today's 70-96% into parse+record and GPU tail. Instrument
-the idle path with how long `WaitDeferredSignals` waits for completion labels after the drain.
-That bounds R1's gain: at most the GPU tail per frame, while the guest is still serialized
-behind our parse and record. R2's further gain is bounded by the guest's CPU time per frame.
+**Success for R1 as an experiment:**
+- higher FPS and GPU busy %;
+- the zero-error list at zero;
+- no read-check increase over R0 at the same pose;
+- over at least 20 min of clinic plus route, with Playtest's eye check per half.
 
-**Success for a step:** higher FPS and GPU busy %, with every section 4 detector at zero, over
-at least 20 min of clinic plus route, with Playtest's eye check per half.
-
-## 6. Implementation sketch (after review)
-
-- **R1:**
-  - Split `WaitDeferredSignals` into the recorder-side signals (host copies, RecorderFences)
-    and the completion labels, whose count the label writer already keeps.
-  - The idle path waits for the first, and for the second only under R0. The completion
-    labels' submissions must be flushed (`FlushLabels(true)`) before GpuIdle, so none waits
-    for a later frame's submission.
-  - At shutdown, drop and report unwritten labels as now.
-  - Toggle: bit 56 is free on macos (SubmitDoneWaitsIdle was withdrawn), with
-    `BB_SUBMIT_THROTTLE=recorded|idle` for the whole run.
-- **R2 (per frame):** at `SubmitDone(N)` record frame N's last graphics submission number
-  (`snapshot_submits`) and the recorder-side signals issued. Frame N is recorded once the
-  parser has completed that submission, stage B has passed it, and those signals are done.
-  `WaitGpuIdleToSubmit` then waits for frame `current - K + 1`'s ticket instead of the global
-  lock. This means GpuIdle per frame rather than "queue empty", raised from the parser as each
-  frame's last submission retires.
-- **Unchanged:** snapshots at submit, label order (sequencer), flip order (publisher),
-  `CheckCommandMemoryWrite`.
+Default-on additionally needs section 4's lifetime condition.
