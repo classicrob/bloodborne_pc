@@ -13,6 +13,8 @@ Pools of slots, each slot an flock on a file in BB_HEAVY_DIR (default ~/bbport-d
             4 jobs (BB_BUILD_JOBS, MAKEFLAGS, CMAKE_BUILD_PARALLEL_LEVEL), warned on stderr after
             BB_HEAVY_QUICK_WARN (300) s, and killed with its whole process group, reported, and
             exit 124 after BB_HEAVY_QUICK_LIMIT (600) s: a long job belongs in the build pool.
+Each slot acquisition (pool, slot, wait, load average, slots held) is appended to
+BB_HEAVY_DIR/history.jsonl; quick jobs also record their duration and exit status.
 A job takes a slot of its pool, then execs COMMAND with the locked descriptor inherited: the slot
 stays held by the job and every process it starts, and the kernel releases it when the last of
 them exits or is killed. There is no lease to expire and nothing to clean up. A command started
@@ -75,6 +77,32 @@ def holder(name):
         return {}
 
 
+def record(event):
+    """One line in BB_HEAVY_DIR/history.jsonl (append; one write per line). Losing a history line
+    must never stop a job, but a failure is reported."""
+    event = {'time': datetime.datetime.now().isoformat(timespec='seconds'), **event}
+    try:
+        fd = os.open(os.path.join(lock_dir(), 'history.jsonl'), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+        try:
+            os.write(fd, (json.dumps(event) + '\n').encode())
+        finally:
+            os.close(fd)
+    except OSError as error:
+        print(f'heavy: history.jsonl not written: {error}', file=sys.stderr)
+
+
+def busy_slots():
+    """Slot names currently held (a non-blocking probe of each lock)."""
+    held = []
+    for name in ['build-priority'] + slot_names('build') + slot_names('quick') + slot_names('playtest'):
+        fd = try_lock(name)
+        if fd is None:
+            held.append(name)
+        else:
+            os.close(fd)
+    return held
+
+
 def describe(info):
     return f"{info.get('label', '?')} (pid {info.get('pid', '?')}, since {info.get('since', '?')})"
 
@@ -106,6 +134,9 @@ def run(pool, priority, label, command):
             os.pwrite(fd, json.dumps(info).encode(), 0)
             os.fsync(fd)
             waited = time.monotonic() - started
+            record({'event': 'start', 'label': label, 'pool': pool, 'slot': name, 'priority': priority,
+                    'waited_s': round(waited, 1), 'load': [round(x, 2) for x in os.getloadavg()],
+                    'held': busy_slots(), 'pid': os.getpid()})
             if waited >= 1:
                 print(f'heavy: {label}: got {name} after {waited:.0f} s', file=sys.stderr, flush=True)
             os.set_inheritable(fd, True)
@@ -144,10 +175,14 @@ def supervise_quick(label, command):
     forward = lambda signum, _: os.killpg(child.pid, signum)
     for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
         signal.signal(signum, forward)
+    def finish(status):
+        record({'event': 'end', 'label': label, 'pool': 'quick', 'status': status,
+                'seconds': round(time.monotonic() - started, 1), 'load': [round(x, 2) for x in os.getloadavg()]})
+        sys.exit(status)
     while True:
         try:
             status = child.wait(timeout=1)
-            sys.exit(status if status >= 0 else 128 - status)
+            finish(status if status >= 0 else 128 - status)
         except subprocess.TimeoutExpired:
             pass
         elapsed = time.monotonic() - started
@@ -164,7 +199,7 @@ def supervise_quick(label, command):
             except subprocess.TimeoutExpired:
                 os.killpg(child.pid, signal.SIGKILL)
                 child.wait()
-            sys.exit(124)
+            finish(124)
 
 
 def main(argv):

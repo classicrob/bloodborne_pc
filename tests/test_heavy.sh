@@ -91,4 +91,14 @@ if "$heavy" G true 2>/dev/null; then fail "missing -- accepted"; fi
 if BB_HEAVY_BUILD_SLOTS=0 "$heavy" H -- true 2>/dev/null; then fail "zero slots accepted"; fi
 if "$heavy" --pool playtest --priority I -- true 2>/dev/null; then fail "priority accepted for the playtest pool"; fi
 if "$heavy" --pool other J -- true 2>/dev/null; then fail "unknown pool accepted"; fi
-echo "heavy.sh: build/playtest/quick pools, quick hints and time limit, waiting, priority slot, release on SIGKILL, nesting, exit status, usage errors PASS"
+# Every acquisition is in the history; quick jobs also record their end.
+python3 - "$dir/history.jsonl" <<'PY' || fail "history.jsonl"
+import json, sys
+lines = [json.loads(l) for l in open(sys.argv[1])]
+starts = [l for l in lines if l['event'] == 'start']
+ends = [l for l in lines if l['event'] == 'end']
+assert any(l['label'] == 'B' and l['waited_s'] >= 1 for l in starts), 'B waited'
+assert all({'pool', 'slot', 'waited_s', 'load', 'held'} <= set(l) for l in starts)
+assert any(l['label'] == 'Q4' and l['status'] == 124 for l in ends), 'Q4 killed'
+PY
+echo "heavy.sh: history log, build/playtest/quick pools, quick hints and time limit, waiting, priority slot, release on SIGKILL, nesting, exit status, usage errors PASS"

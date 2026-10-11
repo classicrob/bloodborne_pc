@@ -30,6 +30,9 @@ their FPS numbers mean nothing.
 - The slot's locked descriptor is inherited by the command and everything it starts, and the
   kernel releases it when the last of them exits or is killed. There are no leases or stale locks.
 - Inside a slot (`BB_HEAVY_HELD` is set), nested calls run directly.
+- Every slot acquisition is appended to `~/bbport-deps/locks/history.jsonl`: label, pool,
+  slot, seconds waited, load average, and which slots were held. Quick jobs also record their
+  duration and exit status. This is the data for sizing the pools.
 
 Automatic: on macOS `build.sh` (the GPU build and `--test`) takes a build slot, a priority one
 with `BB_HEAVY_PRIORITY=1`. `play_route.py` runs each game in a playtest slot, and time spent
