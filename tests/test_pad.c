@@ -36,6 +36,7 @@ int main(void) {
     assert(fd>=0);
     close(fd);
     setenv("BB_PAD_FILE",path,1);
+    unsetenv("BB_PAD_MOTION");
     setenv("SDL_VIDEODRIVER","dummy",1);
     /* Only the virtual test controller is a gamepad, whatever is plugged in. */
     SDL_SetHint(SDL_HINT_GAMECONTROLLER_IGNORE_DEVICES_EXCEPT,"0x1d50/0x6189");
@@ -81,6 +82,10 @@ int main(void) {
     assert(data.touches[0].x==1439 && data.touches[0].y==471 && data.touches[0].id==0);
     assert(data.touches[1].x==480 && data.touches[1].y==942 && data.touches[1].id==1);
 #ifdef __APPLE__
+    assert(!motion_watching && data.angular_velocity[0]==0 && data.orientation[3]==1);
+    SDL_CloseGamepad(gamepad); gamepad=NULL;
+    setenv("BB_PAD_MOTION","diagnostic",1);
+    assert(!pad_read_state(1,&data));
     assert(SDL_GamepadSensorEnabled(gamepad,SDL_SENSOR_ACCEL));
     assert(SDL_GamepadSensorEnabled(gamepad,SDL_SENSOR_GYRO));
     float accel[3]={SDL_STANDARD_GRAVITY,2*SDL_STANDARD_GRAVITY,-SDL_STANDARD_GRAVITY};
@@ -105,9 +110,19 @@ int main(void) {
     assert(!pad_read_state(1,&data) && data.angular_velocity[0]==0);
     assert(!pad_reset_orientation(1)); assert(!pad_read_state(1,&data));
     assert(data.orientation[0]==0 && data.orientation[1]==0 && data.orientation[2]==0 && data.orientation[3]==1);
+    event.gsensor.timestamp=SDL_GetTicksNS();
+    motion_event(NULL,&event);
+    assert(!pad_read_state(1,&data) && data.angular_velocity[0]==0 && data.orientation[3]==1);
     assert(!pad_motion_enable(1,0)); assert(!pad_read_state(1,&data));
     assert(data.acceleration[0]==0 && data.angular_velocity[2]==0);
     assert(!pad_motion_enable(1,1));
+    event.gsensor.timestamp=SDL_GetTicksNS();
+    motion_event(NULL,&event);
+    assert(!pad_read_state(1,&data) && data.angular_velocity[0]==0 && data.orientation[3]==1);
+    event.gsensor.sensor_timestamp=1500000001;
+    event.gsensor.timestamp=motion.epoch_time-1;
+    motion_event(NULL,&event);
+    assert(!pad_read_state(1,&data) && data.angular_velocity[0]==0);
     assert(SDL_SendJoystickVirtualSensorData(joystick,SDL_SENSOR_ACCEL,2000000001,accel,3));
     SDL_UpdateJoysticks(); SDL_UpdateGamepads();
     SDL_Delay(260);

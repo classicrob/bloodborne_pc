@@ -73,11 +73,21 @@ velocity (+0x28/+0x2c/+0x30); 0x2690751 copies its quaternion (+0x0c). Accelerat
 is clamped at +/-3; angular velocity at approximately +/-6.5345. A second
 ReadState call is at 0x2691948. Only offsets/findings are retained here, no game bytes.
 
-Apple motion uses SDL sensor events with separate monotonic arrival and device
+Motion is a diagnostic implementation, OFF by default. Set
+`BB_PAD_MOTION=diagnostic` only for sensor qualification. Production motion
+replacement awaits the orchestrator's policy decision and physical qualification;
+the save/audio/controller-error units are independently mergeable.
+
+Apple diagnostic motion uses SDL sensor events with separate monotonic arrival and device
 sample timestamps. Acceleration is converted from m/s² to g; angular velocity
 remains rad/s, with SDL's controller axes unchanged. Enabled gyro samples update
 a normalized quaternion by constant-rate rotation over each sample interval.
-Reset reanchors identity; disable suppresses samples; repeated/backwards gyro
+Reset reanchors identity without discarding sensor timestamp watermarks; disable
+suppresses samples, and re-enable establishes a new SDL arrival epoch. Events
+with pre-epoch arrival timestamps or old accepted sensor timestamps are rejected.
+SDL does not expose a synchronous hardware clock fence: a never-before-observed
+old sample with both a new arrival timestamp and a newer device timestamp cannot
+be identified as pre-reset from these fields alone. Repeated/backwards gyro
 timestamps do not integrate twice. Intervals exceeding 250 ms are not integrated;
 aged vectors are suppressed with a named diagnostic. Sensor-less devices retain
 button support and report their absent sensor capabilities.

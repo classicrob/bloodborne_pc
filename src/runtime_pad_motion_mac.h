@@ -4,15 +4,17 @@ static pthread_mutex_t motion_lock=PTHREAD_MUTEX_INITIALIZER;
 static struct {
     SDL_JoystickID device;
     int enabled, accel, gyro, seen[2], warned;
-    uint64_t received[2], gyro_time;
+    uint64_t received[2], sensor_watermark[2], gyro_time, enabled_time, epoch_time;
     float acceleration[3], velocity[3], orientation[4];
 } motion;
 static int motion_watching;
 
-static void motion_reset_locked(void) {
+static void motion_reset_locked(uint64_t now) {
     memset(motion.orientation,0,sizeof(motion.orientation));
     motion.orientation[3]=1;
     motion.gyro_time=0;
+    motion.epoch_time=now;
+    motion.seen[0]=motion.seen[1]=0;
 }
 static bool SDLCALL motion_event(void *unused,SDL_Event *event) {
     (void)unused;
@@ -22,10 +24,11 @@ static bool SDLCALL motion_event(void *unused,SDL_Event *event) {
     pthread_mutex_lock(&motion_lock);
     if (!motion.enabled || s->which!=motion.device) goto done;
     int gyro=s->sensor==SDL_SENSOR_GYRO;
-    if (motion.seen[gyro] && s->timestamp<motion.received[gyro]) goto done;
-    if (gyro && motion.gyro_time && s->sensor_timestamp<=motion.gyro_time) goto done;
+    if (s->timestamp<motion.epoch_time || s->timestamp<motion.received[gyro]) goto done;
+    if (motion.sensor_watermark[gyro] && s->sensor_timestamp<=motion.sensor_watermark[gyro]) goto done;
     for (int i=0;i<3;++i) if (!isfinite(s->data[i])) goto done;
     motion.seen[gyro]=1; motion.received[gyro]=s->timestamp;
+    motion.sensor_watermark[gyro]=s->sensor_timestamp;
     if (!gyro) {
         for (int i=0;i<3;++i) motion.acceleration[i]=s->data[i]/SDL_STANDARD_GRAVITY;
     } else {
@@ -60,14 +63,15 @@ static void motion_connect(SDL_Gamepad *g) {
         if (!SDL_AddEventWatch(motion_event,NULL)) { pad_failure("SDL motion event watch"); return; }
         motion_watching=1;
     }
+    uint64_t enabled_time=SDL_GetTicksNS();
     SDL_JoystickID device=SDL_GetGamepadID(g);
     int accel=SDL_GamepadHasSensor(g,SDL_SENSOR_ACCEL);
     int gyro=SDL_GamepadHasSensor(g,SDL_SENSOR_GYRO);
     pthread_mutex_lock(&motion_lock);
     memset(&motion,0,sizeof(motion));
-    motion.device=device; motion.enabled=1;
+    motion.device=device; motion.enabled=1; motion.enabled_time=enabled_time;
     motion.accel=accel; motion.gyro=gyro;
-    motion_reset_locked();
+    motion_reset_locked(enabled_time);
     pthread_mutex_unlock(&motion_lock);
     if (accel && !SDL_SetGamepadSensorEnabled(g,SDL_SENSOR_ACCEL,true)) pad_failure("SDL accelerometer enable");
     if (gyro && !SDL_SetGamepadSensorEnabled(g,SDL_SENSOR_GYRO,true)) pad_failure("SDL gyroscope enable");
@@ -81,9 +85,10 @@ static void motion_sample(PadData *d) {
             int fresh=motion.seen[i] && now>=motion.received[i] && now-motion.received[i]<=250000000;
             if (fresh) memcpy(i ? d->angular_velocity : d->acceleration,
                               i ? motion.velocity : motion.acceleration,3*sizeof(float));
-            else if (motion.seen[i] && !motion.warned) {
+            else if ((i ? motion.gyro : motion.accel) && now>=motion.enabled_time &&
+                     now-motion.enabled_time>250000000 && !motion.warned) {
                 motion.warned=1;
-                fprintf(stderr,"CONTROLLER MOTION FAILURE: sensor sample older than 250 ms; stale vector suppressed, orientation held\n");
+                fprintf(stderr,"CONTROLLER MOTION FAILURE: sensor sample missing or older than 250 ms; stale vector suppressed, orientation held\n");
             }
         }
         memcpy(d->orientation,motion.orientation,sizeof(motion.orientation));
@@ -92,15 +97,18 @@ static void motion_sample(PadData *d) {
 }
 static ABI int32_t pad_reset_orientation(int32_t handle) {
     if (handle!=PAD_HANDLE || !opened) return ERR_INVALID_HANDLE;
-    pthread_mutex_lock(&motion_lock); motion_reset_locked(); pthread_mutex_unlock(&motion_lock);
+    uint64_t now=SDL_GetTicksNS();
+    pthread_mutex_lock(&motion_lock); motion_reset_locked(now); pthread_mutex_unlock(&motion_lock);
     return 0;
 }
 static ABI int32_t pad_motion_enable(int32_t handle,uint8_t enabled) {
     if (handle!=PAD_HANDLE || !opened) return ERR_INVALID_HANDLE;
     pthread_mutex_lock(&lock);
     SDL_Gamepad *g=current_gamepad();
+    uint64_t enabled_time=SDL_GetTicksNS();
     pthread_mutex_lock(&motion_lock);
     motion.enabled=enabled!=0; motion.seen[0]=motion.seen[1]=0; motion.gyro_time=0;
+    motion.enabled_time=enabled_time; motion.epoch_time=enabled_time; motion.warned=0;
     int accel=motion.accel,gyro=motion.gyro;
     pthread_mutex_unlock(&motion_lock);
     if (g && accel && !SDL_SetGamepadSensorEnabled(g,SDL_SENSOR_ACCEL,enabled!=0)) pad_failure("SDL accelerometer state");
