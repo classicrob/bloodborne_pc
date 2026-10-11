@@ -18,6 +18,9 @@
 #include <pthread.h>
 #endif
 #include <vector>
+#if defined(__APPLE__) && defined(__x86_64__)
+#include <x86intrin.h>
+#endif
 #include "bbport_toggles.h"
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -149,7 +152,10 @@ std::string BuilderTrace::ThreadName(u32 thread) {
 void BuilderTrace::Note(const char* builder, const u32* cmdbuf, u32 size,
                         [[maybe_unused]] uintptr_t frame) {
     const u32 thread = ThreadNumber();
-    Call call{builder, cmdbuf, size, thread, 0, 0, {}};
+    Call call{builder, cmdbuf, size, thread, 0, 0, 0, {}};
+#if defined(__APPLE__) && defined(__x86_64__)
+    call.tsc = __rdtsc();
+#endif
 #ifdef __APPLE__
     if (frame) {
         // Frames off the pthread stack (main thread, HLE workers) take a system call each: only
@@ -281,9 +287,10 @@ void BuilderTrace::Report(const u32* at) {
 #endif
         }
         LOG_CRITICAL(Render,
-                     "  #{} thread {} \"{}\" {} cmdbuf {} ({:+} dwords from the packet) size {}, "
+                     "  #{}{} thread {} \"{}\" {} cmdbuf {} ({:+} dwords from the packet) size {}, "
                      "called from{}",
-                     call.seq, call.thread, names[index], call.builder,
+                     call.seq, call.tsc ? fmt::format(" tsc={:#018x}", call.tsc) : "", call.thread,
+                     names[index], call.builder,
                      fmt::ptr(call.cmdbuf),
                      (std::bit_cast<intptr_t>(call.cmdbuf) - std::bit_cast<intptr_t>(at)) /
                          intptr_t{sizeof(u32)},

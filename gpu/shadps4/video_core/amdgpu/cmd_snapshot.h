@@ -100,6 +100,7 @@ public:
         u32 size;   ///< dwords the guest reserved
         u32 thread; ///< small per-thread number, in order of first call
         u64 seq;
+        u64 tsc; ///< x86 time stamp counter at the call (the HLE trace's clock); 0 elsewhere
         u32 depth;              ///< return addresses in `chain`
         uintptr_t chain[10];    ///< callers (guest, then host HLE), innermost first
     };

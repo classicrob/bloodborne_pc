@@ -261,6 +261,11 @@ int main() {
         Expect("trace: latest calls kept in order, threads told apart",
                latest.size() == 2 && latest[0].cmdbuf == stream + 10 &&
                    latest[1].cmdbuf == stream + 140 && latest[0].thread != latest[1].thread);
+#if defined(__APPLE__) && defined(__x86_64__)
+        // Stamped with the HLE trace's clock (rdtsc), so the two logs can be merged.
+        Expect("trace: calls carry the time stamp counter, in call order",
+               latest[0].tsc != 0 && latest[0].tsc <= latest[1].tsc);
+#endif
         BuilderTrace::Report(stream + 106);
 
         // Each call carries the guest call chain and its thread's name.
