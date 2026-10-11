@@ -35,15 +35,22 @@ A shared VkPipelineCache does not serialize creation. 16 threads were not faster
 
 ## Use
 
-- Startup preload (`PipelineCache::WarmUp`): serial. Creating the preloaded pipelines on 8 threads
-  (5f858bd, reverted) made a warm start fail on ca56783: MoltenVK refused to link a pipeline whose
-  fragment shader reads locations 0-4 ("Fragment input(s) user(locn0-4) mismatching vertex shader
-  output type(s) or not written by vertex shader"). The shaders MoltenVK named belong to different
-  cache records: fragment shader a89e01e9 permutation 1 (record g_0x7af64b7767ecc424, an ordinary
-  VS/FS pipeline) and vertex shader 89cda9e4 permutation 2 (record g_0x9733905e9ce37805, a QuadList
-  pipeline with auxiliary tessellation stages). Every stored record is consistent on its own
-  (interface locations and types checked offline). The failure is deterministic with a 13-record
-  subset that mixes QuadList and ordinary records, and needs several of them together. Concurrent
-  creation is the trigger; the mechanism (inside MoltenVK or ours) is being isolated with a harness.
-- Runtime creation on workers (Opus-Renderer branch bb/opus-renderer-async-pipelines, 6caadad) is
-  held for the same reason.
+- Startup preload (`PipelineCache::WarmUp`): store reads and shader modules on the GPU command
+  thread, pipeline creation on up to 8 threads (Apple; one elsewhere).
+- Runtime (Apple): translation stays on the GPU command thread (it needs the shader info). A new
+  graphics pipeline is handed out with its stages, key and fetch shader set, and built on one of
+  up to 8 workers (`PipelineBuildQueue`). Everything the build creates (layouts, the VkPipeline) is
+  read through accessors that wait for it (`Pipeline::WaitBuilt`), so the draw recording thread
+  waits when it records the draw, while the GPU command thread parses on and later new pipelines
+  build in parallel. No draw is skipped or drawn with another pipeline. The pipeline record for the
+  next session is saved by the worker after the build; `PipelineCache::Sync` waits for running
+  builds before closing the store. Frame stats: "waited for pipelines being built" on the
+  "Compiles:" line. Compute pipelines are still built when selected.
+
+The earlier warm-start failure blamed on the parallel preload (5f858bd, reverted on ca56783:
+MoltenVK refused a fragment shader reading locations its vertex stage "does not write") was not
+caused by concurrency: a serial preload on 8867c45 failed the same way. Preloaded pipelines were
+built without their stages' runtime info and without the stages' persisted loads/stores, a record
+that failed part-way left its stages in the selection for the next record, and pipeline layouts
+took image binding counts from the live user data. The warm-start stack (macos 5871a8d) fixed all
+four; the parallel preload and the runtime workers were re-applied on top of it.

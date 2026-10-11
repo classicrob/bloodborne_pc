@@ -463,6 +463,10 @@ void PipelineCache::WarmUp() {
 }
 
 void PipelineCache::Sync() {
+    // Builds still running record their pipelines (RegisterPipelineData) when they finish.
+    if (build_queue) {
+        build_queue->WaitIdle();
+    }
     Storage::DataBase::Instance().Close();
 }
 

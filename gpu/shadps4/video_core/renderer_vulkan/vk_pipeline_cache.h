@@ -15,6 +15,7 @@
 #include "shader_recompiler/specialization.h"
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
+#include "video_core/renderer_vulkan/vk_pipeline_build_queue.h"
 #include "video_core/renderer_vulkan/vk_resource_pool.h"
 
 template <>
@@ -244,6 +245,9 @@ private:
     tsl::robin_map<vk::ShaderModule,
                    std::vector<std::variant<GraphicsPipelineKey, ComputePipelineKey>>>
         module_related_pipelines;
+    /// bbport (Apple): builds new graphics pipelines after they are handed out. Last member:
+    /// destroyed (its builds finished) before the pipelines and modules it uses.
+    std::unique_ptr<PipelineBuildQueue> build_queue;
 };
 
 } // namespace Vulkan

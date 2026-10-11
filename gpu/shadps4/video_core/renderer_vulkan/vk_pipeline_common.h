@@ -3,6 +3,9 @@
 
 #pragma once
 
+#include <atomic>
+#include <condition_variable>
+#include <mutex>
 #include "shader_recompiler/profile.h"
 #include "shader_recompiler/runtime_info.h"
 #include "video_core/renderer_vulkan/vk_common.h"
@@ -33,11 +36,25 @@ public:
     virtual ~Pipeline();
 
     vk::Pipeline Handle() const noexcept {
+        WaitBuilt();
         return *pipeline;
     }
 
     vk::PipelineLayout GetLayout() const noexcept {
+        WaitBuilt();
         return *pipeline_layout;
+    }
+
+    /// bbport: a pipeline can be built on a worker thread after it is handed out (PipelineCache
+    /// on Apple). Its stages, key and fetch shader are set at once; everything the build creates
+    /// (layouts, the VkPipeline) is read through accessors that wait for it here.
+    void WaitBuilt() const noexcept {
+        if (!built.load(std::memory_order_acquire)) [[unlikely]] {
+            WaitBuiltSlow();
+        }
+    }
+    bool IsBuilt() const noexcept {
+        return built.load(std::memory_order_acquire);
     }
 
     auto GetStages() const {
@@ -62,6 +79,8 @@ public:
 
 protected:
     [[nodiscard]] std::string GetDebugString() const;
+    void SetBuilt();
+    void WaitBuiltSlow() const noexcept;
 
     const Instance& instance;
     Scheduler& scheduler;
@@ -73,6 +92,12 @@ protected:
     std::array<const Shader::Info*, Shader::MaxStageTypes> stages{};
     bool uses_push_descriptors{};
     bool is_compute;
+    std::atomic<bool> built{true};
+    mutable std::mutex build_mutex;
+    mutable std::condition_variable build_cv;
 };
+
+/// bbport: time threads spent waiting for pipelines built on workers (BB_FRAME_STATS).
+extern std::atomic<u64> g_bb_pipeline_wait_ns;
 
 } // namespace Vulkan

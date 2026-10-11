@@ -36,6 +36,7 @@ extern std::atomic<u64> g_bb_compile_ns;
 extern std::atomic<u32> g_bb_compiles;
 extern std::atomic<u64> g_bb_translate_ns;
 extern std::atomic<u32> g_bb_translations;
+extern std::atomic<u64> g_bb_pipeline_wait_ns;
 } // namespace Vulkan
 
 namespace Libraries::VideoOut {
@@ -484,11 +485,13 @@ void VideoOutDriver::Flip(const Request& req) {
                         wait_delta(BbStats::tick_wait_ns, 6) / (window * 1e7),
                         frames ? double(BbStats::reduced_draws.exchange(0)) / frames : 0.0,
                         frames ? double(BbStats::scene_draws.exchange(0)) / frames : 0.0);
-            if (compiles) {
+            const u64 pipeline_wait_ns = Vulkan::g_bb_pipeline_wait_ns.exchange(0);
+            if (compiles || pipeline_wait_ns) {
                 std::printf("Compiles: %u shader translations %.1f ms, %u pipeline creations %.1f ms "
-                            "(slow ones: \"Slow compile\" lines)\n",
+                            "(slow ones: \"Slow compile\" lines); waited for pipelines being "
+                            "built %.1f ms\n",
                             translations, translate_ns / 1e6, compiles - translations,
-                            (compile_ns - translate_ns) / 1e6);
+                            (compile_ns - translate_ns) / 1e6, pipeline_wait_ns / 1e6);
             }
             // Frame pacing: spread of the guest flip intervals (judder that the mean hides).
             if (intervals.size() > 2) {
