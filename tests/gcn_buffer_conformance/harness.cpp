@@ -90,7 +90,8 @@ enum class SoffSrc { Inline, Sgpr };
 enum class SmemSrc { None, Imm, Sgpr };
 // Wave64 lane-semantics programs (no buffer access under test).
 enum class Wave { None, Lane, MbcntMask, Readlane, Exec1, Exec2, LoopReadFirstLane, Lds, CtrlPhi, CtrlBreak, Pkrtz, Pkrtz3, SmemFallback, Exec3, Exec3Out, WriteLane,
-                  RlBeforeDiv, RlCselect, RlBareFf1, RlEmptyExec };
+                  RlBeforeDiv, RlCselect, RlBareFf1, RlEmptyExec,
+                  DivRank, DivLoop, DivVopc, DivInnerExec, DivExit };
 
 struct Template {
     std::string name;
@@ -391,6 +392,59 @@ void AssembleWave(GcnAsm::Code& c, Wave w) {
         c.VReadfirstlane(21, 3); // after it: exec may be empty, and lane 0 may be outside the scope
         c.SMovB64(EXEC_LO, 24);
         c.VMov(10, 21);
+        c.words[br] |= u32(int32_t(c.words.size()) - int32_t(br + 1)) & 0xFFFF;
+        c.SMovB64(EXEC_LO, 22);
+        break;
+    }
+    // Ballots of exec inside an s_cbranch_execz scope of a multi-wave workgroup (workgroup-divergent
+    // flow): DivRank is exact by taking the ballot where the scope's condition is computed; the
+    // others must stay loud (a loop inside the scope, a ballot of a compare made inside the scope,
+    // an inner exec change, an s_endpgm path inside the scope).
+    case Wave::DivRank:
+    case Wave::DivLoop:
+    case Wave::DivVopc:
+    case Wave::DivInnerExec:
+    case Wave::DivExit: {
+        c.VMov(9, Inline(0));
+        c.VCmpNeU32(Inline(0), 2);
+        c.SAndSaveexecB64(22, VCC_LO);
+        const size_t br = c.words.size();
+        c.Sopp(8, 0); // s_cbranch_execz END
+        if (w == Wave::DivRank) { // rank among the scope's lanes, and their count
+            c.VMbcnt(false, 10, EXEC_LO, 9);
+            c.VMbcnt(true, 10, EXEC_LO + 1, 10);
+            c.SBcnt1B64(24, EXEC_LO);
+            c.VMov(11, 24);
+        } else if (w == Wave::DivLoop) {
+            c.Sop1(3, 20, Inline(0));
+            const size_t loop = c.words.size();
+            c.SBcnt1B64(24, EXEC_LO);
+            c.VMov(11, 24);
+            c.SAddU32(20, 20, Inline(1));
+            c.SCmpLtU32Literal(20, 2);
+            c.SCbranchScc1To(loop);
+        } else if (w == Wave::DivVopc) {
+            c.VCmpNeU32(Inline(0), 5);
+            c.SBcnt1B64(24, VCC_LO);
+            c.VMov(11, 24);
+        } else if (w == Wave::DivInnerExec) {
+            c.VCmpNeU32(Inline(0), 5);
+            c.SAndSaveexecB64(26, VCC_LO);
+            c.VMov(13, Vgpr(3));
+            c.SBcnt1B64(24, EXEC_LO);
+            c.SMovB64(EXEC_LO, 26);
+            c.VMov(11, 24);
+        } else { // DivExit
+            c.VCmpNeU32(Inline(0), 5);
+            c.SAndSaveexecB64(26, VCC_LO);
+            const size_t br2 = c.words.size();
+            c.Sopp(8, 0);
+            c.SEndpgm();
+            c.words[br2] |= u32(int32_t(c.words.size()) - int32_t(br2 + 1)) & 0xFFFF;
+            c.SMovB64(EXEC_LO, 26);
+            c.SBcnt1B64(24, EXEC_LO);
+            c.VMov(11, 24);
+        }
         c.words[br] |= u32(int32_t(c.words.size()) - int32_t(br + 1)) & 0xFFFF;
         c.SMovB64(EXEC_LO, 22);
         break;
@@ -1875,6 +1929,48 @@ void AddWaveCases() {
         t.compile_only = true;
         t.compute_compile = true;
         t.wg = {16, 1, 1};
+        t.expect_loud = true;
+        const u32 tt = AddTemplate(t);
+        NewJob("wave64", tt, RawV(64), 0);
+    }
+#endif
+    // Ballots of exec in an s_cbranch_execz scope of multi-wave workgroups (0x40229f02's
+    // shape): taken at the uniform point that computes the scope's condition. Exec masks differ
+    // per wave (the mask is rotated by 7 per wave); "lanes0+37" puts one lane in each half-wave.
+    for (const std::array<u32, 3>& wg : {std::array<u32, 3>{128, 1, 1}, std::array<u32, 3>{64, 2, 1},
+                                         std::array<u32, 3>{32, 4, 1}}) {
+        const u32 threads = wg[0] * wg[1] * wg[2];
+        const std::string shape = " [" + std::to_string(wg[0]) + "x" + std::to_string(wg[1]) + "]";
+        Template t;
+        t.name = "wave: s_cbranch_execz scope: v_mbcnt(exec) rank + s_bcnt1(exec)" + shape;
+        t.op.kind = GCN_LOAD;
+        t.wave = Wave::DivRank;
+        t.wg = wg;
+        const u32 tt = AddTemplate(t);
+        for (const M& m : masks) {
+            const std::string mn = m.name;
+            if (mn != "all" && mn != "none" && mn != "even" && mn != "lanes0+37" && mn != "lanes5+40") continue;
+            Job& j = NewJob("wave64", tt, RawV(64), 0);
+            j.label += " exec=" + mn;
+            for (u32 l = 0; l < threads; ++l) {
+                const u64 wm = (l / 64) ? (m.mask << 7 | m.mask >> 57) : m.mask;
+                SetLane(j, l, value(l), 0);
+                j.lanes[l].active = u32(wm >> (l % 64) & 1);
+            }
+        }
+    }
+#ifdef BB_MIRROR_PROFILE_WAVE64
+    for (auto [name, w] : {std::pair{"s_bcnt1(exec) in a loop inside the scope", Wave::DivLoop},
+                           std::pair{"s_bcnt1 of a compare made inside the scope", Wave::DivVopc},
+                           std::pair{"s_bcnt1(exec) after an inner exec change", Wave::DivInnerExec},
+                           std::pair{"s_bcnt1(exec) after an inner scope with s_endpgm", Wave::DivExit}}) {
+        Template t;
+        t.name = std::string("wave: s_cbranch_execz scope: ") + name + " [128x1] (compile)";
+        t.op.kind = GCN_LOAD;
+        t.wave = w;
+        t.compile_only = true;
+        t.compute_compile = true;
+        t.wg = {128, 1, 1};
         t.expect_loud = true;
         const u32 tt = AddTemplate(t);
         NewJob("wave64", tt, RawV(64), 0);
@@ -3367,6 +3463,12 @@ std::vector<u32> WaveExpected(const Job& j) {
         case Wave::Exec3Out: // GCN: every lane of the wave sees the scope's SGPR results
             r[0] = exec ? value(gcn_first_lane(exec)) : 0xDEAD0000u;
             r[1] = exec ? gcn_popcount64(ballot & exec) : 0xDEAD0001u;
+            break;
+        case Wave::DivRank:
+            if (exec >> lane & 1) {
+                r[0] = gcn_popcount64(exec & ((1ull << lane) - 1));
+                r[1] = gcn_popcount64(exec);
+            }
             break;
         case Wave::Exec3:
             if (exec >> lane & 1) {
