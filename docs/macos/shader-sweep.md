@@ -38,8 +38,11 @@ The game data is only read. A recompiler change states its delta against the mer
    SPIRV-Cross revision MoltenVK 1.4.2 vendors (6c09849f) and the options MoltenVK sets on an
    Apple GPU under macOS 26+ (MSL 4.0, padded tier-2 argument buffers with descriptor base types,
    the AGX cube-gradient fixup, 32-wide subgroups, the LS/HS/DS tessellation setups). A failure
-   there is what MoltenVK reports at pipeline creation. Compiling the MSL with the Metal compiler
-   is not done (the Metal Toolchain component is not installed).
+   there is what MoltenVK reports at pipeline creation. With `--metal` the MSL is also compiled
+   with Apple's Metal compiler (`xcrun metal -std=metal4.0`, as MoltenVK does at pipeline
+   creation); its rejects appear in the MSL column as `metal: <error>`. That needs the Metal
+   Toolchain component (`xcodebuild -downloadComponent MetalToolchain`); without it `--metal`
+   stops.
 
 ## Output (`out/shader_sweep`)
 - `results.tsv`: hash, stage, PASS / LOUD (the stop message) / CRASH / HANG / SETUP (the sweep

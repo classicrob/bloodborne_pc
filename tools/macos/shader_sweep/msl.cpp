@@ -7,7 +7,9 @@
 // HS (a compute kernel writing patches) and DS (tessellation evaluation). Resource bindings carry
 // base types as MoltenVK's pipeline layout supplies them; the Metal indices are only numbering.
 //
-//   shader-msl < paths      one SPIR-V path per line; prints "OK <path>" or "ERR <path>\t<message>"
+//   shader-msl [--emit DIR] < paths
+//       one SPIR-V path per line; prints "OK <path>" or "ERR <path>\t<message>"; --emit also
+//       writes the MSL of each converted module as DIR/<name>.metal
 // The stage comes from the BB_DUMP_SHADERS name prefix (vs_, fs_, cs_, gs_, es_, hs_, ls_).
 #include <cstdio>
 #include <cstring>
@@ -112,16 +114,21 @@ std::string Convert(const std::string& path) {
     }
     msl.set_msl_options(o);
     AddResourceBindings(msl, model);
-    msl.compile();
-    return {};
+    return msl.compile();
 }
 
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    // --emit DIR: also write each module's MSL as DIR/<module name>.metal (the Metal compile stage).
+    const std::string emit = argc == 3 && std::string(argv[1]) == "--emit" ? argv[2] : "";
     for (std::string path; std::getline(std::cin, path);) {
         try {
-            Convert(path);
+            const std::string source = Convert(path);
+            if (!emit.empty()) {
+                const auto slash = path.find_last_of('/');
+                std::ofstream(emit + "/" + path.substr(slash + 1) + ".metal") << source;
+            }
             std::printf("OK %s\n", path.c_str());
         } catch (const std::exception& e) {
             std::string message = e.what();
