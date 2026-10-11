@@ -12,6 +12,7 @@
 #include <unordered_map>
 #include <unordered_set>
 
+#include "bbport_toggles.h"
 #include "common/hash.h"
 #include "common/io_file.h"
 #include "common/path_util.h"
@@ -505,7 +506,8 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
         LOG_INFO(Render_Vulkan, "Compiling graphics pipeline {:#x}", pipeline_hash);
 
         GraphicsPipeline::SerializationSupport sdata{};
-        if (build_queue) {
+        const bool on_worker = build_queue && !BbToggle::Disabled(BbToggle::PipelineWorkers);
+        if (on_worker) {
             // Built on a worker (posted below); the draw recording thread waits for the handle.
             it.value() = std::make_unique<GraphicsPipeline>(
                 instance, scheduler, desc_heap, profile, sel.graphics_key, *pipeline_cache,
@@ -544,10 +546,10 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
             stages->run_length = Shader::GsEmulation::IndexRunLength(
                 stages->max_vert_out, regs.vgt_gs_out_prim_type.GetPrimitiveType(0));
             it.value()->SetGsEmulation(std::move(stages));
-        } else if (!build_queue) {
+        } else if (!on_worker) {
             RegisterPipelineData(sel.graphics_key, pipeline_hash, sdata);
         }
-        if (build_queue) {
+        if (on_worker) {
             // GS pipelines are not recorded either way (see above).
             build_queue->Post([pipeline = it.value().get(), key = sel.graphics_key, pipeline_hash,
                                record = sel.graphics_key.gs_es_hash == 0] {
