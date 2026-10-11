@@ -693,7 +693,7 @@ static int probe_main(int argc, char **argv) {
     }
 #ifdef __APPLE__
     const char *entry_config_error=entry_trace_configure(getenv("BB_GUEST_ENTRY_TRACE"),getenv("BB_GUEST_ENTRY_ARM"));
-    if (entry_config_error) fail(entry_config_error);
+    entry_trace_require(entry_config_error);
 #endif
     for (uint64_t i = 0; i < nr; ++i) {
         uintptr_t value = relocs[i].kind == 2 ? (uintptr_t)(data_traps + page_size * relocs[i].value + relocs[i].addend)
@@ -721,11 +721,11 @@ static int probe_main(int argc, char **argv) {
 #endif
 #ifdef __APPLE__
     const char *entry_error=entry_trace_install(getenv("BB_GUEST_ENTRY_TRACE"),image,segments,ns);
-    if (entry_error) fail(entry_error);
+    entry_trace_require(entry_error);
     if (entry_trace_count) {
         struct sigaction trace_action={0}; trace_action.sa_sigaction=fault; trace_action.sa_flags=SA_SIGINFO;
         sigemptyset(&trace_action.sa_mask);
-        if (sigaction(SIGTRAP,&trace_action,NULL)) fail("BB_GUEST_ENTRY_TRACE cannot install SIGTRAP handler");
+        if (sigaction(SIGTRAP,&trace_action,NULL)) entry_trace_require("BB_GUEST_ENTRY_TRACE cannot install SIGTRAP handler");
     }
 #endif
     protect(traps, round_host_page((import_count + 1) * 32), 5);
