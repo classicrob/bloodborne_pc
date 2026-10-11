@@ -192,6 +192,51 @@ int main() {
     std::fprintf(stderr, "Image binding counts: stored stage advances unified by %u\n",
                  after.unified);
     assert(after.unified == stored.buffers.size() + 5 + stored.samplers.size());
+    // A program hash can be shared by distinct hardware stages (the game's GS and copy VS).
+    // Looking up the second stage must not refresh a rejected first-stage permutation with
+    // the second stage's registers. Exercise compute and copy roles through GetProgram itself.
+    selection.worker = nullptr;
+    regs.stage_enable.raw = AmdGpu::ShaderStageEnable::VgtStages::EsGs;
+    regs.es_program.settings = regs.vs_program.settings;
+    regs.vgt_esgs_ring_itemsize = 4;
+    regs.vgt_gs_max_vert_out = 3;
+    regs.vgt_gs_vert_itemsize[0] = 4;
+    GcnAsm::Code shared_shader;
+    shared_shader.SBufferLoad(1, 12, 4, true, 0);
+    shared_shader.SWaitcntAll();
+    shared_shader.VMov(4, 12);
+    shared_shader.Mubuf(28, {.vdata=4, .srsrc=8});
+    shared_shader.SEndpgm();
+    std::array<u32, 16> es_ud{}, copy_ud{};
+    std::memcpy(es_ud.data() + 4, table.data(), sizeof(table));
+    auto copy_table = table;
+    copy_table[0].base_address = 0x34560000;
+    copy_table[0].num_records = 0x1234;
+    std::memcpy(copy_ud.data() + 4, copy_table.data(), sizeof(copy_table));
+    const auto shared_select = [&](Shader::HwStage stage, const std::array<u32, 16>& data) {
+        Shader::Backend::Bindings bindings{};
+        return cache.GetProgram(selection, stage, Shader::SwStage::Vertex,
+            Shader::ShaderParams{data, shared_shader.words, 0x73616d6568617368ull}, bindings);
+    };
+    const auto es_result = shared_select(Shader::HwStage::Export, es_ud);
+    const auto* es_info = std::get<0>(es_result);
+    const auto es_flat = es_info->flattened_ud_buf;
+    const auto copy_result = shared_select(Shader::HwStage::Vertex, copy_ud);
+    const auto* copy_info = std::get<0>(copy_result);
+    const auto copy_flat = copy_info->flattened_ud_buf;
+    assert(es_info != copy_info);
+    assert(es_info->user_data.data() == es_ud.data());
+    assert(es_info->flattened_ud_buf == es_flat);
+    assert(copy_info->user_data.data() == copy_ud.data());
+    for (unsigned repeat = 0; repeat < 3; ++repeat) {
+        assert(std::get<0>(shared_select(Shader::HwStage::Export, es_ud)) == es_info);
+        assert(copy_info->user_data.data() == copy_ud.data());
+        assert(copy_info->flattened_ud_buf == copy_flat);
+        assert(std::get<0>(shared_select(Shader::HwStage::Vertex, copy_ud)) == copy_info);
+        assert(es_info->user_data.data() == es_ud.data());
+        assert(es_info->flattened_ud_buf == es_flat);
+    }
+    std::puts("Shared-hash compute/copy roles retain their own user-data banks PASS");
     std::puts("Permutation resource metadata: GPU + worker + preloaded storage + image binding "
               "counts PASS");
 }
