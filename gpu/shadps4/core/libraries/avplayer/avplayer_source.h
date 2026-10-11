@@ -171,6 +171,9 @@ public:
     bool IsActive();
 
 private:
+    // Caller holds m_state_mutex for frame ownership and playback clock state.
+    u64 CurrentTimeLocked();
+    bool IsActiveLocked();
     u64 DurationMillis() const;
     AvPlayerStreamInfo CreateStreamInfo(u32 stream_index);
 

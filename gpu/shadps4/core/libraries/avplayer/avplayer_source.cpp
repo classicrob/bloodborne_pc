@@ -384,11 +384,13 @@ bool AvPlayerSource::Stop() {
 }
 
 void AvPlayerSource::Pause() {
+    std::unique_lock lock(m_state_mutex);
     m_pause_time = std::chrono::high_resolution_clock::now();
     m_is_paused = true;
 }
 
 void AvPlayerSource::Resume() {
+    std::unique_lock lock(m_state_mutex);
     m_pause_duration += std::chrono::high_resolution_clock::now() - m_pause_time;
     m_is_paused = false;
 }
@@ -408,20 +410,18 @@ bool AvPlayerSource::GetVideoData(AvPlayerFrameInfo& video_info) {
 }
 
 bool AvPlayerSource::GetVideoData(AvPlayerFrameInfoEx& video_info) {
-    if (!IsActive() || m_is_paused) {
+    std::unique_lock lock(m_state_mutex);
+    if (!IsActiveLocked() || m_is_paused) {
         return false;
     }
 
-    if (m_video_frames.Size() == 0) {
+    const auto current_time = CurrentTimeLocked();
+    const bool sync = m_state.GetSyncMode() == AvPlayerAvSyncMode::Default;
+    auto frame = m_video_frames.PopIf([&](const Frame& next) {
+        return !sync || next.info.timestamp <= current_time;
+    });
+    if (!frame) {
         return false;
-    }
-
-    const auto current_time = CurrentTime();
-    const auto& new_frame = m_video_frames.Front();
-    if (m_state.GetSyncMode() == AvPlayerAvSyncMode::Default) {
-        if (new_frame.info.timestamp > current_time) {
-            return false;
-        }
     }
 
     if (m_current_video_frame.has_value()) {
@@ -430,7 +430,6 @@ bool AvPlayerSource::GetVideoData(AvPlayerFrameInfoEx& video_info) {
         m_video_buffers_cv.Notify();
     }
 
-    auto frame = m_video_frames.Pop();
     video_info = frame->info;
 
     m_current_video_frame = std::move(frame);
@@ -438,11 +437,13 @@ bool AvPlayerSource::GetVideoData(AvPlayerFrameInfoEx& video_info) {
 }
 
 bool AvPlayerSource::GetAudioData(AvPlayerFrameInfo& audio_info) {
-    if (!IsActive() || m_is_paused) {
+    std::unique_lock lock(m_state_mutex);
+    if (!IsActiveLocked() || m_is_paused) {
         return false;
     }
 
-    if (m_audio_frames.Size() == 0) {
+    auto frame = m_audio_frames.Pop();
+    if (!frame) {
         return false;
     }
 
@@ -452,7 +453,6 @@ bool AvPlayerSource::GetAudioData(AvPlayerFrameInfo& audio_info) {
         m_audio_buffers_cv.Notify();
     }
 
-    auto frame = m_audio_frames.Pop();
     m_last_audio_ts = frame->info.timestamp;
     m_last_data_time = std::chrono::high_resolution_clock::now();
     m_pause_duration = std::chrono::high_resolution_clock::duration(0);
@@ -507,14 +507,19 @@ u64 AvPlayerSource::DurationMillis() const {
 }
 
 u64 AvPlayerSource::CurrentTime() {
+    std::unique_lock lock(m_state_mutex);
+    return CurrentTimeLocked();
+}
+
+u64 AvPlayerSource::CurrentTimeLocked() {
     if (!m_start_time.has_value()) {
         return 0;
     }
 
-    if (m_is_eof && !IsActive()) {
+    if (m_is_eof && !IsActiveLocked()) {
         return m_duration;
     }
-    if (!IsActive()) {
+    if (!IsActiveLocked()) {
         return 0;
     }
 
@@ -537,6 +542,14 @@ u64 AvPlayerSource::CurrentTime() {
 }
 
 bool AvPlayerSource::IsActive() {
+    std::unique_lock lock(m_state_mutex);
+    return IsActiveLocked();
+}
+
+bool AvPlayerSource::IsActiveLocked() {
+    if (!m_start_time) {
+        return false;
+    }
     return !m_is_eof || m_audio_packets.Size() != 0 || m_video_packets.Size() != 0 ||
            m_video_frames.Size() != 0 || m_audio_frames.Size() != 0;
 }
