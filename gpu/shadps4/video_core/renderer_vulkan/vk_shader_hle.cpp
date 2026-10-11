@@ -3,18 +3,15 @@
 
 #include <array>
 #include <atomic>
-#include <bit>
-#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <mutex>
-#include <optional>
-#include <span>
 #include <string>
 #include <unordered_set>
 #include "shader_recompiler/info.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
+#include "video_core/renderer_vulkan/fill_clear.h"
 #include "video_core/renderer_vulkan/vk_shader_hle.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -312,20 +309,30 @@ static void CensusRenderTargetKernel(const Shader::Info& info,
 #endif
 
 #ifdef __APPLE__
-// bbport: the SDK fill kernel 0x8b355b5a stores one float4 to every element of a buffer. Its code
-// (Opus-GS disassembly, out/shader_sweep/disasm-renderer/0x8b355b5a.s): S_BUFFER_LOAD_DWORDX4 of
-// the V# at s[8:11] (offset 0), then BUFFER_STORE_FORMAT_XYZW (typed: converted by the V#'s
-// format) to the V# at s[4:7], element g*128 + (t & 63) and that +64, for group g and thread t
-// of 64. When that buffer is exactly a cached render target, the fill is a clear of the image:
-// the buffer write and the image's refresh from it are skipped. Only where the clear gives the
-// same bits (FillTexel: every component exactly representable in the format, so no rounding is
-// involved); otherwise the kernel runs, counted by reason. BB_RT_FILL_VERIFY=1 reads a cleared
-// texel back and stops on any difference.
+// bbport: the SDK fill kernel 0x8b355b5a stores one float4 to every element of a buffer
+// (fill_clear.h). When that buffer is exactly a cached render target and the stored bytes are
+// one repeated 32-bit word, the kernel is replaced by a fill of those bytes (vkCmdFillBuffer over
+// the whole range, padding included, so raw-buffer and CPU readers see what the kernel would have
+// written) and a clear of the image to the same value (instead of the image's refresh from the
+// buffer). Only where both are the same bits; otherwise the kernel runs, counted by reason.
+// BB_RT_FILL_VERIFY=1 waits for each replaced fill and stops unless every byte of the range and
+// texel (0, 0) of the image hold the bits the kernel would have stored.
 namespace {
-enum class FillPath : u32 { Cleared, Shape, NoImage, NotExact, Format, GpuValue, Value, Count };
+enum class FillPath : u32 {
+    Cleared,
+    Shape,
+    Format,
+    NoImage,
+    NotExact,
+    GpuValue,
+    Value,
+    HalvesDiffer,
+    Count
+};
 constexpr std::array<const char*, u32(FillPath::Count)> fill_path_names = {
-    "cleared", "dispatch or V# shape", "no image", "not exactly one image", "format",
-    "value GPU-written", "value not exact"};
+    "replaced",          "dispatch, SGPR or V# shape", "format",
+    "no image",          "not exactly one image",      "value GPU-written or in an image",
+    "value not exact",   "8-byte texel halves differ"};
 std::array<std::atomic<u64>, u32(FillPath::Count)> fill_counts{};
 
 void CountFill(FillPath path) {
@@ -342,90 +349,22 @@ void CountFill(FillPath path) {
     std::printf("RT fill (0x8b355b5a): %s\n", text.c_str());
 }
 
-/// A float exactly representable as a small float with a 5-bit exponent (bias 15): its bits, or
-/// nothing (rounding, denormal, out of range, Inf/NaN, -0, or a sign the format has not).
-std::optional<u32> SmallFloatBits(float value, u32 mantissa_bits, bool has_sign) {
-    const u32 bits = std::bit_cast<u32>(value);
-    if (bits == 0) {
-        return 0u;
+vk::Format ImageFormat(FillClear::Format format) {
+    switch (format) {
+    case FillClear::Format::Rgba16Float:
+        return vk::Format::eR16G16B16A16Sfloat;
+    case FillClear::Format::B10G11R11Ufloat:
+        return vk::Format::eB10G11R11UfloatPack32;
+    case FillClear::Format::Rgba8Unorm:
+        return vk::Format::eR8G8B8A8Unorm;
     }
-    const u32 sign = bits >> 31;
-    const s32 exponent = s32((bits >> 23) & 0xff) - 127;
-    const u32 mantissa = bits & 0x7fffff;
-    if ((sign && !has_sign) || exponent < -14 || exponent > 15 ||
-        (mantissa & ((1u << (23 - mantissa_bits)) - 1)) != 0) {
-        return std::nullopt;
-    }
-    return (sign << (5 + mantissa_bits)) | (u32(exponent + 15) << mantissa_bits) |
-           (mantissa >> (23 - mantissa_bits));
+    UNREACHABLE();
 }
 
-/// A float in [0, 1] whose unorm8 value needs no rounding: v * 255 is an integer.
-std::optional<u32> Unorm8Bits(float value) {
-    if (!(value >= 0.0f && value <= 1.0f) || std::bit_cast<u32>(value) == 0x80000000u) {
-        return std::nullopt;
-    }
-    const double scaled = double(value) * 255.0;
-    if (scaled != std::floor(scaled)) {
-        return std::nullopt;
-    }
-    return u32(scaled);
-}
-
-struct FillFormat {
-    AmdGpu::DataFormat data_format;
-    AmdGpu::NumberFormat number_format;
-    vk::Format image_format;
-    u32 texel_bytes;
-};
-constexpr std::array<FillFormat, 3> fill_formats = {{
-    {AmdGpu::DataFormat::Format16_16_16_16, AmdGpu::NumberFormat::Float,
-     vk::Format::eR16G16B16A16Sfloat, 8},
-    {AmdGpu::DataFormat::Format10_11_11, AmdGpu::NumberFormat::Float,
-     vk::Format::eB10G11R11UfloatPack32, 4},
-    {AmdGpu::DataFormat::Format8_8_8_8, AmdGpu::NumberFormat::Unorm, vk::Format::eR8G8B8A8Unorm,
-     4},
-}};
-
-/// The texel the typed store writes for `value`, when no rounding is involved.
-std::optional<std::array<u8, 8>> FillTexel(vk::Format format, const std::array<float, 4>& value) {
-    std::array<u8, 8> texel{};
-    if (format == vk::Format::eR16G16B16A16Sfloat) {
-        for (u32 c = 0; c < 4; ++c) {
-            const auto half = SmallFloatBits(value[c], 10, true);
-            if (!half) {
-                return std::nullopt;
-            }
-            std::memcpy(texel.data() + c * 2, &*half, 2);
-        }
-        return texel;
-    }
-    if (format == vk::Format::eB10G11R11UfloatPack32) {
-        // x: bits 0-10, y: 11-21, z: 22-31 (10_11_11); w is not stored.
-        const auto r = SmallFloatBits(value[0], 6, false);
-        const auto g = SmallFloatBits(value[1], 6, false);
-        const auto b = SmallFloatBits(value[2], 5, false);
-        if (!r || !g || !b) {
-            return std::nullopt;
-        }
-        const u32 packed = *r | (*g << 11) | (*b << 22);
-        std::memcpy(texel.data(), &packed, 4);
-        return texel;
-    }
-    for (u32 c = 0; c < 4; ++c) { // eR8G8B8A8Unorm
-        const auto unorm = Unorm8Bits(value[c]);
-        if (!unorm) {
-            return std::nullopt;
-        }
-        texel[c] = u8(*unorm);
-    }
-    return texel;
-}
-
-/// BB_RT_FILL_VERIFY=1: reads texel (0, 0) of the cleared image back and stops unless it holds
-/// the bits the kernel would have stored.
-void VerifyFillClear(Rasterizer& rasterizer, VideoCore::Image& image,
-                     const std::array<u8, 8>& texel, u32 texel_bytes) {
+/// BB_RT_FILL_VERIFY=1: waits for the replaced fill and stops unless the whole guest range holds
+/// `pattern` and texel (0, 0) of the image the texel the kernel stores.
+void VerifyFillClear(Rasterizer& rasterizer, VideoCore::Image& image, VAddr address, u64 size,
+                     u32 pattern, const std::array<u8, 8>& texel, u32 texel_bytes) {
     auto& runtime = rasterizer.GetRuntime();
     auto& scheduler = runtime.GetScheduler();
     const auto readback = runtime.GetStagingPool().Request(16, VideoCore::MemoryType::HostCached);
@@ -443,32 +382,33 @@ void VerifyFillClear(Rasterizer& rasterizer, VideoCore::Image& image,
     });
     scheduler.Finish();
     readback.Invalidate();
-    static std::atomic<u64> verified{0};
     ASSERT_MSG(std::memcmp(readback.mapped, texel.data(), texel_bytes) == 0,
-               "BB_RT_FILL_VERIFY: the clear of image {:#x} ({}) wrote texel {:02x} where the "
-               "fill kernel stores {:02x}",
-               image.info.guest_address, vk::to_string(image.info.pixel_format),
-               fmt::join(std::span{readback.mapped, texel_bytes}, " "),
-               fmt::join(std::span{texel.data(), texel_bytes}, " "));
+               "BB_RT_FILL_VERIFY: the clear of image {:#x} ({}) wrote a texel other than the "
+               "fill kernel's",
+               image.info.guest_address, vk::to_string(image.info.pixel_format));
+    const auto* bytes = reinterpret_cast<const u8*>(address);
+    for (u64 offset = 0; offset < size; offset += 4) {
+        u32 word;
+        std::memcpy(&word, bytes + offset, 4);
+        ASSERT_MSG(word == pattern,
+                   "BB_RT_FILL_VERIFY: byte {:#x} of the fill of {:#x}+{:#x} holds {:#010x}, the "
+                   "fill kernel stores {:#010x}",
+                   offset, address, size, word, pattern);
+    }
+    static std::atomic<u64> verified{0};
     if (verified.fetch_add(1, std::memory_order_relaxed) % 256 == 0) {
-        std::printf("BB_RT_FILL_VERIFY: %llu fill clears read back identical\n",
+        std::printf("BB_RT_FILL_VERIFY: %llu replaced fills verified (whole range and texel)\n",
                     (unsigned long long)verified.load(std::memory_order_relaxed));
     }
 }
 
-/// The fill as an image clear when that is exact; false: run the kernel.
+/// The fill as a buffer fill plus an image clear when that is exact; false: run the kernel.
 bool FillAsImageClear(const Shader::Info& info, const AmdGpu::ComputeProgram& cs_program,
                       Rasterizer& rasterizer) {
-    const auto shape_fails = [&] {
-        CountFill(FillPath::Shape);
+    const auto fails = [](FillPath path) {
+        CountFill(path);
         return false;
     };
-    if (cs_program.num_thread_x.full != 64 || cs_program.num_thread_x.partial != 0 ||
-        cs_program.num_thread_y.full != 1 || cs_program.num_thread_z.full != 1 ||
-        cs_program.dim_y != 1 || cs_program.dim_z != 1 || cs_program.start_x != 0 ||
-        cs_program.start_y != 0 || cs_program.start_z != 0) {
-        return shape_fails();
-    }
     const Shader::BufferResource* value_desc = nullptr;
     const Shader::BufferResource* target_desc = nullptr;
     for (const auto& desc : info.buffers) {
@@ -477,80 +417,113 @@ bool FillAsImageClear(const Shader::Info& info, const AmdGpu::ComputeProgram& cs
         }
         auto& slot = desc.is_written ? target_desc : value_desc;
         if (slot) {
-            return shape_fails();
+            return fails(FillPath::Shape);
         }
         slot = &desc;
     }
     if (!value_desc || !target_desc) {
-        return shape_fails();
+        return fails(FillPath::Shape);
     }
     const auto value_sharp = value_desc->GetSharp(info);
     const auto target = target_desc->GetSharp(info);
-    const auto format_it = std::ranges::find_if(fill_formats, [&](const FillFormat& f) {
-        return f.data_format == target.GetDataFmt() && f.number_format == target.GetNumberFmt();
-    });
-    if (format_it == fill_formats.end()) {
-        CountFill(FillPath::Format);
-        return false;
+    const auto format = FillClear::TargetFormat(target.data_format, target.num_format);
+    if (!format) {
+        return fails(FillPath::Format);
     }
-    const u64 size = u64(target.num_records) * target.stride;
-    if (target.swizzle_enable || target.add_tid_enable || target.stride != format_it->texel_bytes ||
-        target.dst_sel_x != 4 || target.dst_sel_y != 5 || target.dst_sel_z != 6 ||
-        target.dst_sel_w != 7 || size == 0 || u64(cs_program.dim_x) * 128 < target.num_records ||
+    const FillClear::Dispatch dispatch{
+        .threads_x = cs_program.num_thread_x.full,
+        .threads_x_partial = cs_program.num_thread_x.partial,
+        .threads_y = cs_program.num_thread_y.full,
+        .threads_z = cs_program.num_thread_z.full,
+        .dim_x = cs_program.dim_x,
+        .dim_y = cs_program.dim_y,
+        .dim_z = cs_program.dim_z,
+        .start_x = cs_program.start_x,
+        .start_y = cs_program.start_y,
+        .start_z = cs_program.start_z,
+        .user_sgprs = cs_program.settings.num_user_regs,
+        .tgid_enable = cs_program.settings.tgid_enable,
+    };
+    const FillClear::Target target_fields{
+        .stride = u32(target.stride),
+        .num_records = target.num_records,
+        .swizzle_enable = target.swizzle_enable != 0,
+        .add_tid_enable = target.add_tid_enable != 0,
+        .dst_sel_x = target.dst_sel_x,
+        .dst_sel_y = target.dst_sel_y,
+        .dst_sel_z = target.dst_sel_z,
+        .dst_sel_w = target.dst_sel_w,
+    };
+    const u32 texel_bytes = FillClear::TexelBytes(*format);
+    if (!FillClear::CoversAllElements(dispatch, target_fields, texel_bytes) ||
         value_sharp.base_address == 0 || value_sharp.GetSize() < 16) {
-        return shape_fails();
+        return fails(FillPath::Shape);
     }
-    // Exactly one cached image, at exactly the buffer's range: the fill covers all of it.
+    const VAddr address = target.base_address;
+    const u64 size = u64(target.num_records) * texel_bytes;
+    // Exactly one cached image, at exactly the buffer's range.
     auto& texture_cache = rasterizer.GetTextureCache();
     VideoCore::Image* image = nullptr;
     u32 overlapping = 0;
-    texture_cache.ForEachImageInRegion(target.base_address, size,
+    texture_cache.ForEachImageInRegion(address, size,
                                        [&](VideoCore::ImageId, VideoCore::Image& candidate) {
                                            ++overlapping;
                                            image = &candidate;
                                        });
     if (overlapping == 0) {
-        CountFill(FillPath::NoImage);
-        return false;
+        return fails(FillPath::NoImage);
     }
     // The texture binding helper finishes before image state is read or changed.
-    rasterizer.GetRuntime().BeforeImageAccess();
+    auto& runtime = rasterizer.GetRuntime();
+    runtime.BeforeImageAccess();
     const auto& image_info = image->info;
-    if (overlapping != 1 || image_info.guest_address != target.base_address ||
+    if (overlapping != 1 || image_info.guest_address != address ||
         image_info.guest_size != size || image_info.resources.levels != 1 ||
         image_info.resources.layers != 1 || image_info.props.is_depth ||
         image_info.props.is_volume || image_info.size.depth != 1 ||
         image->backing->num_samples != 1) {
-        CountFill(FillPath::NotExact);
-        return false;
+        return fails(FillPath::NotExact);
     }
-    if (image_info.pixel_format != format_it->image_format) {
-        CountFill(FillPath::Format);
-        return false;
+    if (image_info.pixel_format != ImageFormat(*format)) {
+        return fails(FillPath::Format);
     }
-    // The value the kernel loads, as the GPU would read it: not while a GPU write to it is
-    // outstanding.
-    if (rasterizer.GetBufferCache().IsRegionGpuModified(value_sharp.base_address, 16)) {
-        CountFill(FillPath::GpuValue);
-        return false;
+    // The value the kernel loads: its guest bytes, unless a GPU write to them (through a buffer
+    // or an aliased image) is outstanding.
+    auto& buffer_cache = rasterizer.GetBufferCache();
+    bool value_in_image = false;
+    texture_cache.ForEachImageInRegion(value_sharp.base_address, 16,
+                                       [&](VideoCore::ImageId, VideoCore::Image&) {
+                                           value_in_image = true;
+                                       });
+    if (value_in_image || buffer_cache.IsRegionGpuModified(value_sharp.base_address, 16)) {
+        return fails(FillPath::GpuValue);
     }
     std::array<float, 4> value;
     std::memcpy(value.data(), reinterpret_cast<const void*>(value_sharp.base_address), 16);
-    const auto texel = FillTexel(image_info.pixel_format, value);
+    const auto texel = FillClear::Texel(*format, value);
     if (!texel) {
-        CountFill(FillPath::Value);
-        return false;
+        return fails(FillPath::Value);
     }
+    const auto pattern = FillClear::Pattern(*format, *texel);
+    if (!pattern) {
+        return fails(FillPath::HalvesDiffer);
+    }
+    // The bytes, as the kernel writes them (the buffer write it would have bound).
+    const auto [buffer, offset] = buffer_cache.ObtainBuffer(address, u32(size), true, false);
+    ASSERT_MSG(offset % 4 == 0, "RT fill: target {:#x} is not 4-byte aligned in its buffer",
+               address);
+    runtime.FillBuffer(buffer, offset, size, *pattern);
+    // The image, as its refresh from those bytes would leave it.
     vk::ClearValue clear{};
     clear.color.float32 = value;
-    rasterizer.GetRuntime().ClearImage(image, VideoCore::SubresourceRange{}, clear);
+    runtime.ClearImage(image, VideoCore::SubresourceRange{}, clear);
     CountFill(FillPath::Cleared);
     static const bool verify = [] {
         const char* env = std::getenv("BB_RT_FILL_VERIFY");
         return env && env[0] == '1';
     }();
     if (verify) {
-        VerifyFillClear(rasterizer, *image, *texel, format_it->texel_bytes);
+        VerifyFillClear(rasterizer, *image, address, size, *pattern, *texel, texel_bytes);
     }
     return true;
 }
