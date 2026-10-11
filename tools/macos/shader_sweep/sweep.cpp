@@ -439,17 +439,20 @@ struct Sweep {
         return cache.GetProgram(sel, hw, sw, params, binding);
     }
 
-    /// Representative TessellationDataConstantBuffer (one patch per threadgroup).
-    static void FillTessConstants(u32* at, u32 ls_stride, u32 input_cp, u32 output_cp) {
+    /// TessellationDataConstantBuffer as the Gnm runtime derives it from the hull constants
+    /// (see frontend/tessellation.h), for one patch per threadgroup. cp_stride 0 is a passthrough
+    /// hull: its outputs are its inputs.
+    static void FillTessConstants(u32* at, u32 ls_stride, u32 input_cp, u32 output_cp,
+                                  u32 cp_stride) {
         if (!at) {
             return;
         }
         Shader::TessellationDataConstantBuffer c{};
         c.ls_stride = ls_stride;
-        c.hs_cp_stride = ls_stride;
+        c.hs_cp_stride = cp_stride != 0 ? cp_stride : ls_stride;
         c.num_patches = 1;
-        c.hs_output_base = input_cp * ls_stride;
-        c.patch_output_size = output_cp * ls_stride;
+        c.hs_output_base = cp_stride != 0 ? input_cp * ls_stride * c.num_patches : 0;
+        c.patch_output_size = c.hs_cp_stride * output_cp;
         c.patch_const_size = 16 * 6;
         c.patch_const_base = c.hs_output_base + c.patch_output_size;
         c.off_chip_tessellation_factor_threshold = 1.0f;
@@ -481,7 +484,7 @@ struct Sweep {
             SetRaw(regs.vs_output_control, job.Get("vs_out_cntl"));
             if (k == "ds") {
                 regs.stage_enable.raw = AmdGpu::ShaderStageEnable::VgtStages::LsHs;
-                FillTessConstants(ud.tess_constants, 64, 3, 3);
+                FillTessConstants(ud.tess_constants, 64, 3, 3, 64);
                 Program(sel, HwStage::Vertex, SwStage::TessellationEval, code, ud, job.hash);
             } else {
                 Program(sel, HwStage::Vertex, SwStage::Vertex, code, ud, job.hash);
@@ -515,12 +518,19 @@ struct Sweep {
             SetProgram(regs.hs_program, code, rsrc1, rsrc2);
             regs.stage_enable.raw = AmdGpu::ShaderStageEnable::VgtStages::LsHs;
             SetRaw(regs.tess_config, job.Get("tf_param"));
-            // Hull constants: threads (output control points), input control points.
-            const auto hull = job.kv.at("hull");
-            const u32 threads = u32(std::strtoul(hull.c_str(), nullptr, 16));
-            const u32 input_cp = u32(std::strtoul(hull.substr(hull.find(',') + 1).c_str(), nullptr, 16));
+            // Gnm hull constants: threads (output control points), input control points, -,
+            // control point stride (0: passthrough), ...
+            std::vector<u32> hull;
+            std::istringstream fields(job.kv.at("hull"));
+            for (std::string field; std::getline(fields, field, ',');) {
+                hull.push_back(u32(std::strtoul(field.c_str(), nullptr, 16)));
+            }
+            if (hull.size() != 7) {
+                Setup("hull constants with " + std::to_string(hull.size()) + " words");
+            }
+            const u32 threads = hull[0], input_cp = hull[1], cp_stride = hull[3];
             SetRaw(regs.ls_hs_config, (input_cp << 8) | (threads << 14) | 1);
-            FillTessConstants(ud.tess_constants, 64, input_cp, threads);
+            FillTessConstants(ud.tess_constants, 64, input_cp, threads, cp_stride);
             const auto program = Program(sel, HwStage::Hull, SwStage::TessellationControl, code, ud,
                                          job.hash);
             if (!hull_info && ud.tess_constants) {
@@ -534,7 +544,7 @@ struct Sweep {
             }
             SetProgram(regs.ls_program, code, rsrc1, rsrc2);
             regs.stage_enable.raw = AmdGpu::ShaderStageEnable::VgtStages::LsHs;
-            FillTessConstants(hull_tess_constants, job.Get("ls_stride"), 3, 3);
+            FillTessConstants(hull_tess_constants, job.Get("ls_stride"), 3, 3, job.Get("ls_stride"));
             sel.infos[u32(SwStage::TessellationControl)] = hull_info;
             Program(sel, HwStage::Local, SwStage::Vertex, code, ud, job.hash);
         } else {
