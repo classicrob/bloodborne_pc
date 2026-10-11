@@ -337,9 +337,14 @@ extern "C" int bbgpu_replay_run(const char* dir, unsigned iterations) {
         std::fprintf(stderr, "STOP: perf replay: the GPU library has no Liverpool\n");
         return 2;
     }
-    if (!std::getenv("BB_SPLIT_WINDOW") || std::strcmp(std::getenv("BB_SPLIT_WINDOW"), "1")) {
-        std::fprintf(stderr, "STOP: perf replay: set BB_SPLIT_WINDOW=1 (a Parse split block per "
-                             "iteration)\n");
+    // A Parse split block per iteration. No frame has ended in this process yet, so the window
+    // is still unread.
+    const char* window = std::getenv("BB_SPLIT_WINDOW");
+    if (!window) {
+        setenv("BB_SPLIT_WINDOW", "1", 0);
+    } else if (std::strcmp(window, "1")) {
+        std::fprintf(stderr, "STOP: perf replay: BB_SPLIT_WINDOW=%s; the replay reports per "
+                             "iteration (1)\n", window);
         return 2;
     }
     fmt::print("Perf replay: {} ({} submissions, {} reset ranges), {} iterations; pixel output not "
