@@ -11,6 +11,7 @@ void runtime_restart(void) { abort(); }
 #include <pthread.h>
 #include <stdatomic.h>
 #include <time.h>
+#include <unistd.h>
 
 typedef int (ABI *Register)(GuestCallback);
 typedef int (ABI *RegisterCxa)(void (ABI *)(void *), void *, void *);
@@ -202,6 +203,39 @@ static void direct_memory(void) {
     assert(*(uint64_t *)x==0); /* released allocation does not leak previous data */
     assert(release(a,length)==0); /* release also unmaps owned mapping */
 }
+#ifdef __APPLE__
+typedef void *(ABI *GuestCopy)(void *,const void *,size_t);
+/* The guest caller the overlap report names: the return address inside this function. */
+static __attribute__((noinline)) void copy_from_here(void *dst,const void *src,size_t size) {
+    void *volatile result=GET(GuestCopy,"Q3VBxCXhUHs#q#q")(dst,src,size); /* not a tail call */
+    (void)result;
+}
+/* Overlapping guest memcpy calls are reported once each with the caller; others are not. */
+static void memcpy_overlap_report(void) {
+    char a[32]={0},b[32]={0};
+    fflush(stderr);
+    FILE *capture=tmpfile(); assert(capture);
+    const int saved=dup(2); assert(saved>=0 && dup2(fileno(capture),2)==2);
+    copy_from_here(a+1,a,6);   /* destination above the source */
+    copy_from_here(a,a+1,6);   /* source above the destination */
+    copy_from_here(a,a,6);     /* same pointer */
+    copy_from_here(a+8,a,8);   /* adjacent */
+    copy_from_here(a+1,a,0);   /* zero size */
+    copy_from_here(b,a,sizeof(a)); /* separate objects */
+    fflush(stderr); assert(dup2(saved,2)==2); close(saved);
+    rewind(capture);
+    char line[256]; int reports=0;
+    while (fgets(line,sizeof(line),capture)) {
+        if (!strstr(line,"overlapping guest memcpy")) continue;
+        ++reports;
+        void *caller=NULL; const char *at=strstr(line,"caller ");
+        assert(at && sscanf(at,"caller %p",&caller)==1);
+        assert((char *)caller>(char *)copy_from_here && (char *)caller<(char *)copy_from_here+256);
+    }
+    fclose(capture);
+    assert(reports==2);
+}
+#endif
 static void memory_primitives(void) {
     typedef void *(ABI *Set)(void *,int,size_t);
     typedef void *(ABI *Copy)(void *,const void *,size_t);
@@ -351,6 +385,9 @@ int main(int argc,char **argv) {
     if (argc>1 && !strcmp(argv[1],"--rwlock-concurrency")) { rw_concurrency(); return 0; }
     if (argc>1 && !strcmp(argv[1],"--rwlock-timeouts")) { rw_timeouts(); return 0; }
     libc_support(); posix_mutexes(); wall_time(); exit_handlers(); guards(); mutexes(); direct_memory(); memory_primitives();
+#ifdef __APPLE__
+    memcpy_overlap_report();
+#endif
     rw_lifecycle(); rw_concurrency(); rw_timeouts();
     puts("PASS: callback lifecycle, guard ABI, mutex errors, shared direct memory, memory primitives, resolver scope");
     return 0;
