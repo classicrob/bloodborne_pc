@@ -19,9 +19,9 @@
 namespace Serialization {
 /* You should increment versions below once corresponding serialization scheme is changed. */
 #ifdef __APPLE__
-static constexpr u32 ShaderBinaryVersion = 29u; // Wave64: vertex-stage compare masks as one bit per lane (no subgroup ops).
+static constexpr u32 ShaderBinaryVersion = 30u; // Correct packed unsigned-float buffer conversions and preserve quantization.
 #else
-static constexpr u32 ShaderBinaryVersion = 15u; // IMAGE_GET_LOD sampler tracking and stage-correct subgroup decorations.
+static constexpr u32 ShaderBinaryVersion = 16u; // Correct packed unsigned-float buffer conversions and preserve quantization.
 #endif
 static constexpr u32 ShaderMetaVersion = 14u; // HwVertexRuntimeInfo::point_size (GS points).
 static constexpr u32 PipelineKeyVersion = 11u; // Keys name the ES/GS of an emulated geometry stage.

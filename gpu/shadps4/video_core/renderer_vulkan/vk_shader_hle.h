@@ -20,4 +20,10 @@ class Rasterizer;
 bool ExecuteShaderHLE(const Shader::Info& info, const AmdGpu::Regs& regs,
                       const AmdGpu::ComputeProgram& cs_program, Rasterizer& rasterizer);
 
+#ifdef __APPLE__
+/// After a dispatch is recorded: BB_RT_FILL_VERIFY=2 checks the bytes of a fill kernel that
+/// ExecuteShaderHLE left to run as the reference.
+void AfterDispatchHLE(Rasterizer& rasterizer);
+#endif
+
 } // namespace Vulkan

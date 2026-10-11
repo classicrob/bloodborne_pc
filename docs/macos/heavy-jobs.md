@@ -82,8 +82,14 @@ timestamp gate). So the GPU is its own lock, separate from the pools:
   itself).
 - `heavy.sh status` prints `gpu: free|shared|exclusive`; each GPU acquisition is in the history.
 
-A long perf session (several runs, a profile) still needs a quiet window: the lock keeps games
-off the GPU, not builds off the CPU.
+`--cpu-quiet` (with `--gpu exclusive`, outside any slot; `perf_run.sh` uses it) also keeps the
+CPU quiet for the run: CPU load from builds slowed a perf run by 19% even at low priority. A
+forked watcher holds `BB_HEAVY_DIR/cpu-quiet`. It pauses every running build, quick and sweep job
+(SIGSTOP on its whole process tree; for a quick job, the command under its supervisor, whose
+time limit pauses too), and no new one is admitted. When the run ends it resumes them (SIGCONT).
+The pause is bounded by `BB_HEAVY_QUIET_MAX` (1200 s); past that the jobs resume with a loud
+"CPU QUIET BOUND REACHED". Each pause and resume is printed in the run's output and recorded in
+the history. Games are not paused (the exclusive GPU hold already keeps them off).
 
 - Slots are flocks under `~/bbport-deps/locks` (`BB_HEAVY_DIR`). A job waits for a free slot of
   its pool and prints who holds them every 30 s.

@@ -27,6 +27,7 @@
 #include "video_core/renderer_vulkan/vk_scene_resolution.h"
 #endif
 #include "video_core/texture_cache/tile_manager.h"
+#include "bbport_parse_split.h"
 
 namespace VideoCore {
 
@@ -895,6 +896,7 @@ void TextureCache::RefreshImage(Image& image) {
         return;
     }
     BbStats::Timer timer{BbStats::t_refresh};
+    BB_SPLIT_SCOPE(KImageRefresh);
 #ifdef __APPLE__
     const ImageFlagBits entry_flags = image.flags;
     u64 hashed_bytes = 0, copied_bytes = 0;

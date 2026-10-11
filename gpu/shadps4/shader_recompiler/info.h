@@ -18,6 +18,9 @@
 #include "shader_recompiler/params.h"
 #include "shader_recompiler/resource.h"
 #include "shader_recompiler/runtime_info.h"
+#ifdef __APPLE__
+#include "bbport_cmd_data.h"
+#endif
 
 namespace Serialization {
 struct Archive;
@@ -226,6 +229,13 @@ struct Info : InfoPersistent {
             base = reinterpret_cast<const u32*>(VAddr(base) & 0xFFFFFFFFFFFFULL);
         }
         std::memcpy(&data, base + dword_offset, sizeof(T));
+#ifdef __APPLE__
+        // A read through a user-data pointer (a descriptor table): where it lies relative to
+        // the submitted command memory (BB_CMD_DATA_CHECK).
+        if (ptr_index != IR::NumScalarRegs && BbCmdData::Enabled()) [[unlikely]] {
+            BbCmdData::NoteRead("ud table", pgm_hash, base + dword_offset, sizeof(T), &data);
+        }
+#endif
         return data;
     }
 
@@ -281,6 +291,13 @@ struct Info : InfoPersistent {
         memcpy(&tess_constants,
                reinterpret_cast<TessellationDataConstantBuffer*>(tess_constants_addr),
                sizeof(tess_constants));
+#ifdef __APPLE__
+        if (BbCmdData::Enabled()) [[unlikely]] {
+            BbCmdData::NoteRead("tess constants", pgm_hash,
+                                reinterpret_cast<const void*>(tess_constants_addr),
+                                sizeof(tess_constants), &tess_constants);
+        }
+#endif
     }
 
     void Serialize(Serialization::Archive& ar) const;

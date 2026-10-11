@@ -11,11 +11,12 @@
  * Here, after that one sleep, the step also waits for GX's own frame-done event: G+0x68, G =
  * [[0x55406c8]+0x348]. GX sets it after each frame job (0x21b6a68), the kick resets it
  * (0x21b6aa0). Done is read only under the event's mutex (event+8, through the engine's own
- * mutex imports); while it is clear the step waits on the event's condition through the engine's
- * wait method (event vtable +0x18 = 0x207e8f0), in slices. That method waits once and returns 0
- * for any wake, so a 0 is never taken as done: done is checked again under the mutex. A 5 s
- * deadline is checked after every check of done and stops loudly; it bounds repeated waits that
- * return, not a lock or wait that never returns.
+ * mutex imports). While it is clear, the step sleeps 250 us and checks again. It does not wait on
+ * the event's condition: the engine's timed condition wait (helper 0x2083e80, its call at
+ * 0x2083ec1) is replaced by a mid-function `ret` in every FPS++ patch preset, so a timed wait
+ * through it would crash, and the untimed one could not be bounded. Polling under the mutex reads
+ * the same synchronized state and writes nothing of the guest's. A 5 s deadline is checked after
+ * every check of done and stops loudly; it bounds the polling, not a lock that never returns.
  *
  * If only the main thread kicks GX (not established; the qualification run records the kick's
  * caller threads), no kick can come between this wait and the draw, and the draw then follows
@@ -49,7 +50,7 @@ enum {
     EventWaitSlot = 0x18,          /* in the event's vtable */
     EventWaitMethod = 0x207e8f0,   /* wait(event, microseconds or -1): 0 any wake, -3 timeout */
 };
-#define WAIT_SLICE_US 100000u
+#define POLL_NS UINT64_C(250000)
 #define WAIT_LIMIT_NS UINT64_C(5000000000)
 #define REPORT_EVERY 600
 
@@ -66,10 +67,8 @@ static const Range handoff_ranges[]={
     {"kick wrapper: G = [R+0x348]", 0x2199bf1, 0x2f, 0xc14097d8d785f5b6ull},
     {"event set: bit 1 = signaled", 0x207e855, 0x13, 0x41256cbdf9028df3ull},
     {"event wait method (0x207e8f0) through unlock and return", 0x207e8f0, 0x149, 0xe13c769c0a82343cull},
-    {"condition wait helper (0x2083e80): microseconds, -1, timeout -3", 0x2083e80, 0xd0, 0x79903a6a15eff0b7ull},
 };
 
-typedef int32_t (ABI *EventWait)(void *event, uint32_t microseconds);
 typedef int32_t (ABI *MutexCall)(void *mutex);
 
 static const unsigned char *handoff_image;
@@ -190,8 +189,8 @@ void runtime_movie_handoff_after_sleep(const uintptr_t *return_slot) {
                          now_state);
         if (now_state&2) break;
         was_done=0;
-        const int32_t result=((EventWait)wait)(done,WAIT_SLICE_US);
-        if (result && result!=-3) handoff_stop("GX's done event wait failed",(uint64_t)(uint32_t)result,gx);
+        const struct timespec poll={.tv_sec=0,.tv_nsec=(long)POLL_NS};
+        nanosleep(&poll,NULL); /* an early return (signal) only checks sooner */
     }
     if (!was_done) {
         const uint64_t ns=handoff_now_ns()-start;

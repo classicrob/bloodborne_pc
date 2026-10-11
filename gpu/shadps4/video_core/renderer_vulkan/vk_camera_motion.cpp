@@ -53,6 +53,12 @@ CameraMotion::CameraMotion(const Instance& instance_, Scheduler& scheduler_,
     : instance{instance_}, scheduler{scheduler_}, texture_cache{texture_cache_}, runtime{runtime_} {
     const char* env = std::getenv("BB_DEBUG_MOTION");
     debug_overlay = env && env[0] == '1';
+    const char* camera_env = std::getenv("BB_MOTION_CAMERA_ONLY");
+    camera_only = camera_env && camera_env[0] == '1';
+    if (camera_only) {
+        std::printf("BB_MOTION_CAMERA_ONLY=1: motion vectors are camera-only (diagnostic; the "
+                    "upscaler gets no object vectors)\n");
+    }
     const char* upscaler = std::getenv("BB_UPSCALER");
     // The upscaler can be switched on from the menu at any time: the camera is always tracked
     // unless BB_UPSCALER=none.
@@ -188,8 +194,12 @@ void CameraMotion::RecordMotion(vk::CommandBuffer cmdbuf, vk::ImageView depth_vi
         .size = {float(width), float(height)},
         .jitter = jitter,
         .previous_jitter = previous_jitter,
-        .mode = object_valid ? 1u : 0u,
+        // BB_MOTION_CAMERA_ONLY=1 (diagnostic): the motion target holds the camera vectors only,
+        // so that a dump (BB_DUMP_TRIGGER) has them beside the object vectors to compare
+        // (tools/macos/motion_agree.py). The upscaler then sees no object vectors.
+        .mode = object_valid && !camera_only ? 1u : 0u,
     };
+    last_record = {push.proj[2], push.mode, camera_only, object_valid};
     const vk::DescriptorImageInfo depth_info{.imageView = depth_view,
                                              .imageLayout = vk::ImageLayout::eGeneral};
     const vk::DescriptorImageInfo motion_info{.imageView = motion_view,

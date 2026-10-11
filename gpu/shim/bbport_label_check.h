@@ -1,14 +1,18 @@
-// bbport (macOS diagnostic, BB_LABEL_CHECK=1): did the content at an end-of-pipe label change
-// between its EOP being parsed and its write?
+// bbport (macOS diagnostic, BB_LABEL_CHECK=1): did the content at a tracked label (EOP, or
+// RELEASE_MEM with 32/64-bit data) change between its packet being parsed and its write?
 //
 // Context: the guest frees per-frame objects that hold EOP labels (48-byte heap blocks, label at
 // offset 0) once the submitDone throttle releases it. A label written after that lands in freed
 // memory, where the allocator's free-list link at offset 0 receives the label value (Guest fault
 // 0x263b8e7, docs/history/SESSION_2026-09-30.md). So the value at a label address is sampled when
-// its EOP is parsed, and again just before the write. A change in between that does not match one
-// of our recorded EOP writes is reported (LABEL-CHECK): something else changed the memory, e.g.
-// the guest freeing or reusing the object, resetting the label, or a write this check does not
-// track (WRITE_DATA, EOS, DMA).
+// its packet is parsed, and again just before the write. A change in between that does not match
+// one of our tracked label writes is reported (LABEL-CHECK): something else changed the memory,
+// e.g. the guest freeing or reusing the object, resetting the label, or a write this check does
+// not track (WRITE_DATA, EOS, DMA).
+// The observation window is from the parse sample to the write: changes before the parse are
+// invisible, and so is anything during the waits that precede a RELEASE_MEM's parse sample
+// (host copies, deferred signals). A RELEASE_MEM finding on a command-chunk status word supports
+// a reset and reclaim before the old release; it does not show which cleanup reset the chunk.
 //
 // Supporting evidence only. A change need not be a guest free (other writers exist), and no
 // change does not prove the lifetime is right (a free that leaves the value equal, ABA, or a change
@@ -18,8 +22,8 @@
 //
 // Guest memory is read only through non-faulting Mach reads; an unreadable sample is counted and
 // never compared. History is kept per 8-byte slot. A slot whose pending or completed writes
-// differ in address or width (a 32-bit and a 64-bit EOP on one label) is counted as mixed and
-// not compared.
+// differ in address or width (a 32-bit and a 64-bit label on one address) is counted as mixed
+// and not compared.
 #pragma once
 #include <atomic>
 #include <chrono>
@@ -109,8 +113,8 @@ inline void NoteShape(Slot& slot, std::uint64_t address, std::uint32_t num_bytes
     }
 }
 
-/// When the EOP is parsed, before it is handed to the recording thread (which may write it at
-/// once). The generation is taken before the sample: a write completing in between is seen as
+/// When the label's packet is parsed, before it is handed to the recording thread (which may
+/// write it at once). The generation is taken before the sample: a write completing in between is seen as
 /// ours by the check.
 inline void NoteParsed(std::uint64_t address, std::uint32_t num_bytes) {
     std::uint64_t generation;
@@ -147,7 +151,7 @@ inline bool BeforeWrite(std::uint64_t address, std::uint32_t num_bytes) {
         entry = slot.pending.front();
         slot.pending.pop_front();
         mixed = slot.mixed || entry.address != address || entry.num_bytes != num_bytes;
-        // One of our writes completed after this EOP's sample, and its value is what is there.
+        // One of our writes completed after this label's sample, and its value is what is there.
         ours = slot.generation > entry.generation && current == (slot.last_value & Mask(num_bytes));
     }
     const std::uint64_t n_checked = counts.checked.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -167,8 +171,8 @@ inline bool BeforeWrite(std::uint64_t address, std::uint32_t num_bytes) {
             const bool block_readable =
                 SafeRead(address & ~std::uint64_t{15}, block, sizeof(block));
             std::fprintf(stderr,
-                         "LABEL-CHECK #%llu: label %#llx (%u bytes) changed between its EOP's "
-                         "parse and write, not matched to our recorded EOP writes: %#llx when "
+                         "LABEL-CHECK #%llu: label %#llx (%u bytes) changed between its packet's "
+                         "parse and write, not matched to our tracked label writes: %#llx when "
                          "parsed, %#llx now "
                          "(pending %.1f ms since the parse sample); block %s %#llx %#llx %#llx "
                          "%#llx %#llx %#llx\n",
@@ -198,7 +202,7 @@ inline bool BeforeWrite(std::uint64_t address, std::uint32_t num_bytes) {
     return reported;
 }
 
-/// After the label was written with `data`: later checks of EOPs sampled before this point
+/// After the label was written with `data`: later checks of labels sampled before this point
 /// accept this value as ours.
 inline void AfterWrite(std::uint64_t address, std::uint64_t data, std::uint32_t num_bytes) {
     std::scoped_lock lk{mutex};
@@ -213,7 +217,7 @@ inline void AfterWrite(std::uint64_t address, std::uint64_t data, std::uint32_t 
     slot.last_address = address;
     slot.last_bytes = num_bytes;
     if (slot.pending.empty() && slot.sampling == 0) {
-        slots.erase(it); // no EOP sampled before this write is left to check
+        slots.erase(it); // no label sampled before this write is left to check
     }
 }
 

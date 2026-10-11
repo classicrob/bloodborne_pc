@@ -12,6 +12,7 @@
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_pipeline_common.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "bbport_parse_split.h"
 
 namespace Vulkan {
 
@@ -35,6 +36,7 @@ void Pipeline::SetBuilt() {
 }
 
 void Pipeline::WaitBuiltSlow() const noexcept {
+    BB_SPLIT_SCOPE(KPipelineWait);
     const auto start = std::chrono::steady_clock::now();
     std::unique_lock lk{build_mutex};
     build_cv.wait(lk, [this] { return built.load(std::memory_order_acquire); });
@@ -50,8 +52,10 @@ void Pipeline::BindResources(DescriptorWrites& set_writes,
         IsCompute() ? vk::PipelineBindPoint::eCompute : vk::PipelineBindPoint::eGraphics;
     const auto stage_flags = IsCompute() ? vk::ShaderStageFlagBits::eCompute : AllGraphicsStageBits;
     WaitBuilt();
+    BB_SPLIT_SCOPE(KDescriptorBuild);
     const vk::PipelineLayout layout = *pipeline_layout;
     scheduler.Record([layout, stage_flags, push_data](vk::CommandBuffer cmdbuf) {
+        BB_SPLIT_SCOPE(KEncDescriptors);
         cmdbuf.pushConstants(layout, stage_flags, 0u, sizeof(push_data), &push_data);
     });
 
@@ -63,6 +67,7 @@ void Pipeline::BindResources(DescriptorWrites& set_writes,
     if (uses_push_descriptors) {
         if (!scheduler.IsRecordingDeferred()) {
             scheduler.Record([&](vk::CommandBuffer cmdbuf) {
+                BB_SPLIT_SCOPE(KEncDescriptors);
                 cmdbuf.pushDescriptorSetKHR(bind_point, layout, 0, set_writes);
             });
             return;
@@ -93,6 +98,7 @@ void Pipeline::BindResources(DescriptorWrites& set_writes,
             }
         }
         scheduler.Record([bind_point, layout, writes](vk::CommandBuffer cmdbuf) {
+            BB_SPLIT_SCOPE(KEncDescriptors);
             cmdbuf.pushDescriptorSetKHR(bind_point, layout, 0, writes);
         });
         return;
@@ -105,6 +111,7 @@ void Pipeline::BindResources(DescriptorWrites& set_writes,
     }
     instance.GetDevice().updateDescriptorSets(set_writes, {});
     scheduler.Record([bind_point, layout, desc_set](vk::CommandBuffer cmdbuf) {
+        BB_SPLIT_SCOPE(KEncDescriptors);
         cmdbuf.bindDescriptorSets(bind_point, layout, 0, desc_set, {});
     });
 }

@@ -18,6 +18,9 @@
 #include <queue>
 
 #include "common/assert.h"
+#ifdef __APPLE__
+#include "bbport_cmd_data.h"
+#endif
 #include "common/slot_vector.h"
 #include "common/types.h"
 #include "common/unique_function.h"
@@ -101,6 +104,22 @@ struct Liverpool {
         u64 snapshot_bytes{}, snapshot_ns{}, snapshot_ns_max{}, snapshot_writes_waited{};
         u64 prep_build_ns{}, prep_build_ns_max{}; ///< draw preparation copy, on the guest thread
     } parse_lag;
+    /// GpuIdle's wait split (docs/macos/throttle-relaxation.md, R0), per frame end that raised
+    /// GpuIdle: from the guest's sceGnmSubmitDone to GpuIdle, and its parts (GPU thread only).
+    /// IT_SET_PREDICATION census (GPU command thread; Liverpool::NotePredication).
+    struct PredicationStats {
+        u64 packets{}, by_op[8]{}, continues{}, draws_while_set{};
+        bool active{};
+    } predication;
+    void NotePredication(const PM4Header* header);
+    struct IdleSplitStats {
+        u64 frames{}, total_ns{}, total_ns_max{}, drain_ns{}, recorder_ns{}, labels_ns{};
+        u64 tail_frames{}, tail_ticks{}, unlabeled_frames{}, unpaired{};
+        u64 labels_issued_before{};
+    } idle_split;
+    std::chrono::steady_clock::time_point submit_done_at{}; ///< under submit_mutex
+    std::chrono::steady_clock::time_point idle_split_frame_submit_done{}; ///< GPU thread
+    void NoteIdleSplit(u64 drain_ns, u64 recorder_ns, u64 labels_ns);
     /// bbport (macOS): graphics submissions whose command memory is a submit-time copy and not
     /// fully parsed yet (cmd_snapshot.h), in submission order.
     std::mutex snapshots_mutex;
@@ -114,6 +133,12 @@ struct Liverpool {
     /// does not present or publish the held frame before its draws parse.
     std::array<u32, NumTotalQueues> replay_held_tasks{};
     u32 replay_held_left{};
+#ifdef __APPLE__
+    /// BB_CMD_DATA_CHECK (bbport_cmd_data.h): where `size` bytes at `address`, read as
+    /// `bytes_read`, lie relative to the submitted command memory snapshots still held.
+    static BbCmdData::Result LookupCommandData(void* owner, u64 address, u64 size,
+                                               const void* bytes_read);
+#endif
     /// A stream write the PS4 command processor would see in command memory a copy hides.
     void CheckCommandMemoryWrite(VAddr address, u64 size, const char* writer);
     static u64 HashRegisterPacket(u64 checksum, const u32* words, u32 count);
@@ -130,6 +155,9 @@ public:
 
     void SubmitDone() noexcept {
         std::scoped_lock lk{submit_mutex};
+#ifdef __APPLE__
+        submit_done_at = std::chrono::steady_clock::now(); // GpuIdle's wait split (R0)
+#endif
         mapped_queues[GfxQueueId].ccb_buffer_offset = 0;
         mapped_queues[GfxQueueId].dcb_buffer_offset = 0;
         submit_done = true;

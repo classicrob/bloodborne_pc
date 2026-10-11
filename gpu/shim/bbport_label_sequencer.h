@@ -1,4 +1,4 @@
-// bbport (macOS, BB_LABELS_AT_GPU_COMPLETE=1): GPU-visible labels written strictly in the order
+// bbport (macOS, labels at GPU completion, the default): GPU-visible labels written strictly in the order
 // they were issued in the command stream. A label is issued when the stream reaches it, but becomes
 // ready (its guest-memory copies done) later and from other threads, possibly after a later label:
 // deferred labels go through the copy threads' completion, labels in direct recording mode don't.

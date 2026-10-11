@@ -4,9 +4,11 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <condition_variable>
 #include <csetjmp>
+#include <cstring>
 #include <cstdio>
 #include <deque>
 #include <map>
@@ -40,7 +42,14 @@ public:
         std::chrono::steady_clock::time_point recorded; ///< when it was hashed first
         float record_to_check_ms = 0; ///< filled by the checker
         float retired_to_check_ms = 0; ///< from the checker seeing the tick retired
+        u64 stage_hash = 0; ///< the program of the stage that binds it (vs/ps name the draw)
+        /// A range of at most SmallBytes: its bytes at record, and at the check once it changed,
+        /// so the report names the bytes that changed (a V# range can be larger than what the
+        /// shader reads, and the guest may own the bytes past it).
+        std::array<u8, 64> recorded_bytes{};
+        std::array<u8, 64> checked_bytes{};
     };
+    static constexpr u32 SmallBytes = 64;
     struct Batch {
         u64 tick;
         std::vector<Range> ranges;
@@ -94,17 +103,25 @@ public:
             ++entry.count;
             entry.size = range.size;
             entry.address = range.address;
+            const auto [first, last] = ChangedBytes(range);
+            if (first <= last) {
+                entry.first_changed = std::min(entry.first_changed, first);
+                entry.last_changed = std::max(entry.last_changed, last);
+            }
             if (unmarked_changed <= 64 || (unmarked_changed & 1023) == 0) {
                 std::printf("GPU read check: changed between record and a check after GPU "
                             "retirement, not currently marked GPU-modified (#%llu): frame %llu "
-                            "draw #%llu %s stage %u binding %u vs %#llx ps %#llx range %#llx+%u; "
+                            "draw #%llu %s stage %u (program %#llx) binding %u vs %#llx ps %#llx "
+                            "range %#llx+%u; "
                             "checked %.1f ms after record, %.1f ms after the checker saw the "
                             "tick retired\n",
                             (unsigned long long)unmarked_changed, (unsigned long long)range.frame,
                             (unsigned long long)range.sequence, KindName(range.kind),
-                            u32(range.stage), u32(range.binding), (unsigned long long)range.vs,
+                            u32(range.stage), (unsigned long long)range.stage_hash,
+                            u32(range.binding), (unsigned long long)range.vs,
                             (unsigned long long)range.ps, (unsigned long long)range.address,
                             range.size, range.record_to_check_ms, range.retired_to_check_ms);
+                PrintChangedWords(range);
             }
         }
         const auto now = std::chrono::steady_clock::now();
@@ -127,16 +144,53 @@ public:
         });
         for (std::size_t i = 0; i < std::min<std::size_t>(top.size(), 12); ++i) {
             const auto& [key, entry] = top[i];
-            std::printf("  %llu x %s stage %u binding %u vs %#llx ps %#llx (last %#llx+%u)\n",
+            std::printf("  %llu x %s stage %u binding %u vs %#llx ps %#llx (last %#llx+%u)",
                         (unsigned long long)entry.count, KindName(key.kind), u32(key.stage),
                         u32(key.binding), (unsigned long long)key.vs, (unsigned long long)key.ps,
                         (unsigned long long)entry.address, entry.size);
+            if (entry.first_changed <= entry.last_changed) {
+                std::printf("; bytes +%u..+%u changed", entry.first_changed, entry.last_changed);
+            }
+            std::printf("\n");
         }
         by_binding.clear();
         std::fflush(stdout);
     }
 
 private:
+    /// The first and last byte offsets that differ, for a range small enough to have its bytes
+    /// kept; first > last otherwise.
+    static std::pair<u32, u32> ChangedBytes(const Range& range) {
+        u32 first = ~0u, last = 0;
+        if (range.size <= SmallBytes) {
+            for (u32 at = 0; at < range.size; ++at) {
+                if (range.recorded_bytes[at] != range.checked_bytes[at]) {
+                    first = std::min(first, at);
+                    last = at;
+                }
+            }
+        }
+        return {first, last};
+    }
+
+    /// Recording thread: the changed 32-bit words of a small range, record -> check.
+    static void PrintChangedWords(const Range& range) {
+        const auto [first, last] = ChangedBytes(range);
+        if (first > last) {
+            return;
+        }
+        std::printf("  bytes +%u..+%u of %u changed:", first, last, range.size);
+        for (u32 at = first & ~3u; at <= last && at + 4 <= range.size; at += 4) {
+            u32 before, after;
+            std::memcpy(&before, range.recorded_bytes.data() + at, 4);
+            std::memcpy(&after, range.checked_bytes.data() + at, 4);
+            if (before != after) {
+                std::printf(" +%u %#010x->%#010x", at, before, after);
+            }
+        }
+        std::printf("\n");
+    }
+
     static const char* KindName(char kind) {
         return kind == 'i' ? "index range" : kind == 'v' ? "vertex buffer" : "read-only buffer";
     }
@@ -189,10 +243,16 @@ private:
                 runtime_fault_recover = &recover;
                 const u64 hash =
                     XXH3_64bits(reinterpret_cast<const void*>(range.address), range.size);
+                std::array<u8, SmallBytes> now{};
+                if (hash != range.hash && range.size <= SmallBytes) {
+                    std::memcpy(now.data(), reinterpret_cast<const void*>(range.address),
+                                range.size);
+                }
                 runtime_fault_recover = previous;
                 if (hash != range.hash) {
                     const auto checked_at = std::chrono::steady_clock::now();
                     Range found = range;
+                    found.checked_bytes = now;
                     found.record_to_check_ms =
                         std::chrono::duration<float, std::milli>(checked_at - range.recorded)
                             .count();
@@ -226,6 +286,7 @@ private:
         u64 count = 0;
         VAddr address = 0;
         u32 size = 0;
+        u32 first_changed = ~0u, last_changed = 0; ///< over its small ranges since the summary
     };
 
     const Instance& instance;

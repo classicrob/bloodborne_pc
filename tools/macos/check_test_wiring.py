@@ -15,6 +15,9 @@ TEST_SUFFIXES = ('.c', '.cpp', '.mm', '.py', '.sh')
 
 # path -> why build.sh --test does not run it. Keep reasons specific; a vague reason is a gap.
 EXCLUDED = {
+    'tests/bench_parse_split.cpp': 'overhead benchmark of the parse split (timing, no pass/fail); '
+                                   'run by hand via tests/bench_parse_split.sh',
+    'tests/bench_parse_split.sh': 'builds and runs the parse-split overhead benchmark by hand',
     'tests/paths.py': 'helper module imported by the Python tests, not a test',
     'tests/compare_atrac9_asset.py': 'manual tool: compares against a local game asset that the '
                                      'repository does not ship',

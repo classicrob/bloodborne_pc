@@ -12,6 +12,7 @@
 #pragma once
 
 #include <cstdlib>
+#include "bbport_parse_split.h"
 #include "bbport_threads.h"
 
 #include <array>
@@ -151,6 +152,10 @@ private:
     }
 
     void WaitForSpace(u64 at, u64 size) {
+        if (at + size - consumed.load(std::memory_order_acquire) <= Capacity) {
+            return;
+        }
+        BB_SPLIT_SCOPE(KRingFull);
         while (at + size - consumed.load(std::memory_order_acquire) > Capacity) {
             __builtin_ia32_pause();
         }
@@ -160,6 +165,9 @@ private:
         Common::SetCurrentThreadName("bb:DrawRec");
         on_stage_b = true;
         stage_b_tid.store(static_cast<u32>(gettid()), std::memory_order_release);
+#ifdef __APPLE__
+        BbSplit::Attach(BbSplit::stage_b, BbSplit::BIdle);
+#endif
         u64 at = 0;
         while (true) {
             // Packets follow each other within microseconds while a frame is decoded: spin,
@@ -199,7 +207,13 @@ private:
                 continue;
             }
             const u64 start = __rdtsc();
+#ifdef __APPLE__
+            BbSplit::Mark(BbSplit::BDecode);
+#endif
             handler(context, reinterpret_cast<const u8*>(header + 1), header->payload);
+#ifdef __APPLE__
+            BbSplit::Mark(BbSplit::BAfter);
+#endif
             if (after_packet) {
                 // Before the packet counts as consumed: a stage A drain also waits for this.
                 // `idle`: nothing more is published yet.
@@ -207,6 +221,9 @@ private:
                              published.load(std::memory_order_acquire) == at + header->size);
             }
             busy_cycles.fetch_add(__rdtsc() - start, std::memory_order_relaxed);
+#ifdef __APPLE__
+            BbSplit::Mark(BbSplit::BIdle);
+#endif
             at += header->size;
             consumed.store(at, std::memory_order_release);
         }

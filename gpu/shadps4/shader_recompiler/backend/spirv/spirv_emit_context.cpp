@@ -1258,93 +1258,82 @@ void EmitContext::DefineSharedMemory() {
 }
 
 Id EmitContext::DefineFloat32ToUfloatM5(u32 mantissa_bits, const std::string_view name) {
-    // https://gitlab.freedesktop.org/mesa/mesa/-/blob/main/src/util/format_r11g11b10f.h
-    const auto func_type{TypeFunction(U32[1], F32[1])};
-    const auto func{OpFunction(U32[1], spv::FunctionControlMask::MaskNone, func_type)};
-    const auto value{OpFunctionParameter(F32[1])};
+    // Unsigned e5m6/e5m5, bias 15. Use integer rounding so shader float modes and
+    // speculative float-to-integer conversions cannot change exceptional inputs.
+    // Policy: RTNE, denormals preserved, finite overflow saturated, either-sign NaN
+    // canonicalized. See docs/macos/packed-ufloat.md for the ISA qualification.
+    const auto func_type = TypeFunction(U32[1], F32[1]);
+    const auto func = OpFunction(U32[1], spv::FunctionControlMask::MaskNone, func_type);
+    const auto value = OpFunctionParameter(F32[1]);
     Name(func, name);
     AddLabel();
 
-    const auto raw_value{OpBitcast(U32[1], value)};
-    const auto exponent{
-        OpBitcast(S32[1], OpBitFieldSExtract(U32[1], raw_value, ConstU32(23U), ConstU32(8U)))};
-    const auto sign{OpBitFieldUExtract(U32[1], raw_value, ConstU32(31U), ConstU32(1U))};
+    const u32 shift = 23 - mantissa_bits;
+    const u32 infinity = 31U << mantissa_bits;
+    const u32 max_finite_bits = (142U << 23) | (((1U << mantissa_bits) - 1) << shift);
+    const Id raw = OpBitcast(U32[1], value);
+    const Id magnitude = OpBitwiseAnd(U32[1], raw, ConstU32(0x7fffffffU));
+    const Id negative = OpINotEqual(U1[1], OpBitwiseAnd(U32[1], raw, ConstU32(0x80000000U)),
+                                   u32_zero_value);
+    const Id is_nan = OpUGreaterThan(U1[1], magnitude, ConstU32(0x7f800000U));
+    const Id is_inf = OpIEqual(U1[1], magnitude, ConstU32(0x7f800000U));
+    const Id finite_bits = OpUMin(U32[1], magnitude, ConstU32(max_finite_bits));
 
-    const auto is_zero{OpLogicalOr(U1[1], OpIEqual(U1[1], raw_value, ConstU32(0U)),
-                                   OpIEqual(U1[1], sign, ConstU32(1U)))};
-    const auto is_nan{OpIsNan(U1[1], value)};
-    const auto is_inf{OpIsInf(U1[1], value)};
-    const auto is_denorm{OpSLessThanEqual(U1[1], exponent, ConstS32(-15))};
+    // Round by adding half an ULP minus one plus the retained low bit (ties to even).
+    const auto round_shift = [&](Id significand, Id count) {
+        const Id retained = OpShiftRightLogical(U32[1], significand, count);
+        const Id half = OpShiftLeftLogical(U32[1], u32_one_value,
+                                           OpISub(U32[1], count, u32_one_value));
+        const Id bias = OpIAdd(U32[1], OpISub(U32[1], half, u32_one_value),
+                               OpBitwiseAnd(U32[1], retained, u32_one_value));
+        return OpShiftRightLogical(U32[1], OpIAdd(U32[1], significand, bias), count);
+    };
+    const Id normal = OpISub(U32[1], round_shift(finite_bits, ConstU32(shift)),
+                             ConstU32(112U << mantissa_bits));
 
-    const auto denorm_mantissa{OpConvertFToU(
-        U32[1],
-        OpRoundEven(F32[1], OpFMul(F32[1], value,
-                                   ConstF32(static_cast<float>(1 << (mantissa_bits + 14))))))};
-    const auto denorm_overflow{
-        OpINotEqual(U1[1], OpShiftRightLogical(U32[1], denorm_mantissa, ConstU32(mantissa_bits)),
-                    ConstU32(0U))};
-    const auto denorm{
-        OpSelect(U32[1], denorm_overflow, ConstU32(1U << mantissa_bits), denorm_mantissa)};
-
-    const auto norm_mantissa{OpConvertFToU(
-        U32[1],
-        OpRoundEven(F32[1],
-                    OpLdexp(F32[1], value,
-                            OpISub(S32[1], ConstS32(static_cast<int>(mantissa_bits)), exponent))))};
-    const auto norm_overflow{
-        OpUGreaterThanEqual(U1[1], norm_mantissa, ConstU32(2U << mantissa_bits))};
-    const auto norm_final_mantissa{OpBitwiseAnd(
-        U32[1],
-        OpSelect(U32[1], norm_overflow, OpShiftRightLogical(U32[1], norm_mantissa, ConstU32(1U)),
-                 norm_mantissa),
-        ConstU32((1U << mantissa_bits) - 1))};
-    const auto norm_final_exponent{OpBitcast(
-        U32[1],
-        OpIAdd(S32[1],
-               OpSelect(S32[1], norm_overflow, OpIAdd(S32[1], exponent, ConstS32(1)), exponent),
-               ConstS32(15)))};
-    const auto norm{OpBitFieldInsert(U32[1], norm_final_mantissa, norm_final_exponent,
-                                     ConstU32(mantissa_bits), ConstU32(5U))};
-
-    const auto result{OpSelect(U32[1], is_zero, ConstU32(0U),
-                               OpSelect(U32[1], is_nan, ConstU32(31u << mantissa_bits | 1U),
-                                        OpSelect(U32[1], is_inf, ConstU32(31U << mantissa_bits),
-                                                 OpSelect(U32[1], is_denorm, denorm, norm))))};
-
+    const Id exponent = OpShiftRightLogical(U32[1], finite_bits, ConstU32(23U));
+    const Id fraction = OpBitwiseAnd(U32[1], finite_bits, ConstU32(0x7fffffU));
+    // Only exponents [112-m,112] can round to a nonzero denormal. Clamp before
+    // calculating the shift: OpSelect evaluates both values, so all shifts must be valid.
+    const Id bounded_exponent = OpUMin(U32[1], ConstU32(112U),
+        OpUMax(U32[1], exponent, ConstU32(112U - mantissa_bits)));
+    const Id denorm_shift = OpISub(U32[1], ConstU32(136U - mantissa_bits), bounded_exponent);
+    const Id denorm_rounded = round_shift(
+        OpBitwiseOr(U32[1], fraction, ConstU32(0x800000U)), denorm_shift);
+    const Id denorm = OpSelect(U32[1],
+        OpULessThan(U1[1], exponent, ConstU32(112U - mantissa_bits)),
+        u32_zero_value, denorm_rounded);
+    const Id finite = OpSelect(U32[1], OpULessThan(U1[1], exponent, ConstU32(113U)),
+                               denorm, normal);
+    const Id positive = OpSelect(U32[1], is_inf, ConstU32(infinity), finite);
+    const Id result = OpSelect(U32[1], is_nan, ConstU32(infinity | 1U),
+                               OpSelect(U32[1], negative, u32_zero_value, positive));
     OpReturnValue(result);
     OpFunctionEnd();
     return func;
 }
 
 Id EmitContext::DefineUfloatM5ToFloat32(u32 mantissa_bits, const std::string_view name) {
-    // https://gitlab.freedesktop.org/mesa/mesa/-/blob/main/src/util/format_r11g11b10f.h
-    const auto func_type{TypeFunction(F32[1], U32[1])};
-    const auto func{OpFunction(F32[1], spv::FunctionControlMask::MaskNone, func_type)};
-    const auto value{OpFunctionParameter(U32[1])};
+    const auto func_type = TypeFunction(F32[1], U32[1]);
+    const auto func = OpFunction(F32[1], spv::FunctionControlMask::MaskNone, func_type);
+    const auto value = OpFunctionParameter(U32[1]);
     Name(func, name);
     AddLabel();
 
-    const Id exponent{OpBitFieldUExtract(U32[1], value, ConstU32(mantissa_bits), ConstU32(5U))};
-    const Id mantissa{OpBitFieldUExtract(U32[1], value, ConstU32(0U), ConstU32(mantissa_bits))};
-    const Id mantissa_f{OpConvertUToF(F32[1], mantissa)};
-    const Id a{OpSelect(F32[1], OpINotEqual(U1[1], mantissa, u32_zero_value),
-                        OpFMul(F32[1], ConstF32(1.f / (1 << (14 + mantissa_bits))), mantissa_f),
-                        f32_zero_value)};
-    const Id b{OpBitcast(F32[1], OpBitwiseOr(U32[1], mantissa, ConstU32(0x7f800000U)))};
-    const Id exponent_c{OpISub(U32[1], exponent, ConstU32(15U))};
-    const Id scale_a{
-        OpFDiv(F32[1], ConstF32(1.f),
-               OpConvertUToF(F32[1], OpShiftLeftLogical(U32[1], u32_one_value,
-                                                        OpSNegate(U32[1], exponent_c))))};
-    const Id scale_b{OpConvertUToF(F32[1], OpShiftLeftLogical(U32[1], u32_one_value, exponent_c))};
-    const Id scale{
-        OpSelect(F32[1], OpSLessThan(U1[1], exponent_c, u32_zero_value), scale_a, scale_b)};
-    const Id c{OpFMul(F32[1], scale,
-                      OpFAdd(F32[1], ConstF32(1.f),
-                             OpFDiv(F32[1], mantissa_f, ConstF32(f32(1 << mantissa_bits)))))};
-    const Id result{OpSelect(F32[1], OpIEqual(U1[1], exponent, u32_zero_value), a,
-                             OpSelect(F32[1], OpIEqual(U1[1], exponent, ConstU32(31U)), b, c))};
-    OpReturnValue(result);
+    const Id exponent = OpBitFieldUExtract(U32[1], value, ConstU32(mantissa_bits), ConstU32(5U));
+    const Id mantissa = OpBitFieldUExtract(U32[1], value, u32_zero_value, ConstU32(mantissa_bits));
+    // Every small-float denormal is a normal f32; this exact power-of-two scale is
+    // unaffected by f32 denormal modes. Normal values need only exponent rebiasing.
+    const Id denorm = OpFMul(F32[1], OpConvertUToF(F32[1], mantissa),
+                            ConstF32(1.f / (1U << (14 + mantissa_bits))));
+    const Id normal_bits = OpBitwiseOr(U32[1],
+        OpShiftLeftLogical(U32[1], OpIAdd(U32[1], exponent, ConstU32(112U)), ConstU32(23U)),
+        OpShiftLeftLogical(U32[1], mantissa, ConstU32(23U - mantissa_bits)));
+    // Preserve the existing NaN payload convention; a nonzero mantissa stays NaN.
+    const Id special_bits = OpBitwiseOr(U32[1], ConstU32(0x7f800000U), mantissa);
+    const Id nonzero = OpBitcast(F32[1],
+        OpSelect(U32[1], OpIEqual(U1[1], exponent, ConstU32(31U)), special_bits, normal_bits));
+    OpReturnValue(OpSelect(F32[1], OpIEqual(U1[1], exponent, u32_zero_value), denorm, nonzero));
     OpFunctionEnd();
     return func;
 }

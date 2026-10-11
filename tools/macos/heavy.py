@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Machine-wide limit on heavy jobs (GPU builds, test suites, game runs, benchmarks).
 
-  tools/macos/heavy.sh [--pool build|playtest|quick|sweep] [--priority] [--gpu shared|exclusive]
+  tools/macos/heavy.sh [--pool build|playtest|quick|sweep] [--priority] [--gpu shared|exclusive [--cpu-quiet]]
                        LABEL -- COMMAND [ARG...]
   tools/macos/heavy.sh status
 
@@ -260,6 +260,107 @@ def polite(pool, priority, gpu, command, idle=(False, '')):
     return ['taskpolicy', '-b', *command], f'{idle[1]}: background QoS, {jobs} jobs'
 
 
+QUIET_POOLS = ('build', 'quick', 'sweep')
+
+
+def quiet_active():
+    """True while a --cpu-quiet job (a perf run) holds BB_HEAVY_DIR/cpu-quiet."""
+    fd = lock_file('cpu-quiet')
+    try:
+        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        return False
+    except BlockingIOError:
+        return True
+    finally:
+        os.close(fd)
+
+
+def descendants(pid):
+    """Every process below pid (pgrep -P, breadth first)."""
+    found, queue = [], [pid]
+    while queue:
+        out = subprocess.run(['pgrep', '-P', str(queue.pop(0))], capture_output=True, text=True).stdout
+        for child in (int(x) for x in out.split()):
+            if child not in found:
+                found.append(child)
+                queue.append(child)
+    return found
+
+
+def alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+
+
+def pause_quiet_pools(label):
+    """SIGSTOPs every running build/quick/sweep job (its whole process tree; for a quick job the
+    command under its supervisor, so its time limit can pause). Returns [(job label, pids)]."""
+    paused = []
+    names = ['build-priority', 'build-idle'] + [n for pool in QUIET_POOLS for n in slot_names(pool)]
+    for name in names:
+        fd = try_lock(name)
+        if fd is not None:
+            os.close(fd)
+            continue
+        info = holder(name)
+        if not info.get('pid') or not alive(info['pid']):
+            continue
+        root = info['pid']
+        pids = [] if info.get('pool') == 'quick' else [root]
+        for _ in range(3):  # stop the tree; repeat for processes started while stopping it
+            new = [p for p in descendants(root) if p not in pids]
+            if not new and pids:
+                break
+            pids += new
+            for pid in pids:
+                try:
+                    os.kill(pid, signal.SIGSTOP)
+                except ProcessLookupError:
+                    pass
+        paused.append((info.get('label', name), pids))
+        print(f'heavy: {label}: CPU quiet: paused {info.get("label", name)} ({name}, {len(pids)} processes)',
+              file=sys.stderr, flush=True)
+        record({'event': 'quiet-pause', 'by': label, 'label': info.get('label'), 'slot': name, 'pids': len(pids)})
+    if not paused:
+        print(f'heavy: {label}: CPU quiet: no build, quick or sweep job was running', file=sys.stderr, flush=True)
+    return paused
+
+
+def start_quiet(label):
+    """--cpu-quiet: until this job ends (at most BB_HEAVY_QUIET_MAX seconds), no build, quick or
+    sweep job is admitted and the running ones are paused. A forked watcher holds
+    BB_HEAVY_DIR/cpu-quiet, pauses the jobs, waits for this process (which goes on to exec the
+    perf run) to end or the bound to pass, then resumes them and says so."""
+    bound = seconds('BB_HEAVY_QUIET_MAX', 1200)
+    lock = lock_file('cpu-quiet')
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    target = os.getpid()
+    if os.fork():
+        os.close(lock)  # the watcher keeps the lock
+        return
+    os.setsid()
+    started = time.monotonic()
+    paused = pause_quiet_pools(label)
+    while alive(target) and time.monotonic() - started < bound:
+        time.sleep(1)
+    if alive(target):
+        print(f'heavy: {label}: CPU QUIET BOUND REACHED after {bound} s: resuming paused jobs while '
+              f'this job still runs', file=sys.stderr, flush=True)
+    for job, pids in paused:
+        for pid in reversed(pids):
+            try:
+                os.kill(pid, signal.SIGCONT)
+            except ProcessLookupError:
+                pass
+        print(f'heavy: {label}: CPU quiet over: resumed {job}', file=sys.stderr, flush=True)
+    record({'event': 'quiet-end', 'by': label, 'seconds': round(time.monotonic() - started, 1),
+            'bound_reached': alive(target), 'resumed': [job for job, _ in paused]})
+    os._exit(0)
+
+
 def announce(label):
     """With BB_HEAVY_ANNOUNCE set (play_route.py sets it), says on stderr that the command starts
     now: everything before was waiting for a slot or the GPU, not the command's own startup."""
@@ -267,8 +368,10 @@ def announce(label):
         print(f'heavy: {label}: running', file=sys.stderr, flush=True)
 
 
-def run(pool, priority, gpu, label, command, pool_given=False):
+def run(pool, priority, gpu, label, command, pool_given=False, quiet=False):
     held = os.environ.get('BB_HEAVY_HELD')
+    if held and quiet:
+        fail(f'{label}: --cpu-quiet inside {held} would pause the job it runs in')
     if held:
         held_pool = held.split(':', 1)[0].rstrip('0123456789').replace('build-priority', 'build')
         if pool_given and pool != held_pool and pool != 'playtest':
@@ -284,8 +387,15 @@ def run(pool, priority, gpu, label, command, pool_given=False):
     while True:
         # While the user is idle the build pool admits one more job (build-idle); a job already
         # in it keeps running when the user returns. Checked at most every 10 s while waiting.
-        if pool in ('build', 'quick', 'sweep') and (idle_checked is None or time.monotonic() - idle_checked >= 10):
+        if pool in QUIET_POOLS and (idle_checked is None or time.monotonic() - idle_checked >= 10):
             idle, idle_checked = user_state(), time.monotonic()
+        if pool in QUIET_POOLS and quiet_active():
+            # A perf run wants the CPU quiet: nothing new starts until it ends.
+            if time.monotonic() - reported >= WAIT_REPORT_SECONDS:
+                print(f'heavy: {label}: waiting: a perf run keeps the CPU quiet', file=sys.stderr, flush=True)
+                reported = time.monotonic()
+            time.sleep(1)
+            continue
         names = ((['build-priority'] if priority else []) + slot_names(pool) +
                  (['build-idle'] if pool == 'build' and idle[0] else []))
         for name in names:
@@ -311,6 +421,8 @@ def run(pool, priority, gpu, label, command, pool_given=False):
             os.environ['BB_HEAVY_HELD'] = f'{name}:{label}'
             if gpu:
                 take_gpu(gpu, label)
+            if quiet:
+                start_quiet(label)
             announce(label)
             if pool == 'quick':
                 supervise_quick(label, command)
@@ -350,13 +462,18 @@ def supervise_quick(label, command):
         record({'event': 'end', 'label': label, 'pool': 'quick', 'status': status,
                 'seconds': round(time.monotonic() - started, 1), 'load': [round(x, 2) for x in os.getloadavg()]})
         sys.exit(status)
+    last = time.monotonic()
     while True:
         try:
             status = child.wait(timeout=1)
             finish(status if status >= 0 else 128 - status)
         except subprocess.TimeoutExpired:
             pass
-        elapsed = time.monotonic() - started
+        now = time.monotonic()
+        if quiet_active():
+            started += now - last  # paused for a perf run: the time limit pauses too
+        last = now
+        elapsed = now - started
         if not warned and elapsed >= warn:
             print(f'heavy: WARNING: quick job {label} still running after {warn} s '
                   f'(killed at {limit} s; long jobs belong in the build pool)', file=sys.stderr, flush=True)
@@ -376,24 +493,28 @@ def supervise_quick(label, command):
 def main(argv):
     if argv == ['status']:
         return status()
-    pool, priority, gpu, pool_given = 'build', False, None, False
+    pool, priority, gpu, pool_given, quiet = 'build', False, None, False, False
     while argv and argv[0].startswith('--') and argv[0] != '--':
         if argv[0] == '--priority':
             priority, argv = True, argv[1:]
         elif argv[0] == '--pool' and len(argv) > 1 and argv[1] in POOLS:
             pool, argv, pool_given = argv[1], argv[2:], True
+        elif argv[0] == '--cpu-quiet':
+            quiet, argv = True, argv[1:]
         elif argv[0] == '--gpu' and len(argv) > 1 and argv[1] in ('shared', 'exclusive'):
             gpu, argv = argv[1], argv[2:]
         else:
-            fail(f'unknown option {argv[0]} (--pool build|playtest|quick|sweep, --priority, --gpu shared|exclusive)')
+            fail(f'unknown option {argv[0]} (--pool build|playtest|quick|sweep, --priority, --gpu shared|exclusive, --cpu-quiet)')
     if pool == 'playtest' and gpu is None:
         gpu = 'shared'  # a game uses the GPU
+    if quiet and gpu != 'exclusive':
+        fail('--cpu-quiet is for --gpu exclusive jobs (perf runs)')
     if priority and pool != 'build':
         fail('--priority is for the build pool (shared builds); the playtest pool is dedicated already')
     if len(argv) < 3 or argv[1] != '--' or not argv[0]:
         fail('usage: heavy.sh [--pool build|playtest|quick|sweep] [--priority] [--gpu shared|exclusive] LABEL -- '
              'COMMAND [ARG...] | heavy.sh status')
-    run(pool, priority, gpu, argv[0], argv[2:], pool_given)
+    run(pool, priority, gpu, argv[0], argv[2:], pool_given, quiet)
 
 
 if __name__ == '__main__':

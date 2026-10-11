@@ -15,9 +15,12 @@
 set -euo pipefail
 cd -- "$(dirname -- "$0")/../.."
 # The run takes the GPU exclusively (tools/macos/heavy.sh): it waits until running games end, and
-# games started meanwhile wait for it. The game itself runs under this hold.
+# games started meanwhile wait for it. The game itself runs under this hold. --cpu-quiet pauses
+# running build/quick/sweep jobs and holds new ones for the run (at most BB_HEAVY_QUIET_MAX s);
+# the run's output names every paused job.
 if [[ ${BB_HEAVY_GPU:-} != exclusive ]]; then
-    exec tools/macos/heavy.sh --pool playtest --gpu exclusive "perf_run $*" -- bash "$PWD/tools/macos/perf_run.sh" "$@"
+    exec tools/macos/heavy.sh --pool playtest --gpu exclusive --cpu-quiet "perf_run $*" -- \
+        bash "$PWD/tools/macos/perf_run.sh" "$@"
 fi
 probe='' output=4k phases=0 label=perf until=() hold=0 segments='' seeds=() keep_apps=0
 while (($#)); do
