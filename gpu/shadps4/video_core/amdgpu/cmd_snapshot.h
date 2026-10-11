@@ -53,6 +53,12 @@ public:
     /// writes made after submit. Returns the number of differing dwords.
     u32 ReportGuestRewrites(const Region& region) const;
 
+    /// Diagnostic, at submit: logs regions of this submission that partly overlap command memory
+    /// submitted in the last 64 submissions. A command ring takes far longer to wrap, and a
+    /// buffer called again is the same range, so a partial overlap means two command buffers
+    /// were written into the same memory. Returns the number of overlaps.
+    u32 ReportRecentOverlaps();
+
     u64 submit_number{};
     u64 copied_bytes{};
     u64 copy_ns{};
@@ -95,6 +101,8 @@ public:
     };
     /// Guest thread, on entry to a builder.
     static void Note(const char* builder, const u32* cmdbuf, u32 size);
+    /// The calling thread's number in the trace.
+    [[nodiscard]] static u32 ThreadNumber();
     /// Recorded calls (oldest first) whose dwords overlap [begin, end), plus the `last` latest.
     [[nodiscard]] static std::vector<Call> Around(const u32* begin, const u32* end, u32 last);
     /// Logs Around() for a malformed packet at `at`.

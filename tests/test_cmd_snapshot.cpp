@@ -246,6 +246,24 @@ int main() {
         BuilderTrace::Report(stream + 106);
     }
 
+    // Command memory submitted twice within a few submissions, partly overlapping: reported.
+    {
+        static u32 ring[64];
+        for (u32 i = 0; i < 64; i += 2) {
+            ring[i] = Header(PM4ItOpcode::Nop, 1);
+        }
+        const auto submit = [](u32 first, u32 count, u64 number) {
+            auto snapshot = CmdSnapshot::Take(std::span<const u32>{ring + first, count}, {});
+            snapshot->submit_number = number;
+            return snapshot->ReportRecentOverlaps();
+        };
+        Expect("overlap: first submission of the range clean", submit(0, 16, 1000) == 0);
+        Expect("overlap: same buffer called again not reported", submit(0, 16, 1001) == 0);
+        Expect("overlap: partial overlap reported", submit(10, 16, 1002) == 2);
+        Expect("overlap: adjacent buffer clean", submit(26, 8, 1003) == 0);
+        Expect("overlap: older than 64 submissions forgotten", submit(4, 8, 1100) == 0);
+    }
+
     std::fprintf(stderr, "%s: %u failures\n", failures ? "FAIL" : "PASS", failures);
     return failures ? 1 : 0;
 }

@@ -1894,6 +1894,7 @@ void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
             snapshot->submit_number = ++snapshot_submits;
             gfx_snapshots.push_back(snapshot);
         }
+        snapshot->ReportRecentOverlaps();
         auto task = ProcessGraphics(dcb, ccb, seq, snapshot, &snapshot->Dcb());
 #else
         auto task = ProcessGraphics(dcb, ccb, seq);
