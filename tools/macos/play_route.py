@@ -78,9 +78,12 @@ STEPS = {
 #   ('capture', stage, min_nonblack)          screenshot; fails when the window is darker
 #   ('check_user_cache',)                     the GPU pipeline cache is inside the run's --user
 # A stage that times out, or a game that exits or logs a fatal line, stops the route loudly.
+# Cross on the title only overlays its menu on the still title image: about 0.6% of the window
+# changes (BISECT-P15c), so a 0.04 threshold pressed again and started Continue from the menu.
+TITLE_MENU_CHANGE = 0.003
 TITLE = ('title', [('wait_log', r'^Runtime: pad opened', 120), ('wait_draws', 14, 3, 240), ('sleep', 3),
                    ('capture', 'title', 0.2), ('check_user_cache',)])
-OFFLINE = ('offline', [('press', 'down'), ('press_screen', 'cross', 0.04, 3, 3), ('sleep', 1), ('capture', 'offline-menu', 0.2)])
+OFFLINE = ('offline', [('press', 'down'), ('press_screen', 'cross', TITLE_MENU_CHANGE, 3, 3), ('sleep', 1), ('capture', 'offline-menu', 0.2)])
 # Loading screens already draw the world behind them while pipelines compile, so "in the world"
 # means scene-sized draw counts in windows with no compiles.
 WORLD = ('world', [('wait_draws', 1000, 2, 1800, True), ('sleep', 5), ('capture', 'world', 0.05)])
@@ -112,7 +115,7 @@ SKIP_MOVIE = ('controls', [('press', 'down')] * 6 + [
 # the offline menu's first entry is Continue.
 # Both presses must change the screen: a press dropped under heavy host load left BISECT-P15b
 # on the main menu for 30 min while the route waited for the world.
-CONTINUE = [TITLE, ('offline', [('press_screen', 'cross', 0.04, 3, 3), ('sleep', 1),
+CONTINUE = [TITLE, ('offline', [('press_screen', 'cross', TITLE_MENU_CHANGE, 3, 3), ('sleep', 1),
                                  ('capture', 'offline-menu', 0.2)]),
             ('continue', [('press_screen', 'cross', 0.04, 3, 3), ('sleep', 2), ('capture', 'continue', None)]), WORLD,
             # Basic play in the world: walk (left stick up), look (right stick), attack (R1), menu.
