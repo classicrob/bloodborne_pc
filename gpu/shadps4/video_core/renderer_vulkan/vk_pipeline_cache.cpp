@@ -1102,6 +1102,11 @@ PipelineCache::Result PipelineCache::GetProgram(PipelineSelection& sel, HwStage 
                                                 Shader::Backend::Bindings& binding) {
     auto runtime_info = BuildRuntimeInfo(sel, hw_stage, sw_stage);
     const auto refresh = [&](Shader::Info& info, const Program::Module& module) {
+        // GS and copy VS can share a program hash. Reject incompatible stages/roles before
+        // touching their live data: a previously selected module may still be used by this draw.
+        if (module.spec.runtime_info != runtime_info) {
+            return false;
+        }
         info.pgm_base = params.Base();
         info.user_data = params.user_data;
         // A different fetch program can walk different tables. Check its identity before
