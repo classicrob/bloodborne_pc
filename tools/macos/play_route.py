@@ -72,7 +72,7 @@ STEPS = {
 #   ('wait_log', regex, timeout)              a log line since the last press matches
 #   ('wait_draws', minimum, windows, timeout) that many frame-stats windows since the last press with at least
 #                                             minimum draws/frame in a row
-#   ('press', tokens) / ('sleep', seconds)
+#   ('press', tokens) / ('hold', tokens, seconds) / ('sleep', seconds)
 #   ('press_screen', token, min_changed, tries, settle)  press until the window changes that much
 #   ('press_log', token, regex, tries, timeout)          press until a log line matches
 #   ('capture', stage, min_nonblack)          screenshot; fails when the window is darker
@@ -110,7 +110,14 @@ SKIP_MOVIE = ('controls', [('press', 'down')] * 6 + [
 # From a save fixture the title cursor starts on Play Offline (Down would select Play Online), and
 # the offline menu's first entry is Continue.
 CONTINUE = [TITLE, ('offline', [('press', 'cross'), ('sleep', 4), ('capture', 'offline-menu', 0.2)]),
-            ('continue', [('press', 'cross'), ('sleep', 5), ('capture', 'continue', None)]), WORLD]
+            ('continue', [('press', 'cross'), ('sleep', 5), ('capture', 'continue', None)]), WORLD,
+            # Basic play in the world: walk (left stick up), look (right stick), attack (R1), menu.
+            ('play', [('sleep', 5), ('capture', 'play-start', 0.05),
+                      ('hold', 'ly=0', 3.0), ('capture', 'play-walked', 0.05),
+                      ('hold', 'rx=230', 1.5), ('capture', 'play-looked', 0.05),
+                      ('press', 'r1'), ('sleep', 2), ('capture', 'play-attack', 0.05),
+                      ('press', 'options'), ('sleep', 2), ('capture', 'play-menu', 0.05),
+                      ('press', 'circle'), ('sleep', 2), ('capture', 'play-menu-closed', 0.05)])]
 
 
 def route_stages(args):
@@ -629,6 +636,9 @@ def route(run, until, hold=0, stages=NEW_GAME):
             elif op[0] == 'press':
                 mark = len(log_lines(run))
                 press(run, op[1])
+            elif op[0] == 'hold':
+                mark = len(log_lines(run))
+                press(run, op[1], op[2])
             elif op[0] == 'press_screen':
                 # A press that must change the screen: retried when it was dropped (heavy host load).
                 token, min_changed, tries, settle = op[1:]
@@ -721,7 +731,7 @@ def main():
                        help='BB_PERF_PHASES=1 (needs --perf; perturbed timing, not for FPS claims)')
         if command == 'route':
             p.add_argument('--until', help='last stage: ' + ', '.join(name for name, _ in NEW_GAME) +
-                           ' (with --fixture: title, offline, continue, world)')
+                           ' (with --fixture: title, offline, continue, world, play)')
             p.add_argument('--movie', action='store_true', help='play the opening movie to the end (movie coverage)')
             p.add_argument('--save-fixture', metavar='NAME',
                            help='after the route, store the save data as fixture NAME (FIXTURES/NAME)')
