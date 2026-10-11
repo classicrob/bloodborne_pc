@@ -15,8 +15,12 @@ static VkPipeline pipeline;
 static VkPipelineLayout layout;
 static VkPhysicalDeviceMemoryProperties memory_properties;
 typedef struct { const char *name; uint32_t op,a,b,c; } Case;
-#ifdef BB_FP16_CASES
+#if defined(BB_FP16_CASES) || defined(BB_PKRTZ_CASES)
+#ifdef BB_PKRTZ_CASES
+#include "../macos_pkrtz/cases.h"
+#else
 #include "../macos_fp16/cases.h"
+#endif
 #else
 static const Case cases[]={
     {"add_smallest_subnormals",0,0x00000001,0x00000001,0},
@@ -82,10 +86,13 @@ static const Case cases[]={
 };
 #endif
 int main(int argc,char **argv) {
-#ifdef BB_FP16_CASES
+#if defined(BB_FP16_CASES) || defined(BB_PKRTZ_CASES)
     assert(argc==3);
     const int mode=atoi(argv[2]); assert(mode>=0 && mode<4);
     const int benchmark=0;
+#ifdef BB_PKRTZ_CASES
+    make_cases();
+#endif
 #else
     assert(argc==2 || (argc==3 && !strcmp(argv[2],"--benchmark")));
     const int benchmark=argc==3;
@@ -114,7 +121,7 @@ int main(int argc,char **argv) {
     VkPhysicalDeviceFeatures2 f2={.sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,.pNext=&f12}; vkGetPhysicalDeviceFeatures2(physical,&f2);
     printf("features BDA=%u shaderInt64=%u shaderFloat16=%u shaderFloat64=%u\n",f12.bufferDeviceAddress,f2.features.shaderInt64,f12.shaderFloat16,f2.features.shaderFloat64); assert(f12.bufferDeviceAddress && f2.features.shaderInt64);
     f12=(VkPhysicalDeviceVulkan12Features){.sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,.bufferDeviceAddress=VK_TRUE,.shaderInt8=VK_TRUE};
-#ifdef BB_FP16_CASES
+#if defined(BB_FP16_CASES) || defined(BB_PKRTZ_CASES)
     f12.shaderFloat16=VK_TRUE;
 #endif
     VkQueueFamilyProperties families[32]; count=32; vkGetPhysicalDeviceQueueFamilyProperties(physical,&count,families);
@@ -139,7 +146,11 @@ int main(int argc,char **argv) {
     VkComputePipelineCreateInfo pc={.sType=VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,.stage={.sType=VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,.stage=VK_SHADER_STAGE_COMPUTE_BIT,.module=shader,.pName="main"},.layout=layout};
     CHECK(vkCreateComputePipelines(device,VK_NULL_HANDLE,1,&pc,NULL,&pipeline));
 
+#ifdef BB_PKRTZ_CASES
+    const size_t n=case_count, bytes_data=n*8*sizeof(uint32_t);
+#else
     const size_t n=benchmark ? 65536 : sizeof(cases)/sizeof(*cases), bytes_data=n*8*sizeof(uint32_t);
+#endif
     VkBufferCreateInfo bi={.sType=VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,.size=bytes_data,
         .usage=VK_BUFFER_USAGE_STORAGE_BUFFER_BIT|VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,.sharingMode=VK_SHARING_MODE_EXCLUSIVE};
     VkBuffer buffer; CHECK(vkCreateBuffer(device,&bi,NULL,&buffer));
@@ -159,7 +170,7 @@ int main(int argc,char **argv) {
         words[8*i+2]=benchmark ? 0x3f800001u | ((i&2)?0x80000000u:0) : cases[i].b;
         words[8*i+3]=benchmark ? 0 : cases[i].c;
         words[8*i+4]=0xdeadbeef;
-#ifdef BB_FP16_CASES
+#if defined(BB_FP16_CASES) || defined(BB_PKRTZ_CASES)
         words[8*i+5]=0xcdcdcdcd;
         words[8*i+6]=0xa5a5a5a5;
         words[8*i+7]=0x5a5a5a5a;
@@ -213,9 +224,20 @@ int main(int argc,char **argv) {
             continue;
         }
         uint32_t actual=words[8*i+4]; assert(actual!=0xdeadbeef);
+#ifndef BB_PKRTZ_CASES
         printf("%-44s %08x\n",cases[i].name,actual);
-#ifdef BB_FP16_CASES
+#endif
+#if defined(BB_FP16_CASES) || defined(BB_PKRTZ_CASES)
         const Case *c=cases+i;
+#ifdef BB_PKRTZ_CASES
+        const uint32_t low=reference_half(c->a,mode), high=reference_half(c->b,mode);
+        const uint32_t expected=low | (high<<16);
+        const int match=half_matches(actual&0xffffu,low) && half_matches(actual>>16,high);
+        if(!match) {
+            if(differences<16) printf("MISMATCH mode=%d input=%08x/%08x expected=%08x actual=%08x\n",mode,c->a,c->b,expected,actual);
+            ++differences;
+        }
+#else
         uint32_t expected=c->c;
         if(c->op==0 && (mode==0 || mode==1) && (expected&0x7fffu)>0 && (expected&0x7fffu)<0x400u)
             expected&=0x8000u;
@@ -226,6 +248,7 @@ int main(int argc,char **argv) {
         const int match=c->op!=2 && (expected&magnitude)>infinity
             ? (actual&magnitude)>infinity : actual==expected;
         if(!match) { printf("MISMATCH mode=%d op=%u input=%08x expected=%08x actual=%08x\n",mode,c->op,c->a,expected,actual); ++differences; }
+#endif
         assert(words[8*i]==c->op && words[8*i+1]==c->a && words[8*i+2]==c->b && words[8*i+3]==c->c);
         assert(words[8*i+5]==0xcdcdcdcd && words[8*i+6]==0xa5a5a5a5 && words[8*i+7]==0x5a5a5a5a);
 #else
@@ -243,8 +266,12 @@ int main(int argc,char **argv) {
     if(queries) vkDestroyQueryPool(device,queries,NULL);
     vkDestroyCommandPool(device,commands,NULL); vkDestroyDevice(device,NULL); vkDestroyInstance(instance,NULL);
     if(benchmark) { puts("BENCHMARK: 8,388,608 production multiplies; 65,536 CPU/GPU bitwise results PASS"); return 0; }
-#ifdef BB_FP16_CASES
+#if defined(BB_FP16_CASES) || defined(BB_PKRTZ_CASES)
+#ifdef BB_PKRTZ_CASES
+    printf("MEASURED: PKRTZ mode=%d; %zu packed pairs; differences=%u; input/tail canaries PASS\n",mode,n,differences);
+#else
     printf("MEASURED: OpFConvert mode=%d; %zu cases; differences=%u; input/tail canaries PASS\n",mode,n,differences);
+#endif
 #else
     printf("MEASURED: %zu cases; signed-zero/nonfused semantic differences=%u; candidate sign repair passed\n",n,differences);
 #endif

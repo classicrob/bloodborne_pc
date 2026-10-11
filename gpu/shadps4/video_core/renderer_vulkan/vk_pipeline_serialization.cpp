@@ -13,7 +13,7 @@
 namespace Serialization {
 /* You should increment versions below once corresponding serialization scheme is changed. */
 #ifdef __APPLE__
-static constexpr u32 ShaderBinaryVersion = 20u; // Depth bounds adds stored-depth sampling and Apple push fields.
+static constexpr u32 ShaderBinaryVersion = 21u; // PKRTZ packing uses explicit integer round-toward-zero.
 #else
 static constexpr u32 ShaderBinaryVersion = 13u; // Atomic masked stores preserve concurrent subword LDS writes.
 #endif

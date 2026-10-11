@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "shader_recompiler/backend/spirv/emit_spirv_instructions.h"
+#include "shader_recompiler/ir/microinstruction.h"
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
 
 namespace Shader::Backend::SPIRV {
@@ -126,7 +127,45 @@ Id EmitUnpackSint2x16(EmitContext& ctx, Id value) {
     return ctx.OpBitcast(ctx.F32[2], unpacked);
 }
 
-Id EmitPackHalf2x16(EmitContext& ctx, Id value) {
+Id EmitPackHalf2x16(EmitContext& ctx, [[maybe_unused]] IR::Inst* inst, Id value) {
+#ifdef __APPLE__
+    if (inst && inst->Flags<bool>()) {
+        const auto convert = [&](u32 component) {
+            const Id bits = ctx.OpBitcast(ctx.U32[1], ctx.OpCompositeExtract(ctx.F32[1], value, component));
+            const Id sign = ctx.OpBitwiseAnd(ctx.U32[1],
+                ctx.OpShiftRightLogical(ctx.U32[1], bits, ctx.ConstU32(16u)), ctx.ConstU32(0x8000u));
+            const Id exponent = ctx.OpBitwiseAnd(ctx.U32[1],
+                ctx.OpShiftRightLogical(ctx.U32[1], bits, ctx.ConstU32(23u)), ctx.ConstU32(0xffu));
+            const Id fraction = ctx.OpBitwiseAnd(ctx.U32[1], bits, ctx.ConstU32(0x7fffffu));
+            const Id normal = ctx.OpBitwiseOr(ctx.U32[1],
+                ctx.OpShiftLeftLogical(ctx.U32[1], ctx.OpISub(ctx.U32[1], exponent, ctx.ConstU32(112u)), ctx.ConstU32(10u)),
+                ctx.OpShiftRightLogical(ctx.U32[1], fraction, ctx.ConstU32(13u)));
+            // Clamp even the discarded shift operand: SPIR-V shifts must be defined on every lane.
+            const Id sub_exponent = ctx.OpUMin(ctx.U32[1],
+                ctx.OpUMax(ctx.U32[1], exponent, ctx.ConstU32(103u)), ctx.ConstU32(112u));
+            const Id subnormal = ctx.OpShiftRightLogical(ctx.U32[1],
+                ctx.OpBitwiseOr(ctx.U32[1], fraction, ctx.ConstU32(0x800000u)),
+                ctx.OpISub(ctx.U32[1], ctx.ConstU32(126u), sub_exponent));
+            Id finite = ctx.OpSelect(ctx.U32[1], ctx.OpULessThan(ctx.U1[1], exponent, ctx.ConstU32(113u)),
+                ctx.OpSelect(ctx.U32[1], ctx.OpULessThan(ctx.U1[1], exponent, ctx.ConstU32(103u)), ctx.u32_zero_value, subnormal), normal);
+            finite = ctx.OpSelect(ctx.U32[1], ctx.OpUGreaterThanEqual(ctx.U1[1], exponent, ctx.ConstU32(143u)),
+                                  ctx.ConstU32(0x7bffu), finite);
+            const auto mode = ctx.runtime_info.props.fp_denorm_mode16_64;
+            if (mode == AmdGpu::FpDenormMode::InOutFlush || mode == AmdGpu::FpDenormMode::InAllowOutFlush) {
+                finite = ctx.OpSelect(ctx.U32[1], ctx.OpULessThan(ctx.U1[1], finite, ctx.ConstU32(0x400u)),
+                                      ctx.u32_zero_value, finite);
+            }
+            const Id nan = ctx.OpBitwiseOr(ctx.U32[1], ctx.ConstU32(0x7e00u),
+                ctx.OpShiftRightLogical(ctx.U32[1], fraction, ctx.ConstU32(13u)));
+            const Id special = ctx.OpSelect(ctx.U32[1], ctx.OpIEqual(ctx.U1[1], fraction, ctx.u32_zero_value),
+                                           ctx.ConstU32(0x7c00u), nan);
+            return ctx.OpBitwiseOr(ctx.U32[1], sign,
+                ctx.OpSelect(ctx.U32[1], ctx.OpIEqual(ctx.U1[1], exponent, ctx.ConstU32(255u)), special, finite));
+        };
+        return ctx.OpBitwiseOr(ctx.U32[1], convert(0),
+            ctx.OpShiftLeftLogical(ctx.U32[1], convert(1), ctx.ConstU32(16u)));
+    }
+#endif
     return ctx.OpPackHalf2x16(ctx.U32[1], value);
 }
 
