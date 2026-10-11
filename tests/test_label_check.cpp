@@ -286,8 +286,24 @@ int main() {
                same.selected_differs && // current 9 (copy_b) vs the read of copy_a
                    Describe(same).find("DIFFERS") != std::string::npos &&
                    !reused.selected_differs && reused.differing == 1 && // only 7 (copy_a) differs
-                   Describe(reused).find("matches the read; 1 other held copy, 1 of them differ") !=
+                   Describe(reused).find("matches the read; 1 other held region, 1 of them differ") !=
                        std::string::npos);
+        // A region not copied at submit has no copy: located, never compared (Verifier).
+        const std::vector<HeldRegion> uncopied_held = {
+            {region, 16, 7, copy_a},
+            {region, 16, 9, nullptr}, // unreadable at submit
+        };
+        const Result uncopied_current = Classify(region + 4, 4, copy_b + 4, uncopied_held, pools, 9);
+        const Result uncopied_other = Classify(region + 4, 4, copy_a + 4, uncopied_held, pools, 7);
+        Expect("  ... an uncopied region is never compared, and is named as such",
+               uncopied_current.where == Where::Inside && uncopied_current.selected_uncopied &&
+                   !uncopied_current.selected_differs && uncopied_current.uncopied == 1 &&
+                   uncopied_current.differing == 1 && // copy_a vs the read of copy_b
+                   Describe(uncopied_current).find("not copied at submit (unreadable then): not "
+                                                   "compared") != std::string::npos &&
+                   !uncopied_other.selected_uncopied && !uncopied_other.differing &&
+                   Describe(uncopied_other).find("matches the read; 1 other held region, 0 of "
+                                                 "them differ, 1 not copied") != std::string::npos);
         // A containing region is never renamed by a straddling one, in either order (Astra-2).
         bool kept = true;
         for (const std::uint64_t cur : {std::uint64_t{7}, std::uint64_t{0}}) {
@@ -365,6 +381,9 @@ int main() {
         Expect("  ... the stop's latest-read text comes from the observation, not a re-read",
                text.find("latest instrumented read: ud table") != std::string::npos &&
                    text.find("DIFFERS") != std::string::npos);
+        ForgetLastRead();
+        Expect("  ... after a new descriptor starts, a stop names no earlier read",
+               LastRead().find("no instrumented read for this descriptor") != std::string::npos);
         munmap(two, page);
         // Owner lifetime: Unregister waits for a lookup in flight; none runs after it.
         static std::atomic<int> entered{0}, release{0}, calls{0};
