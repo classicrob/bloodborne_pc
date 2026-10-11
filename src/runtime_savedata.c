@@ -413,9 +413,10 @@ static ABI int32_t memory_setup(int32_t user, uint64_t size, const Param *param)
     snprintf(dir,sizeof(dir),"%s.memory",base);
     if (make_dirs(dir)) return ERR_INTERNAL;
     pthread_mutex_lock(&lock);
-    snprintf(memory_path,sizeof(memory_path),"%s/memory.dat",dir);
-    FILE *f=fopen(memory_path,"r+b");
-    if (!f) f=fopen(memory_path,"w+b");
+    char candidate[sizeof(memory_path)];
+    snprintf(candidate,sizeof(candidate),"%s/memory.dat",dir);
+    FILE *f=fopen(candidate,"r+b");
+    if (!f) f=fopen(candidate,"w+b");
     int32_t r=ERR_INTERNAL;
     if (f) {
         if (fseek(f,0,SEEK_END)) goto done;
@@ -424,7 +425,7 @@ static ABI int32_t memory_setup(int32_t user, uint64_t size, const Param *param)
 #ifdef __APPLE__
         if (fsync(fileno(f))) goto done;
 #endif
-        memory_size=size; r=0;
+        r=0;
     done:
 #ifdef __APPLE__
         if (fclose(f)) r=ERR_INTERNAL;
@@ -437,6 +438,7 @@ static ABI int32_t memory_setup(int32_t user, uint64_t size, const Param *param)
 #else
     if (!r && param) write_param(dir,param);
 #endif
+    if (!r) { memcpy(memory_path,candidate,strlen(candidate)+1); memory_size=size; }
     pthread_mutex_unlock(&lock);
     if (!r) printf("Runtime: save data memory ready (%llu bytes)\n",(unsigned long long)size);
     return r;
