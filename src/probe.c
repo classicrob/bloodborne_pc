@@ -18,6 +18,7 @@
 #include "macos_ui.h"
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
+#include <errno.h>
 #include <sys/sysctl.h>
 #else
 #include <malloc.h>
@@ -225,6 +226,9 @@ static uint64_t patch_tcb_loads(const Segment *segments, uint64_t count) {
 #define CONTEXT_RBP(uc) ((uc)->uc_mcontext.gregs[REG_RBP])
 #define CONTEXT_RDI(uc) ((uc)->uc_mcontext.gregs[REG_RDI])
 #endif
+#ifdef __APPLE__
+#include "probe_fault_dump_mac.h"
+#endif
 static void fault(int sig, siginfo_t *info, void *context) {
     /* GPU page tracking (write-protected guest pages) is resolved first. */
     if (gpu_enabled && (sig == SIGSEGV || sig == SIGBUS) && bbgpu_handle_fault(context, info->si_addr)) return;
@@ -241,6 +245,13 @@ static void fault(int sig, siginfo_t *info, void *context) {
     /* The process is terminating: dladdr/snprintf are acceptable here. */
     ucontext_t *uc = context;
     uintptr_t rip = (uintptr_t)CONTEXT_RIP(uc);
+#ifdef __APPLE__
+    if (fault_dump_enabled && (sig == SIGSEGV || sig == SIGBUS) &&
+        rip - (uintptr_t)image < 0x10000000) {
+        fault_dump_guest(uc, (uintptr_t)image, sig, (uintptr_t)info->si_addr);
+        _exit(128 + sig);
+    }
+#endif
     char line[512];
     Dl_info where;
     if (rip - (uintptr_t)image < 0x10000000)
@@ -527,6 +538,10 @@ static int probe_main(int argc, char **argv) {
     (void)timeout_seconds; /* no watchdog on Windows */
 #else
     page_size = (size_t)sysconf(_SC_PAGESIZE);
+#ifdef __APPLE__
+    if (fault_dump_configure(getenv("BB_FAULT_DUMP")))
+        fail("invalid BB_FAULT_DUMP: use 1, or up to 16 register/offset/dereference expressions");
+#endif
     struct sigaction sa = {0}; sa.sa_sigaction = fault; sa.sa_flags = SA_SIGINFO;
     sigemptyset(&sa.sa_mask);
     sigaction(SIGSEGV, &sa, NULL); sigaction(SIGILL, &sa, NULL); sigaction(SIGBUS, &sa, NULL);
