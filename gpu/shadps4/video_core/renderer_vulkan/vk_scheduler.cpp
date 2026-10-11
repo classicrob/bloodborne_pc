@@ -199,7 +199,7 @@ void Scheduler::SignalAfterHostCopies(std::function<void()> signal) {
 
 #ifdef __APPLE__
 bool Scheduler::LabelsAtGpuComplete() {
-    static const bool enabled = [] {
+    static const bool whole_run = [] {
         const char* env = std::getenv("BB_LABELS_AT_GPU_COMPLETE");
         const bool on = env && env[0] == '1';
         if (on) {
@@ -209,7 +209,8 @@ bool Scheduler::LabelsAtGpuComplete() {
         }
         return on;
     }();
-    return enabled;
+    // Toggle bit 59 (BB_TOGGLE_FILE) switches it live; Liverpool keeps the order at a switch.
+    return whole_run || BbToggle::Disabled(BbToggle::LabelsAtGpuComplete);
 }
 
 void Scheduler::SignalAtGpuCompletion(std::function<void()> signal) {

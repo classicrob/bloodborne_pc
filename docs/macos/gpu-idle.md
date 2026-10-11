@@ -217,3 +217,10 @@ With `BB_LABELS_AT_GPU_COMPLETE=1`:
 
 This is the exact fix candidate, kept toggleable for an A/B on corruption and FPS, and the
 precondition for dropping the submit throttle.
+
+It can be switched live with bit 59 of `BB_TOGGLE_FILE` (`BB_LABELS_AT_GPU_COMPLETE=1` keeps it on
+for the whole run). The mode is read when each label is issued and fixed for that label. At a
+switch, the first label in the new mode waits until every label issued before it was written, so
+the two modes never reorder labels. The switch is logged as
+`Labels at GPU completion: ON|OFF at <UTC time> (switched; ...)`. One run can therefore alternate
+the modes, say every 60 s, and compare its halves under the same load, cache and location.
