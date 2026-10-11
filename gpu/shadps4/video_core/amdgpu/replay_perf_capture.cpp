@@ -476,30 +476,30 @@ private:
             }
             return;
         }
-        case 0x50: { // DMA_DATA
+        case 0x50: { // DMA_DATA, as Liverpool::ProcessGraphics and RunDmaData handle it
             const auto* dma = static_cast<const AmdGpu::PM4DmaData*>(raw);
+            if (dma->dst_addr_lo == 0x3022C) {
+                return; // skipped by the parser: no effect here
+            }
             const auto dst = dma->dst_sel;
-            if ((dst == AmdGpu::DmaDataDst::Memory || dst == AmdGpu::DmaDataDst::MemoryUsingL2) &&
-                !dma->command.das) {
-                Add(dma->DstAddress<u64>(), dma->command.daic ? 4 : dma->NumBytes(),
-                    ResetKind::Written, op);
+            if (dma->command.das) {
+                Blocker(fmt::format("DMA_DATA to register space (dst {:#x}), which the parser "
+                                    "asserts against",
+                                    dma->dst_addr_lo));
+            } else if (dst == AmdGpu::DmaDataDst::Memory ||
+                       dst == AmdGpu::DmaDataDst::MemoryUsingL2) {
+                Add(dma->DstAddress<u64>(), dma->NumBytes(), ResetKind::Written, op);
             } else if (dst != AmdGpu::DmaDataDst::Gds) {
-                Blocker("DMA_DATA to a register space is not decoded");
+                Blocker(fmt::format("DMA_DATA with dst_sel {}", u32(dst)));
             }
             return;
         }
-        case 0x40: { // COPY_DATA
-            const auto* cp = static_cast<const AmdGpu::PM4CmdCopyData*>(raw);
-            const auto dst = cp->dst_sel.Value();
-            if (dst == AmdGpu::CopyDataDst::MemorySync || dst == AmdGpu::CopyDataDst::TCL2 ||
-                dst == AmdGpu::CopyDataDst::MemoryAsync) {
-                Add(cp->DstAddress<u64>(), cp->count_sel.Value() ? 8 : 4, ResetKind::Written, op);
-            }
+        case 0x40: // COPY_DATA: the parser logs it as unhandled and writes nothing; so does the
+                   // replay, so it is neither a reset nor a writer a wait can rely on.
             return;
-        }
         case 0x83: { // DUMP_CONST_RAM
             const auto* dump = static_cast<const AmdGpu::PM4DumpConstRam*>(raw);
-            Add(dump->Address<u64>(), u64{dump->num_dw.Value()} * 4, ResetKind::Written, op);
+            Add(dump->Address<u64>(), dump->Size(), ResetKind::Written, op); // as the parser
             return;
         }
         case 0x46: { // EVENT_WRITE
