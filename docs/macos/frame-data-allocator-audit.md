@@ -121,9 +121,19 @@ wrapper W whose command buffer begins at W+`0x10`.
    `0xc0027600` with the command-buffer shader-type bit, register selector,
    pointer low32 and high32. The register index comes from shader metadata,
    not a hard-coded s[2:3] for every shader.
-6. The alternative `0x26d025b/0x26d026b` stores the pointer into the
-   context's spilled user-data area and marks its state dirty. Provenance
-   for direct SH writes alone does not cover this route.
+6. The alternative `0x26d025b/0x26d026b` stores pointer low32/high32 into
+   the EUD cache at `D + stage*0x200 + 4*(slot-16) + 0xa4a0` and the
+   following dword, then marks its state dirty. Provenance for direct SH
+   writes alone does not cover this route. A diagnostic read from a host
+   user-data snapshot also lies outside the live SH register file, so
+   that diagnostic classification alone does not establish guest spill.
+
+Allocation failure is not checked by returning early: at `0x26d01f6`
+RCX is cleared, and a null allocation skips the payload copy but still
+publishes or spills the null pointer through the same two paths. This
+can explain a null table; it does not explain a nonnull table containing
+float payloads. PM4 independently spot-checked this producer and the
+64 KiB allocator against the extracted image.
 
 Other descriptor-table paths also use `0x26addc0`, including calls at
 `0x26c07f9`, `0x26c08df`, `0x26c0987`, `0x26c0a10` and `0x26c0aa3`.
@@ -191,3 +201,36 @@ node after its actual retirement, is needed. Likewise, uninitialized
 leading descriptor slots are meaningful only if the consuming shader
 actually selects one of them. No production workaround follows solely
 from the address-range observation.
+
+### What the next stop's provenance can distinguish
+
+The proposed stop diagnostic records parser-applied SET_SH_REG origins,
+recent DUMP_CONST_RAM overlaps, the containing mapping and approximate
+flip progress. Those observations locate the consumption side; they do
+not record node allocation, retirement, reclamation or CPU payload writes.
+
+| Hypothesis | Useful observation at the stop | What it does not establish |
+| --- | --- | --- |
+| An old table pointer is consumed after its block was legitimately retired and reused. | A pointer word last set before intervening parsed flips makes retained state a candidate. A SET in the current flip interval instead narrows the question to the value that packet supplied, its high word, spill/preparation state, and the block's lifetime after that publication. | An old SET is legal when registers persist. It does not prove a missed SET, guest use-after-free, or retirement of this block. A current SET can republish an already stale pointer. |
+| An alternate free/reuse path bypasses the normal inline EOP-4 retirement. | A recently published pointer whose bytes already contain float payload is compatible with reuse before consumption. Mapping/alias information helps locate the storage being reused. | The stop contains no free event or node identity. It cannot distinguish immediate free, external-label retirement, cross-stream use, or a correctly retired block referenced again. |
+| Pending-list publication exposes N before N[0] is initialized to 2. | The same recently published pointer and changed payload are compatible with this race too. | Neither SH provenance nor flip progress observes the CAS-to-initialization interval. Proving this requires the same node's pending publication, its pre-initialization value, a concurrent reclaimer accepting it, and subsequent reuse. |
+
+Interpret the fields narrowly. Low-word provenance is not automatically
+provenance for the entire 64-bit pointer. A recent overlapping CE dump is
+an observed writer candidate, not proof that it wrote the complete table
+or was the last writer; CPU and other writes are not covered. Parsed-flip
+counts delimit stream intervals, not an independently established guest
+frame identity. Worker observations can also be newer than the read's
+counter snapshot and must not be interpreted as a wrapped unsigned age.
+
+The first decision from the hunt should be whether the bad read uses a
+direct register pointer with a recorded packet, or an untracked copied/
+spilled source. For a recorded packet, compare its supplied pointer with
+the pointer actually consumed and the applicable command snapshot. A
+missing or reordered update, if established, is parser-state evidence.
+If those agree, the remaining discriminator is a **same-run node timeline**:
+identify the node containing the table, then order its pointer publication,
+retirement label issue/completion, reclaim/free and next payload write
+against this read. Only that timeline can separate legitimate retirement
+followed by stale use from alternate free or premature reclaim. The
+current stop fields alone justify none of those three verdicts.
