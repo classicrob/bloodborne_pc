@@ -607,11 +607,22 @@ bool PipelineCache::RefreshGraphicsKey(PipelineSelection& sel) {
     const auto& regs = (*sel.regs);
     auto& key = sel.graphics_key;
 
-    const bool db_enabled = regs.depth_buffer.DepthValid() || regs.depth_buffer.StencilValid();
+    // bbport: the pipeline declares exactly the depth/stencil attachments the render pass binds.
+    // The rasterizer binds the depth target only when the depth or stencil test is enabled
+    // (Rasterizer::PrepareRenderState); with both off a valid depth buffer is not attached, and a
+    // pipeline still declaring its format does not match the pass (Vulkan dynamic rendering;
+    // Metal validation: "the renderPipelineState pixelFormat must be MTLPixelFormatInvalid").
+    // With both tests off the guest neither tests nor writes depth or stencil, so this is exact.
+    const bool db_bound =
+        (regs.depth_control.depth_enable && regs.depth_buffer.DepthValid()) ||
+        (regs.depth_control.stencil_enable && regs.depth_buffer.StencilValid());
+    const bool db_enabled =
+        db_bound && (regs.depth_buffer.DepthValid() || regs.depth_buffer.StencilValid());
 
-    key.z_format = regs.depth_buffer.DepthValid() ? regs.depth_buffer.z_info.format
-                                                  : AmdGpu::DepthBuffer::ZFormat::Invalid;
-    key.stencil_format = regs.depth_buffer.StencilValid()
+    key.z_format = db_bound && regs.depth_buffer.DepthValid()
+                       ? regs.depth_buffer.z_info.format
+                       : AmdGpu::DepthBuffer::ZFormat::Invalid;
+    key.stencil_format = db_bound && regs.depth_buffer.StencilValid()
                              ? regs.depth_buffer.stencil_info.format
                              : AmdGpu::DepthBuffer::StencilFormat::Invalid;
     key.depth_clamp_enable = !regs.depth_render_override.disable_viewport_clamp;
