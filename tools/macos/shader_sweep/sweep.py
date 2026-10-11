@@ -151,9 +151,11 @@ def loud_message(lines):
         if '<Critical>' in line:
             text = strip_log(line)
             text = re.sub(r'^Critical: ', '', text)
-            # Assertion messages continue on the next line.
-            if text.endswith('Assertion Failed!') and i + 1 < len(lines):
-                text += ' ' + lines[i + 1].strip()
+            # ASSERT_MSG and UNREACHABLE_MSG put their message on the following line(s).
+            j = i + 1
+            while j < len(lines) and not lines[j].startswith(('GPU [', '@@', 'STOP:')):
+                text += ' ' + lines[j].strip()
+                j += 1
             out.append(text)
     return ' | '.join(out) if out else 'stopped (exit 23) without a Critical log line'
 

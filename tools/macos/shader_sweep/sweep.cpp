@@ -494,9 +494,11 @@ struct Sweep {
             SetRaw(regs.ps_input_ena, job.Get("input_ena"));
             SetRaw(regs.ps_input_addr, job.Get("input_addr"));
             regs.num_interp = job.Get("in_control") & 0x3F;
+            // SPI_PS_INPUT_CNTL as Gnmx fills it from the pixel input semantics (bit 10: flat).
             for (u32 i = 0; i < regs.num_interp; ++i) {
                 regs.ps_inputs[i] = {};
                 regs.ps_inputs[i].input_offset = i;
+                regs.ps_inputs[i].flat_shade = i < job.sems.size() && (job.sems[i] >> 10) & 1;
             }
             SetRaw(regs.barycentric_control, job.Get("baryc_cntl"));
             regs.z_export_format = AmdGpu::ShaderExportFormat(job.Get("z_format"));

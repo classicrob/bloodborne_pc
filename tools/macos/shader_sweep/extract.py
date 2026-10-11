@@ -84,7 +84,10 @@ def parse(blob, name):
         regs.update(z_format=w[6], col_format=w[7], input_ena=w[8], input_addr=w[9],
                     in_control=w[10], baryc_cntl=w[11], db_shader_control=w[12],
                     cb_shader_mask=w[13])
-        used += ((w[14] & 0xFF) + 1) // 2  # pixel input semantics, 2 bytes each
+        # Pixel input semantics, 2 bytes each: semantic, default value (bits 8-9), flat (bit 10).
+        n_in = w[14] & 0xFF
+        semantics = struct.unpack_from('<%dH' % n_in, blob, 0x34 + (used) * 4)
+        used += (n_in + 1) // 2
     elif stage in ('es', 'ls'):
         semantics = w[used:used + (w[6] & 0xFF)]
         used += len(semantics)
