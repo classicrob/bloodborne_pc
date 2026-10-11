@@ -15,6 +15,7 @@
 #include <thread>
 #include <vector>
 #include "bbport_label_check.h"
+#include "bbport_label_store.h"
 #include "bbport_label_sequencer.h"
 
 namespace {
@@ -148,6 +149,42 @@ int main() {
         Expect("stopping with labels pending writes none past the gap and reports both as "
                "outstanding",
                written.size() == 2 && sequencer.Outstanding() == 2);
+    }
+
+    // A label stored through the guest mapping (bbport_label_store.h): its bytes only.
+    {
+        alignas(16) static std::uint8_t bytes[32];
+        std::memset(bytes, 0xEE, sizeof(bytes));
+        BbLabelStore::StoreOnce(&bytes[8], 0x1122334455667788ull, 8);
+        BbLabelStore::StoreOnce(&bytes[20], 0xFFFF'FFFF'99AA'BBCCull, 4);
+        BbLabelStore::StoreOnce(&bytes[26], 0xDDEEull, 2);
+        std::uint64_t q;
+        std::uint32_t d;
+        std::uint16_t h;
+        std::memcpy(&q, &bytes[8], 8);
+        std::memcpy(&d, &bytes[20], 4);
+        std::memcpy(&h, &bytes[26], 2);
+        Expect("label stores of 8, 4 and 2 bytes write their value and nothing around it",
+               q == 0x1122334455667788ull && d == 0x99AABBCCu && h == 0xDDEE &&
+                   bytes[7] == 0xEE && bytes[16] == 0xEE && bytes[24] == 0xEE &&
+                   bytes[28] == 0xEE);
+        // WRITE_DATA payloads: 1 or 2 aligned dwords as one store, others copied.
+        std::memset(bytes, 0xEE, sizeof(bytes));
+        const std::uint32_t one = 0x01020304;
+        const std::uint32_t two[2] = {0x05060708, 0x090A0B0C};
+        const std::uint32_t three[3] = {1, 2, 3};
+        BbLabelStore::WriteData(&bytes[0], &one, 4);
+        BbLabelStore::WriteData(&bytes[8], two, 8);
+        BbLabelStore::WriteData(&bytes[17], &one, 4); // unaligned: copied
+        BbLabelStore::WriteData(&bytes[22], two, 8);  // two dwords, not 8-aligned: copied
+        std::uint8_t three_at[12];
+        BbLabelStore::WriteData(three_at, three, 12);
+        Expect("WRITE_DATA payloads land exactly: 1 dword (aligned, unaligned), 2 dwords "
+               "(aligned, unaligned), 3 dwords",
+               !std::memcmp(&bytes[0], &one, 4) && !std::memcmp(&bytes[8], two, 8) &&
+                   !std::memcmp(&bytes[17], &one, 4) && !std::memcmp(&bytes[22], two, 8) &&
+                   !std::memcmp(three_at, three, 12) && bytes[4] == 0xEE &&
+                   bytes[16] == 0xEE && bytes[21] == 0xEE && bytes[30] == 0xEE);
     }
 
     std::fprintf(stderr, "%s: %u failures\n", failures ? "FAIL" : "PASS", failures);

@@ -13,6 +13,9 @@
 #include "core/libraries/gnmdriver/gnmdriver.h"
 #include "core/libraries/kernel/time.h"
 #include "video_core/amdgpu/pm4_opcodes.h"
+#ifdef __APPLE__
+#include "bbport_label_store.h"
+#endif
 
 namespace AmdGpu {
 
@@ -1024,7 +1027,11 @@ struct PM4CmdReleaseMem {
     void SignalFence(auto&& signal_irq, auto&& gds_to_mem) const {
         SignalFence(
             [](void* address, u64 data, u32 num_bytes) {
+#ifdef __APPLE__
+                BbLabelStore::StoreOnce(address, data, num_bytes);
+#else
                 std::memcpy(address, &data, num_bytes);
+#endif
             },
             signal_irq, gds_to_mem);
     }

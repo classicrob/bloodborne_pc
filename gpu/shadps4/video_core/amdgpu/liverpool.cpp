@@ -35,6 +35,7 @@
 #include "video_core/amdgpu/liverpool.h"
 #include "bbport_write_log.h"
 #include "bbport_label_check.h"
+#include "bbport_label_store.h"
 #include "video_core/amdgpu/pm4_cmds.h"
 #include "video_core/renderdoc.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
@@ -443,7 +444,11 @@ void SignalEop(const PM4CmdEventWriteEop& eop, bool backing_only = false) {
             } else
 #endif
                 if (!memory->TryWriteBacking(address, &data, num_bytes)) {
+#ifdef __APPLE__
+                BbLabelStore::StoreOnce(address, data, num_bytes);
+#else
                 memcpy(address, &data, num_bytes);
+#endif
             }
 #ifdef __APPLE__
             if (BbLabelCheck::Enabled()) {
@@ -546,8 +551,13 @@ void RunWriteData(Vulkan::Rasterizer& rasterizer, const u8* data) {
     rasterizer.WaitDeferredSignals();
     BbWriteLog::Note(write_data->Address<u64>(), write_data->data,
                      (header->type3.count.Value() - 2) * sizeof(u32), BbWriteLog::WriteData);
+#ifdef __APPLE__
+    BbLabelStore::WriteData(write_data->Address<u64*>(), write_data->data,
+                            (header->type3.count.Value() - 2) * sizeof(u32));
+#else
     std::memcpy(write_data->Address<u64*>(), write_data->data,
                 (header->type3.count.Value() - 2) * sizeof(u32));
+#endif
 #ifdef __APPLE__
     StreamWrites::Landed(false);
 #endif
@@ -564,7 +574,11 @@ void SignalEos(const PM4CmdEventWriteEos& event_eos, bool backing_only = false) 
         }
 #endif
         if (!memory->TryWriteBacking(address, &value, num_bytes)) {
+#ifdef __APPLE__
+            BbLabelStore::StoreOnce(address, value, num_bytes);
+#else
             memcpy(address, &value, num_bytes);
+#endif
         }
     });
 }
@@ -1493,7 +1507,12 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                                                         (count - 2) * sizeof(u32));
                     }
                 } else {
+#ifdef __APPLE__
+                    BbLabelStore::WriteData(write_data->Address<u64*>(), write_data->data,
+                                            (count - 2) * 4);
+#else
                     std::memcpy(write_data->Address<u64*>(), write_data->data, (count - 2) * 4);
+#endif
                 }
                 break;
             }
@@ -1984,7 +2003,11 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             ASSERT(write_data->dst_sel.Value() == 2 || write_data->dst_sel.Value() == 5);
             const u32 data_size = (header->type3.count.Value() - 2) * 4;
             if (!write_data->wr_one_addr.Value()) {
+#ifdef __APPLE__
+                BbLabelStore::WriteData(write_data->Address<void*>(), write_data->data, data_size);
+#else
                 std::memcpy(write_data->Address<void*>(), write_data->data, data_size);
+#endif
             } else {
                 UNREACHABLE();
             }

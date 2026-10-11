@@ -1097,7 +1097,10 @@ static void sync_executable_aliases(uint64_t phys, uint64_t size) {
     }
 }
 #endif
-/* Writes through the backing view; 0 when part of the range has no backing. */
+/* Writes through the backing view; 0 when part of the range has no backing. On macOS an aligned
+ * 2-, 4- or 8-byte write (a GPU label) is one release store, so a guest reading it concurrently
+ * sees the old or the new value, never part of each (memcpy of a variable size gives no such
+ * guarantee). */
 int runtime_memory_write_backing(uintptr_t address, const void *data, uint64_t size) {
     read_lock();
 #ifdef __APPLE__
@@ -1120,7 +1123,18 @@ int runtime_memory_write_backing(uintptr_t address, const void *data, uint64_t s
             (vmas[i].kind==KIND_FLEXIBLE && vmas[i].phys<POOL_SIZE))
             mapping_stop("invalid live backing translation",at,n,0,&vmas[i]);
 #endif
+#ifdef __APPLE__
+        unsigned char *target=backing_base+vmas[i].phys+(at-vmas[i].start);
+        if (at==address && n==size && (size==2 || size==4 || size==8) && !(address&(size-1))) {
+            // Aligned: within one page, so within this region.
+            if (size==8) { uint64_t v; memcpy(&v,data,8); __atomic_store_n((uint64_t *)target,v,__ATOMIC_RELEASE); }
+            else if (size==4) { uint32_t v; memcpy(&v,data,4); __atomic_store_n((uint32_t *)target,v,__ATOMIC_RELEASE); }
+            else { uint16_t v; memcpy(&v,data,2); __atomic_store_n((uint16_t *)target,v,__ATOMIC_RELEASE); }
+        } else
+            memcpy(target,(const unsigned char *)data+(at-address),n);
+#else
         memcpy(backing_base+vmas[i].phys+(at-vmas[i].start),(const unsigned char *)data+(at-address),n);
+#endif
 #ifdef __APPLE__
         sync_executable_aliases(vmas[i].phys+(at-vmas[i].start),n);
 #endif
