@@ -130,7 +130,8 @@ public:
     /// issued has run to the end; false and `why` if anything is still outstanding (the caller
     /// rejects the cut).
     bool QuiesceForCapture(std::string& why);
-    /// Empty if a capture may be armed, else the host features that are on and make a frame
+    /// Empty if a capture may be armed, else the host features available (the menu switches them
+    /// live; BB_UPSCALER=none removes the upscaler and camera motion for the run) that make a frame
     /// depend on host-side history or redirect it (upscaler incl. TAA, reduced scene / live
     /// resolution, camera or object motion vectors).
     [[nodiscard]] std::string CaptureSettingsRefusal() const;

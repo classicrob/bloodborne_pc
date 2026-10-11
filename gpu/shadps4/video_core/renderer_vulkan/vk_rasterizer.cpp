@@ -4765,13 +4765,39 @@ void Rasterizer::GpuReadCheck(const GraphicsPipeline* pipeline, bool is_indexed,
             continue;
         }
         const auto& info = *stages[stage];
+        // The tessellation constants' V# (the same read as Info::ReadTessConstantBuffer at
+        // pipeline selection, under fault recovery).
+        volatile VAddr tess_constants = 0;
+        if (info.tess_consts_dword_offset >= 0) {
+            auto* const previous = runtime_fault_recover;
+            sigjmp_buf recover;
+            if (!sigsetjmp(recover, 0)) {
+                runtime_fault_recover = &recover;
+                tess_constants = info.ReadUdReg<AmdGpu::Buffer>(
+                                         u32(info.tess_consts_ptr_base),
+                                         u32(info.tess_consts_dword_offset))
+                                     .base_address;
+            }
+            runtime_fault_recover = previous;
+        }
         for (u32 i = 0; i < info.buffers.size(); ++i) {
             const auto& desc = info.buffers[i];
             if (desc.IsSpecial() || desc.is_written) {
                 continue;
             }
             const auto sharp = desc.GetSharp(info);
-            add(sharp.base_address, SharpSpan(sharp), 'b', stage, i, info.pgm_hash);
+            u64 size = SharpSpan(sharp);
+            // The tessellation constants are 36 B (TessellationDataConstantBuffer) under a V#
+            // rounded up to its 16 B stride (48 B). The guest allocates them at the end of a
+            // command chunk, so the 12 B after them are the chunk's status word and the next
+            // chunk's first dword, which the guest rewrites and no stage reads (Astra-2's RE;
+            // READBYTES: every change was in +36..+47). TES only: the programs checked read bytes
+            // 4..27 (Verifier: 0xc1888bd, 0x7f03e945); a hull stage binding it keeps the 48 B.
+            if (tess_constants && sharp.base_address == tess_constants &&
+                stage == u32(Shader::SwStage::TessellationEval)) {
+                size = std::min<u64>(size, sizeof(Shader::TessellationDataConstantBuffer));
+            }
+            add(sharp.base_address, size, 'b', stage, i, info.pgm_hash);
         }
     }
     if (gpu_read_check >= 2 && !pipeline->GsEmulation()) {
@@ -4842,13 +4868,13 @@ std::string Rasterizer::CaptureSettingsRefusal() const {
         on += on.empty() ? name : fmt::format(", {}", name);
     };
     if (upscaler && upscaler->Enabled()) {
-        add("upscaler (incl. TAA and DisplayOverride)");
+        add("upscaler available, incl. TAA and DisplayOverride (BB_UPSCALER=none to capture: the menu can switch it on mid-replay)");
     }
     if (scene_targets && scene_targets->Reduced()) {
         add("reduced scene (live resolution)");
     }
     if (camera_motion && camera_motion->Enabled()) {
-        add("camera motion vectors");
+        add("camera motion vectors available (follow BB_UPSCALER)");
     }
     if (object_motion && object_motion->Enabled()) {
         add("object motion vectors");
