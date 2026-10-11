@@ -72,7 +72,7 @@ static std::vector<u32> shader(bool null_write) {
         add_vector(EmitImageGradient(ctx, nullptr, 0, coords, {}, {}, {}, {}), 4);
         add_vector(EmitImageRead(ctx, nullptr, 0, coords, {}, {}), 4);
         add_vector(EmitImageQueryDimensions(ctx, nullptr, 0, {}, true), 4, true);
-        add_vector(EmitImageQueryLod(ctx, nullptr, 0, coords), 2);
+        add_vector(EmitImageQueryLod(ctx, nullptr, 0, coords, {}), 2);
         results.push_back(EmitImageAtomicIAdd32(ctx, nullptr, 0, coords, ctx.ConstU32(9u)));
         results.push_back(EmitImageAtomicCmpSwap32(ctx, nullptr, 0, coords,
                                                  ctx.ConstU32(9u), ctx.ConstU32(0u)));

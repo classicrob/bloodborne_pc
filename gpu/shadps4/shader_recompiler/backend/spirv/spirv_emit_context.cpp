@@ -376,12 +376,16 @@ void EmitContext::DefineInputs() {
     if (info.uses_lane_id) {
         subgroup_local_invocation_id = DefineVariable(
             U32[1], spv::BuiltIn::SubgroupLocalInvocationId, spv::StorageClass::Input);
-        Decorate(subgroup_local_invocation_id, spv::Decoration::Flat);
+        if (hw_stage == HwStage::Fragment) {
+            Decorate(subgroup_local_invocation_id, spv::Decoration::Flat);
+        }
     }
     if (info.loads.GetAny(IR::Attribute::SubgroupLtMask)) {
         subgroup_lt_mask =
             DefineVariable(U32[4], spv::BuiltIn::SubgroupLtMask, spv::StorageClass::Input);
-        Decorate(subgroup_lt_mask, spv::Decoration::Flat);
+        if (hw_stage == HwStage::Fragment) {
+            Decorate(subgroup_lt_mask, spv::Decoration::Flat);
+        }
     }
     if (IsGsComputeRole(runtime_info)) {
         DefineGsEmulationInterface(*this);
@@ -521,6 +525,9 @@ void EmitContext::DefineInputs() {
                 continue;
             }
             const IR::Attribute param = IR::Attribute::Param0 + i;
+            if (!profile.supports_fragment_per_vertex_inputs && !info.loads.GetAny(param)) {
+                continue;
+            }
             const u32 num_components = info.loads.NumComponents(param);
             const auto [primary, auxiliary] = info.fs_interpolation[i];
             if (primary == Qualifier::PerVertex && !profile.supports_fragment_per_vertex_inputs) {

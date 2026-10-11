@@ -335,7 +335,8 @@ void PatchImageSharp(const ResourceDiscovery& resource, Info& info, Descriptors&
 
     IR::IREmitter ir{*inst.GetParent(), IR::Block::InstructionList::s_iterator_to(inst)};
 
-    if (inst.GetOpcode() == IR::Opcode::ImageSampleRaw) {
+    if (inst.GetOpcode() == IR::Opcode::ImageSampleRaw ||
+        inst.GetOpcode() == IR::Opcode::ImageQueryLod) {
         auto& lod_prod = resource.sharps[1].post_op_data.lod_prod;
         const u32 sampler_binding = descriptors.Add(SamplerResource{
             .sharp_fetch = ConstructSharpFetch<AmdGpu::Sampler>(resource.sharps[1]),
@@ -345,6 +346,9 @@ void PatchImageSharp(const ResourceDiscovery& resource, Info& info, Descriptors&
             .is_depth = bool(inst_info.is_depth), // true for the _C (compare) opcodes
         });
         inst.SetArg(0, ir.Imm32(image_binding | sampler_binding << 16));
+        if (inst.GetOpcode() == IR::Opcode::ImageQueryLod) {
+            inst.SetArg(2, IR::Value{});
+        }
     } else {
         inst.SetArg(0, ir.Imm32(image_binding));
     }

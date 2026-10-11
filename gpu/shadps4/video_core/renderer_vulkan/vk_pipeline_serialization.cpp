@@ -18,9 +18,9 @@
 namespace Serialization {
 /* You should increment versions below once corresponding serialization scheme is changed. */
 #ifdef __APPLE__
-static constexpr u32 ShaderBinaryVersion = 25u; // Wave64: compute workgroups of one subgroup keep native subgroup operations.
+static constexpr u32 ShaderBinaryVersion = 26u; // IMAGE_GET_LOD sampler tracking and stage-correct subgroup decorations.
 #else
-static constexpr u32 ShaderBinaryVersion = 14u; // Integer buffer swizzle constants and packed SNORM minima.
+static constexpr u32 ShaderBinaryVersion = 15u; // IMAGE_GET_LOD sampler tracking and stage-correct subgroup decorations.
 #endif
 static constexpr u32 ShaderMetaVersion = 13u; // Persistent Info: image binding counts, attribute loads/stores, FS interpolation.
 static constexpr u32 PipelineKeyVersion = 11u; // Keys name the ES/GS of an emulated geometry stage.
