@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <string>
 #include <thread>
@@ -25,6 +26,10 @@
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/amdgpu/replay_format.h"
 #include "video_core/amdgpu/replay_state_access.h"
+#include "video_core/renderer_vulkan/vk_rasterizer.h"
+#include "video_core/texture_cache/capture_images.h"
+#include <map>
+#include <xxhash.h>
 #include "../../src/runtime_memory.h"
 
 extern std::unique_ptr<AmdGpu::Liverpool> liverpool;
@@ -100,6 +105,8 @@ struct Capture {
     std::vector<u8> ce_heap;
     std::vector<std::pair<u32, AmdGpu::ComputeProgram>> cs_states;
     VAddr indirect_args = 0;
+    u64 gfx_reg_checksum = 0;
+    bool have_checksum = false;
     std::vector<Submission> submissions;
     std::vector<Reset> resets;
 
@@ -171,13 +178,20 @@ private:
                     return false;
                 }
                 break;
+            case LiverpoolSection::GfxRegChecksum:
+                if (!expect(sizeof(gfx_reg_checksum)) ||
+                    !r.Read(&gfx_reg_checksum, sizeof(gfx_reg_checksum), why)) {
+                    return false;
+                }
+                have_checksum = true;
+                break;
             default:
                 why = fmt::format("liverpool.bin: unknown section {}", u32(s.section));
                 return false;
             }
         }
-        if (!have_regs || !have_heap) {
-            why = "liverpool.bin lacks the registers or the CE heap";
+        if (!have_regs || !have_heap || !have_checksum) {
+            why = "liverpool.bin lacks the registers, the CE heap or the register checksum";
             return false;
         }
         return true;
@@ -318,6 +332,195 @@ bool Restore(AmdGpu::Liverpool& lp, const Capture& c, std::string& why) {
         AmdGpu::ReplayStateAccess::SetCsState(lp, queue, cs);
     }
     AmdGpu::ReplayStateAccess::SetIndirectArgs(lp, c.indirect_args);
+    lp.gfx_reg_checksum = c.gfx_reg_checksum;
+    // Draw preparation restarts from the restored registers (vk_draw_prep.h ResetBaseline).
+    if (Vulkan::Rasterizer* rasterizer = AmdGpu::ReplayStateAccess::Rasterizer(lp)) {
+        auto& prep = rasterizer->GetDrawPreparation();
+        if (prep.Enabled()) {
+            prep.ResetBaseline(lp.gfx_submit_seq, lp.regs, lp.gfx_reg_checksum);
+        }
+    }
+    return true;
+}
+
+/// Runs `step` on the GPU command thread (a blocking host command): the restore steps and the
+/// image capture/restore are GPU-thread work.
+bool OnGpuThread(AmdGpu::Liverpool& lp, const std::function<bool()>& step) {
+    bool ok = false;
+    lp.SendCommand<true>([&] { ok = step(); });
+    return ok;
+}
+
+/// What identifies a captured image and what its bytes are, for the round-trip comparison.
+struct ImagePrint {
+    VideoCore::CapturedImageState state{};
+    std::vector<std::pair<std::string, u64>> aspects; ///< "aspect a mip m", XXH3 of the texels
+};
+using ImageKey = std::pair<VAddr, u64>; ///< guest address, XXH3 of the ImageInfo
+
+bool PrintOf(const VideoCore::CapturedImage& image, ImageKey& key, ImagePrint& print,
+             std::string& why) {
+    if (image.state.size() != sizeof(print.state)) {
+        why = fmt::format("an image state blob is {} bytes, this build's is {}", image.state.size(),
+                          sizeof(print.state));
+        return false;
+    }
+    std::memcpy(&print.state, image.state.data(), sizeof(print.state));
+    key = {print.state.info.guest_address, XXH3_64bits(&print.state.info, sizeof(print.state.info))};
+    for (const auto& a : image.aspects) {
+        print.aspects.emplace_back(fmt::format("aspect {:#x} mip {}", a.aspect, a.mip),
+                                   XXH3_64bits(a.texels.data(), a.texels.size()));
+    }
+    return true;
+}
+
+/// The fields of two captures of one image that differ ("" when none).
+std::string Differences(const ImagePrint& a, const ImagePrint& b) {
+    std::string out;
+    const auto add = [&](const char* name) { out += out.empty() ? name : fmt::format(", {}", name); };
+    const auto& s = a.state;
+    const auto& t = b.state;
+    if (s.flags != t.flags) add("flags");
+    if (s.usage != t.usage) add("usage");
+    if (s.aspect_mask != t.aspect_mask) add("aspect mask");
+    if (s.num_mip_hashes != t.num_mip_hashes ||
+        std::memcmp(s.mip_hashes, t.mip_hashes, sizeof(s.mip_hashes))) add("mip hashes");
+    if (s.tracked != t.tracked) add("tracking");
+    if (s.image_uid != t.image_uid) add("image uid");
+    if (s.depth_uid != t.depth_uid) add("depth uid");
+    if (s.hash != t.hash) add("hash");
+    if (a.aspects.size() != b.aspects.size()) {
+        add("aspect count");
+    } else {
+        for (size_t i = 0; i < a.aspects.size(); ++i) {
+            if (a.aspects[i] != b.aspects[i]) {
+                add(a.aspects[i].first.c_str());
+            }
+        }
+    }
+    return out;
+}
+
+/// Before iteration 1: restore the captured images into the fresh cache, capture them again and
+/// compare record by record (Opus-Renderer's round-trip check). Exact, or a STOP naming each
+/// image and what differs.
+bool RestoreImagesChecked(AmdGpu::Liverpool& lp, const std::filesystem::path& dir, u64& count,
+                          std::string& why) {
+    Vulkan::Rasterizer* rasterizer = AmdGpu::ReplayStateAccess::Rasterizer(lp);
+    if (!rasterizer) {
+        why = "no rasterizer";
+        return false;
+    }
+    VideoCore::CapturedMetadata metadata;
+    {
+        Reader meta;
+        MetadataRecord m{};
+        if (!meta.Open(dir / "image_metadata.bin", ImageMetaMagic, why) || meta.records != 1 ||
+            !meta.Get(m, why)) {
+            if (why.empty()) why = "image_metadata.bin holds no record";
+            return false;
+        }
+        metadata.version = m.version;
+        metadata.state.resize(m.bytes);
+        if (!meta.Read(metadata.state.data(), metadata.state.size(), why)) {
+            return false;
+        }
+    }
+    Reader images;
+    if (!images.Open(dir / "images.bin", ImagesMagic, why)) {
+        return false;
+    }
+    std::map<ImageKey, ImagePrint> captured, again;
+    u64 read = 0;
+    std::string read_why;
+    const auto next = [&](VideoCore::CapturedImage& image) {
+        if (read == images.records || !read_why.empty()) {
+            return false;
+        }
+        ImageHeader h{};
+        image = {};
+        if (!images.Get(h, read_why)) {
+            return false;
+        }
+        image.version = h.version;
+        image.state.resize(h.state_bytes);
+        if (!images.Read(image.state.data(), image.state.size(), read_why)) {
+            return false;
+        }
+        for (u32 i = 0; i < h.aspects; ++i) {
+            AspectRecord ar{};
+            if (!images.Get(ar, read_why)) {
+                return false;
+            }
+            VideoCore::CapturedAspect a{ar.aspect, ar.mip, ar.layers, ar.width, ar.height, ar.depth,
+                                        ar.texel_bytes, std::vector<u8>(ar.bytes)};
+            if (!images.Read(a.texels.data(), a.texels.size(), read_why)) {
+                return false;
+            }
+            image.aspects.push_back(std::move(a));
+        }
+        ImageKey key;
+        ImagePrint print;
+        if (!PrintOf(image, key, print, read_why)) {
+            return false;
+        }
+        captured.emplace(key, std::move(print));
+        ++read;
+        return true;
+    };
+    VideoCore::CapturedMetadata metadata_again;
+    std::string capture_why;
+    const bool restored = OnGpuThread(lp, [&] {
+        if (!rasterizer->RestoreImages(next, metadata, why)) {
+            return false;
+        }
+        return rasterizer->CaptureImages(
+            [&](VideoCore::CapturedImage&& image) {
+                ImageKey key;
+                ImagePrint print;
+                if (PrintOf(image, key, print, capture_why)) {
+                    again.emplace(key, std::move(print));
+                }
+            },
+            metadata_again, capture_why);
+    });
+    if (!read_why.empty()) {
+        why = read_why;
+        return false;
+    }
+    if (!restored) {
+        why = "image restore or recapture refused: " + (why.empty() ? capture_why : why);
+        return false;
+    }
+    if (read != images.records) {
+        why = fmt::format("RestoreImages took {} of {} images", read, images.records);
+        return false;
+    }
+    std::vector<std::string> diffs;
+    for (const auto& [key, print] : captured) {
+        const auto it = again.find(key);
+        if (it == again.end()) {
+            diffs.push_back(fmt::format("image {:#x}: missing after restore", key.first));
+        } else if (const std::string d = Differences(print, it->second); !d.empty()) {
+            diffs.push_back(fmt::format("image {:#x}: {} differ", key.first, d));
+        }
+    }
+    for (const auto& [key, print] : again) {
+        if (!captured.count(key)) {
+            diffs.push_back(fmt::format("image {:#x}: present after restore, not captured", key.first));
+        }
+    }
+    if (metadata_again.state != metadata.state) {
+        diffs.push_back("the metadata surfaces differ");
+    }
+    if (!diffs.empty()) {
+        why = fmt::format("the image round trip is not exact ({} differences):", diffs.size());
+        for (size_t i = 0; i < diffs.size() && i < 16; ++i) {
+            why += "\n  " + diffs[i];
+        }
+        return false;
+    }
+    count = read;
     return true;
 }
 
@@ -351,6 +554,21 @@ extern "C" int bbgpu_replay_run(const char* dir, unsigned iterations) {
                "qualified, iteration 1 is warm-up\n",
                dir, capture.submissions.size(), capture.resets.size(), iterations);
     std::fflush(stdout);
+    // Memory and registers first (RestoreImages needs them), then the images, checked.
+    if (!WaitIdle(*lp, std::chrono::seconds(30)) ||
+        !OnGpuThread(*lp, [&] { return Restore(*lp, capture, why); })) {
+        std::fprintf(stderr, "STOP: perf replay: %s\n",
+                     why.empty() ? "the GPU did not go idle before the restore" : why.c_str());
+        return 3;
+    }
+    u64 images = 0;
+    if (!RestoreImagesChecked(*lp, dir, images, why)) {
+        std::fprintf(stderr, "STOP: perf replay: %s\n", why.c_str());
+        return 3;
+    }
+    fmt::print("Perf replay: {} images restored; capture -> restore -> capture again is exact\n",
+               images);
+    std::fflush(stdout);
     std::vector<double> wall_ms, cpu_ms;
     for (unsigned it = 1; it <= iterations; ++it) {
         if (!WaitIdle(*lp, std::chrono::seconds(30))) {
@@ -358,7 +576,7 @@ extern "C" int bbgpu_replay_run(const char* dir, unsigned iterations) {
                                  "iteration %u\n", it);
             return 3;
         }
-        if (!Restore(*lp, capture, why)) {
+        if (!OnGpuThread(*lp, [&] { return Restore(*lp, capture, why); })) {
             std::fprintf(stderr, "STOP: perf replay: %s\n", why.c_str());
             return 3;
         }

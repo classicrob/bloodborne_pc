@@ -27,6 +27,8 @@ constexpr char ImageMagic[8] = {'B', 'B', 'R', 'P', 'E', 'B', 'O', 'T'};
 constexpr char LiverpoolMagic[8] = {'B', 'B', 'R', 'P', 'L', 'P', 'O', 'O'};
 constexpr char SubmissionsMagic[8] = {'B', 'B', 'R', 'P', 'S', 'U', 'B', 'S'};
 constexpr char ResetsMagic[8] = {'B', 'B', 'R', 'P', 'R', 'S', 'E', 'T'};
+constexpr char ImagesMagic[8] = {'B', 'B', 'R', 'P', 'I', 'M', 'G', 'S'};
+constexpr char ImageMetaMagic[8] = {'B', 'B', 'R', 'P', 'I', 'M', 'T', 'A'};
 
 /// views.bin: blocks first (records = blocks + views), then views.
 struct BlockRecord {
@@ -63,6 +65,7 @@ enum class LiverpoolSection : u32 {
     CeHeap = 3,         ///< ConstantEngine::constants_heap
     QueueCsState = 4,   ///< u32 queue id, then AmdGpu::ComputeProgram
     IndirectArgs = 5,   ///< u64 indirect_args_addr
+    GfxRegChecksum = 6, ///< u64 gfx_reg_checksum (rolling: draw preparation's baseline)
 };
 struct SectionRecord {
     LiverpoolSection section;
@@ -99,6 +102,24 @@ struct ResetRecord {
     ResetKind kind;
     u32 opcode; ///< the PM4 opcode that named it (first one, after merging)
     u32 reserved;
+};
+
+/// images.bin: per GPU-modified image (Rasterizer::CaptureImages), an ImageHeader, its state
+/// blob, then `aspects` x (AspectRecord + texels).
+struct ImageHeader {
+    u32 version;  ///< VideoCore::CapturedImageVersion
+    u32 aspects;
+    u64 state_bytes;
+};
+struct AspectRecord {
+    u32 aspect, mip, layers, width, height, depth, texel_bytes, reserved;
+    u64 bytes;
+};
+/// image_metadata.bin: one record, then its bytes (VideoCore::CapturedMetadata).
+struct MetadataRecord {
+    u32 version;
+    u32 reserved;
+    u64 bytes;
 };
 
 } // namespace ReplayFormat

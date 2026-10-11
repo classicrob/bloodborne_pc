@@ -23,6 +23,8 @@
 #include "video_core/amdgpu/pm4_cmds.h"
 #include "video_core/amdgpu/replay_format.h"
 #include "video_core/amdgpu/replay_state_access.h"
+#include "video_core/renderer_vulkan/vk_rasterizer.h"
+#include "video_core/texture_cache/capture_images.h"
 #include "../../../../src/runtime_memory.h"
 
 
@@ -280,7 +282,9 @@ bool WriteLiverpool(const std::filesystem::path& dir, const Liverpool& lp, std::
         !section(LiverpoolSection::CeCounters, counters, sizeof(counters)) ||
         !section(LiverpoolSection::CeHeap, ReplayStateAccess::CeHeap().data(),
                  ReplayStateAccess::CeHeap().size()) ||
-        !section(LiverpoolSection::IndirectArgs, &indirect, sizeof(indirect))) {
+        !section(LiverpoolSection::IndirectArgs, &indirect, sizeof(indirect)) ||
+        !section(LiverpoolSection::GfxRegChecksum, &lp.gfx_reg_checksum,
+                 sizeof(lp.gfx_reg_checksum))) {
         return false;
     }
     for (u32 q = 0; q < Liverpool::NumTotalQueues; ++q) {
@@ -579,6 +583,64 @@ private:
     std::vector<std::pair<u64, u64>> written; // in execution order
 };
 
+/// Every GPU-modified image (Rasterizer::CaptureImages, GPU command thread after
+/// QuiesceForCapture), streamed: one image's texels in memory at a time.
+bool WriteImages(const std::filesystem::path& dir, const Liverpool& lp, u64& count,
+                 u64& texel_bytes, std::string& why) {
+    Vulkan::Rasterizer* rasterizer = ReplayStateAccess::Rasterizer(lp);
+    if (!rasterizer) {
+        why = "no rasterizer";
+        return false;
+    }
+    File images;
+    if (!images.Open(dir / "images.bin", ImagesMagic, why)) {
+        return false;
+    }
+    bool write_ok = true;
+    std::string write_why;
+    VideoCore::CapturedMetadata metadata;
+    count = texel_bytes = 0;
+    const bool captured = rasterizer->CaptureImages(
+        [&](VideoCore::CapturedImage&& image) {
+            if (!write_ok) {
+                return;
+            }
+            write_ok = images.Put(ImageHeader{image.version, u32(image.aspects.size()),
+                                              image.state.size()},
+                                  write_why) &&
+                       images.Write(image.state.data(), image.state.size(), write_why);
+            for (const auto& a : image.aspects) {
+                if (!write_ok) {
+                    break;
+                }
+                write_ok = images.Put(AspectRecord{a.aspect, a.mip, a.layers, a.width, a.height,
+                                                   a.depth, a.texel_bytes, 0, a.texels.size()},
+                                      write_why) &&
+                           images.Write(a.texels.data(), a.texels.size(), write_why);
+                texel_bytes += a.texels.size();
+            }
+            images.Record();
+            ++count;
+        },
+        metadata, why);
+    if (!captured) {
+        why = "image capture refused: " + why;
+        return false;
+    }
+    if (!write_ok) {
+        why = write_why;
+        return false;
+    }
+    File meta;
+    if (!images.Close(why) || !meta.Open(dir / "image_metadata.bin", ImageMetaMagic, why) ||
+        !meta.Put(MetadataRecord{metadata.version, 0, metadata.state.size()}, why) ||
+        !meta.Write(metadata.state.data(), metadata.state.size(), why)) {
+        return false;
+    }
+    meta.Record();
+    return meta.Close(why);
+}
+
 bool WriteResets(const std::filesystem::path& dir, const Memory& m, ResetWalk& walk,
                  u64& count, u64& bytes, std::string& why) {
     auto ranges = walk.ranges;
@@ -650,7 +712,7 @@ std::string Write(const Liverpool& liverpool, std::span<const std::shared_ptr<Cm
         why = fmt::format("cannot create {}: {}", base.string(), ec.message());
         return {};
     }
-    u64 estimate = memory.image_size;
+    u64 estimate = memory.image_size + (u64{2} << 30); // images: ~0.5 GiB in the clinic
     for (const auto& b : memory.blocks) {
         estimate += b.size;
     }
@@ -686,11 +748,12 @@ std::string Write(const Liverpool& liverpool, std::span<const std::shared_ptr<Cm
         return {};
     };
 
-    u64 backing_bytes = 0, words = 0, resets = 0, reset_bytes = 0;
+    u64 backing_bytes = 0, words = 0, resets = 0, reset_bytes = 0, images = 0, texel_bytes = 0;
     if (!WriteViews(dir, memory, why) || !WriteBacking(dir, memory, backing_bytes, why) ||
         !WriteImage(dir, memory, why) || !WriteLiverpool(dir, liverpool, why) ||
         !WriteSubmissions(dir, held, words, why) ||
-        !WriteResets(dir, memory, walk, resets, reset_bytes, why)) {
+        !WriteResets(dir, memory, walk, resets, reset_bytes, why) ||
+        !WriteImages(dir, liverpool, images, texel_bytes, why)) {
         return fail();
     }
     // Written last: a capture without a manifest is not a capture.
@@ -705,9 +768,11 @@ std::string Write(const Liverpool& liverpool, std::span<const std::shared_ptr<Cm
                "  \"vma_generation\": {},\n  \"blocks\": {},\n  \"views\": {},\n"
                "  \"backing_payload_bytes\": {},\n  \"image\": [{}, {}],\n"
                "  \"submissions\": {},\n  \"command_dwords\": {},\n"
-               "  \"resets\": {},\n  \"reset_bytes\": {}\n}}\n",
+               "  \"resets\": {},\n  \"reset_bytes\": {},\n"
+               "  \"images\": {},\n  \"image_texel_bytes\": {}\n}}\n",
                Version, memory.generation, memory.blocks.size(), memory.views.size(), backing_bytes,
-               memory.image_start, memory.image_size, held.size(), words, resets, reset_bytes);
+               memory.image_start, memory.image_size, held.size(), words, resets, reset_bytes,
+               images, texel_bytes);
     if (std::fclose(manifest) != 0) {
         why = "writing manifest.json failed";
         return fail();

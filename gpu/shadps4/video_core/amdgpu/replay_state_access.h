@@ -25,6 +25,9 @@ public:
     static u32 CounterPairs(const Liverpool& lp) {
         return lp.num_counter_pairs;
     }
+    static Vulkan::Rasterizer* Rasterizer(const Liverpool& lp) {
+        return lp.rasterizer;
+    }
     /// The constant engine's RAM (one per process).
     static std::span<u8> CeHeap() {
         return Liverpool::ConstantEngine::constants_heap;
