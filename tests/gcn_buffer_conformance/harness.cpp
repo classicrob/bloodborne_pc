@@ -367,6 +367,7 @@ void AssembleVertex(Template& t) {
     using namespace GcnAsm;
     Code c;
     c.SMovLiteral(VCC_HI, 0x5eed);
+    for (u32 i = 0; i < 4; ++i) c.VMovLiteral(4 + i, VgprMarker + i); // a narrower fetch leaves the rest
     c.SSwappcB64(0, 0);
     c.Vop2(27, 9, 0, Inline(63)); // v_and_b32 v9, 63, v0
     c.VLshlrevB32(8, Inline(4), 9);
@@ -383,10 +384,11 @@ void AssembleVertex(Template& t) {
     f.SLoadDwordx4(4, 2, 0);
     f.SWaitcntAll();
     const Code::BufFields fl{.idxen = true, .vaddr = 0, .vdata = 4, .srsrc = 4};
+    const u32 width = std::clamp<u32>(t.op.ncomp, 1, 4) - 1; // X/XY/XYZ/XYZW
     if (t.mtbuf) {
-        f.Mtbuf(TBUFFER_LOAD_FORMAT_XYZW, t.op.inst_dfmt, t.op.inst_nfmt, fl);
+        f.Mtbuf(TBUFFER_LOAD_FORMAT_X + width, t.op.inst_dfmt, t.op.inst_nfmt, fl);
     } else {
-        f.Mubuf(BUFFER_LOAD_FORMAT_XYZW, fl);
+        f.Mubuf(BUFFER_LOAD_FORMAT_X + width, fl);
     }
     f.SWaitcntAll();
     f.SSetpcB64(0);
@@ -1681,6 +1683,95 @@ void AddVertexCases() {
         const u32 big[] = {0x10000000u, 0x7FFFFFC0u, 0xFFFFFF80u, 0x40000000u};
         for (u32 k = 0; k < 4; ++k) SetLane(j, 40 + k, big[k] | (40 + k), 0);
     }
+    // Every buffer data/number format a skinned mesh's attributes use (bone indices and weights:
+    // 8- and 16-bit integer and normalized, 10-bit packed, half floats), descriptor-formatted
+    // BUFFER_LOAD_FORMAT_X..XYZW as in the game's fetch shaders, at the strides the game binds.
+    // Vertices 0 and 1 hold edge values (sign bits, the most negative SNORM, all ones).
+    {
+        struct F { u32 dfmt, nfmt; u32 ncomp; u32 stride; };
+        const F fs[] = {
+            {GCN_DFMT_8_8_8_8, GCN_NFMT_UNORM, 4, 20}, {GCN_DFMT_8_8_8_8, GCN_NFMT_SNORM, 4, 20},
+            {GCN_DFMT_8_8_8_8, GCN_NFMT_USCALED, 4, 12}, {GCN_DFMT_8_8_8_8, GCN_NFMT_SSCALED, 4, 12},
+            {GCN_DFMT_8_8_8_8, GCN_NFMT_UINT, 4, 32}, {GCN_DFMT_8_8_8_8, GCN_NFMT_SINT, 4, 32},
+            {GCN_DFMT_8_8_8_8, GCN_NFMT_UINT, 2, 44}, {GCN_DFMT_8_8_8_8, GCN_NFMT_UNORM, 3, 36},
+            {GCN_DFMT_16_16, GCN_NFMT_UNORM, 2, 12}, {GCN_DFMT_16_16, GCN_NFMT_SNORM, 2, 12},
+            {GCN_DFMT_16_16, GCN_NFMT_UINT, 2, 20}, {GCN_DFMT_16_16, GCN_NFMT_SINT, 2, 20},
+            {GCN_DFMT_16_16, GCN_NFMT_FLOAT, 2, 32}, {GCN_DFMT_16_16, GCN_NFMT_USCALED, 2, 32},
+            {GCN_DFMT_16_16_16_16, GCN_NFMT_UNORM, 4, 20}, {GCN_DFMT_16_16_16_16, GCN_NFMT_SNORM, 4, 20},
+            {GCN_DFMT_16_16_16_16, GCN_NFMT_UINT, 4, 32}, {GCN_DFMT_16_16_16_16, GCN_NFMT_SINT, 4, 32},
+            {GCN_DFMT_16_16_16_16, GCN_NFMT_FLOAT, 4, 36}, {GCN_DFMT_16_16_16_16, GCN_NFMT_FLOAT, 3, 44},
+            {GCN_DFMT_10_10_10_2, GCN_NFMT_UNORM, 4, 12}, {GCN_DFMT_10_10_10_2, GCN_NFMT_SNORM, 4, 12},
+            {GCN_DFMT_10_10_10_2, GCN_NFMT_UINT, 4, 20},
+            {GCN_DFMT_2_10_10_10, GCN_NFMT_UNORM, 4, 12}, {GCN_DFMT_2_10_10_10, GCN_NFMT_SNORM, 4, 12},
+            {GCN_DFMT_2_10_10_10, GCN_NFMT_UINT, 4, 20}, {GCN_DFMT_2_10_10_10, GCN_NFMT_USCALED, 4, 20},
+            {GCN_DFMT_2_10_10_10, GCN_NFMT_SNORM, 3, 32},
+            {GCN_DFMT_10_11_11, GCN_NFMT_FLOAT, 3, 12}, {GCN_DFMT_11_11_10, GCN_NFMT_FLOAT, 3, 12},
+            {GCN_DFMT_8_8, GCN_NFMT_UNORM, 2, 12}, {GCN_DFMT_8_8, GCN_NFMT_UINT, 2, 12},
+            {GCN_DFMT_8, GCN_NFMT_UNORM, 1, 12}, {GCN_DFMT_16, GCN_NFMT_FLOAT, 1, 12},
+            {GCN_DFMT_32_32_32, GCN_NFMT_FLOAT, 3, 44}, {GCN_DFMT_32_32, GCN_NFMT_FLOAT, 2, 20},
+        };
+        static const char* nf[] = {"unorm", "snorm", "uscaled", "sscaled", "uint", "sint", "snorm_ogl", "float"};
+        std::map<u32, u32> widths; // ncomp -> template
+        auto fetch = [&](u32 ncomp) {
+            if (!widths.count(ncomp)) {
+                static const char* w[] = {"x", "xy", "xyz", "xyzw"};
+                const std::string name = std::string("vertex: fetch buffer_load_format_") + w[ncomp - 1] + " v0 idxen";
+                Template t = g_templates[fmt];
+                t.name = name;
+                t.op.ncomp = ncomp;
+                t.code.clear();
+                t.fetch.clear();
+                widths[ncomp] = AddTemplate(t);
+            }
+            return widths[ncomp];
+        };
+        auto edges = [](u32 dfmt, u32 v) -> u32 { // the element's first dword for vertex v
+            switch (dfmt) {
+            case GCN_DFMT_8_8_8_8: return v ? 0x7E01FE81u : 0x00FF7F80u;
+            case GCN_DFMT_16_16: case GCN_DFMT_16_16_16_16: return v ? 0x7FFF8000u : 0x0001FFFFu;
+            case GCN_DFMT_10_10_10_2: case GCN_DFMT_2_10_10_10: return v ? 0x7FE00802u : 0x801FF3FFu;
+            case GCN_DFMT_10_11_11: case GCN_DFMT_11_11_10: return v ? 0x3C1E03C0u : 0xFFC007FFu;
+            case GCN_DFMT_8_8: return v ? 0x7E01FE81u : 0x00FF7F80u;
+            case GCN_DFMT_8: return v ? 0x7E01FE81u : 0x00FF7F80u;
+            case GCN_DFMT_16: return v ? 0x7FFF7C00u : 0x0001FBFFu;
+            default: return v ? 0x3F800000u : 0xBF800000u;
+            }
+        };
+        for (const F& f : fs) {
+            gcn_vsharp v = StructV(f.stride, 6, f.dfmt, f.nfmt);
+            Job& j = NewJob("vertex-format", fetch(f.ncomp), v, 0);
+            j.label += std::string(" ") + nf[f.nfmt] + " stride " + std::to_string(f.stride);
+            for (u32 w = 0; w < 2 * f.stride / 4; ++w) j.init_words.push_back(0x5A5A0000u | w);
+            j.init_words[0] = edges(f.dfmt, 0);
+            j.init_words[f.stride / 4] = edges(f.dfmt, 1);
+            if (f.dfmt == GCN_DFMT_2_10_10_10 || f.dfmt == GCN_DFMT_10_10_10_2) {
+                j.init_words.resize(3 * f.stride / 4, 0x5A5A5A5Au);
+                j.init_words[2 * f.stride / 4] = 0xA007FE00u; // 2_10_10_10: X -512, Y 511, Z -512, W -2
+            }
+            if (f.dfmt == GCN_DFMT_16_16_16_16) { // second dword: more edges
+                j.init_words[1] = 0x00007FFFu;
+                j.init_words[f.stride / 4 + 1] = 0x80008001u;
+            }
+            for (u32 i = 0; i < 9; ++i) SetLane(j, i, i, 0); // 6 records, then 3 past the end
+        }
+        // dst_sel swizzles on integer and normalized bytes: reversed, and X/0/0/ONE
+        for (auto [nfmt, sel] : {std::pair{GCN_NFMT_UINT, std::array<u8, 4>{7, 6, 5, 4}},
+                                 std::pair{GCN_NFMT_UNORM, std::array<u8, 4>{7, 6, 5, 4}},
+                                 std::pair{GCN_NFMT_UINT, std::array<u8, 4>{4, 0, 0, 1}},
+                                 std::pair{GCN_NFMT_UNORM, std::array<u8, 4>{4, 5, 0, 1}},
+                                 std::pair{GCN_NFMT_SINT, std::array<u8, 4>{5, 4, 1, 1}},
+                                 std::pair{GCN_NFMT_USCALED, std::array<u8, 4>{4, 0, 0, 1}},
+                                 std::pair{GCN_NFMT_SSCALED, std::array<u8, 4>{4, 5, 1, 1}},
+                                 std::pair{GCN_NFMT_SNORM, std::array<u8, 4>{4, 5, 6, 1}}}) {
+            gcn_vsharp v = StructV(20, 6, GCN_DFMT_8_8_8_8, nfmt);
+            for (u32 c = 0; c < 4; ++c) v.dst_sel[c] = sel[c];
+            Job& j = NewJob("vertex-format", fetch(4), v, 0);
+            j.label += std::string(" ") + nf[nfmt] + " dst_sel " + std::to_string(sel[0]) + std::to_string(sel[1]) +
+                       std::to_string(sel[2]) + std::to_string(sel[3]);
+            j.init_words = {0x00FF7F80u, 0, 0, 0, 0, 0x7E01FE81u};
+            for (u32 i = 0; i < 8; ++i) SetLane(j, i, i, 0);
+        }
+    }
     // indirect draws: the CP passes the base vertex in s13 and the fetch shader adds it to v0
     {
         Template ti = g_templates[fmt];
@@ -2167,6 +2258,10 @@ Shader::Profile MakeProfile(const DeviceCaps& c) {
 #ifdef BB_MIRROR_PROFILE_VERTEX_FETCH
         if constexpr (requires { prof.emulate_vertex_fetch; }) prof.emulate_vertex_fetch = true;
 #endif
+        // BB_VERTEX_PULLING=0/1 overrides the tree's choice, to test both vertex paths.
+        if constexpr (requires { prof.emulate_vertex_fetch; }) {
+            if (const char* e = std::getenv("BB_VERTEX_PULLING")) prof.emulate_vertex_fetch = std::atoi(e) != 0;
+        }
 #ifdef BB_MIRROR_PROFILE_SIGNED_ZERO
         if constexpr (requires { prof.repair_mul_signed_zero; }) prof.repair_mul_signed_zero = true;
 #endif
@@ -3013,7 +3108,11 @@ std::vector<Outcome> Expected(Gpu& g, const Job& j, std::vector<u8>& work, const
     const gcn_vsharp v = ActualV(j);
     std::map<std::string, size_t> index;
     std::vector<Outcome> outs;
+    const u32 typed_dfmt = t.op.inst_typed ? t.op.inst_dfmt : v.dfmt;
+    const bool packed = t.op.typed && typed_dfmt >= GCN_DFMT_10_11_11 && typed_dfmt <= GCN_DFMT_2_10_10_10;
     for (u32 r = 0; r < GCN_NUM_READINGS; ++r) {
+        if ((r & GCN_R_PACK_MIRROR) && !packed) continue; // only packed formats have a layout question
+        if (r & GCN_R_SEL1_FLOAT) continue;                // decided: integer ONE (SPEC.md)
         Outcome o;
         o.regs.assign(kLanes * 4, 0);
         for (u32 lane = 0; lane < kLanes; ++lane) {
@@ -3052,6 +3151,9 @@ std::vector<Outcome> Expected(Gpu& g, const Job& j, std::vector<u8>& work, const
                 }
             } else if (op.kind == GCN_LOAD) {
                 for (u32 i = 0; i < op.ncomp; ++i) o.regs[lane * 4 + i] = res.value[i];
+                if (t.vertex) {
+                    for (u32 i = op.ncomp; i < 4; ++i) o.regs[lane * 4 + i] = VgprMarker + i;
+                }
             } else if (op.kind == GCN_ATOMIC && op.atomic_return) {
                 o.regs[lane * 4] = res.value[0];
                 if (op.comp_bytes == 8) o.regs[lane * 4 + 1] = res.value[1];
@@ -3110,6 +3212,7 @@ const char* ReadingName(u32 bit) {
     case GCN_R_MTBUF_BOUND: return "MTBUF_BOUND";
     case GCN_R_SHORT_ALIGN: return "SHORT_ALIGN";
     case GCN_R_SEL1_FLOAT: return "SEL1_FLOAT";
+    case GCN_R_PACK_MIRROR: return "PACK_MIRROR";
     }
     return "?";
 }
@@ -3235,10 +3338,42 @@ JobResult Evaluate(Gpu& g, const Job& j, const Bound& tb, const u8* guest_after,
         if (outs[i].unknown) continue;
         if (outs[i].regs == regs && mem_matches(outs[i], nullptr)) matches.push_back(i);
     }
+    // Typed loads: the ISA fixes neither NaN payloads (FLOAT) nor the last bit of a normalized
+    // conversion (UNORM/SNORM, x/(2^n-1) by division or by a reciprocal multiply).
+    std::string tolerance;
+    if (matches.empty() && t.op.typed && t.op.kind == GCN_LOAD) {
+        const gcn_vsharp tv = ActualV(j);
+        const u32 nfmt = t.op.inst_typed ? t.op.inst_nfmt : tv.nfmt;
+        const bool fp = nfmt == GCN_NFMT_FLOAT, norm = nfmt == GCN_NFMT_UNORM || nfmt == GCN_NFMT_SNORM ||
+                                                     nfmt == GCN_NFMT_SNORM_OGL;
+        auto nan32 = [](u32 x) { return (x & 0x7F800000u) == 0x7F800000u && (x & 0x7FFFFFu) != 0; };
+        bool used_nan = false, used_ulp = false;
+        auto close = [&](u32 got, u32 want) {
+            if (got == want) return true;
+            if (fp && nan32(got) && nan32(want)) return used_nan = true;
+            if (norm && (got >> 31) == (want >> 31) && (got > want ? got - want : want - got) == 1) return used_ulp = true;
+            return false;
+        };
+        for (size_t i = 0; i < outs.size() && matches.empty(); ++i) {
+            if (outs[i].unknown || !mem_matches(outs[i], nullptr)) continue;
+            bool all = true;
+            for (size_t k = 0; k < regs.size() && all; ++k) all = close(regs[k], outs[i].regs[k]);
+            if (all) matches.push_back(i);
+        }
+        if (!matches.empty()) {
+            tolerance = std::string("  matched with ") + (used_nan ? "a different NaN payload" : "") +
+                        (used_nan && used_ulp ? " and " : "") + (used_ulp ? "normalized conversions within 1 ulp" : "") + "\n";
+        }
+    }
     JobResult r;
     if (null_dirty) {
         r.verdict = Verdict::Fail;
         r.detail = "  shared null buffer was written during this batch\n";
+        return r;
+    }
+    if (!matches.empty() && !tolerance.empty()) {
+        r.verdict = Verdict::Ambiguous;
+        r.detail = tolerance;
         return r;
     }
     if (!matches.empty()) {
@@ -3418,6 +3553,11 @@ bool RecordDepthBoundsGate(Job& j) {
 
 bool RecordRender(Gpu& g, vk::CommandBuffer cmd, Job& j, const std::vector<vk::DescriptorBufferInfo>& infos,
                   const Shader::PushData& push, std::vector<RenderTarget>& targets) {
+    if (!g_spirv.count({g_templates[j.tmpl].fs_tmpl, j.fs_perm})) {
+        j.status = Status::HarnessError;
+        j.message = "render: the fragment shader was not compiled (its helper job filtered out or failed)";
+        return false;
+    }
     const Template& t = g_templates[j.tmpl];
     const bool pulling = VertexPulling();
     static std::map<std::string, Pipe> pipes;
