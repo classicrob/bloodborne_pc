@@ -17,10 +17,12 @@ message; nothing is skipped quietly.
 
 Pad tokens are BB_PAD_FILE tokens (src/runtime_pad.c): cross circle square triangle l1 r1 l2 r2
 l3 r3 options touchpad up down left right, sticks lx= ly= rx= ry= (0..255, 128 neutral).
-Rosetta rules (team brief): at most two translated processes; no debugger or sampler is used.
+Rosetta rules (team brief): at most four translated processes; no debugger or sampler is used.
+Parallel runs are safe: each has its own --user, run directory and window, and launches are serialized.
 """
 import argparse
 import datetime
+import fcntl
 import hashlib
 import json
 import os
@@ -34,7 +36,6 @@ import time
 
 ROOT = Path(__file__).resolve().parents[2]
 BASE = ROOT / 'out' / 'macos_route'
-DATA = BASE / 'data'  # run.sh generated files (boot images, patches), shared by all runs
 TOOL_SOURCE = Path(__file__).resolve().parent / 'window_tool.swift'
 # Save fixtures are user data: outside git, next to the game files (BB_SAVE_FIXTURES overrides).
 FIXTURES = Path(os.environ.get('BB_SAVE_FIXTURES', Path.home() / 'bbport-game' / 'saves'))
@@ -290,8 +291,8 @@ def launch(args):
     if removed:
         print('play_route: not passed to the game: ' + ', '.join(removed), file=sys.stderr)
     running = translated_games()
-    if len(running) >= 2:
-        die(f'two bb-probe processes are already running ({running}); the Rosetta limit is two')
+    if len(running) >= 4:
+        die(f'{len(running)} bb-probe processes are already running ({running}); the Rosetta limit is four')
     game = Path(os.environ.get('BB_GAME_DIR', DEFAULT_GAME))
     deps = Path(os.environ.get('BB_DEPS_PREFIX', DEFAULT_DEPS))
     if not (game / 'eboot.bin').is_file():
@@ -326,10 +327,13 @@ def launch(args):
     (run / 'shots').mkdir()
     (run / 'pad.txt').write_text('\n')
     (run / 'bbport.ini').write_text(SETTINGS[args.output])
-    DATA.mkdir(parents=True, exist_ok=True)
+    # run.sh regenerates boot images and patches at every launch: one directory per output size, and
+    # launches serialized (see below) so a starting game never reads a half-written file.
+    data = BASE / f'data-{args.output}'
+    data.mkdir(parents=True, exist_ok=True)
     env = {k: v for k, v in os.environ.items() if k not in removed}
     env.update(BB_PREBUILT='1', BB_PROBE=str(probe), BB_GAME_DIR=str(game), BB_DEPS_PREFIX=str(deps),
-               BB_DATA_DIR=str(DATA), BB_USER_DIR=str(run / 'user'),
+               BB_DATA_DIR=str(data), BB_USER_DIR=str(run / 'user'),
                BB_CONFIG=str(run / 'bbport.ini'),
                BB_PAD_FILE=str(run / 'pad.txt'), BB_IME_TEXT=args.name, BB_FPS=args.fps,
                BB_FRAME_STATS='1', BB_MODS_ENABLED='0', BB_TIMEOUT=str(args.timeout))
@@ -341,6 +345,11 @@ def launch(args):
         env['BB_PERF_PHASES'] = '1'  # one submit per phase: perturbs timing, never an FPS measurement
     if args.dump_shaders:
         env['BB_DUMP_SHADERS'] = '1'
+    for item in args.raw_env:
+        key, sep, value = item.partition('=')
+        if not sep or not key or key.startswith(('BB_', 'DYLD_')) or key in env:
+            die(f'--raw-env needs a new non-BB_, non-DYLD_ name and a value: {item}')
+        env[key] = value
     for item in args.diag_env:
         key, sep, value = item.partition('=')
         if not sep or not key.startswith('BB_') or key in env:
@@ -357,6 +366,7 @@ def launch(args):
               'artifacts': artifacts, 'pinned_probe': str(probe), 'repo_head': subprocess.run(
                   ['git', '-C', str(ROOT), 'rev-parse', 'HEAD'], capture_output=True, text=True).stdout.strip(),
               'env': {k: v for k, v in env.items() if k.startswith(('BB_', 'DYLD_'))}, 'env_removed': removed,
+              'raw_env': args.raw_env,
               'diagnostics': [n for n, on in (('BB_DUMP_SHADERS', args.dump_shaders),
                                               ('BB_CAPTURE_TRIGGER', args.frame_capture),
                                               ('BB_TOGGLE_FILE', args.disable_optimizations is not None)) if on]
@@ -372,6 +382,9 @@ def launch(args):
     if current.is_symlink() or current.exists():
         current.unlink()
     current.symlink_to(run.name)
+    # One launch at a time (parallel games): held until the new game has started running.
+    lock = (BASE / 'launch.lock').open('w')
+    fcntl.flock(lock, fcntl.LOCK_EX)
     # A detached supervisor owns the game, so its exit status is recorded however the run ends.
     subprocess.Popen([sys.executable, __file__, '_supervise', str(run)], start_new_session=True,
                      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
@@ -382,6 +395,7 @@ def launch(args):
         if (run / 'exit.json').exists():
             die(f'game exited during startup: {(run / "exit.json").read_text().strip()}; log {run / "game.log"}')
         if info.get('pid') and any(l.startswith('Runtime:') for l in log_lines(run)):
+            fcntl.flock(lock, fcntl.LOCK_UN)
             print(json.dumps({'run': str(run), 'pid': info['pid'], 'log': str(run / 'game.log')}))
             return run
     die(f'no runtime output within 60 s (Rosetta rule: report, do not retry); run {run}')
@@ -445,6 +459,10 @@ REPORT = {
     'sync_einval': r'Runtime sync EINVAL',
     'guest_panic': r'Dantelion2 Panic|Guest fault',
     'cache_rebuilt': r'Pipeline cache isn.t compatible|Pipeline cache cleared',
+    'stream_write_waits': r'Command snapshot #\d+.*waited for',
+    'builder_rejected': r'rejected a \d+-dword command buffer request',
+    'gpu_copy_gap': r'runs on the GPU',
+    'cmd_overlap': r'CMD-OVERLAP',
 }
 
 
@@ -616,6 +634,8 @@ def main():
         p.add_argument('--fixture', metavar='NAME', help='seed the fresh --user with save fixture NAME (route: Continue)')
         p.add_argument('--warm-cache', metavar='NAME',
                        help='seed the pipeline cache from cache fixture NAME (not for compile/cache/acceptance runs)')
+        p.add_argument('--raw-env', action='append', default=[], metavar='NAME=VALUE',
+                       help='extra non-BB_ variable, e.g. MVK_CONFIG_* (recorded; repeatable)')
         p.add_argument('--diag-env', action='append', default=[], metavar='BB_NAME=VALUE',
                        help='extra diagnostic BB_ variable (recorded; repeatable)')
         p.add_argument('--disable-optimizations', type=int, metavar='MASK',
