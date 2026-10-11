@@ -214,37 +214,28 @@ bool Scheduler::LabelsAtGpuComplete() {
 
 void Scheduler::SignalAtGpuCompletion(std::function<void()> signal) {
     const u64 tick = CurrentTick(); // the next submission signals this value
+    // Issued now, in stream order; the writer takes labels only in this order, whichever
+    // becomes ready first (deferred ones after the copy threads, direct ones at once).
+    const u64 sequence = labels.Issue();
+    deferred_signals_issued.fetch_add(1, std::memory_order_relaxed);
+    std::call_once(label_thread_once, [this] {
+        label_thread = std::jthread([this](std::stop_token stoken) { LabelThread(stoken); });
+    });
     if (!IsRecordingDeferred()) {
         const u64 submitted = Flush();
         ASSERT_MSG(submitted == tick,
-                   "macOS: a label's submission signals timeline value {}, it waits for {}",
+                   "macOS: a label's submission signals timeline value {}, its writer waits for {}",
                    submitted, tick);
-        WaitHostCopies();
-        Wait(tick);
-        signal();
+        WaitHostCopies(); // the guest-memory copies issued before it
+        labels.Ready(sequence, tick, std::move(signal));
         return;
     }
     BbCopy::FlushBatch();
-    deferred_signals_issued.fetch_add(1, std::memory_order_relaxed);
-    Record([this, tick, signal = std::move(signal),
-            done = deferred_signals_done](vk::CommandBuffer) mutable {
-        // After the copies queued before it, then after the GPU passed `tick`: the label thread
-        // waits for each label's tick in order.
-        BbCopy::AfterCopies([this, tick, signal = std::move(signal),
-                             done = std::move(done)]() mutable {
-            {
-                std::scoped_lock lk{label_mutex};
-                auto write = [signal = std::move(signal), done = std::move(done)]() mutable {
-                    signal();
-                    done->fetch_add(1, std::memory_order_release);
-                };
-                label_ops.push_back({std::move(write), tick});
-            }
-            label_cv.notify_one();
+    Record([this, tick, sequence, signal = std::move(signal)](vk::CommandBuffer) mutable {
+        // After the copies queued before it; the writer then waits for `tick`.
+        BbCopy::AfterCopies([this, tick, sequence, signal = std::move(signal)]() mutable {
+            labels.Ready(sequence, tick, std::move(signal));
         });
-    });
-    std::call_once(label_thread_once, [this] {
-        label_thread = std::jthread([this](std::stop_token stoken) { LabelThread(stoken); });
     });
     const u64 submitted = Flush();
     // The writer waits for `tick`: it must be the submission holding the label and the work
@@ -254,43 +245,48 @@ void Scheduler::SignalAtGpuCompletion(std::function<void()> signal) {
                submitted, tick);
 }
 
+bool Scheduler::WaitLabelTick(u64 tick, const std::stop_token& stoken) {
+    // Waited in slices so that a stop (exit, possibly after a device loss) is never stuck here;
+    // a failed wait stops loudly.
+    work_semaphore.Refresh();
+    while (!work_semaphore.IsFree(tick)) {
+        if (stoken.stop_requested()) {
+            return false;
+        }
+        const vk::Semaphore semaphore = work_semaphore.Handle();
+        const vk::SemaphoreWaitInfo wait_info = {
+            .semaphoreCount = 1,
+            .pSemaphores = &semaphore,
+            .pValues = &tick,
+        };
+        const vk::Result result =
+            instance.GetDevice().waitSemaphores(&wait_info, 10'000'000); // 10 ms
+        ASSERT_MSG(result == vk::Result::eSuccess || result == vk::Result::eTimeout,
+                   "macOS: the label writer's wait for timeline value {} failed: {}", tick,
+                   vk::to_string(result));
+        work_semaphore.Refresh();
+    }
+    return true;
+}
+
 void Scheduler::LabelThread(std::stop_token stoken) {
     Common::SetCurrentThreadName("shadPS4:GpuLabelWriter");
-    while (!stoken.stop_requested()) {
-        PendingOp op;
-        {
-            std::unique_lock lk{label_mutex};
-            label_cv.wait(lk, stoken, [this] { return !label_ops.empty(); });
-            if (stoken.stop_requested()) {
-                break;
-            }
-            op = std::move(label_ops.front());
-            label_ops.pop_front();
-        }
-        // Submitted by SignalAtGpuCompletion's Flush. Waited in slices so that a stop (exit,
-        // possibly after a device loss) is never stuck here; a failed wait stops loudly.
-        work_semaphore.Refresh();
-        while (!work_semaphore.IsFree(op.gpu_tick)) {
-            if (stoken.stop_requested()) {
-                return;
-            }
-            const vk::Semaphore semaphore = work_semaphore.Handle();
-            const vk::SemaphoreWaitInfo wait_info = {
-                .semaphoreCount = 1,
-                .pSemaphores = &semaphore,
-                .pValues = &op.gpu_tick,
-            };
-            const vk::Result result =
-                instance.GetDevice().waitSemaphores(&wait_info, 10'000'000); // 10 ms
-            ASSERT_MSG(result == vk::Result::eSuccess || result == vk::Result::eTimeout,
-                       "macOS: the label writer's wait for timeline value {} failed: {}",
-                       op.gpu_tick, vk::to_string(result));
-            work_semaphore.Refresh();
-        }
-        if (stoken.stop_requested()) {
+    u64 dropped = 0;
+    while (auto label = labels.Next(stoken)) {
+        if (!WaitLabelTick(label->tick, stoken)) {
+            ++dropped; // taken, its work not complete
             break;
         }
-        op.callback();
+        label->write();
+        deferred_signals_done->fetch_add(1, std::memory_order_release);
+    }
+    // Stopping (exit): labels not written are dropped, and counted as done so that nothing is
+    // left waiting for them (WaitDeferredSignals).
+    dropped += labels.Outstanding();
+    if (dropped) {
+        deferred_signals_done->fetch_add(dropped, std::memory_order_release);
+        std::fprintf(stderr, "Labels at GPU completion: %llu labels not written at shutdown\n",
+                     static_cast<unsigned long long>(dropped));
     }
 }
 #endif

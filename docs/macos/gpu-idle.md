@@ -199,12 +199,19 @@ With `BB_LABELS_AT_GPU_COMPLETE=1`:
 - That command buffer is submitted at once, one submission per label, so a guest or a
   WAIT_REG_MEM waiting on the label is never left waiting for a submission that only comes at the
   frame's end.
-- A dedicated label writer thread waits for each submission's timeline tick in FIFO order, so
-  labels keep stream order across the graphics and compute queues. It is not the priority
-  runner, whose other ops may wait for ticks submitted only at the frame's end.
+- A dedicated label writer thread writes labels strictly in the order they were issued in the
+  stream (`gpu/shim/bbport_label_sequencer.h`), across the graphics and compute queues and across
+  deferred and direct recording. A label that becomes ready early waits for the earlier ones. Each
+  is written after its submission's timeline tick. It is not the priority runner, whose other ops
+  may wait for ticks submitted only at the frame's end.
+- Labels are stored only through the memory's backing, which cannot fault. A faulting store on the
+  writer could enter the write-fault handler while a recording thread waits for that very label.
+  A label without a backing stops.
+- At shutdown, labels not written are counted as done (nothing waits for them) and reported.
 - WaitDeferredSignals, and with it GpuIdle, waits for them.
-- A RELEASE_MEM GDS store needs a GPU copy, so it waits for the GPU synchronously
-  (Rasterizer::Finish).
+- A RELEASE_MEM GDS store is a GPU copy. It is recorded, the GPU completes it (Rasterizer::Finish),
+  the labels before it land, and only then is the interrupt raised. The guest reads the destination
+  through the buffer cache's GPU-modified tracking.
 - WRITE_DATA and DMA_DATA are unchanged. The command processor executes them in stream order
   without waiting for earlier draws, so the guest cannot take them as "GPU done".
 

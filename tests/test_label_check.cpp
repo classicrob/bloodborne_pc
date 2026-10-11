@@ -9,7 +9,13 @@
 #include <cstring>
 #include <sys/mman.h>
 #include <unistd.h>
+#include <atomic>
+#include <chrono>
+#include <mutex>
+#include <thread>
+#include <vector>
 #include "bbport_label_check.h"
+#include "bbport_label_sequencer.h"
 
 namespace {
 unsigned failures = 0;
@@ -99,6 +105,51 @@ int main() {
     const auto unmatched_before = counts.unmatched.load();
     Expect("a write without a parse note is not reported", !Write(&block[3], 9));
     Expect("  ... counted as unmatched", counts.unmatched.load() == unmatched_before + 1);
+    // BB_LABELS_AT_GPU_COMPLETE's writer order (bbport_label_sequencer.h). Label A is issued
+    // deferred (ready only after the copy threads), B direct (ready at once): B must not be
+    // written before A, however long A's prerequisites take.
+    {
+        BbLabels::Sequencer sequencer;
+        std::vector<char> written;
+        std::mutex written_mutex;
+        const auto label = [&](char name) {
+            return [&, name] {
+                std::scoped_lock lk{written_mutex};
+                written.push_back(name);
+            };
+        };
+        const auto a = sequencer.Issue();
+        const auto b = sequencer.Issue();
+        std::atomic<int> taken{0};
+        std::jthread writer([&](std::stop_token stop) {
+            while (auto next = sequencer.Next(stop)) {
+                next->write();
+                ++taken;
+            }
+        });
+        sequencer.Ready(b, 2, label('B')); // the direct label, ready first
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        Expect("a later label ready first is held until the earlier one is ready",
+               taken.load() == 0);
+        sequencer.Ready(a, 1, label('A'));
+        for (int i = 0; i < 200 && taken.load() < 2; ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        Expect("then both are written in issue order (A, B)",
+               written == std::vector<char>{'A', 'B'});
+        // Teardown with labels pending: one issued and ready behind one not ready.
+        const auto c = sequencer.Issue();
+        const auto d = sequencer.Issue();
+        (void)c;
+        sequencer.Ready(d, 4, label('D'));
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        writer.request_stop();
+        writer.join();
+        Expect("stopping with labels pending writes none past the gap and reports both as "
+               "outstanding",
+               written.size() == 2 && sequencer.Outstanding() == 2);
+    }
+
     std::fprintf(stderr, "%s: %u failures\n", failures ? "FAIL" : "PASS", failures);
     return failures ? 1 : 0;
 }

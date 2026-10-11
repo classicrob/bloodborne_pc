@@ -17,6 +17,9 @@
 #include <utility>
 #include <vector>
 #include <mutex>
+#ifdef __APPLE__
+#include "bbport_label_sequencer.h"
+#endif
 #include <thread>
 #include <queue>
 
@@ -984,13 +987,14 @@ private:
     bool recording_threaded{false};
     std::jthread recorder_thread;
 #ifdef __APPLE__
-    /// SignalAtGpuCompletion's writer: labels only, FIFO, each after its own (already submitted)
-    /// timeline tick. Not the priority runner, whose other ops may wait for ticks that are only
-    /// submitted at the frame's end. Declared last: the thread stops before the queue goes.
+    /// SignalAtGpuCompletion's writer: labels only, in issue order (BbLabels::Sequencer), each
+    /// after its own (already submitted) timeline tick. Not the priority runner, whose other ops
+    /// may wait for ticks submitted only at the frame's end. Declared last: the thread stops
+    /// before the sequencer goes.
     void LabelThread(std::stop_token stoken);
-    std::mutex label_mutex;
-    std::condition_variable_any label_cv;
-    std::deque<PendingOp> label_ops;
+    /// Waits in slices until the GPU passed `tick`; false if stopped first.
+    bool WaitLabelTick(u64 tick, const std::stop_token& stoken);
+    BbLabels::Sequencer labels;
     std::once_flag label_thread_once;
     std::jthread label_thread;
 #endif
