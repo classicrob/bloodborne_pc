@@ -131,6 +131,10 @@ struct Template {
     bool clip_planes = false;  // vertex: user clip plane 0 enabled (adds the ClipPlanes buffer)
     bool check_bindings = false; // compile-only: the chosen module's bindings must start at the job's start
     bool no_buffer_load = false; // stage-compile: export constants only (no s_buffer_load)
+    bool vs_mask_rt = false;     // vertex job: compare masks read back per vertex (EvaluateVsMask)
+    u32 vs_mask = 0;             // stage-compile VS: compare mask in s[24:25] read back (1 same-exec
+                                 // region, 2 after reconvergence, 3 counted with s_bcnt1, 4 as 1 then
+                                 // reused as an s_buffer_load destination)
     std::vector<u32> fetch;
     std::array<u32, 3> wg{64, 1, 1}; // compute workgroup shape (power-of-two x)
     u32 lds_bits = 0;                // Wave::Lds: guest LDS access width (16, 32, 64)
@@ -544,15 +548,56 @@ constexpr u32 IndirectBaseSgpr = 13;
 // Vertex shader: s_swappc_b64 into the fetch shader (V# via s_load_dwordx4 from the table at
 // s[2:3], buffer/tbuffer_load_format_xyzw v[4:7], v0 idxen), then stores v[4:7] to the result
 // slot (vertex index & 63) and exports a position. Rasterization is discarded.
+// Vertex job body for vs_mask_rt: A = w0 != 0, B = w1 != 0, C = w2 != 0 of the vertex's record
+// (v4..v6). VOP3 compares write B and C into s[24:25] and s[30:31] (which hold unrelated data
+// before) in an s_cbranch_execz region under exec = A; a later region under the same exec reads
+// them back through s_and_saveexec: v12 = A && B, v13 = A && !B (s_not_b64), v14 = A && B && C
+// (s_and_b64); v15 = 7 in every vertex.
+void AssembleVsMaskBody(GcnAsm::Code& c) {
+    using namespace GcnAsm;
+    for (u32 v = 12; v < 15; ++v) c.VMov(v, Inline(0));
+    c.SMovLiteral(24, 0x12345678u);
+    c.SMovLiteral(25, 0x9abcdef0u);
+    c.SMovLiteral(30, 0x0f0f0f0fu);
+    c.SMovLiteral(31, 0xf0f0f0f0u);
+    c.VCmpNeU32(Inline(0), 4);
+    c.SAndSaveexecB64(22, VCC_LO);
+    const size_t br1 = c.words.size();
+    c.Sopp(8, 0);
+    c.words.push_back(0xD0000000u | (197u << 17) | 24u); // v_cmp_ne_u32 s[24:25], 0, v5
+    c.words.push_back(Inline(0) | (Vgpr(5) << 9));
+    c.words.push_back(0xD0000000u | (197u << 17) | 30u); // v_cmp_ne_u32 s[30:31], 0, v6
+    c.words.push_back(Inline(0) | (Vgpr(6) << 9));
+    c.words[br1] |= u32(int32_t(c.words.size()) - int32_t(br1 + 1)) & 0xFFFF;
+    c.Sop1(3, 20, Inline(0));
+    const size_t br2 = c.words.size();
+    c.Sopp(8, 0);
+    c.SAndSaveexecB64(26, 24);
+    c.VMov(12, Inline(1));
+    c.SMovB64(EXEC_LO, 26);
+    c.Sop1(8, 28, 24);           // s_not_b64 s[28:29], s[24:25]
+    c.SAndSaveexecB64(26, 28);
+    c.VMov(13, Inline(1));
+    c.SMovB64(EXEC_LO, 26);
+    c.Sop2(15, 28, 24, 30);      // s_and_b64 s[28:29], s[24:25], s[30:31]
+    c.SAndSaveexecB64(26, 28);
+    c.VMov(14, Inline(1));
+    c.SMovB64(EXEC_LO, 26);
+    c.words[br2] |= u32(int32_t(c.words.size()) - int32_t(br2 + 1)) & 0xFFFF;
+    c.SMovB64(EXEC_LO, 22);
+    c.VMov(15, Inline(7));
+}
+
 void AssembleVertex(Template& t) {
     using namespace GcnAsm;
     Code c;
     c.SMovLiteral(VCC_HI, 0x5eed);
     for (u32 i = 0; i < 4; ++i) c.VMovLiteral(4 + i, VgprMarker + i); // a narrower fetch leaves the rest
     c.SSwappcB64(0, 0);
+    if (t.vs_mask_rt) AssembleVsMaskBody(c);
     c.Vop2(27, 9, 0, Inline(63)); // v_and_b32 v9, 63, v0
     c.VLshlrevB32(8, Inline(4), 9);
-    c.Mubuf(BUFFER_STORE_DWORDX4, Code::BufFields{.offen = true, .vaddr = 8, .vdata = 4, .srsrc = 8});
+    c.Mubuf(BUFFER_STORE_DWORDX4, Code::BufFields{.offen = true, .vaddr = 8, .vdata = t.vs_mask_rt ? 12u : 4u, .srsrc = 8});
     c.SWaitcntAll();
     c.VMov(10, Inline(0));
     c.VMovLiteral(11, 0x3f800000);
@@ -662,10 +707,96 @@ void AssembleCtrlBreak(Template& t) {
     t.hash = 0xb4eaull ^ (u64(t.wg[0]) << 16);
 }
 
+// A VS whose VOP3 compare mask (s[24:25], an SGPR pair that held other data before) is computed in
+// one s_cbranch_execz region and read back in a later one under the same exec (0x21a4e622's shape):
+// vs_mask 1 reads it with s_and_saveexec inside that region (every reading lane wrote the mask),
+// 2 reads it after the regions reconverge (lanes outside them would see the old data), 3 counts it,
+// 4 is 1 followed by an s_buffer_load into the pair (SMEM_ZERO reading for the shader), 5 mixes the
+// halves of two masks, 6 reads the mask at the top of the next loop iteration (2, 3, 5, 6 must stop).
+void AssembleVsMask(GcnAsm::Code& c, u32 shape) {
+    using namespace GcnAsm;
+    if (shape == 6) { // the mask read at the top of a loop iteration: from the previous iteration
+        c.SMovLiteral(24, 0x12345678u);
+        c.SMovLiteral(25, 0x9abcdef0u);
+        c.Sop1(3, 20, Inline(0));
+        const size_t loop = c.words.size();
+        c.SAndSaveexecB64(26, 24);
+        c.VMovLiteral(1, 0x3f800000u);
+        c.SMovB64(EXEC_LO, 26);
+        c.VCmpNeU32(Inline(0), 0);
+        c.SAndSaveexecB64(22, VCC_LO);
+        const size_t br = c.words.size();
+        c.Sopp(8, 0);
+        c.words.push_back(0xD0000000u | (196u << 17) | 24u); // v_cmp_gt_u32 s[24:25], 2, v0
+        c.words.push_back(Inline(2) | (Vgpr(0) << 9));
+        c.words[br] |= u32(int32_t(c.words.size()) - int32_t(br + 1)) & 0xFFFF;
+        c.SMovB64(EXEC_LO, 22);
+        c.SAddU32(20, 20, Inline(1));
+        c.SCmpLtU32Literal(20, 2);
+        c.SCbranchScc1To(loop);
+        for (u32 i = 0; i < 4; ++i) {
+            if (i != 1) c.VMovLiteral(i, 0x3f800000u);
+        }
+        c.Exp(12, 0xF, true, 0, 1, 2, 3);
+        c.SEndpgm();
+        return;
+    }
+    c.SMovLiteral(24, 0x12345678u); // the pair's earlier, unrelated value
+    c.SMovLiteral(25, 0x9abcdef0u);
+    c.VCmpNeU32(Inline(0), 0);      // vcc = vertex index != 0
+    c.SAndSaveexecB64(22, VCC_LO);
+    const size_t br1 = c.words.size();
+    c.Sopp(8, 0);                   // s_cbranch_execz L1
+    c.words.push_back(0xD0000000u | (196u << 17) | 24u); // v_cmp_gt_u32 s[24:25], 2, v0 (VOP3)
+    c.words.push_back(Inline(2) | (Vgpr(0) << 9));
+    if (shape == 5) {
+        c.words.push_back(0xD0000000u | (197u << 17) | 30u); // v_cmp_ne_u32 s[30:31], 0, v0
+        c.words.push_back(Inline(0) | (Vgpr(0) << 9));
+    }
+    c.words[br1] |= u32(int32_t(c.words.size()) - int32_t(br1 + 1)) & 0xFFFF;
+    c.Sop1(3, 20, Inline(0));       // L1: a scalar op between the regions, exec unchanged
+    const size_t br2 = c.words.size();
+    c.Sopp(8, 0);                   // s_cbranch_execz L2
+    if (shape == 5) c.Sop1(3, 25, 31); // s_mov_b32 s25, s31: one mask's low half, another's high half
+    if (shape == 1 || shape == 4 || shape == 5) {
+        c.SAndSaveexecB64(26, 24);  // exec &= mask
+        c.VMovLiteral(1, 0x3f800000u);
+        c.SMovB64(EXEC_LO, 26);
+    } else if (shape == 3) {
+        c.SBcnt1B64(20, 24);
+        c.VMov(1, 20);
+    }
+    c.words[br2] |= u32(int32_t(c.words.size()) - int32_t(br2 + 1)) & 0xFFFF;
+    c.SMovB64(EXEC_LO, 22);         // L2: reconverge
+    if (shape == 4) {               // the pair is then an s_buffer_load destination (old value kept
+        c.SBufferLoad(1, 24, 4, true, 2); // for an out-of-range dword: the mask, or 0 under SMEM_ZERO)
+        c.SWaitcntAll();
+        c.VMov(2, 24);
+    }
+    if (shape == 2) {
+        c.SAndSaveexecB64(26, 24);
+        c.VMovLiteral(1, 0x3f800000u);
+        c.SMovB64(EXEC_LO, 26);
+    }
+    for (u32 i = 0; i < 4; ++i) {
+        if (i != 1 && !(i == 2 && shape == 4)) c.VMovLiteral(i, 0x3f800000u);
+    }
+    c.Exp(12, 0xF, true, 0, 1, 2, 3); // pos0
+    c.SEndpgm();
+}
+
 void AssembleStage(Template& t) {
     using namespace GcnAsm;
     Code c;
     c.SMovLiteral(VCC_HI, 0x5eed);
+    if (t.vs_mask) {
+        AssembleVsMask(c, t.vs_mask);
+        t.code = std::move(c.words);
+        u64 h = 0xcbf29ce484222325ull ^ (0x500 + t.vs_mask);
+        for (u32 w : t.code) h = (h ^ w) * 0x100000001b3ull;
+        t.hash = h;
+        return;
+    }
     c.Sop1(3, 124, 8); // s_mov_b32 m0, s8
     if (!t.no_buffer_load) {
         c.SBufferLoad(t.op.ncomp, t.sdst, 4, t.smem == SmemSrc::Imm, t.smem == SmemSrc::Imm ? t.smem_imm : 9);
@@ -2033,6 +2164,24 @@ void AddVertexCases() {
         return AddTemplate(t);
     };
     const u32 fmt = tmpl("vertex: fetch buffer_load_format_xyzw v0 idxen", false, 0, 0);
+    // VS compare masks read back per vertex (the eboot VS shape, with invert and combine)
+    {
+        Template t = g_templates[fmt];
+        t.name = "vertex: VOP3 compare masks in s[24:25]/s[30:31] read back in a later region (A&&B, A&&!B, A&&B&&C)";
+        t.vs_mask_rt = true;
+        t.code.clear();
+        t.fetch.clear();
+        const u32 tt = AddTemplate(t);
+        Job& j = NewJob("vertex", tt, StructV(16, 16, GCN_DFMT_32_32_32_32, GCN_NFMT_UINT), 0);
+        for (u32 v = 0; v < 16; ++v) {
+            // every combination of A, B, C, twice, with assorted nonzero words
+            j.init_words.push_back((v & 1) ? 0x100u + v : 0u);
+            j.init_words.push_back((v & 2) ? 0x80000000u >> v : 0u);
+            j.init_words.push_back((v & 4) ? 0xFFFFFFFFu - v : 0u);
+            j.init_words.push_back(0x5A5A0000u | v);
+            SetLane(j, v, v, 0);
+        }
+    }
     const u32 tb = tmpl("vertex: fetch tbuffer_load_format_xyzw dfmt:14 nfmt:4", true, GCN_DFMT_32_32_32_32, GCN_NFMT_UINT);
     gcn_vsharp a = StructV(16, 5, GCN_DFMT_32_32_32_32, GCN_NFMT_UINT);
     gcn_vsharp b = StructV(8, 3, GCN_DFMT_32_32, GCN_NFMT_FLOAT);
@@ -2231,6 +2380,22 @@ void AddInternalCases() {
             const u32 t = stage(fragment, 4, sdst, SmemSrc::Imm, 0, true);
             for (const gcn_vsharp& v : {RawV(64), StructV(16, 4)}) NewJob("dead-access", t, v, 0);
         }
+    }
+    // VS compare masks read back with InverseBallot (0x21a4e622): exact per lane where every
+    // reading lane wrote the mask; loud where the pair's old data can reach the read, or the mask
+    // is counted. Loud only where the device has no subgroup operations in vertex shaders.
+    for (u32 shape : {1u, 4u, 2u, 3u, 5u, 6u}) {
+        static const char* names[] = {"", "read in a later region under the same exec",
+                                      "read after reconvergence (old data reachable)", "counted with s_bcnt1",
+                                      "read in a later region, then an s_buffer_load destination",
+                                      "with its high half from another mask", "read at the top of the next loop iteration"};
+        Template t;
+        t.name = std::string("vs: VOP3 compare mask s[24:25] ") + names[shape] + " (compile)";
+        t.compile_only = true;
+        t.vertex = true;
+        t.vs_mask = shape;
+        t.op.kind = GCN_SLOAD;
+        NewJob("stage-compile", AddTemplate(t), RawV(64), 0);
     }
     // compute: the buffer under test is loaded into a register that is never stored
     for (bool idxen : {false, true}) {
@@ -2673,6 +2838,10 @@ Shader::Profile MakeProfile(const DeviceCaps& c) {
 #ifdef BB_MIRROR_PROFILE_SIGNED_ZERO
         if constexpr (requires { prof.repair_mul_signed_zero; }) prof.repair_mul_signed_zero = true;
 #endif
+        // the device's answer, as the renderer's Profile takes it (subgroupSupportedStages & VERTEX)
+        if constexpr (requires { prof.subgroup_supported_stages; }) {
+            prof.subgroup_supported_stages = c.subgroup_stages;
+        }
     }(p);
     return p;
 }
@@ -4411,6 +4580,26 @@ JobResult EvaluatePkrtz(const Job& j, const u32* res) {
 // SmemFallback: v10 = the in-range dword (or 0 when out of range), v11 = 0: the shader reads
 // out-of-range scalar dwords as 0 (the SMEM_ZERO reading, taken for the whole shader), never the
 // old 0x1234; v12/v13 keep their markers.
+// vs_mask_rt: per vertex, the own-bit reads of the compare masks (AssembleVsMaskBody).
+JobResult EvaluateVsMask(const Job& j, const u32* res) {
+    u32 bad = 0;
+    std::string d;
+    for (u32 l = 0; l < u32(j.init_words.size() / 4); ++l) {
+        const bool a = j.init_words[l * 4] != 0, b = j.init_words[l * 4 + 1] != 0, c = j.init_words[l * 4 + 2] != 0;
+        const u32 want[4] = {u32(a && b), u32(a && !b), u32(a && b && c), 7u};
+        for (u32 i = 0; i < 4; ++i) {
+            if (res[l * 4 + i] != want[i] && bad++ < 8) {
+                char buf[160];
+                std::snprintf(buf, sizeof(buf), "    vertex %u v%u: got %#x want %#x (A=%d B=%d C=%d)\n", l, 12 + i,
+                              res[l * 4 + i], want[i], a, b, c);
+                d += buf;
+            }
+        }
+    }
+    if (!bad) return {Verdict::Strict, ""};
+    return {Verdict::Fail, "  " + std::to_string(bad) + " values wrong\n" + d};
+}
+
 JobResult EvaluateSmemFallback(Gpu& g, const Job& j, const u32* res) {
     const Template& t = g_templates[j.tmpl];
     u32 in_range;
@@ -4597,6 +4786,10 @@ std::map<u32, JobResult> RunBatch(Gpu& g, const std::vector<u32>& jobs) {
         }
         if (g_templates[j.tmpl].wave == Wave::SmemFallback) {
             out[ji] = EvaluateSmemFallback(g, j, res);
+            continue;
+        }
+        if (g_templates[j.tmpl].vs_mask_rt) {
+            out[ji] = EvaluateVsMask(j, res);
             continue;
         }
         if (g_templates[j.tmpl].wave == Wave::Pkrtz || g_templates[j.tmpl].wave == Wave::Pkrtz3) {
@@ -5389,6 +5582,28 @@ int main(int argc, char** argv) {
                                                                      " declares bindings " + list(got) +
                                                                      ", the pipeline layout expects " + list(want) +
                                                                      " (reused across start bindings)\n"};
+        } else if ((g_templates[j.tmpl].vs_mask == 1 || g_templates[j.tmpl].vs_mask == 4) &&
+                   j.status == Status::Ok && (g_caps.subgroup_stages & 1u) == 0) {
+            // compiled: it must not need subgroup operations, which this device's vertex stage lacks
+            const auto& spv = g_spirv.at({j.tmpl, j.perm});
+            u32 cap = 0;
+            for (size_t w = 5; w < spv.size();) {
+                const u32 count = spv[w] >> 16, opcode = spv[w] & 0xFFFF;
+                if (count == 0) break;
+                if (opcode == 17 && count >= 2 && spv[w + 1] >= 61 && spv[w + 1] <= 68) cap = spv[w + 1];
+                w += count;
+            }
+            results[ji] = cap == 0 ? JobResult{Verdict::Strict, ""}
+                                   : JobResult{Verdict::Fail, "  the vertex shader declares subgroup capability " +
+                                                                  std::to_string(cap) +
+                                                                  ", which this device's vertex stage does not support\n"};
+        } else if (g_templates[j.tmpl].vs_mask != 0 && g_templates[j.tmpl].vs_mask != 1 &&
+                   g_templates[j.tmpl].vs_mask != 4 && (g_caps.subgroup_stages & 1u) == 0) {
+            results[ji] = j.status == Status::LoudCompile
+                              ? JobResult{Verdict::Strict, ""}
+                              : JobResult{Verdict::Fail, "  compiled, but this device's vertex stage has no "
+                                                         "subgroup operations and the mask read is not this "
+                                                         "lane's own compare bit\n"};
         } else if (g_templates[j.tmpl].expect_loud) {
             results[ji] = j.status == Status::LoudCompile
                               ? JobResult{Verdict::Strict, ""}

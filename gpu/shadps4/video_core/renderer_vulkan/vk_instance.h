@@ -402,6 +402,11 @@ public:
         return vk11_props.subgroupSize;
     }
 
+    /// Returns the shader stages that support subgroup operations (VkShaderStageFlags).
+    u32 SubgroupSupportedStages() const {
+        return static_cast<u32>(vk11_props.subgroupSupportedStages);
+    }
+
     /// Returns the maximum size of compute shared memory.
     u32 MaxComputeSharedMemorySize() const {
         return properties.limits.maxComputeSharedMemorySize;

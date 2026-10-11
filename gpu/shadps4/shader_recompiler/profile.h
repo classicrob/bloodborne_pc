@@ -13,6 +13,9 @@ struct Profile {
     u32 max_shared_memory_size{};
     u32 supported_spirv{0x00010000};
     u32 subgroup_size{};
+    /// Shader stages with subgroup operations (VkShaderStageFlags, subgroupSupportedStages);
+    /// MoltenVK on Apple: tessellation control, fragment and compute only.
+    u32 subgroup_supported_stages{~0u};
     u32 sparse_page_shift{};
     bool support_int8{};
     bool support_int16{};

@@ -34,6 +34,21 @@ Apple in `vk_pipeline_cache.cpp`) makes `lower_wave64_pass.cpp` rebuild every wa
   1D/2D/3D shapes). This is separate from
   the lane-numbering assumption, which the reductions no longer need. The lowering checks the
   workgroup size the shader declares (its LocalSize), which is what the dispatch uses.
+- **Graphics stages without subgroup operations** (MoltenVK on M4: subgroupSupportedStages has
+  no vertex or tessellation-evaluation bit, so Metal vertex functions cannot use them; the
+  Profile carries the mask and the pass checks the stage the shader is emitted as): a VS/DS
+  wave's lanes are vertices, and the recompiler keeps exec and VOPC/VOP3 compare masks as one bit
+  per lane, read back by InverseBallot. `Ballot(x)` becomes the lane's own bit in all 64
+  positions and `InverseBallot(m)` becomes `m != 0`. Exact where every value reaching the read
+  is ballot-derived (through 64-bit bitwise ops, phis, and 32-bit halves that stay mirrored); a
+  phi arm carrying an SGPR pair's older data is allowed only as the skip edge of an if whose
+  condition is implied by a condition enclosing the read (every reading lane went through the
+  compare). A mask used only as a scalar load's old-destination operand puts the shader on the
+  SMEM_ZERO reading (below). Anything else stops naming the shader. This makes ~165 game vertex
+  and domain shaders subgroup-free (they used ballots only for that fallback) and the 4 eboot
+  vertex shaders that SPIR-V to MSL refused translatable. Suite: `stage-compile` "vs: VOP3
+  compare mask ..." (2 positives, 4 must-stop shapes) and `vertex` "VOP3 compare masks in
+  s[24:25]/s[30:31] read back" (per-vertex values).
 - **Graphics**: a 32-lane subgroup is a legal partially populated wave (lanes 32-63 inactive), so
   subgroup semantics are kept, except reading a lane that may be >= 32, which is a hard error.
 

@@ -18,7 +18,7 @@
 namespace Serialization {
 /* You should increment versions below once corresponding serialization scheme is changed. */
 #ifdef __APPLE__
-static constexpr u32 ShaderBinaryVersion = 27u; // Wave64: SMEM_ZERO choice follows divergent masks through bitwise ops.
+static constexpr u32 ShaderBinaryVersion = 29u; // Wave64: vertex-stage compare masks as one bit per lane (no subgroup ops).
 #else
 static constexpr u32 ShaderBinaryVersion = 15u; // IMAGE_GET_LOD sampler tracking and stage-correct subgroup decorations.
 #endif
