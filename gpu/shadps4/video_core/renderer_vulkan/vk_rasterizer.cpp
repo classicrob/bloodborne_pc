@@ -4645,8 +4645,8 @@ bool Rasterizer::DrawBisectSkip(const GraphicsPipeline* pipeline, bool is_indexe
 // a difference proves: the bytes changed between the record and that check. Not when: before the
 // GPU read them (the corruption) or after it (a guest that waited correctly). The checker can lag
 // behind retirement, and labels and flips may let the guest write by then, so each difference is
-// printed with the time from record and from the checker seeing the retirement: small lags make
-// "before the GPU read" likely, large ones prove nothing. The recording thread then splits the
+// printed with the time from record and from the checker seeing the retirement (not the actual
+// retirement); neither tells when the bytes changed. The recording thread then splits the
 // differences by the tracker's current state (marked GPU-modified now, most likely later GPU work,
 // or not) and prints them, with a per-binding summary every 5 s.
 namespace {
@@ -4739,7 +4739,11 @@ void Rasterizer::GpuReadCheck(const GraphicsPipeline* pipeline, bool is_indexed,
 Rasterizer::~Rasterizer() {
 #ifdef __APPLE__
     // The draw pipe's last packets record draws that use the read checker: drain and stop it while
-    // the checker (and everything else) is alive, then stop the checker.
+    // the checker (and everything else) is alive, then stop the checker. Stage A has stopped
+    // producing packets by now (the GPU command thread is stopped before the rasterizer goes).
+    if (draw_pipe) {
+        draw_pipe->Drain(); // while draw_pipe still points to it (its packets may consult it)
+    }
     draw_pipe.reset();
     read_checker.reset();
 #endif
