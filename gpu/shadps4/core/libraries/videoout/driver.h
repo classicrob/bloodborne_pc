@@ -8,6 +8,10 @@
 #endif
 
 #include <deque>
+#include <memory>
+#ifdef __APPLE__
+#include "bbport_flip_publish.h"
+#endif
 #include <functional>
 
 #include "common/debug.h"
@@ -40,6 +44,9 @@ struct VideoOutPort {
     std::condition_variable vblank_cv;
     int flip_rate = 0;
     int prev_index = -1;
+    /// bbport: bumped by Close; a flip published late (at GPU retirement) for an older
+    /// generation is dropped, not applied to the reopened port.
+    u64 generation = 0;
     bool is_open = false;
     bool is_hdr = false;
 
@@ -101,7 +108,8 @@ public:
     int ChangeBufferAttribute(VideoOutPort* port, s32 bufferIndex,
                               const BufferAttribute* attribute);
 
-    bool SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg, bool is_eop = false);
+    /// ORBIS_OK, or the guest's error (flip queue full; on Apple a closed port: invalid handle).
+    s32 SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg, bool is_eop = false);
 
 private:
     struct Request {
@@ -110,6 +118,10 @@ private:
         s64 flip_arg;
         s32 index;
         bool eop;
+        /// bbport: the frame copy's draw-scheduler timeline value, taken while the frame was
+        /// exclusively ours (right after PrepareFrame), and the port generation at SubmitFlip.
+        u64 ready_tick = 0;
+        u64 generation = 0;
 
         operator bool() const noexcept {
             return frame != nullptr;
@@ -117,9 +129,12 @@ private:
     };
 
     void Flip(const Request& req);
+    /// The flip's guest-visible effects: status and count, flip events, previous buffer label.
+    void PublishFlip(const Request& req);
     void DrawBlankFrame(); // Video port out not open
     void DrawLastFrame();  // Used when there is no flip request
-    void SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_arg, bool is_eop = false);
+    void SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_arg, bool is_eop,
+                            u64 generation);
     void PresentThread(std::stop_token token);
     /// bbport: runs presenter work (acquire, blit, vkQueuePresent) off the vblank thread, in
     /// order. Acquire and present block while the GPU is the bottleneck (much longer on NVIDIA);
@@ -138,6 +153,13 @@ private:
     std::mutex mutex;
     std::condition_variable request_cv; ///< bbport: a flip was queued (immediate flips)
     VideoOutPort main_port{};
+#ifdef __APPLE__
+    /// bbport: serializes a flip's publication (generation check and all its effects) against
+    /// Close's whole reset of the port.
+    std::mutex lifecycle_mutex;
+    /// Flips published at GPU retirement of their frame copy, in flip order (FlipAtGpuRetire).
+    std::unique_ptr<BbFlip::Publisher<Request>> publisher;
+#endif
     std::jthread present_thread;
     std::queue<Request> requests;
 };

@@ -865,6 +865,12 @@ public:
     /// Stage B, between packets: submits the labels recorded since the last submission when
     /// `idle` or once the oldest has waited LabelBatchAge.
     void FlushLabels(bool idle);
+
+    /// Waits in slices until the GPU passed timeline value `tick` of this scheduler; false if
+    /// `stoken` was stopped first. A failed wait (device loss) stops loudly.
+    bool WaitRetired(u64 tick, const std::stop_token& stoken) {
+        return WaitLabelTick(tick, stoken);
+    }
     static constexpr auto LabelBatchAge = std::chrono::microseconds(500);
 
     /// Whether labels are written at GPU completion now: BB_LABELS_AT_GPU_COMPLETE=1 for the

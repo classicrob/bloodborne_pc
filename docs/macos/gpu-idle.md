@@ -244,3 +244,38 @@ switch, the first label in the new mode waits until every label issued before it
 the two modes never reorder labels. The switch is logged as
 `Labels at GPU completion: ON|OFF at <UTC time> (switched; ...)`. One run can therefore alternate
 the modes, say every 60 s, and compare its halves under the same load, cache and location.
+
+## Flip publication at GPU retirement (`FlipAtGpuRetire`, toggle bit 60)
+
+A flip tells the guest that its previous display buffer may be reused. That means the flip
+status (count, flip_arg, current buffer, pending counters), the flip events, and the previous
+buffer's label reset to 0. The guest's frame gate (`FlipStatus.flip_arg >= F + 1 - B`) and its
+display-buffer reuse depend on it.
+
+The presenter reads the guest framebuffer only in the frame copy that PrepareFrame records and
+submits on the draw scheduler (`Frame::ready_tick`). Presenting to the swapchain reads our copy,
+not guest memory. So that copy's GPU retirement is the exact point. The moment the frame is
+actually on screen matters only for pacing, which vblank events model, and MoltenVK does not
+report it reliably.
+
+With bit 60 of `BB_TOGGLE_FILE` (or `BB_FLIP_AT_GPU_RETIRE=1` for the whole run), flips are
+published by `BbFlip::Publisher` (`gpu/shim/bbport_flip_publish.h`, test `flip-publish-test`):
+- Each flip carries its frame copy's ready_tick, read in SubmitFlipInternal while the frame is
+  still exclusively ours. A blank frame carries its own copy submission's tick.
+- It also carries the port generation, taken in SubmitFlip together with the pending count.
+- The publisher's thread waits for each tick in flip order, then publishes.
+- With the bit cleared, flips publish at once, unless publications are still queued. Then they
+  queue behind them, so order holds across a live switch.
+- The port's flip lifecycle is shared code (`core/libraries/videoout/port_lifecycle.h`, test
+  `videoout-lifecycle-test`):
+  - A flip is admitted only to an open port and a registered buffer, together with its pending
+    count and generation. Otherwise the guest gets its error (invalid handle, invalid index) and
+    nothing is counted. An EOP flip that reaches a closed port is dropped and reported. A buffer
+    unregistered while its flip is pending stops the run, as on the other platforms.
+  - Close resets the port and bumps the generation in one step under port_mutex, and holds the
+    lifecycle lock across its whole reset. A publication holds the same lock for its check and
+    all three effects.
+  - A flip admitted before a Close is dropped before its frame is prepared (it is never read
+    from the reset or reopened port's buffers) and again at publication (nothing decremented,
+    no buffer released). Both are reported.
+- Flips still queued at shutdown are reported.

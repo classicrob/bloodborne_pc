@@ -69,6 +69,11 @@ public:
         return *rasterizer.get();
     }
 
+    /// bbport: the scheduler whose timeline Frame::ready_tick belongs to (PrepareFrame).
+    Scheduler& GetDrawScheduler() {
+        return draw_scheduler;
+    }
+
     bool IsHDRSupported() const {
         return swapchain.HasHDR();
     }
