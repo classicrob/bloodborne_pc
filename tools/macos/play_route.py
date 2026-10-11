@@ -80,7 +80,7 @@ STEPS = {
 # A stage that times out, or a game that exits or logs a fatal line, stops the route loudly.
 TITLE = ('title', [('wait_log', r'^Runtime: pad opened', 120), ('wait_draws', 14, 3, 240), ('sleep', 3),
                    ('capture', 'title', 0.2), ('check_user_cache',)])
-OFFLINE = ('offline', [('press', 'down'), ('press', 'cross'), ('sleep', 4), ('capture', 'offline-menu', 0.2)])
+OFFLINE = ('offline', [('press', 'down'), ('press_screen', 'cross', 0.04, 3, 3), ('sleep', 1), ('capture', 'offline-menu', 0.2)])
 # Loading screens already draw the world behind them while pipelines compile, so "in the world"
 # means scene-sized draw counts in windows with no compiles.
 WORLD = ('world', [('wait_draws', 1000, 2, 1800, True), ('sleep', 5), ('capture', 'world', 0.05)])
@@ -110,8 +110,11 @@ SKIP_MOVIE = ('controls', [('press', 'down')] * 6 + [
     ('capture', 'movie-skipped', None)])
 # From a save fixture the title cursor starts on Play Offline (Down would select Play Online), and
 # the offline menu's first entry is Continue.
-CONTINUE = [TITLE, ('offline', [('press', 'cross'), ('sleep', 4), ('capture', 'offline-menu', 0.2)]),
-            ('continue', [('press', 'cross'), ('sleep', 5), ('capture', 'continue', None)]), WORLD,
+# Both presses must change the screen: a press dropped under heavy host load left BISECT-P15b
+# on the main menu for 30 min while the route waited for the world.
+CONTINUE = [TITLE, ('offline', [('press_screen', 'cross', 0.04, 3, 3), ('sleep', 1),
+                                 ('capture', 'offline-menu', 0.2)]),
+            ('continue', [('press_screen', 'cross', 0.04, 3, 3), ('sleep', 2), ('capture', 'continue', None)]), WORLD,
             # Basic play in the world: walk (left stick up), look (right stick), attack (R1), menu.
             ('play', [('sleep', 5), ('capture', 'play-start', 0.05),
                       ('hold', 'ly=0', 3.0), ('capture', 'play-walked', 0.05),
