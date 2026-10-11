@@ -54,9 +54,11 @@ struct RefreshCensus {
 };
 RefreshCensus refresh_census;
 
+// Written by the faulting guest thread, read by the GPU thread: relaxed atomic accesses (plain
+// fields keep Image movable in its slot vector).
 void NoteDirty(Image& image, DirtySource source, u64 detail) {
-    image.dirty_source = source;
-    image.dirty_detail = detail;
+    __atomic_store_n(&image.dirty_source, u8(source), __ATOMIC_RELAXED);
+    __atomic_store_n(&image.dirty_detail, detail, __ATOMIC_RELAXED);
 }
 
 /// One RefreshImage call: `entry_flags` as it found the image; bytes hashed and copied.
@@ -79,9 +81,9 @@ void NoteRefresh(const Image& image, ImageFlagBits entry_flags, u64 hashed, u64 
     entry.format = image.info.pixel_format;
     entry.usage = image.usage.texture | image.usage.storage << 1 | image.usage.render_target << 2 |
                   image.usage.depth_target << 3 | image.usage.vo_surface << 4;
-    entry.source = image.dirty_source;
-    entry.detail = image.dirty_detail;
-    ++entry.by_source[std::min<u32>(image.dirty_source, entry.by_source.size() - 1)];
+    entry.source = __atomic_load_n(&image.dirty_source, __ATOMIC_RELAXED);
+    entry.detail = __atomic_load_n(&image.dirty_detail, __ATOMIC_RELAXED);
+    ++entry.by_source[std::min<u32>(entry.source, entry.by_source.size() - 1)];
     ++census.refreshes;
     census.entered += image.info.guest_size;
     census.hashed += hashed;
