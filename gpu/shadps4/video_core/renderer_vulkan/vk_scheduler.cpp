@@ -267,7 +267,26 @@ void Scheduler::LabelThread(std::stop_token stoken) {
             op = std::move(label_ops.front());
             label_ops.pop_front();
         }
-        work_semaphore.Wait(op.gpu_tick); // submitted by SignalAtGpuCompletion's Flush
+        // Submitted by SignalAtGpuCompletion's Flush. Waited in slices so that a stop (exit,
+        // possibly after a device loss) is never stuck here; a failed wait stops loudly.
+        work_semaphore.Refresh();
+        while (!work_semaphore.IsFree(op.gpu_tick)) {
+            if (stoken.stop_requested()) {
+                return;
+            }
+            const vk::Semaphore semaphore = work_semaphore.Handle();
+            const vk::SemaphoreWaitInfo wait_info = {
+                .semaphoreCount = 1,
+                .pSemaphores = &semaphore,
+                .pValues = &op.gpu_tick,
+            };
+            const vk::Result result =
+                instance.GetDevice().waitSemaphores(&wait_info, 10'000'000); // 10 ms
+            ASSERT_MSG(result == vk::Result::eSuccess || result == vk::Result::eTimeout,
+                       "macOS: the label writer's wait for timeline value {} failed: {}",
+                       op.gpu_tick, vk::to_string(result));
+            work_semaphore.Refresh();
+        }
         if (stoken.stop_requested()) {
             break;
         }
