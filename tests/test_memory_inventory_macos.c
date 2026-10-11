@@ -60,6 +60,40 @@ int main(void) {
     assert(!map_flexible(&flex,3*PAGE,3,0));
     assert(!reserve_range(&reserved,5*PAGE,0,PAGE));
     expect("flexible and reservation",4,1,1,8,3,7,4);
+    /* Layout: every committed view with its backing offset, the direct block, and bytes written
+     * through a guest view visible through the backing pool at that offset. */
+    {
+        RuntimeMemoryView views[64]; RuntimeMemoryBlock blks[64];
+        size_t nv=0, nb=0; uint64_t generation=0, direct=0, total=0;
+        assert(runtime_memory_layout(NULL,1,&nv,blks,64,&nb,&generation)==-1);
+        assert(!runtime_memory_layout(views,64,&nv,blks,64,&nb,&generation));
+        assert(generation==take().generation);
+        size_t small=0, small_blocks=0; uint64_t g2=0;
+        assert(!runtime_memory_layout(views,1,&small,blks,0,&small_blocks,&g2) && small==nv && small_blocks==nb);
+        const unsigned char *backing=runtime_memory_backing(&direct,&total);
+        assert(backing && direct==POOL_SIZE && total>direct);
+        int found_a=0, found_flex=0, found_block=0;
+        ((unsigned char *)a)[5]=0xA5; ((unsigned char *)flex)[PAGE+7]=0x5A;
+        for (size_t i=0;i<nv;++i) {
+            assert(i==0 || views[i-1].end<=views[i].start);
+            if (views[i].start==(uintptr_t)a) {
+                found_a=1;
+                assert(!views[i].flexible && views[i].phys==(uint64_t)physical && views[i].end==(uintptr_t)a+2*PAGE);
+                assert(backing[views[i].phys+5]==0xA5);
+            }
+            if (views[i].start==(uintptr_t)flex) {
+                found_flex=1;
+                assert(views[i].flexible && views[i].phys>=direct && views[i].end==(uintptr_t)flex+3*PAGE);
+                assert(backing[views[i].phys+PAGE+7]==0x5A);
+            }
+        }
+        for (size_t i=0;i<nb;++i) {
+            assert(i==0 || blks[i-1].start<blks[i].start);
+            found_block|=blks[i].start==(uint64_t)physical && blks[i].size==4*PAGE;
+        }
+        assert(found_a && found_flex && found_block);
+        printf("  layout: %zu views, %zu direct blocks; backing reads match guest writes\n",nv,nb);
+    }
     /* Unmapping the duplicate leaves A shared with the partial alias only. */
     assert(!direct_unmap(dup,2*PAGE));
     expect("duplicate unmapped",3,1,1,6,3,7,3);

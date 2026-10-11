@@ -1277,6 +1277,41 @@ int runtime_memory_inventory(RuntimeMemoryInventory *out) {
     free(spans);
     return 0;
 }
+int runtime_memory_layout(RuntimeMemoryView *views, size_t view_capacity, size_t *view_count,
+                          RuntimeMemoryBlock *out_blocks, size_t block_capacity, size_t *block_count,
+                          uint64_t *generation) {
+    if (!view_count || !block_count || !generation || (!views && view_capacity) ||
+        (!out_blocks && block_capacity)) return -1;
+    size_t nv=0, nb=0;
+    read_lock();
+    *generation=__atomic_load_n(&table_generation,__ATOMIC_ACQUIRE);
+    for (size_t i=0;i<vma_count;++i) {
+        const Vma *v=&vmas[i];
+        if (v->kind==KIND_RESERVED) continue;
+        if (nv<view_capacity)
+            views[nv]=(RuntimeMemoryView){v->start,v->end,v->phys,v->kind==KIND_FLEXIBLE,v->prot,v->type,0};
+        ++nv;
+    }
+    /* blocks[] (the allocator table) is unordered: insertion-sort the copied prefix by offset. */
+    for (int i=0;i<LIMIT;++i) {
+        if (!blocks[i].used) continue;
+        if (nb<block_capacity) {
+            size_t at=nb;
+            while (at && out_blocks[at-1].start>blocks[i].start) { out_blocks[at]=out_blocks[at-1]; --at; }
+            out_blocks[at]=(RuntimeMemoryBlock){blocks[i].start,blocks[i].size,blocks[i].type,0};
+        }
+        ++nb;
+    }
+    read_unlock();
+    *view_count=nv;
+    *block_count=nb;
+    return 0;
+}
+const void *runtime_memory_backing(uint64_t *direct_bytes, uint64_t *total_bytes) {
+    if (direct_bytes) *direct_bytes=POOL_SIZE;
+    if (total_bytes) *total_bytes=POOL_SIZE+FLEX_SPAN;
+    return backing_base;
+}
 #endif
 /* GPU page tracking: restrict host access, never beyond the guest's own protection. */
 void runtime_memory_gpu_protect(uintptr_t address, uint64_t size, int read, int write) {

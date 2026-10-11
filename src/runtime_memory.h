@@ -72,6 +72,25 @@ typedef struct {
  * fault handlers. Low/untracked host allocations outside the VMA table are not counted.
  * Returns 0, or -1 for a NULL output or failed allocation. */
 int runtime_memory_inventory(RuntimeMemoryInventory *out);
+typedef struct {
+    uint64_t start, end;   /* guest VA */
+    uint64_t phys;         /* backing offset (runtime_memory_backing) */
+    int32_t flexible;      /* 0 direct, 1 flexible */
+    int32_t prot, type, reserved;
+} RuntimeMemoryView;
+typedef struct { uint64_t start, size; int32_t type, reserved; } RuntimeMemoryBlock;
+/* Capture-replay layout (diagnostic): the committed views in VA order and the direct
+ * allocations in offset order, from one read of the VMA table (`generation` as in
+ * RuntimeMemoryInventory). Writes up to each capacity and sets the total counts; a count above
+ * its capacity means call again with more room. Returns 0, or -1 for a NULL count/generation or
+ * a NULL array with a nonzero capacity. Not for fault handlers. */
+int runtime_memory_layout(RuntimeMemoryView *views, size_t view_capacity, size_t *view_count,
+                          RuntimeMemoryBlock *blocks, size_t block_capacity, size_t *block_count,
+                          uint64_t *generation);
+/* The host view of the backing pool (direct memory in [0, *direct_bytes), flexible memory after
+ * it, *total_bytes in all), or NULL before the pool exists. Reads through it bypass guest and
+ * GPU page protection: capture only. */
+const void *runtime_memory_backing(uint64_t *direct_bytes, uint64_t *total_bytes);
 #endif
 #ifdef __cplusplus
 }
