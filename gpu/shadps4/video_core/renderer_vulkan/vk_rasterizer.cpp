@@ -4224,19 +4224,64 @@ namespace {
 //   skip 120-340        skip the frame's draws 120 to 340 (inclusive; "skip 7" is one draw)
 //   skip vs 0x1234abcd  skip every draw whose vertex shader has this hash ("ps": pixel shader)
 //   skip rt 0x...       skip every draw whose first color target is at this guest address
+//   skip vb 0xLO-0xHI   skip every draw whose bound index range (direct indexed draws) or a
+//                       bound fetched vertex buffer range (not emulated ES/GS fetch) overlaps
+//                       LO..HI, inclusive: the whole bound range, not the bytes indices select
+//   dump vs 0x1234abcd  for the next frame's draws with this vertex shader, print its user data
+//                       s0-s15 and, per fetch attribute, where its V# is read and its raw words
 //   list 7              a new value lists every draw of the frame that starts at the next flip
 // Rules add up. A line that does not parse, or a file that cannot be read, rejects the whole file
 // (nothing is skipped) loudly. Write the file elsewhere and rename it over the control file, so
 // that a flip never reads it half written.
+/// A fetch attribute's V#, read under this thread's fault recovery: the vertex table it reads is
+/// guest memory, and these diagnostics run before the draw binds it; nothing if it is unreadable.
+std::optional<AmdGpu::Buffer> GuardedSharp(const Shader::Gcn::VertexAttribute& attribute,
+                                           const Shader::Info& vs) {
+    auto* const previous = runtime_fault_recover;
+    sigjmp_buf recover;
+    if (sigsetjmp(recover, 0)) {
+        runtime_fault_recover = previous;
+        return std::nullopt;
+    }
+    runtime_fault_recover = &recover;
+    const AmdGpu::Buffer sharp = attribute.GetSharp(vs);
+    runtime_fault_recover = previous;
+    return sharp;
+}
+
+/// The 4 words of a fetch attribute's V# as stored (Info::ReadUdReg, before GetSharp applies the
+/// instruction offset and format override), under the same recovery; nothing if unreadable.
+std::optional<std::array<u32, 4>> GuardedRawSharp(const Shader::Gcn::VertexAttribute& attribute,
+                                                  const Shader::Info& vs) {
+    auto* const previous = runtime_fault_recover;
+    sigjmp_buf recover;
+    if (sigsetjmp(recover, 0)) {
+        runtime_fault_recover = previous;
+        return std::nullopt;
+    }
+    runtime_fault_recover = &recover;
+    const auto words = vs.ReadUdReg<std::array<u32, 4>>(attribute.sgpr_base,
+                                                        attribute.dword_offset);
+    runtime_fault_recover = previous;
+    return words;
+}
+
+/// The bytes a V# describes, in 64 bits (GetSize's u32 product can wrap for a malformed one).
+u64 SharpSpan(const AmdGpu::Buffer& sharp) {
+    return sharp.stride ? u64(sharp.num_records) * sharp.stride : u64(sharp.num_records);
+}
+
 struct DrawBisect {
     struct Range {
         u32 first, last;
     };
     std::vector<Range> ranges;
-    std::vector<u64> vs_hashes, ps_hashes;
+    std::vector<u64> vs_hashes, ps_hashes, dump_vs;
     std::vector<VAddr> targets;
+    std::vector<std::pair<VAddr, VAddr>> vb_ranges; ///< inclusive
     std::string list_value;
     bool listing = false; ///< this frame's draws are printed
+    bool dumping = false; ///< this frame's dump_vs draws are dumped
     bool report = false;  ///< print this frame's counts at its end (the first after a change)
     u32 draw = 0;         ///< index of the next draw in this frame
     u64 frame = 0, skipped = 0, frames_since_note = 0;
@@ -4244,7 +4289,8 @@ struct DrawBisect {
     off_t size = -1;
 
     bool Active() const {
-        return !ranges.empty() || !vs_hashes.empty() || !ps_hashes.empty() || !targets.empty();
+        return !ranges.empty() || !vs_hashes.empty() || !ps_hashes.empty() || !targets.empty() ||
+               !vb_ranges.empty();
     }
 };
 
@@ -4288,6 +4334,8 @@ bool ReadDrawBisect(DrawBisect& b) {
         b.vs_hashes.clear();
         b.ps_hashes.clear();
         b.targets.clear();
+        b.vb_ranges.clear();
+        b.dump_vs.clear();
     };
     DrawBisect next;
     next.list_value = b.list_value;
@@ -4324,6 +4372,21 @@ bool ReadDrawBisect(DrawBisect& b) {
             if (ok) {
                 next.ranges.push_back({u32(first), u32(last)});
             }
+        } else if (ok && verb == "dump" && what == "vs" && !value.empty()) {
+            u64 hash = 0;
+            ok = ParseBisectNumber(value, hash);
+            if (ok) {
+                next.dump_vs.push_back(hash);
+            }
+        } else if (ok && verb == "skip" && what == "vb" && !value.empty()) {
+            const auto dash = value.find('-');
+            u64 low = 0, high = 0;
+            ok = dash != std::string::npos &&
+                 ParseBisectNumber(std::string_view{value}.substr(0, dash), low) &&
+                 ParseBisectNumber(std::string_view{value}.substr(dash + 1), high) && low <= high;
+            if (ok) {
+                next.vb_ranges.emplace_back(low, high);
+            }
         } else if (ok && verb == "skip" && (what == "vs" || what == "ps" || what == "rt") &&
                    !value.empty()) {
             u64 number_value = 0;
@@ -4355,6 +4418,9 @@ bool ReadDrawBisect(DrawBisect& b) {
     b.vs_hashes = std::move(next.vs_hashes);
     b.ps_hashes = std::move(next.ps_hashes);
     b.targets = std::move(next.targets);
+    b.vb_ranges = std::move(next.vb_ranges);
+    b.dump_vs = std::move(next.dump_vs);
+    b.dumping = !b.dump_vs.empty();
     b.list_value = next.list_value;
     b.listing = next.listing;
     std::string rules;
@@ -4369,6 +4435,12 @@ bool ReadDrawBisect(DrawBisect& b) {
     }
     for (const VAddr target : b.targets) {
         rules += fmt::format(" rt {:#x}", target);
+    }
+    for (const auto& [low, high] : b.vb_ranges) {
+        rules += fmt::format(" vb {:#x}-{:#x}", low, high);
+    }
+    for (const u64 hash : b.dump_vs) {
+        rules += fmt::format("; dumping vs {:#x}", hash);
     }
     std::printf("Draw bisect: frame %llu: skipping%s%s\n", (unsigned long long)b.frame,
                 rules.empty() ? " nothing" : rules.c_str(),
@@ -4395,6 +4467,7 @@ void Rasterizer::DrawBisectOnFlip() {
     b.draw = 0;
     b.skipped = 0;
     b.listing = false;
+    b.dumping = false; // one frame per change of the file
     b.report = ReadDrawBisect(b);
     std::fflush(stdout);
 }
@@ -4414,11 +4487,43 @@ bool Rasterizer::DrawBisectSkip(const GraphicsPipeline* pipeline, bool is_indexe
     const auto contains = [](const auto& values, u64 value) {
         return std::ranges::find(values, value) != values.end();
     };
+    // Whether the draw's bound index range or a bound fetched vertex buffer range overlaps a "skip
+    // vb" range (the whole bound range, not the bytes the indices select). Spans are 64-bit and
+    // addresses 48-bit, so the inclusive end cannot wrap; an unreadable V# matches nothing.
+    const auto reads_vb_range = [&] {
+        const auto overlaps = [&](VAddr address, u64 size) {
+            if (size == 0) {
+                return false;
+            }
+            const u64 last = address + (size - 1);
+            return std::ranges::any_of(b.vb_ranges, [&](const auto& range) {
+                return address <= range.second && range.first <= last;
+            });
+        };
+        if (is_indexed && !indirect) {
+            const u32 index_size =
+                regs.index_buffer_type.index_type == AmdGpu::IndexType::Index16 ? 2u : 4u;
+            if (overlaps(regs.index_base_address.Address<VAddr>() + u64(index_offset) * index_size,
+                         u64(regs.num_indices) * index_size)) {
+                return true;
+            }
+        }
+        // The copy shader of an emulated geometry stage has no fetch of its own here.
+        if (const auto& fetch = pipeline->GetFetchShader(); fetch && !pipeline->GsEmulation()) {
+            for (const auto& attribute : fetch->attributes) {
+                const auto sharp = GuardedSharp(attribute, vs);
+                if (sharp && overlaps(sharp->base_address, SharpSpan(*sharp))) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    };
     const bool skip =
         std::ranges::any_of(b.ranges,
                             [&](const auto& r) { return r.first <= index && index <= r.last; }) ||
         contains(b.vs_hashes, vs.pgm_hash) || (ps && contains(b.ps_hashes, ps_hash)) ||
-        (target && contains(b.targets, target));
+        (target && contains(b.targets, target)) || (!b.vb_ranges.empty() && reads_vb_range());
     if (b.listing) {
         const VAddr depth =
             regs.depth_buffer.DepthValid() ? regs.depth_buffer.DepthAddress() : VAddr{0};
@@ -4445,16 +4550,70 @@ bool Rasterizer::DrawBisectSkip(const GraphicsPipeline* pipeline, bool is_indexe
         if (const auto& fetch = pipeline->GetFetchShader(); fetch && !pipeline->GsEmulation()) {
             std::vector<VAddr> seen;
             for (const auto& attribute : fetch->attributes) {
-                const auto sharp = attribute.GetSharp(vs);
-                if (contains(seen, sharp.base_address)) {
+                const auto sharp = GuardedSharp(attribute, vs);
+                if (!sharp) {
+                    line += fmt::format(" vb (attr {}: vertex table unreadable)",
+                                        attribute.semantic);
                     continue;
                 }
-                seen.push_back(sharp.base_address);
-                line += fmt::format(" vb {:#x}+{} stride {}", sharp.base_address, sharp.GetSize(),
-                                    sharp.GetStride());
+                if (contains(seen, sharp->base_address)) {
+                    continue;
+                }
+                seen.push_back(sharp->base_address);
+                line += fmt::format(" vb {:#x}+{} stride {}", sharp->base_address,
+                                    SharpSpan(*sharp), sharp->GetStride());
             }
         }
         std::printf("%s\n", line.c_str());
+    }
+    if (b.dumping && contains(b.dump_vs, vs.pgm_hash)) {
+        // Where each fetch attribute's V# comes from: the table pointer in user data
+        // (sgpr_base) and the dword offset in it, as Info::ReadUdReg reads them now.
+        const auto ud = vs.UserData();
+        std::string text = fmt::format("Draw bisect: frame {} draw {} dump vs {:#x}: ud", b.frame,
+                                       index, vs.pgm_hash);
+        for (u32 i = 0; i < std::min<size_t>(ud.size(), 16); ++i) {
+            text += fmt::format(" s{}={:#010x}", i, ud[i]);
+        }
+        if (const auto& fetch = pipeline->GetFetchShader(); fetch && !pipeline->GsEmulation()) {
+            for (const auto& attribute : fetch->attributes) {
+                // Where the V# is read: a table whose pointer is in user data s[sgpr_base:+1],
+                // or (sgpr_base == NumScalarRegs) the user data itself.
+                std::string source;
+                if (attribute.sgpr_base == Shader::IR::NumScalarRegs) {
+                    source = fmt::format("user data s{}-s{}", attribute.dword_offset,
+                                         attribute.dword_offset + 3);
+                } else if (attribute.sgpr_base + 1u < ud.size()) {
+                    const VAddr table =
+                        (VAddr(ud[attribute.sgpr_base + 1]) << 32 | ud[attribute.sgpr_base]) &
+                        0xFFFFFFFFFFFFULL;
+                    source = fmt::format("table s[{}:{}]={:#x} + {} dwords = {:#x}",
+                                         attribute.sgpr_base, attribute.sgpr_base + 1, table,
+                                         attribute.dword_offset,
+                                         table + attribute.dword_offset * 4u);
+                } else {
+                    source = fmt::format("table pointer s{} beyond the user data",
+                                         attribute.sgpr_base);
+                }
+                const auto raw = GuardedRawSharp(attribute, vs);
+                const auto sharp = GuardedSharp(attribute, vs);
+                if (!raw || !sharp) {
+                    text += fmt::format("; attr {} from {}: UNREADABLE", attribute.semantic,
+                                        source);
+                    continue;
+                }
+                text += fmt::format(
+                    "; attr {} from {}: raw {:08x} {:08x} {:08x} {:08x}; effective (inst_offset {}"
+                    ", format override {}/{}) base {:#x} span {} stride {} fmt {}/{} records "
+                    "{}{}",
+                    attribute.semantic, source, (*raw)[0], (*raw)[1], (*raw)[2], (*raw)[3],
+                    attribute.inst_offset, attribute.data_format, attribute.num_format,
+                    sharp->base_address, SharpSpan(*sharp), sharp->GetStride(),
+                    u32(sharp->data_format), u32(sharp->num_format), sharp->num_records,
+                    sharp->Valid() ? "" : " INVALID");
+            }
+        }
+        std::printf("%s\n", text.c_str());
     }
     if (skip) {
         ++b.skipped;
