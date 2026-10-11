@@ -17,7 +17,7 @@
 namespace Serialization {
 /* You should increment versions below once corresponding serialization scheme is changed. */
 #ifdef __APPLE__
-static constexpr u32 ShaderBinaryVersion = 22u; // Integer buffer swizzle constants and packed SNORM minima.
+static constexpr u32 ShaderBinaryVersion = 24u; // Wave64: SMEM_ZERO for divergent masks that only feed scalar-load destinations (23: Flatbuf elision).
 #else
 static constexpr u32 ShaderBinaryVersion = 14u; // Integer buffer swizzle constants and packed SNORM minima.
 #endif

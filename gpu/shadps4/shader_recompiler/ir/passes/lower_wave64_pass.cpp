@@ -346,6 +346,33 @@ void LowerWave64Graphics(IR::Program& program) {
     }
 }
 
+// Whether every consumer of `inst` (through phis and 32/64-bit packing) is the old-destination
+// operand of a scalar buffer load (ReadConstBuffer arg 2: the SDST value kept for out-of-range
+// dwords). Collects the pass-through instructions in `chain`.
+bool OnlyFeedsScalarLoadFallback(const IR::Inst& inst, std::vector<IR::Inst*>& chain) {
+    std::vector<const IR::Inst*> work{&inst};
+    std::unordered_set<const IR::Inst*> seen{&inst};
+    while (!work.empty()) {
+        const IR::Inst* x = work.back();
+        work.pop_back();
+        for (const IR::Use& use : x->Uses()) {
+            IR::Inst* user = use.user;
+            const auto op = user->GetOpcode();
+            if (op == IR::Opcode::ReadConstBuffer && use.operand == 2) continue;
+            const std::string_view name = IR::NameOf(op);
+            const bool pass = op == IR::Opcode::Phi || name.starts_with("CompositeExtract") ||
+                              name.starts_with("CompositeConstruct") || op == IR::Opcode::UnpackUint2x32 ||
+                              op == IR::Opcode::PackUint2x32;
+            if (!pass) return false;
+            if (seen.insert(user).second) {
+                chain.push_back(user);
+                work.push_back(user);
+            }
+        }
+    }
+    return true;
+}
+
 void LowerWave64Compute(IR::Program& program, const RuntimeInfo& runtime_info, const Profile& profile) {
     auto& info = program.info;
     const auto [size_x, size_y, size_z] = runtime_info.hw.cs.workgroup_size;
@@ -353,6 +380,49 @@ void LowerWave64Compute(IR::Program& program, const RuntimeInfo& runtime_info, c
     const u32 num_waves = (num_threads + 63) / 64;
     const WorkgroupUniformity uniformity{program, num_waves <= 1};
     const auto uniform_blocks = FindWorkgroupUniformBlocks(program, uniformity);
+
+    // A scalar buffer load leaves an out-of-range destination dword unwritten (§7.4 "not
+    // performed"), so ReadConstBuffer carries the destination's old value. Game code reuses the
+    // SGPR pair of a VOP3 compare as such a destination; when the compare sits in
+    // workgroup-divergent flow, its 64-lane mask cannot be exchanged without a barrier, yet it is
+    // observable only if that scalar load is out of range. If that is the only use of every
+    // divergent cross-lane value, the shader takes the other accepted reading of §7.4 for all of
+    // its scalar buffer loads (out-of-range dwords read 0; tests/gcn_buffer_conformance/SPEC.md
+    // SMEM_ZERO) and the masks become dead. Any other divergent use stays a hard error.
+    {
+        std::vector<IR::Inst*> divergent_cross_lane, chain;
+        bool all_fallback = true;
+        for (IR::Block* block : program.blocks) {
+            if (std::ranges::contains(uniform_blocks, block)) continue;
+            for (IR::Inst& inst : block->Instructions()) {
+                if (!IsCrossLane(inst.GetOpcode())) continue;
+                divergent_cross_lane.push_back(&inst);
+                all_fallback = all_fallback && OnlyFeedsScalarLoadFallback(inst, chain);
+            }
+        }
+        if (!divergent_cross_lane.empty() && all_fallback) {
+            LOG_WARNING(Render_Recompiler,
+                        "Apple wave64: shader {:#x} reads out-of-range scalar buffer dwords as 0 (SMEM_ZERO "
+                        "reading): {} divergent wave masks only fed s_buffer_load destinations",
+                        info.pgm_hash, divergent_cross_lane.size());
+            for (IR::Block* block : program.blocks) {
+                for (IR::Inst& inst : block->Instructions()) {
+                    if (inst.GetOpcode() == IR::Opcode::ReadConstBuffer) inst.SetArg(2, IR::Value{0u});
+                }
+            }
+            // The masks and their phis/packing are dead now.
+            chain.insert(chain.end(), divergent_cross_lane.begin(), divergent_cross_lane.end());
+            for (bool changed = true; changed;) {
+                changed = false;
+                for (IR::Inst* x : chain) {
+                    if (x->GetOpcode() != IR::Opcode::Void && !x->HasUses()) {
+                        x->Invalidate();
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
 
     std::vector<IR::Inst*> cross_lane, per_lane;
     bool needs_lane_values = false;
