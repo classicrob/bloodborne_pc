@@ -1104,7 +1104,11 @@ PipelineCache::Result PipelineCache::GetProgram(PipelineSelection& sel, HwStage 
     const auto refresh = [&](Shader::Info& info, const Program::Module& module) {
         // GS and copy VS can share a program hash. Reject incompatible stages/roles before
         // touching their live data: a previously selected module may still be used by this draw.
-        if (module.spec.runtime_info != runtime_info) {
+        // Full specialization compares derived tessellation constants after RefreshFlatBuf.
+        // They are not populated in BuildRuntimeInfo, so only stage identity is valid here.
+        const auto& stored = module.spec.runtime_info;
+        if (stored.hw_stage != runtime_info.hw_stage ||
+            stored.sw_stage != runtime_info.sw_stage || stored.gs_role != runtime_info.gs_role) {
             return false;
         }
         info.pgm_base = params.Base();

@@ -237,6 +237,68 @@ int main() {
         assert(es_info->flattened_ud_buf == es_flat);
     }
     std::puts("Shared-hash compute/copy roles retain their own user-data banks PASS");
+    // Tessellation specializations fill fields from the constant buffer after the raw
+    // register state is built. Repeated lookups must compare the constructed specs.
+    selection.worker = nullptr;
+    regs.stage_enable.raw = AmdGpu::ShaderStageEnable::VgtStages::LsHs;
+    regs.hs_program.settings = regs.vs_program.settings;
+    regs.ls_hs_config.hs_input_control_points = 3;
+    regs.ls_hs_config.hs_output_control_points = 3;
+    regs.tess_config.type = AmdGpu::TessellationType::Triangle;
+    regs.tess_config.topology = AmdGpu::TessellationTopology::TriangleCw;
+    regs.tess_config.partitioning = AmdGpu::TessellationPartitioning::Integer;
+    Shader::TessellationDataConstantBuffer tess_constants{};
+    tess_constants.ls_stride = 16;
+    tess_constants.hs_cp_stride = 16;
+    tess_constants.num_patches = 1;
+    tess_constants.hs_output_base = 48;
+    tess_constants.patch_const_base = 96;
+    tess_constants.patch_output_size = 48;
+    AmdGpu::Buffer tess_buffer{};
+    const auto tess_address = reinterpret_cast<uintptr_t>(&tess_constants);
+    assert(tess_address < (1ull << 44));
+    tess_buffer.base_address = tess_address;
+    tess_buffer.num_records = sizeof(tess_constants);
+    std::array<u32, 16> tess_ud{};
+    std::memcpy(tess_ud.data() + 4, &tess_buffer, sizeof(tess_buffer));
+    for (bool hull : {true, false}) {
+        GcnAsm::Code tess_shader;
+        tess_shader.SBufferLoad(1, 12, 4, true, 3);
+        tess_shader.SWaitcntAll();
+        tess_shader.VMov(4, 12);
+        if (hull) {
+            tess_shader.VMovLiteral(5, 0x3f800000);
+            tess_shader.Ds(13, 4, 5, 0);
+        } else {
+            tess_shader.Ds(54, 4, 0, 5);
+            tess_shader.SWaitcntAll();
+            tess_shader.Exp(12, 15, true, 5, 5, 5, 5);
+        }
+        tess_shader.SEndpgm();
+        const auto select_tess = [&]() {
+            Shader::Backend::Bindings bindings{};
+            return cache.GetProgram(selection,
+                hull ? Shader::HwStage::Hull : Shader::HwStage::Vertex,
+                hull ? Shader::SwStage::TessellationControl : Shader::SwStage::TessellationEval,
+                Shader::ShaderParams{tess_ud, tess_shader.words, 0x7465737372657573ull + hull},
+                bindings);
+        };
+        const auto compiled = select_tess();
+        for (unsigned repeat = 0; repeat < 16; ++repeat) {
+            const auto hit = select_tess();
+            assert(std::get<0>(hit) == std::get<0>(compiled));
+            assert(std::get<1>(hit) == std::get<1>(compiled));
+            assert(std::get<3>(hit) == std::get<3>(compiled));
+        }
+        selection.worker = &worker;
+        worker.stages.clear();
+        const auto prepared = select_tess();
+        assert(!worker.failed && worker.stages.size() == 1);
+        assert(std::get<1>(prepared) == std::get<1>(compiled));
+        selection.worker = nullptr;
+        std::printf("%s derived-constant specialization: 16 cache hits + worker hit PASS\n",
+                    hull ? "TCS" : "TES");
+    }
     std::puts("Permutation resource metadata: GPU + worker + preloaded storage + image binding "
               "counts PASS");
 }
