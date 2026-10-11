@@ -61,6 +61,7 @@ void Scheduler::BeginRendering(const RenderState& new_state) {
     if (is_rendering && render_state == new_state) {
         return;
     }
+    BB_SPLIT_SCOPE(KRenderPassSwitch);
     EndRendering();
     is_rendering = true;
     render_state = new_state;
@@ -110,12 +111,14 @@ void Scheduler::BeginRendering(const RenderState& new_state) {
     };
 
     if (!recording_threaded) {
+        BB_SPLIT_SCOPE(KEncRendering);
         current_cmdbuf.beginRendering(rendering_info);
         return;
     }
     // The attachment infos live on this stack frame: the recorded closure keeps copies.
     Record([info = rendering_info, color_attachments, depth_attachment,
             stencil_attachment](vk::CommandBuffer cmdbuf) mutable {
+        BB_SPLIT_SCOPE(KEncRendering);
         info.pColorAttachments = color_attachments.data();
         if (info.pDepthAttachment) {
             info.pDepthAttachment = &depth_attachment;
@@ -132,7 +135,11 @@ void Scheduler::EndRendering() {
         return;
     }
     is_rendering = false;
-    Record([](vk::CommandBuffer cmdbuf) { cmdbuf.endRendering(); });
+    BB_SPLIT_SCOPE(KRenderPassSwitch);
+    Record([](vk::CommandBuffer cmdbuf) {
+        BB_SPLIT_SCOPE(KEncRendering);
+        cmdbuf.endRendering();
+    });
 }
 
 void Scheduler::TraceDirectRecording(void* caller) {
@@ -734,6 +741,7 @@ void Scheduler::PriorityPendingOpsThread(std::stop_token stoken) {
 }
 
 void DynamicState::Commit(const Instance& instance, const vk::CommandBuffer& cmdbuf) {
+    BB_SPLIT_SCOPE(KDynamicState);
     // A null command buffer only updates the dirty flags, exactly as recording would.
     CommitWith(instance.IsDepthBoundsSupported(), instance.IsDynamicColorWriteMaskSupported(),
                instance.IsAttachmentFeedbackLoopLayoutSupported(), [&](auto&& command) {

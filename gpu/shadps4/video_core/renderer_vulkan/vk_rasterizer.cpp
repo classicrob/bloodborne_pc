@@ -1256,7 +1256,11 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
 #ifdef __APPLE__
     if (pipeline->GsEmulation()) {
         scheduler.Record([=](vk::CommandBuffer cmdbuf) {
-            cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, handle);
+            BB_SPLIT_SCOPE(KEncDraw);
+            {
+                BB_SPLIT_SCOPE(KEncPipeline);
+                cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, handle);
+            }
             if (gs_draw.indirect) {
                 // Point output: the compaction kernel wrote the command.
                 cmdbuf.bindIndexBuffer(gs_draw.index_buffer, gs_draw.index_offset,
@@ -1272,7 +1276,11 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     } else
 #endif
     scheduler.Record([=](vk::CommandBuffer cmdbuf) {
-        cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, handle);
+        BB_SPLIT_SCOPE(KEncDraw);
+        {
+            BB_SPLIT_SCOPE(KEncPipeline);
+            cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, handle);
+        }
         if (is_indexed) {
             cmdbuf.drawIndexed(num_indices, num_instances, 0, s32(first_vertex), first_instance);
         } else {
@@ -1477,7 +1485,11 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
     if (gs_draw.indirect) {
         const vk::Pipeline gs_handle = pipeline->Handle();
         scheduler.Record([=](vk::CommandBuffer cmdbuf) {
-            cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, gs_handle);
+            BB_SPLIT_SCOPE(KEncDraw);
+            {
+                BB_SPLIT_SCOPE(KEncPipeline);
+                cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, gs_handle);
+            }
             cmdbuf.bindIndexBuffer(gs_draw.index_buffer, gs_draw.index_offset,
                                    vk::IndexType::eUint32);
             cmdbuf.drawIndexedIndirect(gs_draw.index_buffer, gs_draw.indirect_offset, 1,
@@ -1497,7 +1509,11 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
     const vk::Buffer counts = count_address != 0 ? count_buffer->Handle() : vk::Buffer{};
     const u64 counts_offset = count_address != 0 ? count_offset : 0;
     scheduler.Record([=](vk::CommandBuffer cmdbuf) {
-        cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, handle);
+        BB_SPLIT_SCOPE(KEncDraw);
+        {
+            BB_SPLIT_SCOPE(KEncPipeline);
+            cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, handle);
+        }
         if (is_indexed) {
             if (counts) {
                 cmdbuf.drawIndexedIndirectCount(args, args_offset, counts, counts_offset, max_count,
@@ -1583,7 +1599,11 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
         FrameCapture::Dispatch(cs.pgm_hash, dim_x, dim_y, dim_z);
     }
     scheduler.Record([=](vk::CommandBuffer cmdbuf) {
-        cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, handle);
+        BB_SPLIT_SCOPE(KEncDispatch);
+        {
+            BB_SPLIT_SCOPE(KEncPipeline);
+            cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, handle);
+        }
         cmdbuf.dispatch(dim_x, dim_y, dim_z);
     });
     DebugState.IncDispatch();
@@ -1638,7 +1658,11 @@ void Rasterizer::DispatchIndirectRecord(const ComputePipeline* pipeline, VAddr a
     const vk::Buffer args = buffer->Handle();
     const u64 args_offset = base;
     scheduler.Record([=](vk::CommandBuffer cmdbuf) {
-        cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, handle);
+        BB_SPLIT_SCOPE(KEncDispatch);
+        {
+            BB_SPLIT_SCOPE(KEncPipeline);
+            cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, handle);
+        }
         cmdbuf.dispatchIndirect(args, args_offset);
     });
     DebugState.IncDispatch();
@@ -2058,6 +2082,7 @@ void Rasterizer::EmitVertexBuffers(const GraphicsPipeline* pipeline) {
                           attributes = scheduler.RecordData(std::span<const vk::VertexInputAttributeDescription2EXT>{
                               v.attributes.data(), v.attributes.size()})](
                              vk::CommandBuffer cmdbuf) {
+            BB_SPLIT_SCOPE(KEncDraw);
             cmdbuf.setVertexInputEXT(bindings, attributes);
         });
     }
@@ -2068,6 +2093,7 @@ void Rasterizer::EmitVertexBuffers(const GraphicsPipeline* pipeline) {
     const auto offsets = scheduler.RecordData(std::span<const vk::DeviceSize>{v.host_offsets.data(), num_buffers});
     if (dynamic_input) {
         scheduler.Record([num_buffers, buffers, offsets](vk::CommandBuffer cmdbuf) {
+            BB_SPLIT_SCOPE(KEncDraw);
             cmdbuf.bindVertexBuffers(0, num_buffers, buffers.data(), offsets.data());
         });
         return;
@@ -2075,6 +2101,7 @@ void Rasterizer::EmitVertexBuffers(const GraphicsPipeline* pipeline) {
     const auto sizes = scheduler.RecordData(std::span<const vk::DeviceSize>{v.host_sizes.data(), num_buffers});
     const auto strides = scheduler.RecordData(std::span<const vk::DeviceSize>{v.host_strides.data(), num_buffers});
     scheduler.Record([num_buffers, buffers, offsets, sizes, strides](vk::CommandBuffer cmdbuf) {
+        BB_SPLIT_SCOPE(KEncDraw);
         cmdbuf.bindVertexBuffers2(0, num_buffers, buffers.data(), offsets.data(), sizes.data(),
                                   strides.data());
     });
@@ -2236,6 +2263,7 @@ void Rasterizer::BindIndexBuffer(u32 index_offset) {
 void Rasterizer::EmitIndexBuffer() {
     scheduler.Record([handle = index_bind.handle, offset = index_bind.offset,
                       type = index_bind.type](vk::CommandBuffer cmdbuf) {
+        BB_SPLIT_SCOPE(KEncDraw);
         cmdbuf.bindIndexBuffer(handle, offset, type);
     });
 }

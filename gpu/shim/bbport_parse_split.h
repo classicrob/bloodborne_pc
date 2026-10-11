@@ -87,13 +87,31 @@ enum K : std::uint32_t {
     KGpuTick,        ///< waits for a GPU tick (fence)
     KVoLabel,        ///< waits for a presentation label
     KFlush,          ///< Scheduler::Flush (queue submit), less the waits inside
+    // Recording internals (Opus-Renderer): work inside the buckets above.
+    KImageRefresh,   ///< TextureCache::RefreshImage (re-read from guest memory: detile, upload)
+    KTexelSync,      ///< BufferCache::SynchronizeMemoryFromImage (an image tiled into its memory)
+    KPipelineWait,   ///< waits for a pipeline still being built (WaitBuiltSlow)
+    KDescriptorBuild,///< Pipeline::BindResources: push constants, descriptor writes
+    KDynamicState,   ///< DynamicState::Commit
+    KBarrierFlush,   ///< Runtime::FlushBarriers
+    KRenderPassSwitch,///< Scheduler::BeginRendering / EndRendering
+    KEncPipeline,    ///< recorder: vkCmdBindPipeline
+    KEncDescriptors, ///< recorder: push constants, push descriptors, descriptor set binds
+    KEncDraw,        ///< recorder: draws (direct, indirect) and index buffer binds
+    KEncDispatch,    ///< recorder: dispatches
+    KEncRendering,   ///< recorder: vkCmdBeginRendering / vkCmdEndRendering
+    KEncBarrier,     ///< recorder: pipeline barriers from Runtime::FlushBarriers
+    KEncCopy,        ///< recorder: copies, fills, clears (Runtime)
     KCount
 };
 inline constexpr const char* k_names[KCount] = {
     "stage B drain at DUMP_CONST_RAM", "stage B drain at idle", "stage B drain at submit/flush",
     "stage B drain at other packets", "draw pipe full", "deferred signals (GPU completion)",
     "recorder signals", "recorder sync", "host copies", "GPU ticks", "presentation label",
-    "queue submit"};
+    "queue submit", "image refresh", "texel sync (image tiled to memory)", "pipeline build wait", "descriptor build",
+    "dynamic state", "barrier flush", "render pass switch", "encode pipeline bind",
+    "encode descriptors", "encode draws", "encode dispatches", "encode rendering begin/end",
+    "encode barriers", "encode copies"};
 
 constexpr std::uint32_t MaxBuckets = 16;
 constexpr std::uint32_t MaxDepth = 8; ///< nested scopes

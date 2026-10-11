@@ -69,8 +69,21 @@ claim.
 - recorder signals, recorder sync, host copies, GPU ticks, presentation label;
 - queue submit.
 
-Opus-Renderer adds the stage B recording internals and the recorder's per-command-type encoding,
-as further scope kinds.
+Opus-Renderer's scope kinds, the recording internals (inside whichever bucket is open). Per-call
+lookups (image and buffer lookups, samplers) have no scope: they are what remains of "bind
+textures" / "bind buffers" / "render state". At about 22 ns per scope under Rosetta, stage B pays
+two per draw (descriptor build, dynamic state) plus the rare ones:
+- image refresh (RefreshImage: detile and upload records), texel sync (SynchronizeMemoryFromImage:
+  an image tiled into its guest memory for a texel-buffer read);
+- pipeline build wait (WaitBuiltSlow only), descriptor build (Pipeline::BindResources), dynamic
+  state (DynamicState::Commit), barrier flush (Runtime::FlushBarriers, when it has barriers), render
+  pass switch (Scheduler::BeginRendering when the pass changes, EndRendering);
+- on the Vulkan recording thread, inside "executing chunks": MoltenVK's vkCmd* by type: pipeline
+  bind, descriptors (push constants, push descriptors, set binds), draws (with vertex input,
+  vertex and index buffer binds), dispatches, rendering begin/end, barriers, copies/fills/clears
+  (about four per draw there). The rest of a chunk (dynamic state setters, other commands) stays in
+  "executing chunks". MoltenVK records Metal work in these calls or at queue submit (in "queue
+  submit"); these scopes do not see the Metal driver after submission.
 
 ## Output
 
