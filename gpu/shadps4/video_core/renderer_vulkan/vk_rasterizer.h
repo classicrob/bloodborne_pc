@@ -160,6 +160,21 @@ public:
     /// written the range, recorded work completes.
     void SyncParserRead(VAddr address, u64 size);
     /// Before a guest-visible write: fences deferred earlier are written first.
+#ifdef __APPLE__
+    /// GpuIdle's wait split (R0, docs/macos/throttle-relaxation.md): the recorder-side deferred
+    /// writes only, and the completion labels' progress.
+    void WaitRecorderSignals() {
+        scheduler.WaitRecorderSignals();
+    }
+    struct LabelProgress {
+        u64 issued;              ///< completion labels issued so far
+        u64 last_label_tick;     ///< the timeline tick the last one waits for
+        u64 last_submitted_tick; ///< the last tick submitted to the GPU
+    };
+    LabelProgress GetLabelProgress() {
+        return {scheduler.LabelsIssued(), scheduler.LastLabelTick(), scheduler.CurrentTick() - 1};
+    }
+#endif
     void WaitDeferredSignals() {
 #ifdef __APPLE__
         // Labels this stage B batched are not submitted yet: submit them before waiting for
