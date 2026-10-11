@@ -11,7 +11,7 @@ cxx() {
         -include gpu/shim/bb_mac_compat.h \
         -Igpu/shim -Igpu/shadps4 -Igpu/third_party/gcn/include \
         -Igpu/third_party/sirit/include -Igpu/third_party/sirit/externals/SPIRV-Headers/include \
-        -I"$prefix/include" -I/opt/homebrew/include "$@" \
+        -Igpu/third_party/magic_enum/include -I"$prefix/include" -I/opt/homebrew/include "$@" \
         tests/test_gpu_runtime_stubs.cpp -Wl,-export_dynamic \
         -L"$BB_GPU_BUILD" -Wl,-rpath,"$BB_GPU_BUILD" -lbbgpu \
         -L"$prefix/lib" -Wl,-rpath,"$prefix/lib" -lfmt
@@ -27,7 +27,7 @@ cxx tests/macos_pkrtz/optimizer.cpp \
 cxx tests/macos_pkrtz/entry.cpp \
     gpu/shadps4/shader_recompiler/backend/spirv/emit_spirv.cpp \
     gpu/shadps4/shader_recompiler/backend/spirv/emit_spirv_bitwise_conversion.cpp \
-    -Igpu/third_party/magic_enum/include -o "$output/entry"
+    -o "$output/entry"
 clang -arch x86_64 -std=c11 -O2 -Wall -Wextra -Werror -DBB_PKRTZ_CASES \
     -I"$prefix/include" tests/macos_float_modes/probe.c \
     -L"$prefix/lib" -Wl,-rpath,"$prefix/lib" -lvulkan -o "$output/probe"
