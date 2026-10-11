@@ -96,6 +96,7 @@ struct Liverpool {
     struct ParseLagStats {
         u64 frames{}, samples{}, queued_sum{}, queued_max{}, idle_held_back{};
         u64 snapshot_bytes{}, snapshot_ns{}, snapshot_ns_max{}, snapshot_writes_waited{};
+        u64 prep_build_ns{}, prep_build_ns_max{}; ///< draw preparation copy, on the guest thread
     } parse_lag;
     /// bbport (macOS): graphics submissions whose command memory is a submit-time copy and not
     /// fully parsed yet (cmd_snapshot.h), in submission order.

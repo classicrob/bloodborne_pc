@@ -270,17 +270,21 @@ void Liverpool::Process(std::stop_token stoken) {
                 std::scoped_lock lk{submit_mutex};
                 if (++parse_lag.frames == 600) {
                     const double samples = parse_lag.samples ? double(parse_lag.samples) : 1.0;
-                    LOG_INFO(Render,
-                             "Parse lag, last 600 frames: {} graphics submissions, queued ahead of "
-                             "the parser at submit: mean {:.1f}, max {}; GpuIdle held back {} "
-                             "times; command snapshots {:.1f} KiB/frame, {:.1f} us/submit mean, "
-                             "{:.1f} us max, waited for {} stream writes",
+                    // Printed like the Stall lines: Info-level logging is filtered in perf runs.
+                    fmt::print("Parse lag, last 600 frames: {} graphics submissions, queued ahead "
+                               "of the parser at submit: mean {:.1f}, max {}; GpuIdle held back {} "
+                               "times; command snapshots {:.1f} KiB/frame, {:.1f} us/submit mean, "
+                               "{:.1f} us max, waited for {} stream writes; draw preparation "
+                               "copy {:.1f} us/submit mean, {:.1f} us max\n",
                              parse_lag.samples, parse_lag.queued_sum / samples,
                              parse_lag.queued_max, parse_lag.idle_held_back,
                              parse_lag.snapshot_bytes / 600.0 / 1024.0,
                              parse_lag.snapshot_ns / samples / 1000.0,
                              parse_lag.snapshot_ns_max / 1000.0,
-                             parse_lag.snapshot_writes_waited);
+                             parse_lag.snapshot_writes_waited,
+                             parse_lag.prep_build_ns / samples / 1000.0,
+                             parse_lag.prep_build_ns_max / 1000.0);
+                    std::fflush(stdout);
                     parse_lag = {};
                 }
             }
@@ -2008,7 +2012,15 @@ void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
     // The copy for the draw preparation workers is made before taking the queue lock, which
     // the GPU thread needs to pick up work.
     auto* draw_prep = rasterizer ? &rasterizer->GetDrawPreparation() : nullptr;
+#ifdef __APPLE__
+    const auto prep_start = std::chrono::steady_clock::now();
+#endif
     auto prep_submission = draw_prep ? draw_prep->Build(dcb) : nullptr;
+#ifdef __APPLE__
+    const u64 prep_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now() - prep_start)
+                            .count();
+#endif
     {
         // Numbering, enqueueing and queueing under one lock keep the three orders identical.
         std::scoped_lock lock{queue.m_access};
@@ -2044,6 +2056,8 @@ void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
     parse_lag.snapshot_ns += snapshot->copy_ns;
     parse_lag.snapshot_ns_max = std::max(parse_lag.snapshot_ns_max, snapshot->copy_ns);
     parse_lag.snapshot_writes_waited += snapshot->writes_waited;
+    parse_lag.prep_build_ns += prep_ns;
+    parse_lag.prep_build_ns_max = std::max(parse_lag.prep_build_ns_max, prep_ns);
     ++parse_lag.samples;
     parse_lag.queued_sum += num_submits;
     parse_lag.queued_max = std::max<u64>(parse_lag.queued_max, num_submits);
