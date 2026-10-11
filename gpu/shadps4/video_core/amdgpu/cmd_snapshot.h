@@ -43,6 +43,10 @@ public:
     [[nodiscard]] std::span<const u32> Words(const Region& region) const {
         return {words.data() + region.copy_offset, region.size_dw};
     }
+    /// Every region of this submission: the DCB, the CCB if any, then indirect buffers.
+    [[nodiscard]] std::span<const Region> Regions() const {
+        return regions;
+    }
     /// The region captured for an indirect buffer packet, or nullptr.
     [[nodiscard]] Region* Find(const u32* guest, u32 size_dw, bool constant);
 

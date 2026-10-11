@@ -255,7 +255,8 @@ if [[ ${1:-} == --test || ${1:-} == --test-dry ]]; then
         # tests (motion, UI composition, scene resolution, TAA, camera motion).
         unit_tests=(cmd-snapshot-test cond-exec-test label-check-test capture-quiesce-test flip-publish-test videoout-lifecycle-test strmout-update-test equeue-concurrency-test feature-checks-test image-view-storage-test
             submit-info-bounds-test vertex-fetch-translation-test buffer-null-test rect-interface-test
-            fence-address-test overlay-concurrency-test depth-bounds-probe-test motion-history-test
+            fence-address-test overlay-concurrency-test depth-bounds-probe-test replay-capture-test
+            motion-history-test
             motion-shader-test
             ui-composition-test scene-resolution-test taa-shader-test camera-motion-test)
         ninja -C out/gpu "${ninja_jobs[@]}" "${unit_tests[@]}"
@@ -276,6 +277,7 @@ if [[ ${1:-} == --test || ${1:-} == --test-dry ]]; then
         t out/gpu/overlay-concurrency-test
         t out/gpu/rect-interface-test
         t out/gpu/depth-bounds-probe-test
+        t out/gpu/replay-capture-test
         rm -rf out/buffer-null && mkdir -p out/buffer-null
         t out/gpu/buffer-null-test out/buffer-null
         t spirv-val --target-env vulkan1.3 out/buffer-null/null-buffer.spv
@@ -299,6 +301,7 @@ if [[ ${1:-} == --test || ${1:-} == --test-dry ]]; then
         t sh tests/test_guest_alloc_macos.sh
         t sh tests/test_memory_clamp.sh
         t sh tests/test_memory_cpu_alias_macos.sh
+        t sh tests/test_memory_inventory_macos.sh
         t sh tests/test_audio_macos.sh
         t sh tests/test_guest_heap_lock_macos.sh
         t sh tests/test_low_map_trace_macos.sh
