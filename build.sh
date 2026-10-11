@@ -255,10 +255,10 @@ if [[ ${1:-} == --test || ${1:-} == --test-dry ]]; then
         # tests (motion, UI composition, scene resolution, TAA, camera motion).
         unit_tests=(cmd-snapshot-test cond-exec-test label-check-test capture-quiesce-test flip-publish-test videoout-lifecycle-test strmout-update-test equeue-concurrency-test feature-checks-test image-view-storage-test
             submit-info-bounds-test vertex-fetch-translation-test buffer-null-test rect-interface-test
-            fence-address-test overlay-concurrency-test depth-bounds-probe-test replay-capture-test
+            fence-address-test fill-clear-device-test overlay-concurrency-test depth-bounds-probe-test replay-capture-test
             motion-history-test
             motion-shader-test
-            ui-composition-test scene-resolution-test taa-shader-test camera-motion-test)
+            ui-composition-test fill-clear-test scene-resolution-test taa-shader-test camera-motion-test)
         ninja -C out/gpu "${ninja_jobs[@]}" "${unit_tests[@]}"
         for unit_test in "${unit_tests[@]}"; do sign_darwin "out/gpu/$unit_test"; done
         t out/gpu/cmd-snapshot-test
@@ -274,6 +274,7 @@ if [[ ${1:-} == --test || ${1:-} == --test-dry ]]; then
         t out/gpu/submit-info-bounds-test
         t out/gpu/vertex-fetch-translation-test
         t out/gpu/fence-address-test
+        t out/gpu/fill-clear-device-test
         t out/gpu/overlay-concurrency-test
         t out/gpu/rect-interface-test
         t out/gpu/depth-bounds-probe-test
@@ -287,6 +288,7 @@ if [[ ${1:-} == --test || ${1:-} == --test-dry ]]; then
         t out/gpu/motion-shader-test out/motion-shaders
         for spv in out/motion-shaders/*.spv; do t spirv-val --target-env vulkan1.3 "$spv"; done
         t out/gpu/ui-composition-test
+        t out/gpu/fill-clear-test
         t out/gpu/scene-resolution-test
         t out/gpu/taa-shader-test
         t out/gpu/camera-motion-test

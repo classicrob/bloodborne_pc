@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <array>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <mutex>
@@ -9,6 +11,7 @@
 #include "shader_recompiler/info.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
+#include "video_core/renderer_vulkan/fill_clear.h"
 #include "video_core/renderer_vulkan/vk_shader_hle.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -305,11 +308,293 @@ static void CensusRenderTargetKernel(const Shader::Info& info,
 }
 #endif
 
+#ifdef __APPLE__
+// bbport: the SDK fill kernel 0x8b355b5a stores one float4 to every element of a buffer
+// (fill_clear.h). When that buffer is exactly a cached render target and the stored bytes are
+// one repeated 32-bit word, the kernel is replaced by a fill of those bytes (vkCmdFillBuffer over
+// the whole range, padding included, so raw-buffer and CPU readers see what the kernel would have
+// written) and a clear of the image to the same value (instead of the image's refresh from the
+// buffer). Only where both are the same bits; otherwise the kernel runs, counted by reason.
+// BB_RT_FILL_VERIFY=1 waits for each replaced fill and stops unless every byte of the range and
+// texel (0, 0) of the image hold the bits the kernel would have stored.
+namespace {
+enum class FillPath : u32 {
+    Cleared,
+    Shape,
+    Format,
+    NoImage,
+    NotExact,
+    GpuValue,
+    Value,
+    HalvesDiffer,
+    Reference,
+    Count
+};
+constexpr std::array<const char*, u32(FillPath::Count)> fill_path_names = {
+    "replaced",          "dispatch, SGPR or V# shape", "format",
+    "no image",          "not exactly one image",      "value GPU-written or in an image",
+    "value not exact",   "8-byte texel halves differ",     "kernel run as the verify reference"};
+std::array<std::atomic<u64>, u32(FillPath::Count)> fill_counts{};
+
+/// BB_RT_FILL_VERIFY: 1 checks every replaced fill; 2 also runs every other qualifying fill as the
+/// kernel and checks the kernel's bytes against the same derived pattern.
+const int fill_verify = [] {
+    const char* env = std::getenv("BB_RT_FILL_VERIFY");
+    return env ? std::atoi(env) : 0;
+}();
+/// A qualifying fill left to the kernel (verify 2), checked once its dispatch is recorded. Only the
+/// thread recording dispatches touches it.
+struct KernelCheck {
+    bool armed;
+    VAddr address;
+    u64 size;
+    u32 pattern;
+};
+KernelCheck kernel_check{};
+
+/// Waits until the GPU ran everything recorded and stops unless the guest range holds `pattern`.
+void CheckRangeHolds(Rasterizer& rasterizer, VAddr address, u64 size, u32 pattern,
+                     const char* what) {
+    rasterizer.GetRuntime().GetScheduler().Finish();
+    const auto* bytes = reinterpret_cast<const u8*>(address);
+    for (u64 offset = 0; offset < size; offset += 4) {
+        u32 word;
+        std::memcpy(&word, bytes + offset, 4);
+        ASSERT_MSG(word == pattern,
+                   "BB_RT_FILL_VERIFY: byte {:#x} of {:#x}+{:#x} holds {:#010x} after {}, the "
+                   "derived fill is {:#010x}",
+                   offset, address, size, word, what, pattern);
+    }
+}
+
+void CountFill(FillPath path) {
+    fill_counts[u32(path)].fetch_add(1, std::memory_order_relaxed);
+    static std::atomic<u64> calls{0};
+    if ((calls.fetch_add(1, std::memory_order_relaxed) + 1) % 4096 != 0) {
+        return;
+    }
+    std::string text;
+    for (u32 i = 0; i < u32(FillPath::Count); ++i) {
+        text += fmt::format("{}{} {}", i ? ", " : "", fill_path_names[i],
+                            fill_counts[i].load(std::memory_order_relaxed));
+    }
+    std::printf("RT fill (0x8b355b5a): %s\n", text.c_str());
+}
+
+vk::Format ImageFormat(FillClear::Format format) {
+    switch (format) {
+    case FillClear::Format::Rgba16Float:
+        return vk::Format::eR16G16B16A16Sfloat;
+    case FillClear::Format::B10G11R11Ufloat:
+        return vk::Format::eB10G11R11UfloatPack32;
+    case FillClear::Format::Rgba8Unorm:
+        return vk::Format::eR8G8B8A8Unorm;
+    }
+    UNREACHABLE();
+}
+
+/// BB_RT_FILL_VERIFY=1: waits for the replaced fill and stops unless the whole guest range holds
+/// `pattern` and texel (0, 0) of the image the texel the kernel stores.
+void VerifyFillClear(Rasterizer& rasterizer, VideoCore::Image& image, VAddr address, u64 size,
+                     u32 pattern, const std::array<u8, 8>& texel, u32 texel_bytes) {
+    auto& runtime = rasterizer.GetRuntime();
+    auto& scheduler = runtime.GetScheduler();
+    const auto readback = runtime.GetStagingPool().Request(16, VideoCore::MemoryType::HostCached);
+    runtime.Transit(&image, vk::ImageLayout::eTransferSrcOptimal,
+                    vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferRead);
+    runtime.FlushBarriers();
+    const vk::BufferImageCopy region{
+        .bufferOffset = readback.offset,
+        .imageSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+        .imageExtent = {1, 1, 1},
+    };
+    scheduler.Record([source = image.GetImage(), buffer = readback.buffer->Handle(),
+                      region](vk::CommandBuffer cmdbuf) {
+        cmdbuf.copyImageToBuffer(source, vk::ImageLayout::eTransferSrcOptimal, buffer, region);
+    });
+    scheduler.Finish();
+    readback.Invalidate();
+    ASSERT_MSG(std::memcmp(readback.mapped, texel.data(), texel_bytes) == 0,
+               "BB_RT_FILL_VERIFY: the clear of image {:#x} ({}) wrote a texel other than the "
+               "fill kernel's",
+               image.info.guest_address, vk::to_string(image.info.pixel_format));
+    const auto* bytes = reinterpret_cast<const u8*>(address);
+    for (u64 offset = 0; offset < size; offset += 4) {
+        u32 word;
+        std::memcpy(&word, bytes + offset, 4);
+        ASSERT_MSG(word == pattern,
+                   "BB_RT_FILL_VERIFY: byte {:#x} of the fill of {:#x}+{:#x} holds {:#010x}, the "
+                   "fill kernel stores {:#010x}",
+                   offset, address, size, word, pattern);
+    }
+    static std::atomic<u64> verified{0};
+    if (verified.fetch_add(1, std::memory_order_relaxed) % 256 == 0) {
+        std::printf("BB_RT_FILL_VERIFY: %llu replaced fills verified (whole range and texel)\n",
+                    (unsigned long long)verified.load(std::memory_order_relaxed));
+    }
+}
+
+/// The fill as a buffer fill plus an image clear when that is exact; false: run the kernel.
+bool FillAsImageClear(const Shader::Info& info, const AmdGpu::ComputeProgram& cs_program,
+                      Rasterizer& rasterizer) {
+    const auto fails = [](FillPath path) {
+        CountFill(path);
+        return false;
+    };
+    const Shader::BufferResource* value_desc = nullptr;
+    const Shader::BufferResource* target_desc = nullptr;
+    for (const auto& desc : info.buffers) {
+        if (desc.IsSpecial()) {
+            continue;
+        }
+        auto& slot = desc.is_written ? target_desc : value_desc;
+        if (slot) {
+            return fails(FillPath::Shape);
+        }
+        slot = &desc;
+    }
+    if (!value_desc || !target_desc) {
+        return fails(FillPath::Shape);
+    }
+    const auto value_sharp = value_desc->GetSharp(info);
+    const auto target = target_desc->GetSharp(info);
+    const auto format = FillClear::TargetFormat(target.data_format, target.num_format);
+    if (!format) {
+        return fails(FillPath::Format);
+    }
+    const FillClear::Dispatch dispatch{
+        .threads_x = cs_program.num_thread_x.full,
+        .threads_x_partial = cs_program.num_thread_x.partial,
+        .threads_y = cs_program.num_thread_y.full,
+        .threads_y_partial = cs_program.num_thread_y.partial,
+        .threads_z = cs_program.num_thread_z.full,
+        .threads_z_partial = cs_program.num_thread_z.partial,
+        .dim_x = cs_program.dim_x,
+        .dim_y = cs_program.dim_y,
+        .dim_z = cs_program.dim_z,
+        .start_x = cs_program.start_x,
+        .start_y = cs_program.start_y,
+        .start_z = cs_program.start_z,
+        .user_sgprs = cs_program.settings.num_user_regs,
+        .tgid_enable = cs_program.settings.tgid_enable,
+    };
+    const FillClear::Target target_fields{
+        .stride = u32(target.stride),
+        .num_records = target.num_records,
+        .swizzle_enable = target.swizzle_enable != 0,
+        .add_tid_enable = target.add_tid_enable != 0,
+        .dst_sel_x = target.dst_sel_x,
+        .dst_sel_y = target.dst_sel_y,
+        .dst_sel_z = target.dst_sel_z,
+        .dst_sel_w = target.dst_sel_w,
+    };
+    const u32 texel_bytes = FillClear::TexelBytes(*format);
+    if (!FillClear::CoversAllElements(dispatch, target_fields, texel_bytes) ||
+        value_sharp.base_address == 0 || value_sharp.GetSize() < 16) {
+        return fails(FillPath::Shape);
+    }
+    const VAddr address = target.base_address;
+    const u64 size = u64(target.num_records) * texel_bytes;
+    // Exactly one cached image, at exactly the buffer's range.
+    auto& texture_cache = rasterizer.GetTextureCache();
+    VideoCore::Image* image = nullptr;
+    u32 overlapping = 0;
+    texture_cache.ForEachImageInRegion(address, size,
+                                       [&](VideoCore::ImageId, VideoCore::Image& candidate) {
+                                           ++overlapping;
+                                           image = &candidate;
+                                       });
+    if (overlapping == 0) {
+        return fails(FillPath::NoImage);
+    }
+    // The texture binding helper finishes before image state is read or changed.
+    auto& runtime = rasterizer.GetRuntime();
+    runtime.BeforeImageAccess();
+    const auto& image_info = image->info;
+    if (overlapping != 1 || image_info.guest_address != address ||
+        image_info.guest_size != size || image_info.resources.levels != 1 ||
+        image_info.resources.layers != 1 || image_info.props.is_depth ||
+        image_info.props.is_volume || image_info.size.depth != 1 ||
+        image->backing->num_samples != 1) {
+        return fails(FillPath::NotExact);
+    }
+    if (image_info.pixel_format != ImageFormat(*format)) {
+        return fails(FillPath::Format);
+    }
+    // The value the kernel loads: its guest bytes, unless a GPU write to them (through a buffer
+    // or an aliased image) is outstanding.
+    auto& buffer_cache = rasterizer.GetBufferCache();
+    bool value_in_image = false;
+    texture_cache.ForEachImageInRegion(value_sharp.base_address, 16,
+                                       [&](VideoCore::ImageId, VideoCore::Image&) {
+                                           value_in_image = true;
+                                       });
+    if (value_in_image || buffer_cache.IsRegionGpuModified(value_sharp.base_address, 16)) {
+        return fails(FillPath::GpuValue);
+    }
+    std::array<float, 4> value;
+    std::memcpy(value.data(), reinterpret_cast<const void*>(value_sharp.base_address), 16);
+    const auto texel = FillClear::Texel(*format, value);
+    if (!texel) {
+        return fails(FillPath::Value);
+    }
+    const auto pattern = FillClear::Pattern(*format, *texel);
+    if (!pattern) {
+        return fails(FillPath::HalvesDiffer);
+    }
+    // BB_RT_FILL_VERIFY=2: every other qualifying fill runs the kernel itself, and AfterDispatchHLE
+    // checks that it wrote exactly the derived bytes: the reference for the replaced ones.
+    static u64 qualifying = 0;
+    if (fill_verify == 2 && (qualifying++ & 1) == 0) {
+        kernel_check = {true, address, size, *pattern};
+        return fails(FillPath::Reference);
+    }
+    // The bytes, as the kernel writes them (the buffer write it would have bound).
+    const auto [buffer, offset] = buffer_cache.ObtainBuffer(address, u32(size), true, false);
+    ASSERT_MSG(offset % 4 == 0, "RT fill: target {:#x} is not 4-byte aligned in its buffer",
+               address);
+    runtime.FillBuffer(buffer, offset, size, *pattern);
+    // The image, as its refresh from those bytes would leave it.
+    vk::ClearValue clear{};
+    clear.color.float32 = value;
+    runtime.ClearImage(image, VideoCore::SubresourceRange{}, clear);
+    CountFill(FillPath::Cleared);
+    if (fill_verify) {
+        VerifyFillClear(rasterizer, *image, address, size, *pattern, *texel, texel_bytes);
+    }
+    return true;
+}
+} // namespace
+
+void AfterDispatchHLE(Rasterizer& rasterizer) {
+    if (!kernel_check.armed) {
+        return;
+    }
+    kernel_check.armed = false;
+    CheckRangeHolds(rasterizer, kernel_check.address, kernel_check.size, kernel_check.pattern,
+                    "the fill kernel");
+    static u64 matched = 0;
+    if (matched++ % 256 == 0) {
+        std::printf("BB_RT_FILL_VERIFY=2: %llu kernel fills wrote exactly the derived bytes\n",
+                    (unsigned long long)matched);
+    }
+}
+#endif
+
 bool ExecuteShaderHLE(const Shader::Info& info, const AmdGpu::Regs& regs,
                       const AmdGpu::ComputeProgram& cs_program, Rasterizer& rasterizer) {
 #ifdef __APPLE__
+    if (kernel_check.armed) {
+        // The previous dispatch was not recorded (its bindings failed): nothing to check.
+        std::printf("BB_RT_FILL_VERIFY=2: a reference fill was not dispatched, not checked\n");
+        kernel_check.armed = false;
+    }
     if (info.pgm_hash == SDK_FILL_HASH || info.pgm_hash == SDK_COPY_HASH) {
         CensusRenderTargetKernel(info, cs_program, rasterizer);
+    }
+    if (info.pgm_hash == SDK_FILL_HASH && !BbToggle::Disabled(BbToggle::RtFillKernel) &&
+        FillAsImageClear(info, cs_program, rasterizer)) {
+        return true;
     }
 #endif
     switch (info.pgm_hash) {

@@ -1567,6 +1567,9 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
 
     ResetBindings(true);
     scheduler.KickRecording();
+#ifdef __APPLE__
+    AfterDispatchHLE(*this); // BB_RT_FILL_VERIFY=2 reference fills
+#endif
 }
 
 void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {

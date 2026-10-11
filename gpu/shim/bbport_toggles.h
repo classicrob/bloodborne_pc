@@ -89,6 +89,9 @@ enum : std::uint64_t {
     // (the device-loss bug), so it is only for load A/Bs. BB_STAGING_RELEASE_AT_REQUEST=1 sets
     // it for the whole run; read at each request.
     StagingReleaseAtRequest = 1ull << 61,
+    // Apple: bit set always runs the SDK fill kernel 0x8b355b5a, instead of clearing the render
+    // target it exactly covers (vk_shader_hle.cpp FillAsImageClear); for before/after A/Bs.
+    RtFillKernel = 1ull << 62,
     // Bits 20-29 are used as raw debug toggles by the camera/object motion and the upscaler.
 };
 inline bool Disabled(std::uint64_t bit) {
