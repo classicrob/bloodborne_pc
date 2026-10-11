@@ -416,11 +416,56 @@ static size_t vma_index(uintptr_t a) { /* first VMA with end > a */
     while (lo<hi) { size_t mid=(lo+hi)/2; if (vmas[mid].end<=a) lo=mid+1; else hi=mid; }
     return lo;
 }
+#ifdef __APPLE__
+/* Mutation/failure diagnostics only; never used by per-draw region queries. */
+static _Noreturn void mapping_stop(const char *reason,uintptr_t start,uint64_t size,
+                                  int flags,const Vma *old) {
+    fprintf(stderr,"STOP: memory mapping %s request=[0x%" PRIxPTR ",+0x%" PRIx64
+                   ") flags=0x%x\n",reason,start,size,(unsigned)flags);
+    if (old) fprintf(stderr,"  existing=[0x%" PRIxPTR ",0x%" PRIxPTR
+                    ") kind=%d prot=0x%x backing=0x%" PRIx64 "\n",
+                    old->start,old->end,old->kind,old->prot,old->phys);
+    RuntimeMemoryAlias rows[8]; RuntimeMemoryAliasSnapshot snapshot;
+    uintptr_t query=old ? old->start : start;
+    int found=runtime_memory_alias_snapshot(query,rows,8,&snapshot);
+    fprintf(stderr,"  alias snapshot tracked=%d generation=%" PRIu64
+                   " backing_byte=0x%" PRIx64 " other=%zu copied=%zu truncated=%d\n",
+                   found,snapshot.generation,snapshot.backing_byte,snapshot.total,
+                   snapshot.copied,snapshot.truncated);
+    for (size_t i=0;i<snapshot.copied;++i)
+        fprintf(stderr,"  alias[%zu]=[0x%" PRIxPTR ",0x%" PRIxPTR ") byte_va=0x%"
+                       PRIxPTR " backing=0x%" PRIx64 " prot=0x%x\n",i,rows[i].start,
+                       rows[i].end,rows[i].address,rows[i].backing_offset,rows[i].prot);
+    abort();
+}
+static void audit_vmas(void) {
+    for (size_t i=0;i<vma_count;++i) {
+        const Vma *v=&vmas[i];
+        if (v->start>=v->end || (i && vmas[i-1].end>v->start))
+            mapping_stop("invalid/overlapping VMA table",v->start,v->end-v->start,0,
+                         i ? &vmas[i-1] : v);
+    }
+}
+#endif
 static int vma_insert(size_t at, Vma v) {
+#ifdef __APPLE__
+    if (at>vma_count || v.start>=v.end)
+        mapping_stop("invalid VMA insertion",v.start,v.end-v.start,0,NULL);
+    if (at && vmas[at-1].end>v.start)
+        mapping_stop("VMA insertion overlaps predecessor",v.start,v.end-v.start,0,&vmas[at-1]);
+    if (at<vma_count && v.end>vmas[at].start)
+        mapping_stop("VMA insertion overlaps successor",v.start,v.end-v.start,0,&vmas[at]);
+#endif
     if (vma_count==vma_capacity) {
         size_t capacity=vma_capacity ? vma_capacity*2 : 256;
         Vma *next=realloc(vmas,capacity*sizeof(*vmas));
-        if (!next) return -1;
+        if (!next) {
+#ifdef __APPLE__
+            mapping_stop("VMA storage exhausted during mutation",v.start,v.end-v.start,0,NULL);
+#else
+            return -1;
+#endif
+        }
         vmas=next; vma_capacity=capacity;
     }
     memmove(vmas+at+1,vmas+at,(vma_count-at)*sizeof(*vmas));
@@ -481,14 +526,31 @@ static void drop_range(uintptr_t start, uintptr_t end) {
 static int32_t place(void **inout, uint64_t size, int prot, int flags, uint64_t alignment,
                      int kind, int type, uint64_t phys) {
     uintptr_t address=(uintptr_t)*inout;
+#ifdef __APPLE__
+    audit_vmas();
+#endif
     if (flags & MAP_FIXED_FLAG) {
         if (!address || address%PAGE) return INVALID;
+#ifdef __APPLE__
+        if (size>UINTPTR_MAX-address) return INVALID;
+        if (flags & MAP_NO_OVERWRITE)
+            for (size_t i=vma_index(address);i<vma_count && vmas[i].start<address+size;++i)
+                if (vmas[i].kind==KIND_RESERVED)
+                    mapping_stop("unqualified FIXED|NO_OVERWRITE over reservation",
+                                 address,size,flags,&vmas[i]);
+#endif
         if ((flags & MAP_NO_OVERWRITE) && overlaps(address,address+size,1)) return NO_MEMORY;
     } else {
         address=find_free(address,size,alignment);
         if (!address) return NO_MEMORY;
     }
 #ifdef __APPLE__
+    /* Independently check first-fit/non-overwrite before Mach OVERWRITE can
+     * erase evidence. A bare FIXED request intentionally replaces old views. */
+    if (!(flags & MAP_FIXED_FLAG) || (flags & MAP_NO_OVERWRITE))
+        for (size_t i=0;i<vma_count;++i)
+            if (address<vmas[i].end && vmas[i].start<address+size)
+                mapping_stop("forbidden overlap before host map",address,size,flags,&vmas[i]);
     for (size_t i=vma_index(address); i<vma_count && vmas[i].start<address+size; ++i) {
         if (vmas[i].kind==KIND_RESERVED) continue;
         uintptr_t lo=vmas[i].start>address ? vmas[i].start : address;
@@ -676,7 +738,19 @@ static ABI int32_t reserve_range(void **inout, uint64_t size, int flags, uint64_
     if (!inout || !size || size%PAGE || !valid_alignment(alignment)) return INVALID;
     mutation_begin();
     write_lock();
+#ifdef __APPLE__
+    audit_vmas();
+    if ((flags & MAP_FIXED_FLAG) && size>UINTPTR_MAX-(uintptr_t)*inout) {
+        write_unlock(); mutation_end(); return INVALID;
+    }
+#endif
     if ((flags & MAP_FIXED_FLAG) && overlaps((uintptr_t)*inout,(uintptr_t)*inout+size,0)) {
+#ifdef __APPLE__
+        const Vma *old=&vmas[vma_index((uintptr_t)*inout)];
+        if (!(flags & MAP_NO_OVERWRITE) || old->kind==KIND_RESERVED)
+            mapping_stop("unqualified fixed reservation over existing VMA",
+                         (uintptr_t)*inout,size,flags,old);
+#endif
         write_unlock(); mutation_end(); return NO_MEMORY;
     }
     int32_t result=place(inout,size,0,flags,alignment,KIND_RESERVED,0,0);
@@ -982,11 +1056,26 @@ static void sync_executable_aliases(uint64_t phys, uint64_t size) {
 /* Writes through the backing view; 0 when part of the range has no backing. */
 int runtime_memory_write_backing(uintptr_t address, const void *data, uint64_t size) {
     read_lock();
+#ifdef __APPLE__
+    if (size>UINTPTR_MAX-address)
+        mapping_stop("backing write address overflow",address,size,0,NULL);
+    // Preflight under the same lock: a failed write must not partly modify
+    // backing before TryWriteBacking's caller handles an untracked range.
+    if (!covered(address,address+size,0)) { read_unlock(); return 0; }
+#endif
     int ok=1;
     for (uintptr_t at=address, end=address+size; at<end && ok;) {
         size_t i=vma_index(at);
         if (i==vma_count || vmas[i].start>at || vmas[i].kind==KIND_RESERVED) { ok=0; break; }
         uint64_t n=(vmas[i].end<end ? vmas[i].end : end)-at;
+#ifdef __APPLE__
+        uint64_t limit=vmas[i].kind==KIND_DIRECT ? POOL_SIZE : POOL_SIZE+FLEX_SPAN;
+        uint64_t offset=at-vmas[i].start;
+        if (vmas[i].phys>=limit || offset>=limit-vmas[i].phys ||
+            n>limit-vmas[i].phys-offset ||
+            (vmas[i].kind==KIND_FLEXIBLE && vmas[i].phys<POOL_SIZE))
+            mapping_stop("invalid live backing translation",at,n,0,&vmas[i]);
+#endif
         memcpy(backing_base+vmas[i].phys+(at-vmas[i].start),(const unsigned char *)data+(at-address),n);
 #ifdef __APPLE__
         sync_executable_aliases(vmas[i].phys+(at-vmas[i].start),n);

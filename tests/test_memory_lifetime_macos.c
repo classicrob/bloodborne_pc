@@ -2,6 +2,8 @@
 #include "../src/runtime_memory.c"
 #include <assert.h>
 #include <signal.h>
+#include <sys/wait.h>
+#include <sys/resource.h>
 uintptr_t runtime_lookup(const RuntimeExport *table,size_t count,const char *name) {
     for (size_t i=0;i<count;++i) if (!strcmp(table[i].name,name)) return (uintptr_t)table[i].function;
     return 0;
@@ -110,10 +112,103 @@ static void alias_diagnostic_test(void) {
     assert(!direct_unmap(flex,PAGE)); assert(!direct_unmap(reserved,PAGE));
     puts("PASS: bounded alias snapshot, physical offsets, truncation, release splits, generations, untracked vs no aliases");
 }
+static void *audit_address;
+static int64_t audit_physical;
+static void ambiguous_commit(void) {
+    void *p=audit_address;
+    (void)direct_map(&p,PAGE,3,MAP_FIXED_FLAG|MAP_NO_OVERWRITE,audit_physical,PAGE);
+}
+static void ambiguous_reserve(void) {
+    void *p=audit_address;
+    (void)reserve_range(&p,PAGE,MAP_FIXED_FLAG,PAGE);
+}
+static void overlapping_insert(void) {
+    write_lock();
+    size_t i=vma_index((uintptr_t)audit_address);
+    (void)vma_insert(i,vmas[i]);
+}
+static void invalid_table(void) {
+    write_lock();
+    size_t i=vma_index((uintptr_t)audit_address);
+    vmas[i].end=vmas[i].start;
+    audit_vmas();
+}
+static void invalid_backing(void) {
+    write_lock();
+    size_t i=vma_index((uintptr_t)audit_address);
+    vmas[i].phys=POOL_SIZE+FLEX_SPAN;
+    unsigned byte=0;
+    (void)runtime_memory_write_backing((uintptr_t)audit_address,&byte,sizeof(byte));
+}
+static void expect_mapping_stop(void (*run)(void),const char *reason,int tracked) {
+    int pipefd[2]; assert(!pipe(pipefd));
+    fflush(NULL);
+    pid_t child=fork(); assert(child>=0);
+    if (!child) {
+        struct rlimit no_core={0,0}; setrlimit(RLIMIT_CORE,&no_core);
+        close(pipefd[0]); assert(dup2(pipefd[1],STDERR_FILENO)>=0); close(pipefd[1]);
+        run(); _exit(99);
+    }
+    close(pipefd[1]);
+    char report[8192]; size_t bytes=0; ssize_t got;
+    while ((got=read(pipefd[0],report+bytes,sizeof(report)-1-bytes))>0) bytes+=(size_t)got;
+    report[bytes]=0; close(pipefd[0]);
+    int status; assert(waitpid(child,&status,0)==child);
+    assert(WIFSIGNALED(status) && WTERMSIG(status)==SIGABRT);
+    assert(strstr(report,reason) && strstr(report,"request=[") && strstr(report,"existing=["));
+    assert(strstr(report,tracked ? "alias snapshot tracked=1" : "alias snapshot tracked=0"));
+    if (strstr(reason,"insertion")) assert(strstr(report,"other=1"));
+}
+static void mapping_audit_test(void) {
+    assert(!direct_allocate(0,POOL_SIZE,3*PAGE,PAGE,0,&audit_physical));
+    void *a=NULL,*b=NULL,*alias=NULL;
+    assert(!direct_map(&a,3*PAGE,3,0,audit_physical,PAGE));
+    memset(a,0x6d,3*PAGE);
+    b=a; assert(!map_flexible(&b,PAGE,3,0)); assert(b!=a);
+    void *same=a;
+    assert(map_flexible(&same,PAGE,3,MAP_FIXED_FLAG|MAP_NO_OVERWRITE)==NO_MEMORY);
+    assert(same==a && *(unsigned char *)a==0x6d);
+    assert(!direct_map(&alias,PAGE,3,0,audit_physical,PAGE));
+    audit_address=a;
+    expect_mapping_stop(overlapping_insert,"insertion overlaps",1);
+    expect_mapping_stop(invalid_table,"invalid/overlapping VMA table",0);
+    expect_mapping_stop(invalid_backing,"invalid live backing translation",1);
+    expect_mapping_stop(ambiguous_reserve,"unqualified fixed reservation",1);
+    // Bare FIXED replaces exactly the requested page, preserving neighbours.
+    same=(unsigned char *)a+PAGE;
+    assert(!map_flexible(&same,PAGE,3,MAP_FIXED_FLAG));
+    assert(!*(unsigned char *)same && *(unsigned char *)a==0x6d);
+    assert(*((unsigned char *)a+2*PAGE)==0x6d);
+    unsigned word=0x12345678;
+    assert(runtime_memory_write_backing((uintptr_t)a,&word,sizeof(word)));
+    assert(*(unsigned *)alias==word);
+    // A remap must use the current backing, not an old VA->physical cache entry.
+    same=a; assert(!map_flexible(&same,PAGE,3,MAP_FIXED_FLAG));
+    unsigned other=0x87654321;
+    assert(runtime_memory_write_backing((uintptr_t)a,&other,sizeof(other)));
+    assert(*(unsigned *)a==other && *(unsigned *)alias==word);
+    assert(!direct_unmap(a,3*PAGE)); assert(!direct_unmap(b,PAGE));
+    assert(!direct_release(audit_physical,3*PAGE));
+
+    void *reserved=NULL;
+    assert(!reserve_range(&reserved,2*PAGE,0,PAGE)); audit_address=reserved;
+    assert(!direct_allocate(0,POOL_SIZE,PAGE,PAGE,0,&audit_physical));
+    expect_mapping_stop(ambiguous_commit,"unqualified FIXED|NO_OVERWRITE",0);
+    expect_mapping_stop(ambiguous_reserve,"unqualified fixed reservation",0);
+    // Ordinary FIXED commitment of a reservation remains supported.
+    same=reserved; assert(!direct_map(&same,PAGE,3,MAP_FIXED_FLAG,audit_physical,PAGE));
+    unsigned char data[2*PAGE]; memset(data,0x7e,sizeof(data));
+    assert(!runtime_memory_write_backing((uintptr_t)same,data,sizeof(data)));
+    assert(!*(unsigned char *)same); // No partial write on an unbacked suffix.
+    assert(!direct_release(audit_physical,PAGE));
+    assert(!direct_unmap(reserved,2*PAGE));
+    puts("PASS: nonfixed hints, NO_OVERWRITE rejection, exact FIXED replacement, reservation stops, VMA/backing guards, alias remap writes");
+}
 int main(void) {
     alarm(30);
     runtime_memory_reserve();
     alias_diagnostic_test();
+    mapping_audit_test();
     runtime_memory_set_gpu_hooks(notify,notify,notify);
     runtime_memory_set_gpu_lifetime_hooks(begin,retire,end);
     int64_t physical;
@@ -168,7 +263,8 @@ int main(void) {
     void *reserved=NULL; assert(!reserve_range(&reserved,PAGE,0,PAGE));
     assert(!runtime_memory_backing_region((uintptr_t)reserved,&region_start,&region_end,&offset));
     before=begins;
-    assert(reserve_range(&reserved,PAGE,MAP_FIXED_FLAG,PAGE)==NO_MEMORY);
+    void *outside=(void *)USER_MAX;
+    assert(reserve_range(&outside,PAGE,MAP_FIXED_FLAG,PAGE)==NO_MEMORY);
     assert(begins==before+1); balanced();
     assert(!direct_unmap(reserved,PAGE));
     assert(retires>=6 && notifications>=10);
