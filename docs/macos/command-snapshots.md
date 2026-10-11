@@ -97,6 +97,45 @@ that stopped, **as observed then** (it never re-reads guest memory). The latest 
 before each descriptor is read, so when that descriptor came from direct user data or the
 uninstrumented flat buffer, the stop says so instead of naming an earlier read.
 
+The stop line also says:
+- **where the table pointer came from (with `BB_CMD_DATA_CHECK=1`):**
+  - The SET_SH_REG that last wrote its low user-data word: the graphics stream or a compute
+    queue, the packet's guest address, its submission, and how many flip packets the parser had
+    passed between that write and the read.
+  - The high word too, when it was written separately.
+  - Or: that no tracked SET_SH_REG wrote it since the check started; or that the word is not a
+    tracked graphics user-data register (a host snapshot such as stage B or draw preparation,
+    compute queue state, or a spilled slot; not by itself proof of a spill).
+  - "An EARLIER frame" makes retained state a candidate, not a defect: the game may keep a
+    pointer, and a current SET can also republish a stale one (Astra-2).
+  - The read's frame sample is taken under the lock origins are recorded under. An origin
+    newer than it is printed as such, not as an age.
+  - Our newest observed DUMP_CONST_RAM overlapping the table bytes (of the last 512). It is not
+    necessarily the bytes' last writer: CPU and other writes are not tracked.
+  - Liverpool records SET_SH_REG writes and dumps only while the check is on.
+- **compute-queue SET_SH_REG writes outside the compute program, always.**
+  - The parser applies them to the one shared register file, as upstream does, i.e. into the
+    graphics SH registers below 0x200. On the PS4 a compute ring has its own registers.
+  - They are counted in total, into graphics user data, and above the compute program, with the
+    latest write into graphics user data (queue, SH offset, words, first value).
+  - The first 8 of each kind are logged as they happen, and a "Compute SET_SH_REG" summary line
+    is printed every 600 frame ends once any occurred.
+- **where the read lies at the stop:** the guest mapping holding it, `[start, end)` and size, or
+  the unmapped gap, and how many other guest mappings view the same backing. These come from
+  runtime_memory's mapping table, a query and not a guest memory read. Stop hunt #1 found every
+  table read outside command memory (20261011-192653-1080p-HUNT-1), so the mapping is the
+  lead.
+- **how far each side of the flip pipeline had got, always (even without `BB_CMD_DATA_CHECK`).**
+  These come from gpu/shim/bbport_frame_marks.h:
+  - guest flip API calls, counted at entry, before admission;
+  - flip packets parsed by the GPU command thread;
+  - flip preparation entered (on the draw recording thread for EOP flips);
+  - flip status published to the guest.
+
+  Each is a count, with the latest argument where known. These are approximate observations,
+  each sampled on its own. Judged against the guest's reuse gate, they show whether the guest
+  could already reuse the memory the parser was reading.
+
 **Limits:**
 - Supporting evidence only.
 - Reads made by generated code (the SRT walker) are not instrumented.

@@ -38,6 +38,8 @@
 #include "bbport_cmd_data.h"
 #include "bbport_label_check.h"
 #include "bbport_label_store.h"
+#include "bbport_compute_sh.h"
+#include "bbport_frame_marks.h"
 #include "bbport_parse_split.h"
 #include "video_core/amdgpu/pm4_cmds.h"
 #include "video_core/renderdoc.h"
@@ -202,6 +204,52 @@ static std::span<const u32> NextPacket(std::span<const u32> span, size_t offset)
 }
 
 #ifdef __APPLE__
+void Liverpool::NoteShWrite(const PM4Header* header, u64 guest_packet, u64 submission,
+                            s32 compute_queue) {
+    const auto* set_data = reinterpret_cast<const PM4CmdSetData*>(header);
+    const u32 words = header->type3.NumWords() - 1;
+    const u64 flips = BbCmdData::flips_parsed.load(std::memory_order_relaxed);
+    std::scoped_lock lk{origin_mutex};
+    for (u32 i = 0; i < words && set_data->reg_offset + i < OriginShWords; ++i) {
+        sh_origin[set_data->reg_offset + i] = {true, true, guest_packet, submission, flips,
+                                               compute_queue};
+    }
+}
+
+void Liverpool::NoteConstDump(u64 dst, u64 bytes, u64 submission) {
+    const u64 flips = BbCmdData::flips_parsed.load(std::memory_order_relaxed);
+    std::scoped_lock lk{origin_mutex};
+    const_dumps[const_dump_next] = {true, dst, bytes, submission, flips};
+    const_dump_next = (const_dump_next + 1) % const_dumps.size();
+}
+
+void Liverpool::LookupOrigin(void* owner, const void* pointer_word, u64 address, u64 size,
+                             BbCmdData::PointerOrigin& low, BbCmdData::PointerOrigin& high,
+                             BbCmdData::DumpOrigin& dump, u64& flips_now) {
+    // Under BbCmdData's registry lock: the owner outlives the call. The flip sample is taken
+    // under origin_mutex, after every origin recorded so far (each recorded its sample first).
+    auto& self = *static_cast<Liverpool*>(owner);
+    std::scoped_lock lk{self.origin_mutex};
+    flips_now = BbCmdData::flips_parsed.load(std::memory_order_relaxed);
+    const u32* sh = self.regs.reg_array.data() + Regs::ShRegWordOffset;
+    const auto* word = static_cast<const u32*>(pointer_word);
+    if (word && word >= sh && word + 1 < sh + OriginShWords) {
+        low = self.sh_origin[word - sh];
+        low.in_register_file = true;
+        high = self.sh_origin[word + 1 - sh];
+        high.in_register_file = true;
+    }
+    // The newest dump overlapping the bytes (the ring is in write order).
+    for (u32 i = 1; i <= self.const_dumps.size(); ++i) {
+        const auto& d = self.const_dumps[(self.const_dump_next + self.const_dumps.size() - i) %
+                                         self.const_dumps.size()];
+        if (d.found && address < d.dst + d.bytes && d.dst < address + size) {
+            dump = d;
+            break;
+        }
+    }
+}
+
 BbCmdData::Result Liverpool::LookupCommandData(void* owner, u64 address, u64 size,
                                                const void* bytes_read) {
     // Runs under BbCmdData's registry lock, so ~Liverpool's Unregister waits for it.
@@ -230,7 +278,25 @@ Liverpool::Liverpool() : guest_markers_enabled{EmulatorSettings.IsVkGuestMarkers
 #ifdef __APPLE__
     SetAssertStopHook(&ReportParserStop);
     if (BbCmdData::Enabled()) {
-        BbCmdData::Register(&Liverpool::LookupCommandData, this);
+        BbCmdData::Register(&Liverpool::LookupCommandData, &Liverpool::LookupOrigin, this);
+        BbCmdData::region_lookup.store(
+            [](u64 address, u64& start, u64& end, bool& mapped, long long& aliases) {
+                // A mapping-table query (no guest read).
+                uintptr_t lo = 0, hi = 0;
+                int is_mapped = 0;
+                if (!runtime_memory_region(address, &lo, &hi, &is_mapped)) {
+                    return false;
+                }
+                start = lo;
+                end = hi;
+                mapped = is_mapped != 0;
+                RuntimeMemoryAliasSnapshot alias{};
+                aliases = runtime_memory_alias_snapshot(address, nullptr, 0, &alias) == 1
+                              ? static_cast<long long>(alias.total)
+                              : -1;
+                return true;
+            },
+            std::memory_order_release);
     }
 #endif
     num_counter_pairs = Libraries::Kernel::sceKernelIsNeoMode() ? 16 : 8;
@@ -556,6 +622,14 @@ void Liverpool::Process(std::stop_token stoken) {
         // thread will not parse while holding.
         if (retired_frame) {
             BbSplit::NoteFrameEnd(BbStats::draws.load(std::memory_order_relaxed));
+            static u32 compute_sh_frames = 0;
+            if (++compute_sh_frames % 600 == 0 &&
+                (BbComputeSh::into_graphics.load() || BbComputeSh::above_compute.load())) {
+                // Printed like the Stall lines: Info-level logging is filtered in perf runs.
+                std::printf("Compute SET_SH_REG (all so far): %s\n",
+                            BbComputeSh::Describe().c_str());
+                std::fflush(stdout);
+            }
         }
         if (retired_frame && ReplayCapture::Armed()) {
             ReplayCapture::OnReleasedFrameRetired();
@@ -1129,6 +1203,12 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb,
             const auto* dump_const = reinterpret_cast<const PM4DumpConstRam*>(header);
             memcpy(dump_const->Address<void*>(),
                    cblock.constants_heap.data() + dump_const->Offset(), dump_const->Size());
+#ifdef __APPLE__
+            if (BbCmdData::Enabled()) [[unlikely]] {
+                NoteConstDump(dump_const->Address<u64>(), dump_const->Size(),
+                              snapshot ? snapshot->submit_number : 0);
+            }
+#endif
             break;
         }
         case PM4ItOpcode::IncrementCeCounter: {
@@ -1496,6 +1576,15 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
 #endif
             ApplyGraphicsRegisterPacket(regs, header, gfx_reg_checksum, &pipe_dirty);
+#ifdef __APPLE__
+            if (opcode == PM4ItOpcode::SetShReg && BbCmdData::Enabled()) [[unlikely]] {
+                NoteShWrite(header,
+                            region ? reinterpret_cast<u64>(region->guest +
+                                                           (region->size_dw - dcb.size()))
+                                   : reinterpret_cast<u64>(header),
+                            snapshot ? snapshot->submit_number : 0);
+            }
+#endif
             // DmaData to 0x3022C does nothing here (skipped below): no need to wait.
             if (rasterizer && !PipelinedOpcode(opcode) &&
                 !(opcode == PM4ItOpcode::DmaData &&
@@ -1513,6 +1602,10 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
 
                 switch (nop->data_block[0]) {
                 case PM4CmdNop::PayloadType::PatchedFlip: {
+#ifdef __APPLE__
+                    BbFrameMarks::parsed.Note(0); // stop lines: the parser's flip frontier
+                    BbCmdData::flips_parsed.fetch_add(1, std::memory_order_relaxed);
+#endif
                     // There is no evidence that GPU CP drives flip events by parsing
                     // special NOP packets. For convenience lets assume that it does.
                     // bbport: after the writes before it (the buffer label: WriteData, which
@@ -1957,12 +2050,23 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
             case PM4ItOpcode::CopyData: {
                 const auto* copy_data = reinterpret_cast<const PM4CmdCopyData*>(header);
+#ifdef __APPLE__
+                // No form is implemented, and none was seen (the clinic frame has none): one
+                // that arrives stops, naming its form, rather than skipping its write.
+                UNREACHABLE_MSG("IT_COPY_DATA is not implemented: src_sel {}, dst_sel {}, "
+                                "count_sel {}, wr_confirm {}, engine_sel {}, src {:#x}, dst {:#x}",
+                                u32(copy_data->src_sel.Value()), u32(copy_data->dst_sel.Value()),
+                                copy_data->count_sel.Value(), copy_data->wr_confirm.Value(),
+                                u32(copy_data->engine_sel.Value()),
+                                copy_data->SrcAddress<u64>(), copy_data->DstAddress<u64>());
+#else
                 LOG_WARNING(Render,
                             "unhandled IT_COPY_DATA src_sel = {}, dst_sel = {}, "
                             "count_sel = {}, wr_confirm = {}, engine_sel = {}",
                             u32(copy_data->src_sel.Value()), u32(copy_data->dst_sel.Value()),
                             copy_data->count_sel.Value(), copy_data->wr_confirm.Value(),
                             u32(copy_data->engine_sel.Value()));
+#endif
                 break;
             }
             case PM4ItOpcode::MemSemaphore: {
@@ -2379,6 +2483,15 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             } else {
                 std::memcpy(&regs.reg_array[Regs::ShRegWordOffset + set_data->reg_offset],
                             header + 2, set_size);
+#ifdef __APPLE__
+                // Counted always: on the PS4 a compute ring has its own registers.
+                BbComputeSh::Note(vqid, set_data->reg_offset, header->type3.NumWords() - 1,
+                                  reinterpret_cast<const u32*>(header + 2));
+                // Provenance (BB_CMD_DATA_CHECK): a compute queue writing graphics registers.
+                if (BbCmdData::Enabled()) [[unlikely]] {
+                    NoteShWrite(header, reinterpret_cast<u64>(header), 0, s32(vqid));
+                }
+#endif
                 // bbport: interleaves with the graphics stream at an unpredictable point, so
                 // draw-preparation workers cannot reproduce it: make their checksums differ.
                 gfx_reg_checksum = HashRegisterPacket(gfx_reg_checksum ^ 0xA5C0A5C0A5C0ull,

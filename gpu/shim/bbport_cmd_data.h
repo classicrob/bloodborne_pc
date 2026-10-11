@@ -299,18 +299,43 @@ inline void ReadStatus(Result& r) {
 using LookupFn = Result (*)(void* owner, std::uint64_t address, std::uint64_t size,
                             const void* bytes_read);
 
+/// Where a table pointer came from: the user-data word holding it, if that word is in the GPU
+/// command thread's register file, and the SET_SH_REG that last wrote it while the check ran.
+struct PointerOrigin {
+    bool in_register_file = false;
+    bool written = false;             ///< a SET_SH_REG wrote it since the check started
+    std::uint64_t packet = 0;         ///< that packet's guest address
+    std::uint64_t submission = 0;     ///< its submission (0: none known)
+    std::uint64_t flips_parsed = 0;   ///< flip packets parsed when it was written
+    std::int32_t compute_queue = -1;  ///< the writer was this compute queue's SET_SH_REG
+};
+/// Our own latest write over the table's bytes, if a recent DUMP_CONST_RAM made one.
+struct DumpOrigin {
+    bool found = false;
+    std::uint64_t dst = 0, bytes = 0, submission = 0, flips_parsed = 0;
+};
+/// The owner's provenance lookup (Liverpool): `pointer_word` is the low user-data word of the
+/// 64-bit table pointer (nullptr: none; the high word follows it), [address, address + size)
+/// the table bytes read. `flips_now` is the flip sample of this read, taken under the owner's
+/// lock so that no recorded origin is newer than it.
+using OriginFn = void (*)(void* owner, const void* pointer_word, std::uint64_t address,
+                          std::uint64_t size, PointerOrigin& low, PointerOrigin& high,
+                          DumpOrigin& dump, std::uint64_t& flips_now);
+
 namespace detail {
 // Lifetime: a lookup holds `registry` shared for its whole use of the owner, so Unregister
 // (exclusive) returns only once no lookup uses it, and none starts after. Order: registry, then
 // the owner's locks; the owner must not hold its locks while unregistering.
 inline std::shared_mutex registry;
 inline LookupFn lookup_fn = nullptr;
+inline OriginFn origin_fn = nullptr;
 inline void* lookup_owner = nullptr;
 } // namespace detail
 
-inline void Register(LookupFn fn, void* owner) {
+inline void Register(LookupFn fn, OriginFn origin, void* owner) {
     std::unique_lock lk{detail::registry};
     detail::lookup_fn = fn;
+    detail::origin_fn = origin;
     detail::lookup_owner = owner;
 }
 
@@ -319,6 +344,7 @@ inline void Unregister(void* owner) {
     std::unique_lock lk{detail::registry};
     if (detail::lookup_owner == owner) {
         detail::lookup_fn = nullptr;
+        detail::origin_fn = nullptr;
         detail::lookup_owner = nullptr;
     }
 }
@@ -328,6 +354,17 @@ inline Result Lookup(std::uint64_t address, std::uint64_t size, const void* byte
     std::shared_lock lk{detail::registry};
     return detail::lookup_fn ? detail::lookup_fn(detail::lookup_owner, address, size, bytes_read)
                              : Result{};
+}
+
+/// Provenance through the registered owner (nothing known when none).
+inline void LookupOrigin(const void* pointer_word, std::uint64_t address, std::uint64_t size,
+                         PointerOrigin& low, PointerOrigin& high, DumpOrigin& dump,
+                         std::uint64_t& flips_now) {
+    std::shared_lock lk{detail::registry};
+    if (detail::origin_fn) {
+        detail::origin_fn(detail::lookup_owner, pointer_word, address, size, low, high, dump,
+                          flips_now);
+    }
 }
 
 /// One-line description of a result (no guest memory access).
@@ -437,16 +474,27 @@ struct Observation {
     const char* kind = nullptr;
     std::uint64_t shader = 0, address = 0, size = 0;
     Result result;
+    PointerOrigin pointer, pointer_high; ///< the table pointer's low and high words
+    DumpOrigin dump;
+    std::uint64_t flips_parsed = 0; ///< flip packets parsed at the read
 };
 inline thread_local Observation last;
 
-/// One parse-time read of `size` bytes at `address`, whose bytes as read are `bytes_read`.
+/// Flip packets the GPU command thread has parsed (set by the owner), the frame clock of
+/// provenance. Counted always.
+inline std::atomic<std::uint64_t> flips_parsed{0};
+
+/// One parse-time read of `size` bytes at `address`, whose bytes as read are `bytes_read`;
+/// `pointer_word` is the user-data word the table pointer was read from (nullptr: none).
 inline void NoteRead(const char* kind, std::uint64_t shader_hash, const void* address,
-                     std::size_t size, const void* bytes_read) {
+                     std::size_t size, const void* bytes_read,
+                     const void* pointer_word = nullptr) {
     const auto at = reinterpret_cast<std::uint64_t>(address);
     Result r = Lookup(at, size, bytes_read);
     ReadStatus(r);
-    last = {kind, shader_hash, at, size, r};
+    last = {kind, shader_hash, at, size, r, {}, {}, {}, flips_parsed.load(std::memory_order_relaxed)};
+    LookupOrigin(pointer_word, at, size, last.pointer, last.pointer_high, last.dump,
+                 last.flips_parsed);
     const bool notable = (r.where == Where::Inside && r.selected_differs) ||
                          r.where == Where::ChunkTail || r.where == Where::Straddles;
     std::scoped_lock lk{detail::mutex};
@@ -485,8 +533,16 @@ inline void ForgetLastRead() {
     last.kind = nullptr;
 }
 
+/// The guest mapping holding an address: [start, end), whether it is mapped (false: a gap
+/// [start, end) between mappings), and how many other guest mappings view the same backing
+/// byte (-1: not tracked). Set by the owner (Liverpool, runtime_memory_region and
+/// runtime_memory_alias_snapshot); mapping-table queries, not guest memory reads.
+using RegionFn = bool (*)(std::uint64_t address, std::uint64_t& start, std::uint64_t& end,
+                          bool& mapped, long long& aliases);
+inline std::atomic<RegionFn> region_lookup{nullptr};
+
 /// For a stop: this thread's latest instrumented read for the current descriptor, as observed
-/// then. Empty when off.
+/// then, and the guest mapping holding it now. Empty when off.
 inline std::string LastRead() {
     if (!Enabled()) {
         return {};
@@ -502,7 +558,92 @@ inline std::string LastRead() {
                   last.kind, static_cast<unsigned long long>(last.shader),
                   static_cast<unsigned long long>(last.address),
                   static_cast<unsigned long long>(last.size));
-    return text + Describe(last.result);
+    std::string out = text + Describe(last.result);
+    char origin[640];
+    // Frames between an origin and this read; origins are recorded under the owner's lock the
+    // read's flip sample was taken under, so none should be newer: say so if one is.
+    const auto age = [](std::uint64_t then, std::uint64_t now) {
+        char text[192];
+        if (then > now) {
+            std::snprintf(text, sizeof(text), "after this read's frame sample");
+        } else {
+            std::snprintf(text, sizeof(text), "%llu flip packet(s) before this read%s",
+                          static_cast<unsigned long long>(now - then),
+                          now == then ? " (this frame)"
+                                      : " (an EARLIER frame: retained state is a candidate, not "
+                                        "by itself a defect)");
+        }
+        return std::string(text);
+    };
+    const auto writer = [](const PointerOrigin& p) {
+        char text[64] = "the graphics stream";
+        if (p.compute_queue >= 0) {
+            std::snprintf(text, sizeof(text), "compute queue %d", p.compute_queue);
+        }
+        return std::string(text);
+    };
+    const auto& p = last.pointer;
+    if (!p.in_register_file) {
+        std::snprintf(origin, sizeof(origin),
+                      "; its table pointer is not a tracked graphics user-data register (a host "
+                      "snapshot such as stage B or draw preparation, compute queue state, or a "
+                      "spilled slot; not by itself proof of a spill)");
+    } else if (!p.written) {
+        std::snprintf(origin, sizeof(origin),
+                      "; its table pointer (low word) was not written by any tracked SET_SH_REG "
+                      "since the check started (state older than the check)");
+    } else {
+        std::snprintf(origin, sizeof(origin),
+                      "; its table pointer (low word) was last written by a SET_SH_REG of %s at "
+                      "%#llx (submission %llu), %s",
+                      writer(p).c_str(), static_cast<unsigned long long>(p.packet),
+                      static_cast<unsigned long long>(p.submission),
+                      age(p.flips_parsed, last.flips_parsed).c_str());
+    }
+    out += origin;
+    const auto& h = last.pointer_high;
+    if (p.in_register_file &&
+        (h.written != p.written || h.packet != p.packet || h.compute_queue != p.compute_queue)) {
+        if (!h.written) {
+            std::snprintf(origin, sizeof(origin),
+                          "; its high word was not written by any tracked SET_SH_REG");
+        } else {
+            std::snprintf(origin, sizeof(origin),
+                          "; its high word was written separately, by a SET_SH_REG of %s at "
+                          "%#llx (submission %llu), %s",
+                          writer(h).c_str(), static_cast<unsigned long long>(h.packet),
+                          static_cast<unsigned long long>(h.submission),
+                          age(h.flips_parsed, last.flips_parsed).c_str());
+        }
+        out += origin;
+    }
+    if (last.dump.found) {
+        std::snprintf(origin, sizeof(origin),
+                      "; our newest observed DUMP_CONST_RAM overlapping the table bytes (not "
+                      "necessarily their last writer: CPU and other writes are not tracked) went "
+                      "to [%#llx, +%llu) (submission %llu), %s",
+                      static_cast<unsigned long long>(last.dump.dst),
+                      static_cast<unsigned long long>(last.dump.bytes),
+                      static_cast<unsigned long long>(last.dump.submission),
+                      age(last.dump.flips_parsed, last.flips_parsed).c_str());
+        out += origin;
+    }
+    std::uint64_t start = 0, end = 0;
+    bool mapped = false;
+    long long aliases = -1;
+    if (const RegionFn fn = region_lookup.load(std::memory_order_acquire);
+        fn && fn(last.address, start, end, mapped, aliases)) {
+        char region[192];
+        std::snprintf(region, sizeof(region),
+                      "; at the stop it lies in %s [%#llx, %#llx) (%llu KiB), %s%lld other guest "
+                      "mapping(s) of the same backing",
+                      mapped ? "guest mapping" : "the unmapped gap",
+                      static_cast<unsigned long long>(start), static_cast<unsigned long long>(end),
+                      static_cast<unsigned long long>((end - start) >> 10),
+                      aliases < 0 ? "untracked: " : "", aliases < 0 ? 0 : aliases);
+        out += region;
+    }
+    return out;
 }
 
 } // namespace BbCmdData

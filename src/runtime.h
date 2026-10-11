@@ -57,12 +57,6 @@ typedef struct { const char *name; void *function; } RuntimeExport;
 const char *runtime_symbol(const char *nid);
 uintptr_t runtime_lookup(const RuntimeExport *table, size_t count, const char *nid);
 uintptr_t runtime_kernel_resolve(const char *name);
-/* Whether `function` is the runtime's sceKernelUsleep or usleep (the movie handoff's check). */
-int runtime_kernel_is_usleep(uintptr_t function);
-/* BB_MOVIE_HANDOFF (runtime_movie_handoff.c): checks the loaded image once relocated and patched;
- * the usleep implementations report each sleep's return slot. */
-void runtime_movie_handoff_configure(const unsigned char *image, uint64_t size);
-void runtime_movie_handoff_after_sleep(const uintptr_t *return_slot);
 uintptr_t runtime_file_resolve(const char *name);
 uintptr_t runtime_services_resolve(const char *name);
 void runtime_file_report(void);

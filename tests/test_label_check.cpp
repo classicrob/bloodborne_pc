@@ -22,6 +22,8 @@
 #include "bbport_label_mode.h"
 #include "bbport_label_store.h"
 #include "bbport_parse_split.h"
+#include "bbport_compute_sh.h"
+#include "bbport_frame_marks.h"
 #include "bbport_label_sequencer.h"
 
 namespace {
@@ -382,6 +384,56 @@ int main() {
         Expect("  ... the stop's latest-read text comes from the observation, not a re-read",
                text.find("latest instrumented read: ud table") != std::string::npos &&
                    text.find("DIFFERS") != std::string::npos);
+        // The stop names the guest mapping holding the read (a mapping-table query, faked here).
+        region_lookup.store([](std::uint64_t, std::uint64_t& lo, std::uint64_t& hi, bool& mapped,
+                               long long& aliases) {
+            lo = 0x7043000000;
+            hi = 0x704b000000;
+            mapped = true;
+            aliases = 1;
+            return true;
+        });
+        last.flips_parsed = 7;
+        last.pointer = {true, true, 0x7039500100, 41, 5};
+        last.pointer_high = last.pointer;
+        last.dump = {true, 0x70437a7200, 0x100, 40, 6};
+        const std::string named = LastRead();
+        last.pointer_high = {true, true, 0x7039500180, 41, 6};
+        last.dump = {true, 0x70437a7200, 0x100, 40, 9}; // recorded after the read's sample
+        const std::string split = LastRead();
+        last.pointer_high = last.pointer;
+        last.dump = {true, 0x70437a7200, 0x100, 40, 6};
+        last.pointer = {true, true, 0x7039500200, 0, 7, 3};
+        last.pointer_high = last.pointer;
+        const std::string from_compute = LastRead();
+        last.pointer = {true, false, 0, 0, 0};
+        last.pointer_high = last.pointer;
+        last.dump = {};
+        const std::string unwritten = LastRead();
+        last.pointer = {};
+        const std::string elsewhere = LastRead();
+        region_lookup.store(nullptr);
+        Expect("  ... the stop says which SET_SH_REG last wrote the table pointer and how long ago, "
+               "and any DUMP_CONST_RAM of ours over the bytes",
+               named.find("(low word) was last written by a SET_SH_REG of the graphics stream "
+                          "at 0x7039500100 (submission 41), 2 flip packet(s) before this read "
+                          "(an EARLIER frame") != std::string::npos &&
+                   from_compute.find("a SET_SH_REG of compute queue 3 at") != std::string::npos &&
+                   named.find("went to [0x70437a7200, +256) (submission 40), 1 flip "
+                              "packet(s) before") != std::string::npos &&
+                   named.find("high word") == std::string::npos &&
+                   split.find("high word was written separately, by a SET_SH_REG of the "
+                              "graphics stream at 0x7039500180") != std::string::npos &&
+                   split.find("after this read's frame sample") != std::string::npos &&
+                   named.find("retained state is a candidate, not by itself a defect)") !=
+                       std::string::npos &&
+                   unwritten.find("not written by any tracked SET_SH_REG since the check "
+                                  "started") != std::string::npos &&
+                   elsewhere.find("not a tracked graphics user-data register") !=
+                       std::string::npos);
+        Expect("  ... the stop names the guest mapping holding the read and its other views",
+               named.find("guest mapping [0x7043000000, 0x704b000000) (131072 KiB), 1 other") !=
+                   std::string::npos);
         ForgetLastRead();
         Expect("  ... after a new descriptor starts, a stop names no earlier read",
                LastRead().find("no instrumented read for this descriptor") != std::string::npos);
@@ -400,7 +452,7 @@ int main() {
             r.where = Where::Inside;
             return r;
         };
-        Register(blocking, &owner_object);
+        Register(blocking, nullptr, &owner_object);
         Result in_flight;
         std::thread reader([&] { in_flight = Lookup(1, 1, copy_a); });
         while (!entered.load()) {
@@ -517,6 +569,28 @@ int main() {
         Expect("  ... a scope open across a yield stops",
                WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT);
     }
+
+    {
+        const std::uint32_t vs_pointer[2] = {0x43400040, 0x70};
+        BbComputeSh::Note(2, 0x4E, 2, vs_pointer); // VS user data s[2:3]
+        BbComputeSh::Note(2, 0x260, 1, vs_pointer); // above the compute program (0x200..0x250)
+        Expect("compute SET_SH_REG: writes into graphics user data are counted and named",
+               BbComputeSh::IsGraphicsUserData(0x4E) && !BbComputeSh::IsGraphicsUserData(0x4B) &&
+                   !BbComputeSh::IsGraphicsUserData(0x15C) && BbComputeSh::into_graphics == 1 &&
+                   BbComputeSh::into_user_data == 1 && BbComputeSh::above_compute == 1 &&
+                   BbComputeSh::Describe().find("into graphics user data 1, latest: queue 2, SH "
+                                                "0x4e, 2 word(s), first 0x43400040") !=
+                       std::string::npos);
+    }
+    BbFrameMarks::attempted.Note(12);
+    BbFrameMarks::attempted.Note(13);
+    BbFrameMarks::parsed.Note(0);
+    BbFrameMarks::prepared.Note(12);
+    BbFrameMarks::published.Note(11);
+    Expect("frame marks: the stop line gives each side's flip count and latest argument",
+           BbFrameMarks::Describe().find("guest API calls 2 (latest arg 13), flip packets parsed "
+                                         "1, flip preparation entered 1 (latest arg 12), status "
+                                         "published 1 (latest arg 11)") != std::string::npos);
 
     std::fprintf(stderr, "%s: %u failures\n", failures ? "FAIL" : "PASS", failures);
     return failures ? 1 : 0;
