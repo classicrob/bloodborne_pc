@@ -4,6 +4,7 @@
 #include "bbport_toggles.h"
 #include <algorithm>
 #include <bit>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
@@ -36,6 +37,29 @@ u64 RoundAllocationSize(u64 size) {
     return Common::AlignUp(size, step);
 }
 
+#ifdef __APPLE__
+/// StagingReleaseAtRequest (diagnostic A/B): the release before 6850bc0.
+bool ReleaseAtRequest() {
+    static const bool whole_run = [] {
+        const char* env = std::getenv("BB_STAGING_RELEASE_AT_REQUEST");
+        const bool on = env && env[0] == '1';
+        if (on) {
+            std::fprintf(stderr, "\n*** BB_STAGING_RELEASE_AT_REQUEST=1: DIAGNOSTIC MODE. Staging "
+                                 "buffers are released at their request tick (before 6850bc0); "
+                                 "one may be reused before its last use. ***\n\n");
+        }
+        return on;
+    }();
+    const bool on = whole_run || BbToggle::Disabled(BbToggle::StagingReleaseAtRequest);
+    static bool logged = false;
+    if (on != logged) {
+        std::fprintf(stderr, "Staging release: %s\n",
+                     on ? "at request tick (diagnostic, before 6850bc0)" : "after last use");
+        logged = on;
+    }
+    return on;
+}
+#endif
 } // Anonymous namespace
 
 StagingBufferPool::StagingBufferPool(const Instance& instance_, Scheduler& scheduler_)
@@ -60,6 +84,16 @@ StagingBufferPool::~StagingBufferPool() = default;
 StagingBufferRef StagingBufferPool::Request(u64 size, MemoryType type, u64 alignment,
                                             bool deferred, bool retire) {
     std::scoped_lock lk{mutex};
+#ifdef __APPLE__
+    if (retire && ReleaseAtRequest()) {
+        // Released now, as before 6850bc0; Retire then finds it here and does nothing.
+        const StagingBufferRef ref = deferred || size > BLOCK_SIZE
+                                         ? RequestLarge(size, type, deferred, false)
+                                         : RequestFromRing(rings[u32(type)], size, alignment, type);
+        released_at_request.push_back({ref.buffer, ref.offset, 0});
+        return ref;
+    }
+#endif
     Ring& ring = rings[u32(type)];
     if (deferred || size > BLOCK_SIZE) {
         return RequestLarge(size, type, deferred, retire);
@@ -171,6 +205,14 @@ void StagingBufferPool::FreeDeferred(const StagingBufferRef& ref) {
 void StagingBufferPool::Retire(const VideoCore::Buffer* buffer, u64 offset) {
     {
         std::scoped_lock lk{mutex};
+        const auto released_it =
+            std::ranges::find_if(released_at_request, [&](const RingRetire& entry) {
+                return entry.buffer == buffer && entry.offset == offset;
+            });
+        if (released_it != released_at_request.end()) {
+            released_at_request.erase(released_it); // StagingReleaseAtRequest: nothing to do
+            return;
+        }
         const auto ring_it = std::ranges::find_if(ring_retires, [&](const RingRetire& entry) {
             return entry.buffer == buffer && entry.offset == offset;
         });

@@ -105,6 +105,8 @@ private:
         u64 tick;
     };
     std::vector<RingRetire> ring_retires;
+    /// bbport: `retire` allocations released at their request (StagingReleaseAtRequest A/B).
+    std::vector<RingRetire> released_at_request;
     /// bbport: FreeDeferred runs on the priority runner, Retire's marker on the recording
     /// thread, the rest on the thread recording commands.
     std::mutex mutex;
