@@ -199,6 +199,7 @@ void CameraMotion::RecordMotion(vk::CommandBuffer cmdbuf, vk::ImageView depth_vi
         // (tools/macos/motion_agree.py). The upscaler then sees no object vectors.
         .mode = object_valid && !camera_only ? 1u : 0u,
     };
+    last_record = {push.proj[2], push.mode, camera_only, object_valid};
     const vk::DescriptorImageInfo depth_info{.imageView = depth_view,
                                              .imageLayout = vk::ImageLayout::eGeneral};
     const vk::DescriptorImageInfo motion_info{.imageView = motion_view,

@@ -54,6 +54,9 @@ FfxVkPortableImage Describe(vk::Image image, vk::Format format, u32 width, u32 h
 /// the upscaler's images of the next BB_DUMP_FRAMES (8) frames as raw files
 /// <dir>/fNNN_<name>_<w>x<h>_<format>.raw, for checking temporal stability offline.
 /// Returns the frame number to dump, or -1.
+/// The dump session (one per consumed trigger): microseconds since the epoch at the trigger.
+u64 dump_session = 0;
+
 int DumpFrame() {
     static const char* trigger = std::getenv("BB_DUMP_TRIGGER");
     static int remaining = 0, index = 0, polls = 0;
@@ -67,6 +70,9 @@ int DumpFrame() {
         const char* frames = std::getenv("BB_DUMP_FRAMES");
         remaining = frames ? std::max(1, std::atoi(frames)) : 8;
         index = 0;
+        dump_session = u64(std::chrono::duration_cast<std::chrono::microseconds>(
+                               std::chrono::system_clock::now().time_since_epoch())
+                               .count());
     }
     --remaining;
     return index++;
@@ -82,12 +88,17 @@ struct DumpImage {
 
 /// Copies `images` into host buffers after the commands recorded so far and writes them to
 /// files once the GPU is done.
-void DumpImages(const Instance& instance, Scheduler& scheduler, vk::CommandBuffer cmdbuf,
-                int frame, std::initializer_list<DumpImage> images) {
+const std::string& DumpDir() {
     static const std::string dir = [] {
         const char* env = std::getenv("BB_DUMP_DIR");
         return std::string{env && env[0] ? env : "out/dump"};
     }();
+    return dir;
+}
+
+void DumpImages(const Instance& instance, Scheduler& scheduler, vk::CommandBuffer cmdbuf,
+                int frame, std::initializer_list<DumpImage> images) {
+    const std::string& dir = DumpDir();
     const vk::MemoryBarrier2 before{
         .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
         .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
@@ -1649,6 +1660,21 @@ void TemporalUpscaler::RunScaled() {
             reset = false;
             dispatched_last_frame = true;
             if (const int dump = DumpFrame(); dump >= 0) {
+                // Provenance of the motion dump: what the camera motion pass did this frame.
+                const auto record = camera_motion.LastRecord();
+                char meta_path[512];
+                std::snprintf(meta_path, sizeof(meta_path), "%s/f%03d_meta.json",
+                              DumpDir().c_str(), dump);
+                if (FILE* meta = std::fopen(meta_path, "w")) {
+                    std::fprintf(meta,
+                                 "{\"session\": %llu, \"frame\": %d, \"motion_size\": [%u, %u], "
+                                 "\"camera_only\": %s, \"mode\": %u, \"object_valid\": %s, "
+                                 "\"proj_z\": %.9g}\n",
+                                 (unsigned long long)dump_session, dump, w, h,
+                                 record.camera_only ? "true" : "false", record.mode,
+                                 record.object_valid ? "true" : "false", record.proj_z);
+                    std::fclose(meta);
+                }
                 DumpImages(instance, scheduler, cmdbuf, dump,
                            {{color_image, source_width, source_height, 4, "input", "rgba"},
                             {vk::Image(motion_image), w, h, 4, "motion", "rg16f"},
