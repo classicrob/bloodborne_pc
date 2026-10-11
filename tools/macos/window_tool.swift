@@ -2,6 +2,7 @@
 //   window_tool window <pid>   prints the CGWindowID of the largest on-screen layer-0 window
 //                              owned by <pid>; exits 2 when there is none.
 //   window_tool diff <a> <b>   prints the fraction of changed pixels (largest channel delta > 24).
+//   window_tool screen         prints the main display's size in points as WxH.
 //   window_tool stats <png>    prints JSON image statistics: width, height, the fraction of
 //                              pixels with any RGB channel above 16, the mean luma (0..255) and
 //                              the fraction of strongly saturated pixels (max - min channel > 96).
@@ -15,7 +16,12 @@ func fail(_ message: String, _ code: Int32) -> Never {
 }
 
 let args = CommandLine.arguments
-guard args.count >= 3 else { fail("usage: window_tool window <pid> | stats <png> | diff <a> <b>", 64) }
+if args.count == 2 && args[1] == "screen" {
+    let b = CGDisplayBounds(CGMainDisplayID())
+    print("\(Int(b.width))x\(Int(b.height))")
+    exit(0)
+}
+guard args.count >= 3 else { fail("usage: window_tool window <pid> | stats <png> | diff <a> <b> | screen", 64) }
 
 switch args[1] {
 case "window":
