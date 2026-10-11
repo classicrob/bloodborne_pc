@@ -269,6 +269,7 @@ if [[ ${1:-} == --test ]]; then
         sh tests/test_audio_macos.sh
         sh tests/test_guest_heap_lock_macos.sh
         sh tests/test_low_map_trace_macos.sh
+        sh tests/test_perf_summary.sh
         sh tests/test_guest_entry_macos.sh
         sh tests/test_cpu_profile_macos.sh
         sh tests/test_hle_trace_macos.sh

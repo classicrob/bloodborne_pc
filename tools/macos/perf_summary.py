@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Summarize a BB_PERF JSONL file (docs/macos/perf.md): one line per 5 s window, then totals.
 
-  perf_summary.py [--after-line N] perf.jsonl
---after-line N summarizes only windows written after the first N lines (a held stage).
+  perf_summary.py [--after-line N] [--before-line M] perf.jsonl
+--after-line N summarizes only windows written after the first N lines (a held stage);
+--before-line M only windows within the first M lines (a segment of it).
 Fails when the file has no schema record or no window in range."""
 import json
 import sys
@@ -15,15 +16,19 @@ def p(metrics, name, key):
 
 def main():
     args = sys.argv[1:]
-    after = 0
-    if len(args) == 3 and args[0] == '--after-line' and args[1].isdigit():
-        after, args = int(args[1]), args[2:]
+    after, before = 0, None
+    while len(args) >= 3 and args[0] in ('--after-line', '--before-line') and args[1].isdigit():
+        if args[0] == '--after-line':
+            after = int(args[1])
+        else:
+            before = int(args[1])
+        args = args[2:]
     if len(args) != 1:
         sys.exit(__doc__)
     lines = [line for line in open(args[0]) if line.strip()]
     records = [json.loads(line) for line in lines]
     schema = [r for r in records if r.get('type') == 'schema']
-    windows = [r for r in records[after:] if r.get('type') == 'window']
+    windows = [r for r in records[after:before] if r.get('type') == 'window']
     if len(schema) != 1 or schema[0].get('version') != 3:
         sys.exit('perf_summary: expected exactly one version-3 schema record')
     if not windows:
