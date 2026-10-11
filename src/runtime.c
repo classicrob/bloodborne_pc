@@ -163,8 +163,24 @@ static ABI __attribute__((noreturn)) void stack_fail(void) {
 static ABI void *guest_memset(void *dst, int value, size_t size) {
     atomic_fetch_add_explicit(&memory_calls,1,memory_order_relaxed); return memset(dst, value, size);
 }
-static ABI void *guest_memcpy(void *dst, const void *src, size_t size) {
-    atomic_fetch_add_explicit(&memory_calls,1,memory_order_relaxed); return memcpy(dst, src, size);
+#ifdef __APPLE__
+/* Overlapping guest memcpy is undefined in C, and the host's memcpy here is not the PS4 libc's.
+ * Reported (the copy itself is unchanged): two live guest objects overlapping, a heap block
+ * handed out twice, show up here first. */
+static _Atomic size_t memcpy_overlaps;
+#endif
+static ABI __attribute__((noinline)) void *guest_memcpy(void *dst, const void *src, size_t size) {
+    atomic_fetch_add_explicit(&memory_calls,1,memory_order_relaxed);
+#ifdef __APPLE__
+    const uintptr_t d = (uintptr_t)dst, s = (uintptr_t)src;
+    if (size && d != s && (d >= s ? d - s < size : s - d < size)) {
+        size_t n = atomic_fetch_add_explicit(&memcpy_overlaps,1,memory_order_relaxed) + 1;
+        if (n <= 16 || (n & 1023) == 0)
+            fprintf(stderr, "Runtime: overlapping guest memcpy #%zu: dst %p src %p size %zu, caller %p\n",
+                    n, dst, src, size, __builtin_return_address(0));
+    }
+#endif
+    return memcpy(dst, src, size);
 }
 static ABI void *guest_memmove(void *dst, const void *src, size_t size) {
     atomic_fetch_add_explicit(&memory_calls,1,memory_order_relaxed); return memmove(dst, src, size);
