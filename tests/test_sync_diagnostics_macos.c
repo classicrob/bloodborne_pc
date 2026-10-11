@@ -13,6 +13,9 @@ typedef int32_t (ABI *Pair)(void **, void **);
 #define MUTEX(type, nid) ((type)runtime_mutex_resolve(nid))
 #define RW(type, nid) ((type)runtime_rwlock_resolve(nid))
 #define INVALID UINT32_C(0x80020016)
+/* runtime_hle_trace.c (linked for the cond wake check's caller) reads the guest errno. */
+static _Thread_local int32_t guest_error;
+int32_t *runtime_errno(void) { return &guest_error; }
 uintptr_t runtime_lookup(const RuntimeExport *table, size_t count, const char *name) {
     for (size_t i = 0; i < count; ++i)
         if (!strcmp(table[i].name, name)) return (uintptr_t)table[i].function;

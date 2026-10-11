@@ -361,6 +361,7 @@ if [[ ${1:-} == --test || ${1:-} == --test-dry ]]; then
         t bash tests/test_savedata_macos.sh
         t bash tests/test_heavy.sh
         t sh tests/test_sync_diagnostics_macos.sh
+        t sh tests/test_cond_wake_check_macos.sh
         t python3 tests/test_restart_macos.py
         # Last: every test file under tests/ is run above or excluded with a reason.
         python3 tools/macos/check_test_wiring.py

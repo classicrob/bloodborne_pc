@@ -1,6 +1,7 @@
 /* Linux pthread-backed opaque PS4 mutex handles. No guest threads yet. */
 #define _GNU_SOURCE
 #include "runtime.h"
+#include "runtime_hle_trace.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -125,9 +126,81 @@ static ABI int32_t mutex_timedlock(GuestMutex **mutex, uint32_t usec) {
     return e;
 }
 /* Condition variables: opaque handles over host pthread_cond (CLOCK_REALTIME,
- * like FreeBSD's default), sharing the host mutex behind GuestMutex. */
-typedef struct { pthread_cond_t native; } GuestCond;
+ * like FreeBSD's default), sharing the host mutex behind GuestMutex.
+ * `notified` counts signal/broadcast attempts on this cond (BB_COND_WAKE_CHECK). */
+typedef struct { pthread_cond_t native; uint64_t id; _Atomic uint64_t notified; } GuestCond;
 static _Atomic size_t conds, waits, wakeups;
+
+/* BB_COND_WAKE_CHECK=1 (macOS diagnostic; waits behave the same either way): a wait that
+ * returns success although no signal or broadcast was attempted on its cond since it started
+ * is an "unnotified wake candidate" (a host spurious wake, e.g. psynch interrupted by a signal).
+ * A changed count does not prove this waiter was the one woken: one signal can overlap several
+ * waiters. Nothing is enrolled per waiter (a cancelled wait leaves nothing behind) and no
+ * diagnostic lock is held across a wait. */
+static int wake_check;
+static pthread_once_t wake_check_once=PTHREAD_ONCE_INIT;
+static _Atomic uint64_t cond_ids, checked_waits, unnotified, failed_notifications;
+static void wake_check_configure(void) {
+    const char *setting=getenv("BB_COND_WAKE_CHECK");
+    if (!setting || !*setting || !strcmp(setting,"0")) return;
+    if (strcmp(setting,"1")) { fprintf(stderr,"STOP: BB_COND_WAKE_CHECK must be 0 or 1\n"); abort(); }
+#ifdef __APPLE__
+    wake_check=1;
+    printf("Runtime: BB_COND_WAKE_CHECK=1: reporting condition waits that return without a "
+           "signal or broadcast on their cond\n");
+    fflush(stdout);
+#else
+    fprintf(stderr,"STOP: BB_COND_WAKE_CHECK is implemented on macOS only\n"); abort();
+#endif
+}
+static int wake_checking(void) { pthread_once(&wake_check_once,wake_check_configure); return wake_check; }
+#ifdef __APPLE__
+typedef struct { char thread[32]; uintptr_t caller; uint64_t cond, count; } UnnotifiedSite;
+static UnnotifiedSite unnotified_sites[64];
+static pthread_mutex_t unnotified_lock=PTHREAD_MUTEX_INITIALIZER;
+static void report_unnotified_sites_locked(void) {
+    printf("COND-UNNOTIFIED summary: %llu candidates in %llu checked successful waits; "
+           "%llu failed notifications\n",(unsigned long long)atomic_load(&unnotified),
+           (unsigned long long)atomic_load(&checked_waits),
+           (unsigned long long)atomic_load(&failed_notifications));
+    for (size_t i=0;i<64 && unnotified_sites[i].count;++i)
+        printf("  thread \"%s\" caller %#llx cond #%llu: %llu\n",unnotified_sites[i].thread,
+               (unsigned long long)unnotified_sites[i].caller,(unsigned long long)unnotified_sites[i].cond,
+               (unsigned long long)unnotified_sites[i].count);
+    fflush(stdout);
+}
+/* After a successful wait: a candidate if no notification was attempted since `before`. */
+static void note_wake(GuestCond *c, uint64_t before) {
+    atomic_fetch_add_explicit(&checked_waits,1,memory_order_relaxed);
+    const uint64_t after=atomic_load_explicit(&c->notified,memory_order_acquire);
+    if (after!=before) return;
+    const uint64_t n=atomic_fetch_add(&unnotified,1)+1;
+    const uintptr_t caller=sync_return_slot ? runtime_hle_trace_original_return(sync_return_slot) : 0;
+    char name[32]="";
+    pthread_getname_np(pthread_self(),name,sizeof(name));
+    static uint64_t last_summary_ns;
+    struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t);
+    const uint64_t now=(uint64_t)t.tv_sec*1000000000+(uint64_t)t.tv_nsec;
+    pthread_mutex_lock(&unnotified_lock);
+    for (size_t i=0;i<64;++i) {
+        UnnotifiedSite *s=&unnotified_sites[i];
+        if (!s->count) { snprintf(s->thread,sizeof(s->thread),"%s",name); s->caller=caller; s->cond=c->id; }
+        if (s->caller==caller && s->cond==c->id && !strcmp(s->thread,name)) { ++s->count; break; }
+    }
+    if (n<=32)
+        printf("COND-UNNOTIFIED candidate #%llu: thread \"%s\" caller %#llx cond #%llu, wait returned 0, "
+               "notifications before %llu after %llu\n",(unsigned long long)n,name,
+               (unsigned long long)caller,(unsigned long long)c->id,(unsigned long long)before,
+               (unsigned long long)after);
+    if (n==1 || now-last_summary_ns>UINT64_C(10000000000)) {
+        last_summary_ns=now;
+        report_unnotified_sites_locked();
+    }
+    pthread_mutex_unlock(&unnotified_lock);
+}
+#else
+static void note_wake(GuestCond *c, uint64_t before) { (void)c; (void)before; }
+#endif
 static ABI int32_t cond_init(GuestCond **out, void **attr, const char *name) {
     (void)attr; (void)name;
     if (!out) return orbis_error(EINVAL);
@@ -135,6 +208,8 @@ static ABI int32_t cond_init(GuestCond **out, void **attr, const char *name) {
     if (!c) return orbis_error(ENOMEM);
     int e = SYNC_NATIVE(pthread_cond_init(&c->native, NULL));
     if (e) { runtime_guest_free(c); return orbis_error(e); }
+    c->id = atomic_fetch_add_explicit(&cond_ids,1,memory_order_relaxed)+1;
+    atomic_init(&c->notified, 0);
     *out = c; atomic_fetch_add_explicit(&conds,1,memory_order_relaxed); return 0;
 }
 static int32_t ensure_cond(GuestCond **cond) {
@@ -162,14 +237,24 @@ static ABI int32_t cond_wait(GuestCond **cond, GuestMutex **mutex) {
     if (e) return e;
     if (!mutex || (uintptr_t)*mutex < 3) return orbis_error(EINVAL);
     atomic_fetch_add_explicit(&waits,1,memory_order_relaxed);
-    return orbis_error(SYNC_NATIVE(pthread_cond_wait(&(*cond)->native, &(*mutex)->native)));
+    GuestCond *c = *cond;
+    const int check = wake_checking();
+    const uint64_t before = check ? atomic_load_explicit(&c->notified,memory_order_acquire) : 0;
+    const int native = SYNC_NATIVE(pthread_cond_wait(&c->native, &(*mutex)->native));
+    if (check && !native) note_wake(c, before);
+    return orbis_error(native);
 }
 static int32_t cond_wait_until(GuestCond **cond, GuestMutex **mutex, const struct timespec *end) {
     int32_t e = ensure_cond(cond);
     if (e) return e;
     if (!mutex || (uintptr_t)*mutex < 3 || !end) return orbis_error(EINVAL);
     atomic_fetch_add_explicit(&waits,1,memory_order_relaxed);
-    return timed_error(SYNC_NATIVE(pthread_cond_timedwait(&(*cond)->native, &(*mutex)->native, end)));
+    GuestCond *c = *cond;
+    const int check = wake_checking();
+    const uint64_t before = check ? atomic_load_explicit(&c->notified,memory_order_acquire) : 0;
+    const int native = SYNC_NATIVE(pthread_cond_timedwait(&c->native, &(*mutex)->native, end));
+    if (check && !native) note_wake(c, before);
+    return timed_error(native);
 }
 static ABI int32_t cond_timedwait(GuestCond **cond, GuestMutex **mutex, uint32_t usec) {
     struct timespec end;
@@ -179,12 +264,21 @@ static ABI int32_t cond_timedwait(GuestCond **cond, GuestMutex **mutex, uint32_t
 static ABI int32_t cond_signal(GuestCond **cond) {
     int32_t e = ensure_cond(cond);
     if (e) return e;
-    atomic_fetch_add_explicit(&wakeups,1,memory_order_relaxed); return orbis_error(SYNC_NATIVE(pthread_cond_signal(&(*cond)->native)));
+    atomic_fetch_add_explicit(&wakeups,1,memory_order_relaxed);
+    /* Counted before the native wake, so a waiter it wakes never finds the count unchanged. */
+    if (wake_checking()) atomic_fetch_add_explicit(&(*cond)->notified,1,memory_order_release);
+    const int native = SYNC_NATIVE(pthread_cond_signal(&(*cond)->native));
+    if (native && wake_checking()) atomic_fetch_add_explicit(&failed_notifications,1,memory_order_relaxed);
+    return orbis_error(native);
 }
 static ABI int32_t cond_broadcast(GuestCond **cond) {
     int32_t e = ensure_cond(cond);
     if (e) return e;
-    atomic_fetch_add_explicit(&wakeups,1,memory_order_relaxed); return orbis_error(SYNC_NATIVE(pthread_cond_broadcast(&(*cond)->native)));
+    atomic_fetch_add_explicit(&wakeups,1,memory_order_relaxed);
+    if (wake_checking()) atomic_fetch_add_explicit(&(*cond)->notified,1,memory_order_release);
+    const int native = SYNC_NATIVE(pthread_cond_broadcast(&(*cond)->native));
+    if (native && wake_checking()) atomic_fetch_add_explicit(&failed_notifications,1,memory_order_relaxed);
+    return orbis_error(native);
 }
 /* PS4 struct timespec is {int64 sec, int64 nsec}, identical to Linux x86-64. */
 typedef struct { int64_t sec, nsec; } GuestTimespec;
@@ -279,5 +373,8 @@ void runtime_mutex_report(void) {
            atomic_load_explicit(&locks,memory_order_relaxed), atomic_load_explicit(&unlocks,memory_order_relaxed));
     printf("Runtime: condition variables created=%zu, waits=%zu, wakeups=%zu\n", atomic_load_explicit(&conds,memory_order_relaxed),
            atomic_load_explicit(&waits,memory_order_relaxed), atomic_load_explicit(&wakeups,memory_order_relaxed));
+#ifdef __APPLE__
+    if (wake_check) { pthread_mutex_lock(&unnotified_lock); report_unnotified_sites_locked(); pthread_mutex_unlock(&unnotified_lock); }
+#endif
 }
 
