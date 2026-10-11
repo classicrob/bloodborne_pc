@@ -18,6 +18,8 @@
 #endif
 #include <x86intrin.h>
 
+extern "C" std::uint64_t runtime_tsc_frequency(void);
+
 namespace BbWriteLog {
 namespace {
 struct Entry {
@@ -34,6 +36,10 @@ constexpr std::uint64_t Pattern = 0x0000005300000000ull;
 
 void Push(std::array<Entry, Size>& r, std::atomic<std::uint64_t>& h, const Entry& e) {
     r[h.fetch_add(1, std::memory_order_relaxed) % r.size()] = e;
+}
+/// Ages in seconds: the TSC rate the runtime measured (not a fixed 3 GHz; Rosetta's differs).
+double TscPerSecond() {
+    return double(runtime_tsc_frequency());
 }
 } // namespace
 
@@ -96,7 +102,7 @@ void DumpNear(std::uint64_t begin, std::uint64_t end, const char* why) {
         std::fprintf(stderr, "Write log: %s %s %#llx +%llu first %#llx tid %u, %.3f s before %s\n",
                      what, e.source < 6 ? sources[e.source] : "?", (unsigned long long)e.address,
                      (unsigned long long)e.size, (unsigned long long)e.first, e.tid,
-                     double(now - e.tsc) / 3.0e9, why);
+                     double(now - e.tsc) / TscPerSecond(), why);
     };
     const std::uint64_t n = head.load();
     const std::uint64_t oldest = n > Size ? n - Size : 0;
@@ -151,7 +157,7 @@ extern "C" void bbgpu_dump_guest_writes(void* ucontext) {
                      "Write log: %s %s %#llx +%llu first %#llx tid %u, %.3f s before the fault\n",
                      what, e.source < 6 ? sources[e.source] : "?", (unsigned long long)e.address,
                      (unsigned long long)e.size, (unsigned long long)e.first, e.tid,
-                     double(now - e.tsc) / 3.0e9);
+                     double(now - e.tsc) / TscPerSecond());
     };
     const std::uint64_t nh = hits_head.load();
     for (std::uint64_t i = nh > hits.size() ? nh - hits.size() : 0; i < nh; ++i) {
