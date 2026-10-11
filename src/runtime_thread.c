@@ -114,7 +114,7 @@ static void set_gs(void *base) {
 static void *tls_block_alloc(size_t size) {
     size_t alignment=tls_align<64 ? 64 : tls_align;
     if ((alignment&(alignment-1)) || size>SIZE_MAX-(alignment-1)) return NULL;
-    void *p=runtime_low_map(size+alignment-1,PROT_READ|PROT_WRITE);
+    void *p=runtime_low_map_named(size+alignment-1,PROT_READ|PROT_WRITE,"tls");
     if (!p) return NULL;
     return (void *)(((uintptr_t)p+alignment-1)&~(uintptr_t)(alignment-1));
 }
@@ -208,7 +208,7 @@ void runtime_thread_run_host(void (*entry)(void *),void *arg) {
     pthread_mutex_unlock(&hle_stack_lock);
     if (!stack) {
         stack=malloc(sizeof(*stack));
-        if (stack) stack->base=runtime_low_map(HLE_STACK_BYTES+HLE_STACK_GUARD,PROT_READ|PROT_WRITE);
+        if (stack) stack->base=runtime_low_map_named(HLE_STACK_BYTES+HLE_STACK_GUARD,PROT_READ|PROT_WRITE,"hle-stack");
         if (!stack || !stack->base || mprotect(stack->base,HLE_STACK_GUARD,PROT_NONE)) {
             fputs("STOP: cannot allocate/protect low HLE callback stack\n",stderr); abort();
         }
@@ -380,7 +380,7 @@ static int32_t create(GuestThread **out,ThreadAttr **attr_slot,GuestEntry entry,
      * guest code has no stack probes and would step over the guard page. */
     pthread_attr_setstacksize(&host,stack_bytes);
 #else
-    void *stack_memory=runtime_low_map(stack_bytes,PROT_READ|PROT_WRITE);
+    void *stack_memory=runtime_low_map_named(stack_bytes,PROT_READ|PROT_WRITE,"guest-stack");
 #ifdef __APPLE__
     int stack_error=stack_memory ? pthread_attr_setstack(&host,stack_memory,stack_bytes) : ENOMEM;
     if (stack_error) {

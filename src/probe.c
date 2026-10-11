@@ -63,7 +63,7 @@ static uint64_t read64(FILE *f) {
 }
 static size_t round_host_page(size_t size) { return (size + page_size - 1) & ~(page_size - 1); }
 static void *allocate(size_t size) {
-    void *low=runtime_low_map(size,PROT_READ|PROT_WRITE);
+    void *low=runtime_low_map_named(size,PROT_READ|PROT_WRITE,"image");
     if (low) return low;
 #ifdef __APPLE__
     fail("cannot allocate guest memory below 1 TiB");
@@ -740,7 +740,7 @@ static int probe_main(int argc, char **argv) {
 #else
     /* The guest main thread runs on a stack below 1 TiB like PS4 stacks. */
     enum { MAIN_STACK=8*1024*1024 };
-    unsigned char *stack=runtime_low_map(MAIN_STACK,PROT_READ|PROT_WRITE);
+    unsigned char *stack=runtime_low_map_named(MAIN_STACK,PROT_READ|PROT_WRITE,"main-stack");
     if (!stack) fail("cannot allocate guest main stack");
     enter_on_stack(image+entry,&params,(void *)guest_exit,stack+MAIN_STACK-64);
 #endif
