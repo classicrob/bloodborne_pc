@@ -318,8 +318,11 @@ def launch(args):
     if removed:
         print('play_route: not passed to the game: ' + ', '.join(removed), file=sys.stderr)
     # The game runs in a slot of the machine-wide playtest pool (tools/macos/heavy.sh: three
-    # games at once). The pool settings are read here; they never reach the game.
-    heavy = {k: os.environ[k] for k in ('BB_HEAVY_DIR', 'BB_HEAVY_PLAYTEST_SLOTS') if k in os.environ}
+    # games at once). The pool settings are read here; they never reach the game. A route started
+    # inside a heavy.sh hold (perf_run.sh holds a playtest slot and the GPU exclusively) passes the
+    # hold on, so the game's heavy.sh runs it directly instead of waiting for its own caller.
+    heavy = {k: os.environ[k] for k in ('BB_HEAVY_DIR', 'BB_HEAVY_PLAYTEST_SLOTS', 'BB_HEAVY_HELD',
+                                        'BB_HEAVY_GPU') if k in os.environ}
     running = translated_games()
     if len(running) >= 4:
         die(f'{len(running)} bb-probe processes are already running ({running}); the Rosetta limit is four')
