@@ -295,6 +295,19 @@ __attribute__((used,noinline)) uintptr_t runtime_hle_trace_leave(Saved *s,uintpt
     }
     *guest_errno=guest_saved;errno=host_errno;return c.ret;
 }
+uintptr_t runtime_hle_trace_original_return(const uintptr_t *slot) {
+    for(unsigned i=depth;i>0;i--) if(calls[i-1].slot==(uintptr_t)slot) return calls[i-1].ret;
+    if(*slot==(uintptr_t)runtime_hle_trace_return_bridge)die("a return bridge without its call record");
+    return *slot;
+}
+uintptr_t runtime_hle_trace_unwrap(uintptr_t pointer) {
+    pthread_mutex_lock(&import_lock);
+    for(unsigned i=0;i<import_count;i++) if(imports[i].thunk==pointer) {
+        pointer=imports[i].target;break;
+    }
+    pthread_mutex_unlock(&import_lock);
+    return pointer;
+}
 uintptr_t runtime_hle_trace_wrap(const char *nid,const char *symbol,uintptr_t target) {
     int saved=errno;
     pthread_once(&config_once,configure);errno=saved;
@@ -462,6 +475,8 @@ __asm__(
 uintptr_t runtime_hle_trace_wrap(const char *nid,const char *symbol,uintptr_t target) {
     (void)nid;(void)symbol;return target;
 }
+uintptr_t runtime_hle_trace_original_return(const uintptr_t *slot) { return *slot; }
+uintptr_t runtime_hle_trace_unwrap(uintptr_t pointer) { return pointer; }
 void runtime_hle_trace_dump(void) {}
 void runtime_hle_trace_frame(void) {}
 void runtime_hle_trace_summary(void) {}

@@ -115,8 +115,20 @@ static int sleep_ns(uint64_t ns) {
 #endif
     return 0;
 }
-static ABI int32_t kernel_usleep(uint32_t usec) { sleep_ns((uint64_t)usec*1000); return 0; }
-static ABI int32_t posix_usleep(uint32_t usec) { sleep_ns((uint64_t)usec*1000); return 0; }
+/* The return slot is read after the sleep: BB_MOVIE_HANDOFF matches the movie step's call. */
+static ABI int32_t kernel_usleep(uint32_t usec) {
+    sleep_ns((uint64_t)usec*1000);
+    runtime_movie_handoff_after_sleep((const uintptr_t *)__builtin_frame_address(0)+1);
+    return 0;
+}
+static ABI int32_t posix_usleep(uint32_t usec) {
+    sleep_ns((uint64_t)usec*1000);
+    runtime_movie_handoff_after_sleep((const uintptr_t *)__builtin_frame_address(0)+1);
+    return 0;
+}
+int runtime_kernel_is_usleep(uintptr_t function) {
+    return function==(uintptr_t)kernel_usleep || function==(uintptr_t)posix_usleep;
+}
 static ABI uint32_t posix_sleep(uint32_t seconds) { sleep_ns((uint64_t)seconds*1000000000); return 0; }
 static ABI int32_t posix_nanosleep(const GuestTimespec *rq,GuestTimespec *rem) {
     if (!rq || rq->nsec<0 || rq->nsec>=1000000000 || rq->sec<0) return fail_posix(EINVAL);
