@@ -29,6 +29,14 @@ struct GsEmulationStages {
     u32 run_length;     ///< index entries per output slot
 };
 
+/// BB_GS_SKIP_DRAWS=1, a diagnostic for bisecting rendering faults: ES/GS draws record nothing.
+/// Rendering is wrong by design while it is on; a banner at startup and counts every 600 flips
+/// and in each BB_FRAME_STATS window say so.
+bool GsSkipDraws();
+void GsSkipDrawsCount();     ///< a skipped draw
+void GsSkipDrawsOnFlip();    ///< every flip: prints the total every 600 flips
+void GsSkipDrawsOnWindow();  ///< each frame stats window: prints the window's count
+
 /// What the emulation does not reproduce for a pipeline (registers of an ES/GS draw), or null.
 const char* GsEmulationUnsupported(const AmdGpu::Regs& regs);
 

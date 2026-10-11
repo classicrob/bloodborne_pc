@@ -17,6 +17,9 @@
 #include "../../../../../src/runtime_hle_trace.h"
 #endif
 #include "video_core/renderer_vulkan/vk_frame_capture.h"
+#ifdef __APPLE__
+#include "video_core/renderer_vulkan/vk_gs_emulation.h"
+#endif
 #include "common/debug.h"
 #include "common/thread.h"
 #include "core/debug_state.h"
@@ -311,6 +314,9 @@ void VideoOutDriver::Flip(const Request& req) {
     Vulkan::FrameCapture::OnFlip(req.index >= 0 ? req.port->buffer_slots[req.index].address_left
                                                 : 0);
 
+#ifdef __APPLE__
+    Vulkan::GsSkipDrawsOnFlip();
+#endif
     // bbport: BB_FRAME_STATS=1 prints flip rate and frame time spread every 5 seconds.
     static const bool frame_stats = EmulatorSettingsImpl::Flag("BB_FRAME_STATS", false);
     if (frame_stats) {
@@ -470,6 +476,9 @@ void VideoOutDriver::Flip(const Request& req) {
                 previous_waits[index] = current;
                 return delta;
             };
+#ifdef __APPLE__
+            Vulkan::GsSkipDrawsOnWindow();
+#endif
             std::printf("Frame stats: %.1f FPS, worst frame %.1f ms (vblank %u Hz); "
                         "%u shader/pipeline compiles, %.1f ms; %llu recorder syncs; "
                         "%.0f write faults/s, %lld hot pages; GPU thread %.2f us/draw, "

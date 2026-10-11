@@ -1023,6 +1023,10 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     // below is the copy shader over the GS's strip index runs.
     GsEmulationDraw gs_draw{};
     if (pipeline->GsEmulation()) {
+        if (GsSkipDraws()) {
+            GsSkipDrawsCount();
+            return;
+        }
         gs_draw = RecordGsEmulation(pipeline, regs, is_indexed, index_offset);
         is_indexed = false; // the guest index buffer was read by the ES
     }
@@ -1315,6 +1319,10 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
     // ES/GS compute passes and the strip draw indirectly (vk_gs_emulation.cpp).
     GsEmulationDraw gs_draw{};
     if (pipeline->GsEmulation()) {
+        if (GsSkipDraws()) {
+            GsSkipDrawsCount();
+            return;
+        }
         gs_draw = RecordGsEmulationIndirect(pipeline, Regs(), is_indexed, indirect.args, stride,
                                             max_count, count_address);
         is_indexed = false; // the guest index buffer is read by the ES

@@ -527,6 +527,7 @@ REPORT = {
     'gpu_copy_gap': r'runs on the GPU',
     'cmd_overlap': r'CMD-OVERLAP',
     'audio_health_failure': r'AUDIO HEALTH FAILURE',  # software input health, not audibility
+    'gs_skip_diagnostic': r'BB_GS_SKIP_DRAWS=1: DIAGNOSTIC MODE|GS draws SKIPPED',  # rendering wrong by design
 }
 
 

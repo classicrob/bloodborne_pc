@@ -3,6 +3,9 @@
 // shader_recompiler/gs_emulation.h).
 
 #include <array>
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -20,6 +23,45 @@
 namespace Vulkan {
 
 namespace GsEmu = Shader::GsEmulation;
+
+namespace {
+const bool gs_skip_draws = [] {
+    const char* value = std::getenv("BB_GS_SKIP_DRAWS");
+    const bool on = value && value[0] == '1';
+    if (on) {
+        std::fprintf(stderr, "\n*** BB_GS_SKIP_DRAWS=1: DIAGNOSTIC MODE. Every emulated ES/GS draw "
+                             "is skipped; rendering is wrong by design. ***\n\n");
+    }
+    return on;
+}();
+std::atomic<u64> gs_skipped_total{0}, gs_skipped_window{0};
+} // namespace
+
+bool GsSkipDraws() {
+    return gs_skip_draws;
+}
+
+void GsSkipDrawsCount() {
+    gs_skipped_total.fetch_add(1, std::memory_order_relaxed);
+    gs_skipped_window.fetch_add(1, std::memory_order_relaxed);
+}
+
+void GsSkipDrawsOnFlip() {
+    static u64 flips = 0;
+    if (gs_skip_draws && ++flips % 600 == 0) {
+        std::printf("GS draws SKIPPED: %llu in %llu frames (BB_GS_SKIP_DRAWS diagnostic mode, "
+                    "rendering is wrong by design)\n",
+                    (unsigned long long)gs_skipped_total.load(std::memory_order_relaxed),
+                    (unsigned long long)flips);
+    }
+}
+
+void GsSkipDrawsOnWindow() {
+    if (gs_skip_draws) {
+        std::printf("GS draws SKIPPED: %llu in this window (BB_GS_SKIP_DRAWS diagnostic mode)\n",
+                    (unsigned long long)gs_skipped_window.exchange(0, std::memory_order_relaxed));
+    }
+}
 
 const char* GsEmulationUnsupported(const AmdGpu::Regs& regs) {
     if (regs.vgt_gs_mode.mode != AmdGpu::GsScenario::ScenarioG) {
