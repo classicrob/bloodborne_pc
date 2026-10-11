@@ -83,6 +83,10 @@ int main(void) {
     assert(data.touches[1].x==480 && data.touches[1].y==942 && data.touches[1].id==1);
 #ifdef __APPLE__
     assert(!motion_watching && data.angular_velocity[0]==0 && data.orientation[3]==1);
+    assert(!pad_motion_enable(1,1) && !pad_reset_orientation(1) && !pad_motion_filter(1,1));
+    assert(!pad_read_state(1,&data));
+    assert(!motion_watching && !motion.enabled && data.orientation[0]==0 && data.orientation[1]==0 && data.orientation[2]==0 && data.orientation[3]==1);
+    assert(!SDL_GamepadSensorEnabled(gamepad,SDL_SENSOR_GYRO));
     SDL_CloseGamepad(gamepad); gamepad=NULL;
     setenv("BB_PAD_MOTION","diagnostic",1);
     assert(!pad_read_state(1,&data));
@@ -127,6 +131,10 @@ int main(void) {
     SDL_UpdateJoysticks(); SDL_UpdateGamepads();
     SDL_Delay(260);
     assert(!pad_read_state(1,&data) && data.acceleration[0]==0 && motion.warned);
+    SDL_CloseGamepad(gamepad); gamepad=NULL; unsetenv("BB_PAD_MOTION");
+    assert(!pad_read_state(1,&data));
+    assert(!motion_watching && !motion.enabled && data.orientation[3]==1);
+    assert(!SDL_GamepadSensorEnabled(gamepad,SDL_SENSOR_GYRO));
     puts("PASS: SDL motion event samples, g/rad-s units, quaternion rotation, repeated-time rejection, reset/disable/stale data");
 #endif
     uint8_t motors[]={17,91};

@@ -8,6 +8,7 @@ static struct {
     float acceleration[3], velocity[3], orientation[4];
 } motion;
 static int motion_watching;
+static _Atomic int motion_diagnostic;
 
 static void motion_reset_locked(uint64_t now) {
     memset(motion.orientation,0,sizeof(motion.orientation));
@@ -58,7 +59,16 @@ done:
     pthread_mutex_unlock(&motion_lock);
     return true;
 }
+static void motion_disconnect(void) {
+    atomic_store_explicit(&motion_diagnostic,0,memory_order_relaxed);
+    pthread_mutex_lock(&motion_lock);
+    memset(&motion,0,sizeof(motion)); motion.orientation[3]=1;
+    pthread_mutex_unlock(&motion_lock);
+    if (motion_watching) SDL_RemoveEventWatch(motion_event,NULL);
+    motion_watching=0;
+}
 static void motion_connect(SDL_Gamepad *g) {
+    motion_disconnect();
     if (!motion_watching) {
         if (!SDL_AddEventWatch(motion_event,NULL)) { pad_failure("SDL motion event watch"); return; }
         motion_watching=1;
@@ -73,11 +83,13 @@ static void motion_connect(SDL_Gamepad *g) {
     motion.accel=accel; motion.gyro=gyro;
     motion_reset_locked(enabled_time);
     pthread_mutex_unlock(&motion_lock);
+    atomic_store_explicit(&motion_diagnostic,1,memory_order_relaxed);
     if (accel && !SDL_SetGamepadSensorEnabled(g,SDL_SENSOR_ACCEL,true)) pad_failure("SDL accelerometer enable");
     if (gyro && !SDL_SetGamepadSensorEnabled(g,SDL_SENSOR_GYRO,true)) pad_failure("SDL gyroscope enable");
     printf("Runtime: gamepad motion accel=%d gyro=%d; acceleration in g, angular velocity rad/s; orientation is gyro-integrated, PS4 fusion unqualified\n",accel,gyro);
 }
 static void motion_sample(PadData *d) {
+    if (!atomic_load_explicit(&motion_diagnostic,memory_order_relaxed)) return;
     uint64_t now=SDL_GetTicksNS();
     pthread_mutex_lock(&motion_lock);
     if (motion.enabled) {
@@ -97,12 +109,14 @@ static void motion_sample(PadData *d) {
 }
 static ABI int32_t pad_reset_orientation(int32_t handle) {
     if (handle!=PAD_HANDLE || !opened) return ERR_INVALID_HANDLE;
+    if (!atomic_load_explicit(&motion_diagnostic,memory_order_relaxed)) return 0;
     uint64_t now=SDL_GetTicksNS();
     pthread_mutex_lock(&motion_lock); motion_reset_locked(now); pthread_mutex_unlock(&motion_lock);
     return 0;
 }
 static ABI int32_t pad_motion_enable(int32_t handle,uint8_t enabled) {
     if (handle!=PAD_HANDLE || !opened) return ERR_INVALID_HANDLE;
+    if (!atomic_load_explicit(&motion_diagnostic,memory_order_relaxed)) return 0;
     pthread_mutex_lock(&lock);
     SDL_Gamepad *g=current_gamepad();
     uint64_t enabled_time=SDL_GetTicksNS();
@@ -118,6 +132,7 @@ static ABI int32_t pad_motion_enable(int32_t handle,uint8_t enabled) {
 }
 static ABI int32_t pad_motion_filter(int32_t handle,uint8_t enabled) {
     if (handle!=PAD_HANDLE || !opened) return ERR_INVALID_HANDLE;
+    if (!atomic_load_explicit(&motion_diagnostic,memory_order_relaxed)) return 0;
     if (enabled) fprintf(stderr,"CONTROLLER MOTION LIMIT: PS4 deadband/tilt filtering is unqualified; raw SDL motion remains active\n");
     return 0;
 }
