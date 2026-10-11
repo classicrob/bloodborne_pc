@@ -417,7 +417,14 @@ vk::UniqueInstance CreateInstance(Frontend::WindowSystemType window_type, bool e
     }
 #endif
 
-    vk::StructureChain<vk::InstanceCreateInfo, vk::LayerSettingsCreateInfoEXT> instance_ci_chain = {
+#ifdef __APPLE__
+    // MetalFX (docs/macos/metalfx-integration.md) runs on the Metal device behind the Vulkan one.
+    vk::StructureChain<vk::InstanceCreateInfo, vk::LayerSettingsCreateInfoEXT,
+                       vk::ExportMetalObjectCreateInfoEXT>
+#else
+    vk::StructureChain<vk::InstanceCreateInfo, vk::LayerSettingsCreateInfoEXT>
+#endif
+        instance_ci_chain = {
         vk::InstanceCreateInfo{
             .flags = instance_flags,
             .pApplicationInfo = &application_info,
@@ -430,6 +437,11 @@ vk::UniqueInstance CreateInstance(Frontend::WindowSystemType window_type, bool e
             .settingCount = layer_setings.size(),
             .pSettings = layer_setings.data(),
         },
+#ifdef __APPLE__
+        vk::ExportMetalObjectCreateInfoEXT{
+            .exportObjectType = vk::ExportMetalObjectTypeFlagBitsEXT::eMetalDevice,
+        },
+#endif
     };
 
     auto [instance_result, instance] = vk::createInstanceUnique(instance_ci_chain.get());

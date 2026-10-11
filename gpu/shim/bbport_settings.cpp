@@ -143,7 +143,16 @@ void ConfigureUpscalerSupport(bool fsr4, bool fsr411) {
                      UpscalerName(requested));
         std::abort();
     }
+    if (requested == UpscalerMetalFx && !v.metalfx_supported) {
+        // Until the provider is wired (docs/macos/metalfx-integration.md): never treated as FSR.
+        std::fprintf(stderr, "macOS: upscaler=metalfx is not implemented yet\n");
+        std::abort();
+    }
 #else
+    if (v.upscaler == UpscalerMetalFx) {
+        std::fprintf(stderr, "upscaler=metalfx is only available on macOS\n");
+        std::abort();
+    }
     v.fsr4_supported = fsr4;
     v.fsr411_supported = fsr4 && fsr411;
     const int requested = v.upscaler;
@@ -219,7 +228,8 @@ const char* PresetName(int preset) {
 }
 
 const char* UpscalerName(int upscaler) {
-    static constexpr const char* names[UpscalerCount] = {"off", "fsr3", "fsr4", "fsr411", "taa"};
+    static constexpr const char* names[UpscalerCount] = {"off", "fsr3", "fsr4", "fsr411", "taa",
+                                                         "metalfx"};
     return names[std::clamp(upscaler, 0, UpscalerCount - 1)];
 }
 

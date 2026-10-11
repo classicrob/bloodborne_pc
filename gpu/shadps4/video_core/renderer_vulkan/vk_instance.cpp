@@ -262,6 +262,9 @@ bool Instance::CreateDevice() {
         available_extensions.end()) {
         add_extension("VK_KHR_portability_subset");
     }
+    // MetalFX upscaling shares Vulkan's images and timeline semaphores as Metal objects.
+    ASSERT_MSG(add_extension("VK_EXT_metal_objects"),
+               "macOS MetalFX upscaling requires VK_EXT_metal_objects");
 #endif
     ASSERT_MSG(add_extension(VK_KHR_SWAPCHAIN_EXTENSION_NAME),
                "Required Vulkan extension unavailable: {}", VK_KHR_SWAPCHAIN_EXTENSION_NAME);
