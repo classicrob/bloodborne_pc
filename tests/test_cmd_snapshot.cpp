@@ -298,6 +298,48 @@ int main() {
         Expect("trace: a low-stack chain is read and crosses into the thread's stack",
                low.size() == 1 && low[0].depth >= 3 && low[0].chain[0] == 0x1111 &&
                    low[0].chain[1] == 0x2222);
+        // Two threads advancing one command stream are reported (CMD-INTERLEAVE); separate
+        // buffers, even adjacent ones, and a one-way handoff are not.
+        {
+            std::vector<u32> memory(1 << 16);
+            u32* v = memory.data();
+            const auto other = [](const char* builder, const u32* at) {
+                std::thread([=] { BuilderTrace::Note(builder, at, 25); }).join();
+            };
+            const u64 before = BuilderTrace::Interleaves();
+            BuilderTrace::Note("Owner", v, 25);
+            other("Intruder", v); // the same pointer, as in the movie-start tear
+            BuilderTrace::Note("Owner", v + 50, 25);
+            Expect("interleave: A, B at A's pointer, A on from there is reported",
+                   BuilderTrace::Interleaves() == before + 1);
+            BuilderTrace::Note("Owner", v + 30000, 25);
+            other("Neighbour", v + 30100); // a buffer just above
+            BuilderTrace::Note("Owner", v + 30050, 25);
+            BuilderTrace::Note("Owner", v + 10000, 25);
+            other("Far", v + 20000);
+            BuilderTrace::Note("Owner", v + 10030, 25);
+            BuilderTrace::Note("Owner", v + 40000, 25);
+            other("Handoff", v + 40030);
+            BuilderTrace::Note("Elsewhere", v + 60000, 25);
+            Expect("interleave: adjacent buffers and a one-way handoff are not reported",
+                   BuilderTrace::Interleaves() == before + 1);
+            BuilderTrace::Note("Owner", v + 50000, 25);
+            std::thread([=] {
+                BuilderTrace::Note("Intruder", v + 50010, 25);
+                BuilderTrace::Note("Intruder", v + 50040, 25);
+            }).join();
+            BuilderTrace::Note("Owner", v + 50080, 25);
+            Expect("interleave: A continuing after B's latest write is reported",
+                   BuilderTrace::Interleaves() == before + 2);
+            // A third builder thread in between (a worker with its own buffer) hides nothing.
+            BuilderTrace::Note("Owner", v + 55000, 25);
+            other("Worker", v + 62000);
+            other("Intruder", v + 55010);
+            other("Worker", v + 62030);
+            BuilderTrace::Note("Owner", v + 55040, 25);
+            Expect("interleave: reported with a third builder thread in between",
+                   BuilderTrace::Interleaves() == before + 3);
+        }
         static u32 unchained[8];
         BuilderTrace::Note("NoFrame", unchained, 4, 0x10); // not on this stack: no chain
         const auto without = BuilderTrace::Around(unchained, unchained + 1, 0);

@@ -30,7 +30,14 @@ parser reads copies taken at submit (`AmdGpu::CmdSnapshot`, `Liverpool::SubmitGf
   compared with live memory, and guest writes made after submit are logged as `CMD-SNAPSHOT ...`. It cannot see a stream write still on its way: live memory is as stale as the copy.
   At submit it also logs `CMD-OVERLAP` when a captured buffer partly overlaps one submitted in the
   last 64 submissions (two command buffers written into the same memory), with the guest thread
-  numbers the builder trace uses.
+  numbers the builder trace uses. The builder trace logs `CMD-INTERLEAVE` when two threads advance
+  one command stream: thread A writes, thread B writes at or after that, then A writes on at or
+  after B. This is a shared command buffer pointer, as at movie start, where main draws into the
+  render thread's context. Each line gives both threads, rdtsc stamps (the HLE trace's clock) and
+  guest call chains. Calls from other threads in between, such as workers building their own
+  buffers, are ignored. One theoretical false positive: A's buffer ends just below B's chunk, and
+  A's next chunk starts just above B's write (all within 4096 dwords). Both chains are in the
+  report so this case can be checked.
 - **Cost:** the "Parse lag" summary every 600 frames reports snapshot KiB per frame and the mean
   and maximum microseconds per submit. `BB_COPY_GPU_BUFFERS` is refused on Apple.
 

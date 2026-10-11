@@ -11,6 +11,7 @@
 #include <cstring>
 #include <deque>
 #include <mutex>
+#include <optional>
 #ifndef _WIN32
 #include <dlfcn.h>
 #endif
@@ -122,6 +123,33 @@ u64 builder_trace_calls = 0;
 std::atomic<u32> builder_trace_threads = 0;
 std::array<std::array<char, 32>, 256> builder_thread_names{}; ///< by thread number (mod 256)
 std::array<uintptr_t, 256> builder_thread_ids{}; ///< pthread_self(), to match other diagnostics
+
+/// Two threads advancing one command stream (a shared command buffer pointer): thread A writes,
+/// thread B writes at or just after it, then A goes on at or after B's write. Separate buffers
+/// cannot do that: whichever is lower in memory, one of the two steps goes backwards.
+/// Other threads' calls in between do not matter (worker threads build their own buffers).
+struct Interleave {
+    BuilderTrace::Call owner; ///< A's call before B's
+    BuilderTrace::Call guest; ///< B's latest call into A's stream
+    bool pending = false;
+};
+std::array<Interleave, 256> interleave_by_owner{}; ///< by thread number (mod 256)
+std::array<BuilderTrace::Call, 256> last_by_thread{}; ///< latest call, by thread number (mod 256)
+std::atomic<u64> interleaves = 0;
+
+/// `at` goes on from a call at `from` (at or after it, within one stretch of building).
+bool Continues(const u32* from, const u32* at) {
+    constexpr std::ptrdiff_t Stretch = 4096; // dwords
+    return at >= from && at - from <= Stretch;
+}
+
+std::string Chain(const BuilderTrace::Call& call) {
+    std::string chain;
+    for (u32 i = 0; i < call.depth; ++i) {
+        chain += fmt::format(" {:#x}", call.chain[i]);
+    }
+    return chain.empty() ? " (no chain)" : chain;
+}
 } // namespace
 
 u32 BuilderTrace::ThreadNumber() {
@@ -168,9 +196,69 @@ void BuilderTrace::Note(const char* builder, const u32* cmdbuf, u32 size,
             guest_backtrace_ex(frame, call.chain, std::size(call.chain), kernel_reads));
     }
 #endif
-    std::scoped_lock lk{builder_trace_mutex};
+    static const bool check = [] {
+        const char* env = std::getenv("BB_CMD_SNAPSHOT_CHECK");
+        return env && env[0] == '1';
+    }();
+    std::unique_lock lk{builder_trace_mutex};
     call.seq = builder_trace_calls++;
     builder_trace[call.seq % builder_trace.size()] = call;
+    if (!check) {
+        return;
+    }
+    std::optional<Interleave> found;
+    const u32 slot = thread % interleave_by_owner.size();
+    // This thread goes on after another thread wrote into its stream.
+    if (auto& mine = interleave_by_owner[slot]; mine.pending) {
+        if (mine.owner.thread == thread && Continues(mine.guest.cmdbuf, cmdbuf)) {
+            found = mine;
+        }
+        mine.pending = false;
+    }
+    // This thread writes on from another thread's latest call.
+    const u32 threads = std::min<u32>(builder_trace_threads.load(), interleave_by_owner.size());
+    for (u32 number = 1; number <= threads; ++number) { // thread numbers start at 1
+        const u32 other = number % interleave_by_owner.size();
+        auto& intrusion = interleave_by_owner[other];
+        const Call& last = last_by_thread[other];
+        if (other == slot || !last.cmdbuf) {
+            continue;
+        }
+        if (intrusion.pending) {
+            if (intrusion.guest.thread == thread && Continues(intrusion.guest.cmdbuf, cmdbuf)) {
+                intrusion.guest = call;
+            }
+        } else if (Continues(last.cmdbuf, cmdbuf)) {
+            intrusion = {last, call, true};
+        }
+    }
+    last_by_thread[slot] = call;
+    if (!found) {
+        return;
+    }
+    const auto name = [](u32 number) {
+        const u32 slot = number % builder_thread_names.size();
+        return fmt::format("{} pthread {:#x}", builder_thread_names[slot].data(),
+                           builder_thread_ids[slot]);
+    };
+    const std::string owner_name = name(found->owner.thread);
+    const std::string guest_name = name(found->guest.thread);
+    lk.unlock();
+    if (const u64 n = ++interleaves; n <= 16 || (n & 1023) == 0) {
+        LOG_CRITICAL(Render,
+                     "CMD-INTERLEAVE #{}: two threads advance one command stream. Thread {} \"{}\" "
+                     "{} at {} (tsc {:#x}), then thread {} \"{}\" {} at {} (tsc {:#x}) called "
+                     "from{}, then thread {} again {} at {} (tsc {:#x}) called from{}",
+                     n, found->owner.thread, owner_name, found->owner.builder,
+                     fmt::ptr(found->owner.cmdbuf), found->owner.tsc, found->guest.thread,
+                     guest_name, found->guest.builder, fmt::ptr(found->guest.cmdbuf),
+                     found->guest.tsc, Chain(found->guest), call.thread, call.builder,
+                     fmt::ptr(call.cmdbuf), call.tsc, Chain(call));
+    }
+}
+
+u64 BuilderTrace::Interleaves() {
+    return interleaves.load();
 }
 
 namespace {

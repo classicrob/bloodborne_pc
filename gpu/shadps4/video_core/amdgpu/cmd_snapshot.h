@@ -116,6 +116,9 @@ public:
     [[nodiscard]] static std::vector<Call> Around(const u32* begin, const u32* end, u32 last);
     /// Logs Around() for a malformed packet at `at`.
     static void Report(const u32* at);
+    /// With BB_CMD_SNAPSHOT_CHECK=1, Note() logs CMD-INTERLEAVE when two threads advance one
+    /// command stream (A writes, B writes on from there, A writes on from B); how many so far.
+    [[nodiscard]] static u64 Interleaves();
 };
 
 } // namespace AmdGpu
