@@ -1,5 +1,8 @@
 // bbport: SDL3 window for the Vulkan swapchain.
+#include <cstdio>
 #include <cstdlib>
+#include <tuple>
+#include <utility>
 #include <cstring>
 #include <SDL3/SDL.h>
 #ifdef __APPLE__
@@ -13,9 +16,52 @@
 
 namespace Frontend {
 
+#ifdef __APPLE__
+namespace {
+/// "AxB" (separator `sep`) as two integers, or a stop: a malformed value is a setup error.
+std::pair<int, int> ParsePair(const char* name, const char* value, char sep) {
+    char* end = nullptr;
+    const long first = std::strtol(value, &end, 10);
+    ASSERT_MSG(end != value && *end == sep, "{}={} is not of the form A{}B", name, value, sep);
+    const char* second_start = end + 1;
+    const long second = std::strtol(second_start, &end, 10);
+    ASSERT_MSG(end != second_start && *end == 0, "{}={} is not of the form A{}B", name, value,
+               sep);
+    return {int(first), int(second)};
+}
+} // namespace
+#endif
+
 WindowSDL::WindowSDL(s32 width_, s32 height_, const char* title) : width{width_}, height{height_} {
 #ifdef __APPLE__
     ASSERT_MSG(pthread_main_np(), "SDL video must be initialized on the process main thread");
+#endif
+#ifdef __APPLE__
+    // bbport: test runs on a Mac someone is using (play_route). BB_WINDOW_SIZE=WxH (points; the
+    // render size is unchanged, the swapchain follows the window), BB_WINDOW_POS=X,Y (instead of
+    // centred) and BB_WINDOW_BACKGROUND=1 (an accessory app whose window is never activated and
+    // takes no focus: input comes from BB_PAD_FILE). Off by default; malformed values stop.
+    const char* size_env = std::getenv("BB_WINDOW_SIZE");
+    const char* pos_env = std::getenv("BB_WINDOW_POS");
+    const char* background_env = std::getenv("BB_WINDOW_BACKGROUND");
+    const bool background = background_env && background_env[0] == '1';
+    if (background) {
+        // Before the video subsystem registers the app with Cocoa.
+        SDL_SetHint(SDL_HINT_MAC_BACKGROUND_APP, "1");
+        SDL_SetHint(SDL_HINT_WINDOW_ACTIVATE_WHEN_SHOWN, "0");
+    }
+    if (size_env && *size_env) {
+        const auto [w, h] = ParsePair("BB_WINDOW_SIZE", size_env, 'x');
+        ASSERT_MSG(w > 0 && h > 0, "BB_WINDOW_SIZE={} must be positive", size_env);
+        width_ = w;
+        height_ = h;
+    }
+    int x = SDL_WINDOWPOS_CENTERED, y = SDL_WINDOWPOS_CENTERED;
+    if (pos_env && *pos_env) {
+        std::tie(x, y) = ParsePair("BB_WINDOW_POS", pos_env, ',');
+    }
+#else
+    const int x = SDL_WINDOWPOS_CENTERED, y = SDL_WINDOWPOS_CENTERED;
 #endif
     // Gamepads are sampled by runtime_pad.c; their events are pumped here with the window's.
     if (!SDL_InitSubSystem(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) {
@@ -23,8 +69,8 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, const char* title) : width{width_}
     }
     SDL_PropertiesID props = SDL_CreateProperties();
     SDL_SetStringProperty(props, SDL_PROP_WINDOW_CREATE_TITLE_STRING, title);
-    SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_X_NUMBER, SDL_WINDOWPOS_CENTERED);
-    SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_Y_NUMBER, SDL_WINDOWPOS_CENTERED);
+    SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_X_NUMBER, x);
+    SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_Y_NUMBER, y);
     SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_WIDTH_NUMBER, width_);
     SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_HEIGHT_NUMBER, height_);
     SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_RESIZABLE_BOOLEAN, true);
@@ -32,6 +78,11 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, const char* title) : width{width_}
     SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_METAL_BOOLEAN, true);
 #else
     SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_VULKAN_BOOLEAN, true);
+#endif
+#ifdef __APPLE__
+    if (background) {
+        SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_FOCUSABLE_BOOLEAN, false);
+    }
 #endif
     const char* fullscreen = std::getenv("BB_FULLSCREEN");
     SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_FULLSCREEN_BOOLEAN, fullscreen && fullscreen[0] == '1');
@@ -76,6 +127,15 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, const char* title) : width{width_}
     width = w;
     height = h;
     LOG_INFO(Frontend, "Window {}x{} on {}", w, h, driver);
+#ifdef __APPLE__
+    if ((size_env && *size_env) || (pos_env && *pos_env) || background) {
+        int at_x = 0, at_y = 0;
+        SDL_GetWindowPosition(window, &at_x, &at_y);
+        std::printf("Window: %dx%d points (%dx%d pixels) at %d,%d%s\n", width_, height_, w, h,
+                    at_x, at_y, background ? ", background (no activation, not focusable)" : "");
+        std::fflush(stdout);
+    }
+#endif
 }
 
 WindowSDL::~WindowSDL() {
