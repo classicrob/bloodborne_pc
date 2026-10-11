@@ -1,7 +1,10 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <thread>
 #include "common/serdes.h"
 #include "core/emulator_settings.h"
 #include "shader_recompiler/frontend/fetch_shader.h"
@@ -151,7 +154,7 @@ bool ComputePipeline::SerializationSupport::Deserialize(Serialization::Archive& 
     return true;
 }
 
-bool PipelineCache::LoadComputePipeline(Serialization::Archive& ar) {
+bool PipelineCache::LoadComputePipeline(Serialization::Archive& ar, PreloadBatch& batch) {
     compute_key.Deserialize(ar);
 
     ComputePipeline::SerializationSupport sdata{};
@@ -173,9 +176,12 @@ bool PipelineCache::LoadComputePipeline(Serialization::Archive& ar) {
     const auto [it, is_new] = compute_pipelines.try_emplace(compute_key);
     ASSERT(is_new);
 
-    it.value() =
-        std::make_unique<ComputePipeline>(instance, scheduler, desc_heap, profile, *pipeline_cache,
-                                          compute_key, *sel.infos[0], sel.modules[0], sdata, true);
+    auto& slot = batch.compute.emplace_back(compute_key, nullptr).second;
+    batch.creations.push_back([this, &slot, key = compute_key, info = sel.infos[0],
+                               module = sel.modules[0], sdata]() mutable {
+        slot = std::make_unique<ComputePipeline>(instance, scheduler, desc_heap, profile,
+                                                 *pipeline_cache, key, *info, module, sdata, true);
+    });
 
     sel.infos.fill(nullptr);
     sel.modules.fill(nullptr);
@@ -219,7 +225,7 @@ bool GraphicsPipeline::SerializationSupport::Deserialize(Serialization::Archive&
     return true;
 }
 
-bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
+bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar, PreloadBatch& batch) {
     sel.graphics_key.Deserialize(ar);
 
     GraphicsPipeline::SerializationSupport sdata{};
@@ -248,9 +254,14 @@ bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
     const auto [it, is_new] = graphics_pipelines.try_emplace(sel.graphics_key);
     ASSERT(is_new);
 
-    it.value() = std::make_unique<GraphicsPipeline>(
-        instance, scheduler, desc_heap, profile, sel.graphics_key, *pipeline_cache, sel.infos,
-        sel.runtime_infos, sel.fetch_shader, sel.modules, sdata, true);
+    auto& slot = batch.graphics.emplace_back(sel.graphics_key, nullptr).second;
+    batch.creations.push_back([this, &slot, key = sel.graphics_key, infos = sel.infos,
+                               runtime_infos = sel.runtime_infos, fetch_shader = sel.fetch_shader,
+                               modules = sel.modules, sdata]() mutable {
+        slot = std::make_unique<GraphicsPipeline>(instance, scheduler, desc_heap, profile, key,
+                                                  *pipeline_cache, infos, runtime_infos,
+                                                  fetch_shader, modules, sdata, true);
+    });
 
     sel.infos.fill(nullptr);
     sel.modules.fill(nullptr);
@@ -358,6 +369,7 @@ void PipelineCache::WarmUp() {
     u32 num_pipelines{};
     u32 num_total_pipelines{};
     const auto preload_start = std::chrono::steady_clock::now();
+    PreloadBatch batch;
 
     Storage::DataBase::Instance().ForEachBlob(
         Storage::BlobType::PipelineKey, [&](std::vector<u8>&& data) {
@@ -377,9 +389,9 @@ void PipelineCache::WarmUp() {
 
             bool result{};
             if (is_compute) {
-                result = LoadComputePipeline(ar);
+                result = LoadComputePipeline(ar, batch);
             } else {
-                result = LoadGraphicsPipeline(ar);
+                result = LoadGraphicsPipeline(ar, batch);
             }
 
             if (result) {
@@ -387,9 +399,40 @@ void PipelineCache::WarmUp() {
             }
         });
 
-    LOG_INFO(Render, "Preloaded {} pipelines in {:.1f} s", num_pipelines,
+    // bbport: the Metal compile dominates pipeline creation and scales across threads
+    // (docs/macos/pipeline-compile.md). WarmUp runs before the VkPipelineCache exists, so the
+    // creations share nothing but the device. Other platforms keep creating them one by one.
+#ifdef __APPLE__
+    constexpr u32 MaxPreloadThreads = 8;
+#else
+    constexpr u32 MaxPreloadThreads = 1;
+#endif
+    const u32 num_threads = std::clamp<u32>(std::thread::hardware_concurrency(), 1,
+                                            MaxPreloadThreads);
+    std::atomic<size_t> next_creation{0};
+    const auto create = [&] {
+        for (size_t i; (i = next_creation.fetch_add(1)) < batch.creations.size();) {
+            batch.creations[i]();
+        }
+    };
+    {
+        std::vector<std::jthread> workers;
+        for (u32 t = 1; t < num_threads; ++t) {
+            workers.emplace_back(create);
+        }
+        create();
+    }
+    for (auto& [key, pipeline] : batch.graphics) {
+        graphics_pipelines.find(key).value() = std::move(pipeline);
+    }
+    for (auto& [key, pipeline] : batch.compute) {
+        compute_pipelines.find(key).value() = std::move(pipeline);
+    }
+
+    LOG_INFO(Render, "Preloaded {} pipelines in {:.1f} s ({} threads)", num_pipelines,
              std::chrono::duration<double>(std::chrono::steady_clock::now() - preload_start)
-                 .count());
+                 .count(),
+             num_threads);
     if (num_total_pipelines > num_pipelines) {
         LOG_WARNING(Render, "{} stale pipelines were found. Consider re-generating the cache",
                     num_total_pipelines - num_pipelines);
