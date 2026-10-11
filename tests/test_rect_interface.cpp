@@ -81,6 +81,32 @@ u32 CheckMasks() {
     expect("FS inputs: default skipped, flat kept", Shader::Backend::SPIRV::AuxiliaryVaryingLocations(fs), 1U << 4 | 1U << 9);
     fs.motion_vectors = true;
     expect("FS motion on", Shader::Backend::SPIRV::AuxiliaryVaryingLocations(fs), Motion | 1U << 4 | 1U << 9);
+
+    // Flat inputs the auxiliary stages cannot carry: live Flat/PerVertex reads only. The qualifier
+    // outlives a read that DCE removed; only the loads mask (collected after DCE) says it is live.
+    using Shader::Qualifier;
+    Shader::HwFragmentRuntimeInfo flat_fs{};
+    flat_fs.num_inputs = 5;
+    flat_fs.inputs[0] = {.param_index = 0};
+    flat_fs.inputs[1] = {.param_index = 1};
+    flat_fs.inputs[2] = {.param_index = 2};
+    flat_fs.inputs[3] = {.param_index = 3, .is_default = true};
+    flat_fs.inputs[4] = {.param_index = 4};
+    Shader::Info reader{};
+    reader.fs_interpolation[0] = {Qualifier::Flat, Qualifier::None};      // stale: read died
+    reader.fs_interpolation[1] = {Qualifier::PerVertex, Qualifier::None}; // stale: read died
+    reader.fs_interpolation[2] = {Qualifier::Smooth, Qualifier::None};
+    reader.loads.Set(Shader::IR::Attribute::Param0 + 2);
+    reader.fs_interpolation[3] = {Qualifier::Flat, Qualifier::None}; // default input
+    reader.loads.Set(Shader::IR::Attribute::Param0 + 3);
+    expect("flat: stale qualifiers without loads pass",
+           Shader::Backend::SPIRV::AuxiliaryFlatInputs(reader, flat_fs), 0);
+    reader.loads.Set(Shader::IR::Attribute::Param0 + 0);
+    reader.loads.Set(Shader::IR::Attribute::Param0 + 1, 2);
+    reader.fs_interpolation[4] = {Qualifier::Flat, Qualifier::None};
+    reader.loads.Set(Shader::IR::Attribute::Param0 + 4, 3);
+    expect("flat: live Flat and PerVertex reads rejected",
+           Shader::Backend::SPIRV::AuxiliaryFlatInputs(reader, flat_fs), 0b10011);
     return failures;
 }
 #endif

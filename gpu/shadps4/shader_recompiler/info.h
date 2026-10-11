@@ -69,6 +69,14 @@ struct InfoPersistent {
     AttributeFlags loads{};
     AttributeFlags stores{};
 
+    struct Interpolation {
+        Qualifier primary;
+        Qualifier auxiliary;
+    };
+    /// bbport: persistent as well, so a pipeline rebuilt from the cache is checked against the
+    /// fragment inputs it declares (Apple RectList/QuadList flat inputs).
+    std::array<Interpolation, IR::NumParams> fs_interpolation{};
+
     BufferResourceList buffers;
     ImageResourceList images;
     SamplerResourceList samplers;
@@ -121,11 +129,6 @@ struct Info : InfoPersistent {
         Dynamic = 1 << 1,
     };
 
-    struct Interpolation {
-        Qualifier primary;
-        Qualifier auxiliary;
-    };
-
     std::span<const u32> user_data;
     std::vector<u32> flattened_ud_buf;
     PersistentSrtInfo srt_info;
@@ -157,8 +160,6 @@ struct Info : InfoPersistent {
     bool stores_tess_level_outer{};
     bool stores_tess_level_inner{};
     bool translation_failed{};
-
-    std::array<Interpolation, IR::NumParams> fs_interpolation{};
 
     Info() = default;
     Info(HwStage stage_, SwStage l_stage_, ShaderParams params)

@@ -353,6 +353,20 @@ u32 AuxiliaryVaryingLocations(const HwFragmentRuntimeInfo& fs_info) {
     return locations;
 }
 
+u32 AuxiliaryFlatInputs(const Info& fs, const HwFragmentRuntimeInfo& fs_info) {
+    u32 params = 0;
+    for (u32 i = 0; i < fs_info.num_inputs; i++) {
+        // fs_interpolation is set when an interpolation instruction is translated and is not
+        // cleared when its read later dies; the loads mask is collected after the final DCE.
+        const auto primary = fs.fs_interpolation[i].primary;
+        if (!fs_info.inputs[i].IsDefault() && fs.loads.GetAny(IR::Attribute::Param0 + i) &&
+            (primary == Qualifier::Flat || primary == Qualifier::PerVertex)) {
+            params |= 1U << i;
+        }
+    }
+    return params;
+}
+
 u32 PreRasterOutputLocations(const Info& info, const RuntimeInfo& runtime) {
     u32 locations = 0;
     for (u32 i = 0; i < IR::NumParams; i++) {

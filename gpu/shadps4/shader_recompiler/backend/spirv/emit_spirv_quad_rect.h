@@ -31,6 +31,11 @@ enum class AuxShaderType : u32 {
 /// valid with clip-distance emulation.
 [[nodiscard]] u32 PreRasterOutputLocations(const Info& info, const RuntimeInfo& runtime);
 
+/// Fragment parameters (bit i = parameter i) that the fragment stage reads flat or per vertex
+/// (its compiled interpolation qualifiers) and still loads after dead-code elimination; default
+/// inputs are not inputs. The auxiliary stages do not keep the guest's provoking vertex for these.
+[[nodiscard]] u32 AuxiliaryFlatInputs(const Info& fs, const HwFragmentRuntimeInfo& fs_info);
+
 /// vs_output_locations: bit N set when the vertex stage writes a vec4 at Location N. GCN lets the
 /// pixel shader read a parameter the vertex shader never exported (value undefined); Vulkan requires
 /// every input location to be written by the previous stage, so such locations are not read from
