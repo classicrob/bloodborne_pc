@@ -3,7 +3,7 @@
 # tools/macos/play_route.py; this records the host state around it and summarizes perf.jsonl.
 #   tools/macos/perf_run.sh --probe PATH [--output 1080p|4k] [--phases] [--label NAME] [--until STAGE]
 #                           [--fixture NAME] [--warm-cache NAME] [--diag-env BB_X=V]...
-#                           [--hold SECONDS | --segments LIST]
+#                           [--hold SECONDS | --segments LIST] [--keep-apps]
 # --hold keeps the game at the last stage for SECONDS, then stops it; the summary then covers
 # only the windows completed during the hold (the stage itself, not loading on the way).
 # --segments still:60,walk:60 runs the segments in order at the last stage, each with its own
@@ -19,7 +19,7 @@ cd -- "$(dirname -- "$0")/../.."
 if [[ ${BB_HEAVY_GPU:-} != exclusive ]]; then
     exec tools/macos/heavy.sh --pool playtest --gpu exclusive "perf_run $*" -- bash "$PWD/tools/macos/perf_run.sh" "$@"
 fi
-probe='' output=4k phases=0 label=perf until=() hold=0 segments='' seeds=()
+probe='' output=4k phases=0 label=perf until=() hold=0 segments='' seeds=() keep_apps=0
 while (($#)); do
     case $1 in
     --probe) probe=$2; shift 2 ;;
@@ -28,6 +28,7 @@ while (($#)); do
     --label) label=$2; shift 2 ;;
     --until) until=(--until "$2"); shift 2 ;;
     --hold) hold=$2; shift 2 ;;
+    --keep-apps) keep_apps=1; shift ;;
     --segments) segments=$2; shift 2 ;;
     --fixture|--warm-cache|--diag-env) seeds+=("$1" "$2"); shift 2 ;;
     *) echo "perf_run: unknown argument $1" >&2; exit 2 ;;
@@ -62,7 +63,40 @@ json.dump({
 PY
 }
 scratch=$(mktemp -d)
-trap 'rm -rf "$scratch"' EXIT
+# Aqua Voice keeps coreaudiod/audioanalyticsd busy (~300% CPU). The user approved quitting it for
+# perf runs: it is asked to quit (never killed) and relaunched when the run ends, however it ends.
+# --keep-apps leaves it alone. apps.json in the run directory records what happened.
+aqua=not-running load_before_quit=$(sysctl -n vm.loadavg)
+cleanup() {
+    rm -rf "$scratch"
+    if [[ $aqua == quit ]]; then
+        open -a "Aqua Voice" || echo "perf_run: could not relaunch Aqua Voice; start it by hand" >&2
+    fi
+}
+trap cleanup EXIT
+if ((keep_apps)); then
+    aqua=kept
+elif [[ $(osascript -e 'application "Aqua Voice" is running' 2>/dev/null) == true ]]; then
+    osascript -e 'quit app "Aqua Voice"' >/dev/null || true
+    for _ in $(seq 30); do pgrep -x "Aqua Voice" >/dev/null || break; sleep 1; done
+    if pgrep -x "Aqua Voice" >/dev/null; then
+        aqua=still-running
+        echo "perf_run: Aqua Voice did not quit within 30 s; measuring with it running" >&2
+    else
+        aqua=quit
+        echo "perf_run: Aqua Voice quit for this run (load before: $load_before_quit); relaunched at the end"
+        sleep 5 # let coreaudiod settle
+    fi
+fi
+apps_json() {
+    python3 - "$1" "$aqua" "$load_before_quit" <<'PY'
+import json, os, sys
+out, aqua, before = sys.argv[1:4]
+json.dump({'aqua_voice': aqua, 'loadavg_before_quit': before.strip('{} ').split(),
+           'loadavg_at_start': os.getloadavg()}, open(out, 'w'), indent=1)
+PY
+}
+apps_json "$scratch/apps.json"
 host_state "$scratch/host-before.json"
 flags=(--perf)
 if ((phases)); then flags+=(--perf-phases); fi
@@ -97,7 +131,7 @@ if ((hold && status == 0)); then
 fi
 check_game() {
     kill -0 "$game" 2>/dev/null && return
-    cp "$scratch/host-before.json" "$run/host-before.json"
+    cp "$scratch/host-before.json" "$scratch/apps.json" "$run/"
     fail "the game stopped during $1 ($(cat "$run/exit.json" 2>/dev/null || echo 'no exit record')); see $run/game.log"
 }
 if ((${#plan[@]} && status == 0)); then
@@ -129,7 +163,7 @@ elif ((hold && status == 0)); then
     python3 tools/macos/play_route.py stop || status=$?
     summary=(--after-line "$first")
 fi
-cp "$scratch/host-before.json" "$run/host-before.json"
+cp "$scratch/host-before.json" "$scratch/apps.json" "$run/"
 host_state "$run/host-after.json"
 ((status == 0)) || fail "route failed (exit $status); see $run"
 [[ -s $run/perf.jsonl ]] || fail "no $run/perf.jsonl: the game did not record BB_PERF windows"

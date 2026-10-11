@@ -146,6 +146,11 @@ stick, alternating direction every 3 s, so the scene keeps changing without leav
 A segment's summary starts 6 s after the segment does, so no 5 s window spans two segments.
 `segments.txt` in the run directory records each segment's perf.jsonl line range.
 
+Before measuring, the script asks Aqua Voice to quit (`osascript`, never a kill; the user approved
+this for perf runs because it keeps coreaudiod and audioanalyticsd busy) and relaunches it when the
+run ends, however it ends. `apps.json` in the run directory records whether it was quit and the
+load average before the quit and at the start. `--keep-apps` leaves it running.
+
 The script takes the GPU exclusively through `tools/macos/heavy.sh --gpu exclusive`
 (docs/macos/heavy-jobs.md): it waits until running games end, and games started meanwhile wait
 for it. As a backstop it still refuses to run while a `bb-probe` started outside heavy.sh runs. It records `uptime`, the other translated processes, the commit, and the
