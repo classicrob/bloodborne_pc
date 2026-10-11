@@ -609,7 +609,7 @@ void AssembleVertex(Template& t) {
     }
     f.SLoadDwordx4(4, 2, 0);
     f.SWaitcntAll();
-    const Code::BufFields fl{.idxen = true, .vaddr = 0, .vdata = 4, .srsrc = 4};
+    const Code::BufFields fl{.offset = t.inst_offset, .idxen = true, .vaddr = 0, .vdata = 4, .srsrc = 4};
     const u32 width = std::clamp<u32>(t.op.ncomp, 1, 4) - 1; // X/XY/XYZ/XYZW
     if (t.mtbuf) {
         f.Mtbuf(TBUFFER_LOAD_FORMAT_X + width, t.op.inst_dfmt, t.op.inst_nfmt, fl);
@@ -2270,6 +2270,69 @@ void AddVertexCases() {
                 j.init_words[f.stride / 4 + 1] = 0x80008001u;
             }
             for (u32 i = 0; i < 9; ++i) SetLane(j, i, i, 0); // 6 records, then 3 past the end
+        }
+        // Vertex-pulling audit (P0a geometric corruption): every (data format, number format) pair the
+        // Apple decoder accepts, fetched at instruction offsets 0, 4 and 12 inside a 32-byte record.
+        // The fetch path folds the offset into the V# base (VertexAttribute::GetSharp), so the bound
+        // base is 0, 4 or 12 mod 16 (the M4 storage offset alignment is 16).
+        {
+            std::map<std::pair<u32, u32>, u32> fetch_at; // (ncomp, offset) -> template
+            auto fetch_off = [&](u32 ncomp, u32 off) {
+                const auto key = std::pair{ncomp, off};
+                if (!fetch_at.count(key)) {
+                    static const char* w[] = {"x", "xy", "xyz", "xyzw"};
+                    Template t = g_templates[fmt];
+                    t.name = std::string("vertex: fetch buffer_load_format_") + w[ncomp - 1] + " v0 idxen offset:" +
+                             std::to_string(off);
+                    t.op.ncomp = ncomp;
+                    t.inst_offset = off;
+                    t.code.clear();
+                    t.fetch.clear();
+                    fetch_at[key] = AddTemplate(t);
+                }
+                return fetch_at[key];
+            };
+            struct P {
+                u32 dfmt;
+                std::vector<u32> nfmts;
+            };
+            const std::vector<u32> ints7 = {GCN_NFMT_UNORM, GCN_NFMT_SNORM, GCN_NFMT_USCALED, GCN_NFMT_SSCALED,
+                                            GCN_NFMT_UINT, GCN_NFMT_SINT, GCN_NFMT_SNORM_OGL};
+            std::vector<u32> all8 = ints7;
+            all8.push_back(GCN_NFMT_FLOAT);
+            const std::vector<u32> packed6 = {GCN_NFMT_UNORM, GCN_NFMT_SNORM, GCN_NFMT_USCALED, GCN_NFMT_SSCALED,
+                                              GCN_NFMT_UINT, GCN_NFMT_SINT};
+            const std::vector<u32> wide6 = {GCN_NFMT_UNORM, GCN_NFMT_USCALED, GCN_NFMT_SSCALED,
+                                            GCN_NFMT_UINT, GCN_NFMT_SINT, GCN_NFMT_FLOAT};
+            const P pairs[] = {
+                {GCN_DFMT_8, ints7}, {GCN_DFMT_8_8, ints7}, {GCN_DFMT_8_8_8_8, ints7},
+                {GCN_DFMT_16, all8}, {GCN_DFMT_16_16, all8}, {GCN_DFMT_16_16_16_16, all8},
+                {GCN_DFMT_10_10_10_2, packed6}, {GCN_DFMT_2_10_10_10, packed6},
+                {GCN_DFMT_10_11_11, {GCN_NFMT_FLOAT}}, {GCN_DFMT_11_11_10, {GCN_NFMT_FLOAT}},
+                {GCN_DFMT_32, wide6}, {GCN_DFMT_32_32, wide6}, {GCN_DFMT_32_32_32, wide6}, {GCN_DFMT_32_32_32_32, wide6},
+            };
+            constexpr u32 stride = 32, records = 6;
+            for (const P& p : pairs) {
+                u32 bytes = 0, ncomp = 0, shift[4], width[4];
+                gcn_format_bits(p.dfmt, &bytes, &ncomp, shift, width);
+                for (u32 nfmt : p.nfmts) {
+                    for (u32 off : {0u, 4u, 12u}) {
+                        gcn_vsharp v = StructV(stride, records, p.dfmt, nfmt);
+                        Job& j = NewJob("vertex-format", fetch_off(ncomp, off), v, 0);
+                        j.label += std::string(" ") + nf[nfmt] + " offset " + std::to_string(off) + " stride 32";
+                        j.init_words.assign(records * stride / 4, 0x5A5A5A5Au);
+                        for (u32 r = 0; r < records; ++r) {
+                            const u32 w0 = (r * stride + off) / 4;
+                            const u32 e = edges(p.dfmt, r & 1);
+                            for (u32 k = 0; k < (bytes + 3) / 4; ++k) {
+                                // edge patterns, varied per record and dword
+                                j.init_words[w0 + k] = k == 0 ? (r < 2 ? e : e ^ (0x01010101u * r)) : (e ^ (0x10203040u * (k + r)));
+                            }
+                        }
+                        for (u32 i = 0; i < records + 3; ++i) SetLane(j, i, i, 0);
+                    }
+                }
+            }
         }
         // dst_sel swizzles on integer and normalized bytes: reversed, and X/0/0/ONE
         for (auto [nfmt, sel] : {std::pair{GCN_NFMT_UINT, std::array<u8, 4>{7, 6, 5, 4}},
