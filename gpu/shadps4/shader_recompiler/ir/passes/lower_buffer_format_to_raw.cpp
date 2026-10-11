@@ -17,6 +17,7 @@ struct FormatInfo {
     AmdGpu::CompMapping swizzle;
     AmdGpu::NumberConversion num_conversion;
     u32 num_components;
+    bool is_integer;
 };
 
 static bool IsBufferFormatLoad(const IR::Inst& inst) {
@@ -103,7 +104,8 @@ static IR::Value LoadBufferFormat(IR::IREmitter& ir, const IR::Value handle, con
             components.push_back(ir.Imm32(0.f));
         }
     }
-    const auto swizzled = ApplySwizzle(ir, ir.CompositeConstruct(components), format_info.swizzle);
+    const auto swizzled = ApplySwizzle(ir, ir.CompositeConstruct(components), format_info.swizzle,
+                                     format_info.is_integer);
     return swizzled;
 }
 
@@ -221,6 +223,8 @@ static void LowerBufferFormatInst(IR::Block& block, IR::Inst& inst, Info& info, 
                                                                       flags.inst_data_fmt.Value())
                                         : buffer.GetNumberConversion(),
         .num_components = AmdGpu::NumComponents(data_format),
+        .is_integer = AmdGpu::IsInteger(is_inst_typed ? flags.inst_num_fmt.Value()
+                                                     : AmdGpu::NumberFormat(buffer.num_format)),
     };
 
     if (data_format == AmdGpu::DataFormat::FormatInvalid) {

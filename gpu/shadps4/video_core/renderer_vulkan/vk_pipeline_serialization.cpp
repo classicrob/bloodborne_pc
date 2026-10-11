@@ -17,9 +17,9 @@
 namespace Serialization {
 /* You should increment versions below once corresponding serialization scheme is changed. */
 #ifdef __APPLE__
-static constexpr u32 ShaderBinaryVersion = 21u; // PKRTZ packing uses explicit integer round-toward-zero.
+static constexpr u32 ShaderBinaryVersion = 22u; // Integer buffer swizzle constants and packed SNORM minima.
 #else
-static constexpr u32 ShaderBinaryVersion = 13u; // Atomic masked stores preserve concurrent subword LDS writes.
+static constexpr u32 ShaderBinaryVersion = 14u; // Integer buffer swizzle constants and packed SNORM minima.
 #endif
 static constexpr u32 ShaderMetaVersion = 10u; // RuntimeInfo carries the geometry emulation role and GSVS layout.
 static constexpr u32 PipelineKeyVersion = 11u; // Keys name the ES/GS of an emulated geometry stage.
