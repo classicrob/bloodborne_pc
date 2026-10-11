@@ -171,6 +171,19 @@ private:
     /// Sharpness above 1 for FSR 3/4 (their RCAS stops at 1): one more RCAS pass over the target
     /// (output_image, or the 8-bit UI image with ldr) in General layout after the upscaler.
     void ExtraSharpen(vk::CommandBuffer cmdbuf, vk::Image target, bool ldr, u32 w, u32 h);
+    /// What a dump (BB_DUMP_TRIGGER) writes: the inputs at the render size, the motion vectors
+    /// (w x h) and the upscaler's output.
+    struct DumpSources {
+        vk::Image input;
+        u32 input_width, input_height, input_bytes;
+        const char* input_format;
+        vk::Image depth; ///< at the input size
+        u32 w, h;
+        vk::Image output;
+        u32 ow, oh, output_bytes;
+        const char* output_format;
+    };
+    void DumpUpscalerFrame(vk::CommandBuffer cmdbuf, const DumpSources& sources);
 
     const Instance& instance;
     Scheduler& scheduler;

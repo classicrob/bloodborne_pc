@@ -287,12 +287,21 @@ static void CensusRenderTargetKernel(const Shader::Info& info,
         if (sharp.base_address && sharp.GetSize()) {
             texture_cache.ForEachImageInRegion(
                 sharp.base_address, sharp.GetSize(), [&](VideoCore::ImageId, VideoCore::Image& image) {
-                    text += fmt::format(" [image {:#x} size {} {}x{} {} tile {} layers {} mips {}{}]",
+                    // Images that appear later (a copy's destination) make a new call shape.
+                    signature = signature * 0x100000001b3ull ^ image.info.guest_address ^
+                                (u64(image.info.pixel_format) << 48) ^
+                                (u64(image.info.tile_mode) << 40);
+                    text += fmt::format(" [image {:#x} size {} {}x{} {} tile {} pitch {} bits {} samples {} "
+                                        "layers {} mips {}{}{}]",
                                         image.info.guest_address, image.info.guest_size,
                                         image.info.size.width, image.info.size.height,
                                         vk::to_string(image.info.pixel_format),
-                                        u32(image.info.tile_mode), image.info.resources.layers,
-                                        image.info.resources.levels,
+                                        u32(image.info.tile_mode), image.info.pitch,
+                                        image.info.num_bits, image.info.num_samples,
+                                        image.info.resources.layers, image.info.resources.levels,
+                                        True(image.flags & VideoCore::ImageFlagBits::GpuModified)
+                                            ? " gpu-modified"
+                                            : "",
                                         image.info.guest_address == sharp.base_address &&
                                                 image.info.guest_size == sharp.GetSize()
                                             ? " exact"

@@ -40,6 +40,8 @@
 #include "video_core/renderer_vulkan/vk_shader_hle.h"
 #include "video_core/texture_cache/image_view.h"
 #include "video_core/texture_cache/texture_cache.h"
+#include "bbport_parse_split.h"
+#include <optional>
 #include <vk_mem_alloc.h>
 
 namespace Vulkan {
@@ -438,6 +440,18 @@ void Rasterizer::DrainDrawPipe(u32 reason, u32 line, const char* function) {
     if (!draw_pipe || !OnStageA()) {
         return;
     }
+#ifdef __APPLE__
+    const BbSplit::K split_kind = reason == DrawPipe::ReasonConstRam ? BbSplit::KDrainConstRam
+                                  : reason == DrawPipe::ReasonSubmissionEnd
+                                      ? BbSplit::KDrainSubmitEnd
+                                  : reason == DrawPipe::ReasonRasterizer ? BbSplit::KDrainRasterizer
+                                                                         : BbSplit::KDrainPacket;
+    // Timed only when it can wait: a drain of an idle pipe returns at once.
+    std::optional<BbSplit::Scope> split_scope;
+    if (!draw_pipe->Idle()) {
+        split_scope.emplace(split_kind);
+    }
+#endif
     static const bool stats = std::getenv("BB_FRAME_STATS") != nullptr;
     if (!stats) {
         draw_pipe->Drain(reason);
@@ -764,6 +778,7 @@ void Rasterizer::RunDrawPacket(void* context, const u8* data, u32 size) {
     auto& self = *static_cast<Rasterizer*>(context);
     if (*reinterpret_cast<const PacketKind*>(data) == PacketKind::Task) {
         const auto& task = *reinterpret_cast<const TaskPacket*>(data);
+        BB_SPLIT_MARK_ON(stage_b, BTask);
         task.task(self, data + sizeof(TaskPacket));
         return;
     }
@@ -867,10 +882,12 @@ void Rasterizer::RunDrawPacket(void* context, const u8* data, u32 size) {
     self.pipe_db_extent = packet.db_extent;
     if (packet.kind == PacketKind::Special) {
         // A draw FilterDraw handles (fast clear elimination, resolve, depth copy, skip).
+        BB_SPLIT_MARK_ON(stage_b, BSpecial);
         FrameCapture::Poll();
         self.scheduler.PopPendingOperations();
         self.FilterDraw();
     } else if (cs) {
+        BB_SPLIT_MARK_ON(stage_b, BDispatch);
         stage_cs = cs;
         const auto* pipeline = static_cast<const ComputePipeline*>(packet.pipeline);
         if (indirect) {
@@ -880,6 +897,7 @@ void Rasterizer::RunDrawPacket(void* context, const u8* data, u32 size) {
         }
         stage_cs = nullptr;
     } else if (indirect) {
+        BB_SPLIT_MARK_ON(stage_b, BIndirect);
         self.DrawIndirectRecord(static_cast<const GraphicsPipeline*>(packet.pipeline),
                                 packet.is_indexed, *indirect);
     } else {
@@ -1035,6 +1053,7 @@ void Rasterizer::NoteRecordContext(const char* kind, const Pipeline* pipeline) {
 
 void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw* used_prepared,
                             bool is_indexed, u32 index_offset) {
+    BB_SPLIT_MARK_ON(stage_b, BDrawSetup);
     NoteRecordContext("draw", pipeline);
     if (DrawPipe::OnStageB()) {
         FrameCapture::Poll();
@@ -1078,6 +1097,7 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     motion_draw = pipeline->GetGraphicsKey().motion_vectors;
     motion_geometry = 0;
 
+    BB_SPLIT_MARK_ON(stage_b, BRenderState);
     PrepareRenderState(pipeline);
     if (upscaler->Enabled() && std::popcount(pipeline->GetGraphicsKey().mrt_mask) == 1) {
         const auto& viewport = Regs().viewports[0];
@@ -1089,6 +1109,7 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     // bbport: vertex and index buffers are resolved while the helper binds textures (their
     // commands are recorded after BeginRendering, as before).
     draw_inputs = {pipeline, draw_prepared, index_offset, is_indexed, true, false};
+    BB_SPLIT_MARK_ON(stage_b, BBind);
     const bool bound = BindResources(pipeline);
     bind_prepared = nullptr; // indirect draws and dispatches bind without prepared sharps
     const bool inputs_resolved = draw_inputs.resolved;
@@ -1096,7 +1117,9 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     if (!bound) {
         return;
     }
+    BB_SPLIT_MARK_ON(stage_b, BBegin);
     const auto state = BeginRendering(pipeline);
+    BB_SPLIT_MARK_ON(stage_b, BRecord);
 #ifdef __APPLE__
     if (gs_draw.ended_pass && *gs_draw.ended_pass == state) {
         // The compute passes ended the pass this draw continues (not counted when the draw
@@ -1233,7 +1256,11 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
 #ifdef __APPLE__
     if (pipeline->GsEmulation()) {
         scheduler.Record([=](vk::CommandBuffer cmdbuf) {
-            cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, handle);
+            BB_SPLIT_SCOPE(KEncDraw);
+            {
+                BB_SPLIT_SCOPE(KEncPipeline);
+                cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, handle);
+            }
             if (gs_draw.indirect) {
                 // Point output: the compaction kernel wrote the command.
                 cmdbuf.bindIndexBuffer(gs_draw.index_buffer, gs_draw.index_offset,
@@ -1249,7 +1276,11 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     } else
 #endif
     scheduler.Record([=](vk::CommandBuffer cmdbuf) {
-        cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, handle);
+        BB_SPLIT_SCOPE(KEncDraw);
+        {
+            BB_SPLIT_SCOPE(KEncPipeline);
+            cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, handle);
+        }
         if (is_indexed) {
             cmdbuf.drawIndexed(num_indices, num_instances, 0, s32(first_vertex), first_instance);
         } else {
@@ -1454,7 +1485,11 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
     if (gs_draw.indirect) {
         const vk::Pipeline gs_handle = pipeline->Handle();
         scheduler.Record([=](vk::CommandBuffer cmdbuf) {
-            cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, gs_handle);
+            BB_SPLIT_SCOPE(KEncDraw);
+            {
+                BB_SPLIT_SCOPE(KEncPipeline);
+                cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, gs_handle);
+            }
             cmdbuf.bindIndexBuffer(gs_draw.index_buffer, gs_draw.index_offset,
                                    vk::IndexType::eUint32);
             cmdbuf.drawIndexedIndirect(gs_draw.index_buffer, gs_draw.indirect_offset, 1,
@@ -1474,7 +1509,11 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
     const vk::Buffer counts = count_address != 0 ? count_buffer->Handle() : vk::Buffer{};
     const u64 counts_offset = count_address != 0 ? count_offset : 0;
     scheduler.Record([=](vk::CommandBuffer cmdbuf) {
-        cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, handle);
+        BB_SPLIT_SCOPE(KEncDraw);
+        {
+            BB_SPLIT_SCOPE(KEncPipeline);
+            cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, handle);
+        }
         if (is_indexed) {
             if (counts) {
                 cmdbuf.drawIndexedIndirectCount(args, args_offset, counts, counts_offset, max_count,
@@ -1560,7 +1599,11 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
         FrameCapture::Dispatch(cs.pgm_hash, dim_x, dim_y, dim_z);
     }
     scheduler.Record([=](vk::CommandBuffer cmdbuf) {
-        cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, handle);
+        BB_SPLIT_SCOPE(KEncDispatch);
+        {
+            BB_SPLIT_SCOPE(KEncPipeline);
+            cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, handle);
+        }
         cmdbuf.dispatch(dim_x, dim_y, dim_z);
     });
     DebugState.IncDispatch();
@@ -1615,7 +1658,11 @@ void Rasterizer::DispatchIndirectRecord(const ComputePipeline* pipeline, VAddr a
     const vk::Buffer args = buffer->Handle();
     const u64 args_offset = base;
     scheduler.Record([=](vk::CommandBuffer cmdbuf) {
-        cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, handle);
+        BB_SPLIT_SCOPE(KEncDispatch);
+        {
+            BB_SPLIT_SCOPE(KEncPipeline);
+            cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, handle);
+        }
         cmdbuf.dispatchIndirect(args, args_offset);
     });
     DebugState.IncDispatch();
@@ -2035,6 +2082,7 @@ void Rasterizer::EmitVertexBuffers(const GraphicsPipeline* pipeline) {
                           attributes = scheduler.RecordData(std::span<const vk::VertexInputAttributeDescription2EXT>{
                               v.attributes.data(), v.attributes.size()})](
                              vk::CommandBuffer cmdbuf) {
+            BB_SPLIT_SCOPE(KEncDraw);
             cmdbuf.setVertexInputEXT(bindings, attributes);
         });
     }
@@ -2045,6 +2093,7 @@ void Rasterizer::EmitVertexBuffers(const GraphicsPipeline* pipeline) {
     const auto offsets = scheduler.RecordData(std::span<const vk::DeviceSize>{v.host_offsets.data(), num_buffers});
     if (dynamic_input) {
         scheduler.Record([num_buffers, buffers, offsets](vk::CommandBuffer cmdbuf) {
+            BB_SPLIT_SCOPE(KEncDraw);
             cmdbuf.bindVertexBuffers(0, num_buffers, buffers.data(), offsets.data());
         });
         return;
@@ -2052,6 +2101,7 @@ void Rasterizer::EmitVertexBuffers(const GraphicsPipeline* pipeline) {
     const auto sizes = scheduler.RecordData(std::span<const vk::DeviceSize>{v.host_sizes.data(), num_buffers});
     const auto strides = scheduler.RecordData(std::span<const vk::DeviceSize>{v.host_strides.data(), num_buffers});
     scheduler.Record([num_buffers, buffers, offsets, sizes, strides](vk::CommandBuffer cmdbuf) {
+        BB_SPLIT_SCOPE(KEncDraw);
         cmdbuf.bindVertexBuffers2(0, num_buffers, buffers.data(), offsets.data(), sizes.data(),
                                   strides.data());
     });
@@ -2213,6 +2263,7 @@ void Rasterizer::BindIndexBuffer(u32 index_offset) {
 void Rasterizer::EmitIndexBuffer() {
     scheduler.Record([handle = index_bind.handle, offset = index_bind.offset,
                       type = index_bind.type](vk::CommandBuffer cmdbuf) {
+        BB_SPLIT_SCOPE(KEncDraw);
         cmdbuf.bindIndexBuffer(handle, offset, type);
     });
 }
@@ -2403,6 +2454,7 @@ bool Rasterizer::IsComputeImageClear(const Pipeline* pipeline) {
 void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* prepared,
                              Shader::Backend::Bindings& binding,
                              Shader::PushData& push_data, u32& write_index) {
+    BB_SPLIT_SECTION(stage_b, BBuffers);
     const u64 alignment = instance.StorageMinAlignment();
     for (u32 buffer_index = 0; buffer_index < stage.buffers.size(); ++buffer_index) {
         const auto& desc = stage.buffers[buffer_index];
@@ -2609,6 +2661,7 @@ Rasterizer::ImageDescCacheEntry& Rasterizer::CachedImageDescEntry(const AmdGpu::
 void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* prepared,
                               Shader::Backend::Bindings& binding, u32& write_index,
                               bool& barrier, bool on_helper) {
+    BB_SPLIT_SECTION(stage_b, BTextures);
     const u32 first_image_idx = image_infos.size();
     TextureSet* set_slot = nullptr;
     if (!on_helper && BindTexturesFromSet(stage, prepared, first_image_idx, barrier, set_slot)) {
@@ -4712,13 +4765,39 @@ void Rasterizer::GpuReadCheck(const GraphicsPipeline* pipeline, bool is_indexed,
             continue;
         }
         const auto& info = *stages[stage];
+        // The tessellation constants' V# (the same read as Info::ReadTessConstantBuffer at
+        // pipeline selection, under fault recovery).
+        volatile VAddr tess_constants = 0;
+        if (info.tess_consts_dword_offset >= 0) {
+            auto* const previous = runtime_fault_recover;
+            sigjmp_buf recover;
+            if (!sigsetjmp(recover, 0)) {
+                runtime_fault_recover = &recover;
+                tess_constants = info.ReadUdReg<AmdGpu::Buffer>(
+                                         u32(info.tess_consts_ptr_base),
+                                         u32(info.tess_consts_dword_offset))
+                                     .base_address;
+            }
+            runtime_fault_recover = previous;
+        }
         for (u32 i = 0; i < info.buffers.size(); ++i) {
             const auto& desc = info.buffers[i];
             if (desc.IsSpecial() || desc.is_written) {
                 continue;
             }
             const auto sharp = desc.GetSharp(info);
-            add(sharp.base_address, SharpSpan(sharp), 'b', stage, i, info.pgm_hash);
+            u64 size = SharpSpan(sharp);
+            // The tessellation constants are 36 B (TessellationDataConstantBuffer) under a V#
+            // rounded up to its 16 B stride (48 B). The guest allocates them at the end of a
+            // command chunk, so the 12 B after them are the chunk's status word and the next
+            // chunk's first dword, which the guest rewrites and no stage reads (Astra-2's RE;
+            // READBYTES: every change was in +36..+47). TES only: the programs checked read bytes
+            // 4..27 (Verifier: 0xc1888bd, 0x7f03e945); a hull stage binding it keeps the 48 B.
+            if (tess_constants && sharp.base_address == tess_constants &&
+                stage == u32(Shader::SwStage::TessellationEval)) {
+                size = std::min<u64>(size, sizeof(Shader::TessellationDataConstantBuffer));
+            }
+            add(sharp.base_address, size, 'b', stage, i, info.pgm_hash);
         }
     }
     if (gpu_read_check >= 2 && !pipeline->GsEmulation()) {
@@ -4789,13 +4868,13 @@ std::string Rasterizer::CaptureSettingsRefusal() const {
         on += on.empty() ? name : fmt::format(", {}", name);
     };
     if (upscaler && upscaler->Enabled()) {
-        add("upscaler (incl. TAA and DisplayOverride)");
+        add("upscaler available, incl. TAA and DisplayOverride (BB_UPSCALER=none to capture: the menu can switch it on mid-replay)");
     }
     if (scene_targets && scene_targets->Reduced()) {
         add("reduced scene (live resolution)");
     }
     if (camera_motion && camera_motion->Enabled()) {
-        add("camera motion vectors");
+        add("camera motion vectors available (follow BB_UPSCALER)");
     }
     if (object_motion && object_motion->Enabled()) {
         add("object motion vectors");
