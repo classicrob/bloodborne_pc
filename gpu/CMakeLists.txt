@@ -327,7 +327,8 @@ if (APPLE)
     add_executable(shader-sweep EXCLUDE_FROM_ALL ../tools/macos/shader_sweep/sweep.cpp
         ../tests/test_gpu_runtime_stubs.cpp)
     target_include_directories(shader-sweep PRIVATE shim shadps4 third_party/gcn/include)
-    target_compile_options(shader-sweep PRIVATE -UNDEBUG -fPIC)
+    # Production NDEBUG: the driver shares Vulkan-Hpp and renderer types with libbbgpu.
+    target_compile_options(shader-sweep PRIVATE -fPIC)
     target_link_libraries(shader-sweep PRIVATE bbgpu)
     target_include_directories(depth-bounds-shader-test PRIVATE third_party/sirit/externals/SPIRV-Headers/include)
     # Unit tests of the GPU library's Apple paths (build.sh --test runs each).
