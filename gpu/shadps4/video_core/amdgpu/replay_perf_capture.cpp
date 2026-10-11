@@ -99,6 +99,14 @@ private:
     char magic[8]{};
 };
 
+/// Reads host memory without faulting: false if any byte is unreadable.
+bool SafeRead(u64 address, void* out, u64 size) {
+    mach_vm_size_t got = 0;
+    return mach_vm_read_overwrite(mach_task_self(), address, size,
+                                  reinterpret_cast<mach_vm_address_t>(out), &got) == KERN_SUCCESS &&
+           got == size;
+}
+
 /// Guest memory as the capture sees it: the views and blocks of one VMA-table read, the
 /// backing pool and the eboot image range.
 struct Memory {
@@ -145,8 +153,7 @@ struct Memory {
     /// image; false unless one view or the image holds the whole range.
     bool Read(u64 va, void* out, u64 size) const {
         if (va >= image_start && size <= image_size && va - image_start <= image_size - size) {
-            std::memcpy(out, reinterpret_cast<const void*>(va), size);
-            return true;
+            return SafeRead(va, out, size); // protected regions inside the image fail, not fault
         }
         const auto it = std::upper_bound(views.begin(), views.end(), va,
                                          [](u64 a, const RuntimeMemoryView& v) { return a < v.start; });
@@ -250,15 +257,45 @@ bool WriteBacking(const std::filesystem::path& dir, const Memory& m, u64& payloa
     return f.Close(why);
 }
 
-bool WriteImage(const std::filesystem::path& dir, const Memory& m, std::string& why) {
+/// The eboot image as runs of readable pages: it holds protected regions (a plain read of them
+/// faults; Playtest's first image write failed with EFAULT).
+bool WriteImage(const std::filesystem::path& dir, const Memory& m, u64& readable, std::string& why) {
     File f;
     if (!f.Open(dir / "image.bin", ImageMagic, why) ||
-        !f.Put(ImageRecord{m.image_start, m.image_size}, why) ||
-        !f.Write(reinterpret_cast<const void*>(m.image_start), m.image_size, why)) {
+        !f.Put(ImageRecord{m.image_start, m.image_size}, why)) {
         return false;
     }
-    f.Record();
-    return f.Close(why);
+    const u64 page = vm_page_size;
+    std::vector<u8> buffer(page);
+    readable = 0;
+    u64 run_start = 0, run_bytes = 0;
+    std::vector<u8> run;
+    const auto flush = [&]() {
+        if (!run_bytes) {
+            return true;
+        }
+        if (!f.Put(ImageRun{run_start, run_bytes}, why) || !f.Write(run.data(), run.size(), why)) {
+            return false;
+        }
+        f.Record();
+        readable += run_bytes;
+        run.clear();
+        run_bytes = 0;
+        return true;
+    };
+    for (u64 off = 0; off < m.image_size; off += page) {
+        const u64 n = std::min(page, m.image_size - off);
+        if (SafeRead(m.image_start + off, buffer.data(), n)) {
+            if (!run_bytes) {
+                run_start = off;
+            }
+            run.insert(run.end(), buffer.begin(), buffer.begin() + n);
+            run_bytes += n;
+        } else if (!flush()) {
+            return false;
+        }
+    }
+    return flush() && f.Close(why);
 }
 
 bool WriteLiverpool(const std::filesystem::path& dir, const Liverpool& lp, std::string& why) {
@@ -748,9 +785,10 @@ std::string Write(const Liverpool& liverpool, std::span<const std::shared_ptr<Cm
         return {};
     };
 
-    u64 backing_bytes = 0, words = 0, resets = 0, reset_bytes = 0, images = 0, texel_bytes = 0;
+    u64 backing_bytes = 0, words = 0, resets = 0, reset_bytes = 0, images = 0, texel_bytes = 0,
+        image_readable = 0;
     if (!WriteViews(dir, memory, why) || !WriteBacking(dir, memory, backing_bytes, why) ||
-        !WriteImage(dir, memory, why) || !WriteLiverpool(dir, liverpool, why) ||
+        !WriteImage(dir, memory, image_readable, why) || !WriteLiverpool(dir, liverpool, why) ||
         !WriteSubmissions(dir, held, words, why) ||
         !WriteResets(dir, memory, walk, resets, reset_bytes, why) ||
         !WriteImages(dir, liverpool, images, texel_bytes, why)) {
@@ -767,11 +805,13 @@ std::string Write(const Liverpool& liverpool, std::span<const std::shared_ptr<Cm
                "  \"pixel_output\": \"not qualified (perf replay)\",\n"
                "  \"vma_generation\": {},\n  \"blocks\": {},\n  \"views\": {},\n"
                "  \"backing_payload_bytes\": {},\n  \"image\": [{}, {}],\n"
+               "  \"image_readable_bytes\": {},\n"
                "  \"submissions\": {},\n  \"command_dwords\": {},\n"
                "  \"resets\": {},\n  \"reset_bytes\": {},\n"
                "  \"images\": {},\n  \"image_texel_bytes\": {}\n}}\n",
                Version, memory.generation, memory.blocks.size(), memory.views.size(), backing_bytes,
-               memory.image_start, memory.image_size, held.size(), words, resets, reset_bytes,
+               memory.image_start, memory.image_size, image_readable, held.size(), words, resets,
+               reset_bytes,
                images, texel_bytes);
     if (std::fclose(manifest) != 0) {
         why = "writing manifest.json failed";

@@ -822,7 +822,7 @@ static int run_replay(const char *dir, unsigned char *image_base, uint64_t image
     struct { char magic[8]; uint32_t version, reserved; uint64_t records; } h;
     uint64_t range[2];
     if (!f || fread(&h,sizeof(h),1,f)!=1 || memcmp(h.magic,"BBRPEBOT",8) || h.version!=1 ||
-        h.records!=1 || fread(range,sizeof(range),1,f)!=1) {
+        fread(range,sizeof(range),1,f)!=1) {
         fprintf(stderr,"STOP: perf replay: %s is not a version 1 image file\n",path);
         if (f) fclose(f);
         return 2;
@@ -834,10 +834,15 @@ static int run_replay(const char *dir, unsigned char *image_base, uint64_t image
         fclose(f);
         return 2;
     }
-    if (fread(image_base,1,image_size,f)!=image_size) {
-        fprintf(stderr,"STOP: perf replay: %s is truncated\n",path);
-        fclose(f);
-        return 2;
+    /* Runs of the pages that were readable at capture (protected regions are left as loaded). */
+    for (uint64_t i=0;i<h.records;++i) {
+        uint64_t run[2];
+        if (fread(run,sizeof(run),1,f)!=1 || run[0]>image_size || run[1]>image_size-run[0] ||
+            fread(image_base+run[0],1,run[1],f)!=run[1]) {
+            fprintf(stderr,"STOP: perf replay: %s: bad or truncated run %" PRIu64 "\n",path,i);
+            fclose(f);
+            return 2;
+        }
     }
     fclose(f);
     unsigned iterations=10;

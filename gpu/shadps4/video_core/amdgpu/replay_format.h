@@ -53,9 +53,15 @@ struct BackingRun {
     u64 bytes; ///< payload bytes that follow
 };
 
-/// image.bin: one record, the eboot image range, then its bytes.
+/// image.bin: an ImageRecord (the eboot image range, not counted in `records`), then one
+/// ImageRun + bytes per run of readable pages (`records` runs). Unreadable pages (protected
+/// regions inside the image) are not captured; the replay leaves them as loaded.
 struct ImageRecord {
     u64 start, size;
+};
+struct ImageRun {
+    u64 offset; ///< from the image start
+    u64 bytes;
 };
 
 /// liverpool.bin: one record per state section, then its bytes.
