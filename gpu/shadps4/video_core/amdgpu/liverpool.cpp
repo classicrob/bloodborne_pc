@@ -6,6 +6,7 @@
 #include <pthread.h>
 #ifdef __APPLE__
 #include "bb_mac_compat.h"
+#include "../../../../src/runtime_memory.h"
 #endif
 #ifndef _WIN32
 #include <sys/resource.h>
@@ -66,6 +67,31 @@ static const char* acb_task_name[] = NAME_ARRAY(ACB_TASK, MAX_NAMES);
 std::array<u8, 48_KB> Liverpool::ConstantEngine::constants_heap;
 
 #ifdef __APPLE__
+/// Lost packet alignment: other guest views of the command memory (a second writer through an
+/// alias would explain words nobody wrote at this address).
+static void ReportCommandMemoryAliases(const u32* guest) {
+    std::array<RuntimeMemoryAlias, 8> rows{};
+    RuntimeMemoryAliasSnapshot snapshot{};
+    const int tracked = runtime_memory_alias_snapshot(reinterpret_cast<uintptr_t>(guest),
+                                                      rows.data(), rows.size(), &snapshot);
+    if (tracked != 1) {
+        LOG_CRITICAL(Render, "Command memory {} is not committed guest memory the runtime tracks "
+                             "(alias query returned {})",
+                     fmt::ptr(guest), tracked);
+        return;
+    }
+    LOG_CRITICAL(Render,
+                 "Command memory {}: mapping {:#x}-{:#x} prot {}, backing byte {:#x}, {} other "
+                 "guest views{} (table generation {})",
+                 fmt::ptr(guest), snapshot.start, snapshot.end, snapshot.prot,
+                 snapshot.backing_byte, snapshot.total, snapshot.truncated ? " (truncated)" : "",
+                 snapshot.generation);
+    for (size_t i = 0; i < snapshot.copied; ++i) {
+        LOG_CRITICAL(Render, "  same backing at {:#x} (view {:#x}-{:#x} prot {})",
+                     rows[i].address, rows[i].start, rows[i].end, rows[i].prot);
+    }
+}
+
 /// BB_CMD_SNAPSHOT_CHECK=1: command snapshot diagnostics (guest rewrites, CMD-OVERLAP).
 static bool SnapshotCheck() {
     static const bool check = EmulatorSettingsImpl::Flag("BB_CMD_SNAPSHOT_CHECK", false);
@@ -848,8 +874,10 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
 #ifdef __APPLE__
         if (type == 0 || type == 1) {
             // Lost packet alignment: which builder calls wrote around here (guest address).
-            BuilderTrace::Report(region ? region->guest + (region->size_dw - dcb.size())
-                                        : dcb.data());
+            const u32* guest = region ? region->guest + (region->size_dw - dcb.size())
+                                      : dcb.data();
+            BuilderTrace::Report(guest);
+            ReportCommandMemoryAliases(guest);
         }
 #endif
         switch (type) {
