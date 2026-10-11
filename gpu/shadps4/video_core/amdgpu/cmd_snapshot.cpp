@@ -109,11 +109,66 @@ u64 builder_trace_calls = 0;
 std::atomic<u32> builder_trace_threads = 0;
 } // namespace
 
-void BuilderTrace::Note(const char* builder, const u32* cmdbuf, u32 size) {
+u32 BuilderTrace::ThreadNumber() {
     static thread_local const u32 thread = ++builder_trace_threads;
+    return thread;
+}
+
+void BuilderTrace::Note(const char* builder, const u32* cmdbuf, u32 size) {
+    const u32 thread = ThreadNumber();
     std::scoped_lock lk{builder_trace_mutex};
     const u64 seq = builder_trace_calls++;
     builder_trace[seq % builder_trace.size()] = {builder, cmdbuf, size, thread, seq};
+}
+
+namespace {
+struct SubmittedRegion {
+    const u32* guest;
+    u32 size_dw;
+    u64 submit_number;
+    u32 thread;
+};
+std::mutex recent_regions_mutex;
+std::deque<SubmittedRegion> recent_regions; ///< oldest first
+} // namespace
+
+u32 CmdSnapshot::ReportRecentOverlaps() {
+    constexpr u64 Recent = 64; // submissions
+    const u32 thread = BuilderTrace::ThreadNumber();
+    std::scoped_lock lk{recent_regions_mutex};
+    while (!recent_regions.empty() &&
+           recent_regions.front().submit_number + Recent < submit_number) {
+        recent_regions.pop_front();
+    }
+    u32 overlaps = 0;
+    for (const auto& region : regions) {
+        if (!region.copied) {
+            continue;
+        }
+        const u32* end = region.guest + region.size_dw;
+        for (const auto& old : recent_regions) {
+            const u32* old_end = old.guest + old.size_dw;
+            const bool same = old.guest == region.guest && old.size_dw == region.size_dw;
+            if (same || !(region.guest < old_end && old.guest < end)) {
+                continue;
+            }
+            ++overlaps;
+            static std::atomic<u64> reports = 0;
+            if (const u64 n = ++reports; n <= 16 || (n & 1023) == 0) {
+                LOG_CRITICAL(Render,
+                             "CMD-OVERLAP #{}: submission {} (thread {}) buffer {}+{} dwords "
+                             "partly overlaps submission {} (thread {}) buffer {}+{} dwords",
+                             n, submit_number, thread, fmt::ptr(region.guest), region.size_dw,
+                             old.submit_number, old.thread, fmt::ptr(old.guest), old.size_dw);
+            }
+        }
+    }
+    for (const auto& region : regions) {
+        if (region.copied) {
+            recent_regions.push_back({region.guest, region.size_dw, submit_number, thread});
+        }
+    }
+    return overlaps;
 }
 
 std::vector<BuilderTrace::Call> BuilderTrace::Around(const u32* begin, const u32* end, u32 last) {
