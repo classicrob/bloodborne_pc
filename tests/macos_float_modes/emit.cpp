@@ -83,7 +83,7 @@ static std::vector<u32> Emit(bool repair, bool benchmark) {
             case 5: result = EmitFPMax32(ctx, a, b); break;
             case 6: bits = ctx.OpBitcast(ctx.U32[1], EmitConvertS32F32(ctx, a)); break;
             case 7: result = EmitConvertF32S32(ctx, ctx.OpBitcast(ctx.S32[1], a_bits)); break;
-            case 8: bits = EmitPackHalf2x16(ctx, ctx.OpCompositeConstruct(ctx.F32[2], a, b)); break;
+            case 8: bits = EmitPackHalf2x16(ctx, nullptr, ctx.OpCompositeConstruct(ctx.F32[2], a, b)); break;
             case 9: result = ctx.OpCompositeExtract(ctx.F32[1], EmitUnpackHalf2x16(ctx, a_bits), 0u); break;
             case 10: {
                 const auto eq = ctx.OpSelect(ctx.U32[1], EmitFPOrdEqual32(ctx, a, b), ctx.ConstU32(1u), ctx.u32_zero_value);
