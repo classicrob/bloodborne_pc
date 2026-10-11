@@ -267,6 +267,9 @@ void Liverpool::Process(std::stop_token stoken) {
             }
         }
 
+#ifdef __APPLE__
+        const bool frame_ended = submit_done;
+#endif
         if (submit_done) {
 #ifdef __APPLE__
             {
@@ -307,10 +310,29 @@ void Liverpool::Process(std::stop_token stoken) {
         // heap free list after minutes of play).
         // The same holds when sceGnmSubmitDone finds the GPU idle and does not block at all:
         // decoded (num_submits 0) is not done until then (work_retired).
+#ifdef __APPLE__
+        // GpuIdle's wait split (R0): the drain, the recorder-side writes, then the completion
+        // labels, timed separately; the waits are the same as without it.
+        u64 drain_ns = 0, recorder_ns = 0, labels_ns = 0;
+        if (rasterizer) {
+            const auto t0 = std::chrono::steady_clock::now();
+            rasterizer->DrainDrawPipe(Vulkan::DrawPipe::ReasonSubmissionEnd);
+            const auto t1 = std::chrono::steady_clock::now();
+            rasterizer->WaitRecorderSignals();
+            const auto t2 = std::chrono::steady_clock::now();
+            rasterizer->WaitDeferredSignals();
+            const auto t3 = std::chrono::steady_clock::now();
+            using std::chrono::duration_cast, std::chrono::nanoseconds;
+            drain_ns = duration_cast<nanoseconds>(t1 - t0).count();
+            recorder_ns = duration_cast<nanoseconds>(t2 - t1).count();
+            labels_ns = duration_cast<nanoseconds>(t3 - t2).count();
+        }
+#else
         if (rasterizer) {
             rasterizer->DrainDrawPipe(Vulkan::DrawPipe::ReasonSubmissionEnd);
             rasterizer->WaitDeferredSignals();
         }
+#endif
 #ifdef __APPLE__
         // GpuIdle releases the guest's sceGnmSubmitDone throttle (submission_lock), after which
         // it rebuilds command buffers it double-buffers. The drain above can take long while the
@@ -322,6 +344,9 @@ void Liverpool::Process(std::stop_token stoken) {
             if (num_submits == 0) {
                 work_retired = true;
                 Platform::IrqC::Instance()->Signal(Platform::InterruptId::GpuIdle);
+                if (frame_ended) {
+                    NoteIdleSplit(drain_ns, recorder_ns, labels_ns);
+                }
             } else if (++parse_lag.idle_held_back <= 8) {
                 LOG_INFO(Render, "GpuIdle held back: {} submissions arrived while retiring",
                          num_submits.load());
@@ -338,6 +363,49 @@ void Liverpool::Process(std::stop_token stoken) {
 #endif
     }
 }
+
+#ifdef __APPLE__
+void Liverpool::NoteIdleSplit(u64 drain_ns, u64 recorder_ns, u64 labels_ns) {
+    // Under submit_mutex, with GpuIdle just raised for a frame end.
+    auto& s = idle_split;
+    const u64 total_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             std::chrono::steady_clock::now() - submit_done_at)
+                             .count();
+    s.total_ns += total_ns;
+    s.total_ns_max = std::max(s.total_ns_max, total_ns);
+    s.drain_ns += drain_ns;
+    s.recorder_ns += recorder_ns;
+    s.labels_ns += labels_ns;
+    if (rasterizer) {
+        const auto progress = rasterizer->GetLabelProgress();
+        if (progress.issued == s.labels_issued_before) {
+            ++s.unlabeled_frames;
+        } else if (progress.last_submitted_tick > progress.last_label_tick) {
+            ++s.tail_frames;
+            s.tail_ticks += progress.last_submitted_tick - progress.last_label_tick;
+        }
+        s.labels_issued_before = progress.issued;
+    }
+    if (++s.frames < 600) {
+        return;
+    }
+    const double n = double(s.frames);
+    const u64 parts = s.drain_ns + s.recorder_ns + s.labels_ns;
+    // Printed like the Stall lines: Info-level logging is filtered in perf runs.
+    fmt::print("GpuIdle split, last 600 frame ends: sceGnmSubmitDone to GpuIdle {:.2f} ms mean "
+               "({:.2f} max) = parse and queue {:.2f} + stage-B drain {:.2f} + recorder writes "
+               "{:.2f} + completion labels {:.2f} ms; frames whose last GPU submission follows "
+               "their last label {} (mean {:.1f} ticks), frames without a label {}\n",
+               s.total_ns / n / 1e6, s.total_ns_max / 1e6,
+               (s.total_ns > parts ? s.total_ns - parts : 0) / n / 1e6, s.drain_ns / n / 1e6,
+               s.recorder_ns / n / 1e6, s.labels_ns / n / 1e6, s.tail_frames,
+               s.tail_frames ? double(s.tail_ticks) / s.tail_frames : 0.0, s.unlabeled_frames);
+    std::fflush(stdout);
+    const u64 keep = s.labels_issued_before;
+    s = {};
+    s.labels_issued_before = keep;
+}
+#endif
 
 namespace {
 /// bbport: packets the GPU command thread handles while the draw recording thread may still

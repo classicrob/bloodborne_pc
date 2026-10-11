@@ -228,6 +228,8 @@ void Scheduler::SignalAtGpuCompletion(std::function<void()> signal, bool batch) 
     // Issued now, in stream order; the writer takes labels only in this order, whichever
     // becomes ready first (deferred ones after the copy threads, direct ones at once).
     const u64 sequence = labels.Issue();
+    labels_issued.fetch_add(1, std::memory_order_relaxed);
+    last_label_tick.store(tick, std::memory_order_relaxed);
     deferred_signals_issued.fetch_add(1, std::memory_order_relaxed);
     std::call_once(label_thread_once, [this] {
         label_thread = std::jthread([this](std::stop_token stoken) { LabelThread(stoken); });
@@ -302,12 +304,16 @@ void Scheduler::LabelThread(std::stop_token stoken) {
             break;
         }
         label->write();
+        // Before deferred_signals_done: the recorder-side count (done - written) never runs
+        // ahead (WaitRecorderSignals).
+        labels_written.fetch_add(1, std::memory_order_release);
         deferred_signals_done->fetch_add(1, std::memory_order_release);
     }
     // Stopping (exit): labels not written are dropped, and counted as done so that nothing is
     // left waiting for them (WaitDeferredSignals).
     dropped += labels.Outstanding();
     if (dropped) {
+        labels_written.fetch_add(dropped, std::memory_order_release);
         deferred_signals_done->fetch_add(dropped, std::memory_order_release);
         std::fprintf(stderr, "Labels at GPU completion: %llu labels not written at shutdown\n",
                      static_cast<unsigned long long>(dropped));
@@ -329,6 +335,27 @@ void Scheduler::WaitDeferredSignals() {
         std::this_thread::yield();
     }
 }
+
+#ifdef __APPLE__
+void Scheduler::WaitRecorderSignals() {
+    // Stage A issues no label while it waits here (the draw pipe is drained), so the issued
+    // counts are stable.
+    const u64 issued = deferred_signals_issued.load(std::memory_order_relaxed) -
+                       labels_issued.load(std::memory_order_relaxed);
+    const auto recorder_done = [this] {
+        const u64 written = labels_written.load(std::memory_order_acquire);
+        return deferred_signals_done->load(std::memory_order_acquire) - written;
+    };
+    if (recorder_done() >= issued || BbToggle::Disabled(BbToggle::OrderedGuestWrites)) {
+        return;
+    }
+    KickRecording(true);
+    while (recorder_done() < issued) {
+        BbCopy::WaitAsync();
+        std::this_thread::yield();
+    }
+}
+#endif
 
 void Scheduler::WaitHostCopies() {
     if (host_copies_done.load(std::memory_order_acquire) < host_copies_issued) {
