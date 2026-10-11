@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <memory>
 #include <boost/container/static_vector.hpp>
 #include <xxhash.h>
 
@@ -44,6 +45,10 @@ struct GraphicsPipelineKey {
     std::array<u8, AmdGpu::NUM_COLOR_BUFFERS> color_samples;
     u32 mrt_mask;
     u32 motion_vectors = 0;
+    /// bbport (Apple): ES and GS of an emulated geometry stage (compute roles); 0 otherwise. The
+    /// vertex stage of such a pipeline is the copy shader (vk_gs_emulation.h).
+    size_t gs_es_hash;
+    size_t gs_gs_hash;
     struct {
         AmdGpu::DepthBuffer::ZFormat z_format : 2;
         AmdGpu::DepthBuffer::StencilFormat stencil_format : 1;
@@ -68,6 +73,8 @@ struct GraphicsPipelineKey {
     void Serialize(Serialization::Archive& ar) const;
     bool Deserialize(Serialization::Archive& ar);
 };
+
+struct GsEmulationStages;
 
 class GraphicsPipeline : public Pipeline {
 public:
@@ -98,6 +105,13 @@ public:
         return fetch_shader;
     }
 
+    /// bbport (Apple): the ES/GS compute pipelines when this pipeline draws an emulated geometry
+    /// stage (vk_gs_emulation.h), else null.
+    const GsEmulationStages* GsEmulation() const noexcept {
+        return gs_emulation.get();
+    }
+    void SetGsEmulation(std::unique_ptr<GsEmulationStages> stages);
+
     bool UsesVertexPulling() const noexcept {
         return profile.emulate_vertex_fetch;
     }
@@ -122,6 +136,7 @@ public:
                          u32 step_rate_1) const;
 
 private:
+    std::unique_ptr<GsEmulationStages> gs_emulation;
     void BuildDescSetLayout(bool preloading);
 
 private:

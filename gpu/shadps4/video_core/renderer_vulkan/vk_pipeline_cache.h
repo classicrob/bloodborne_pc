@@ -100,6 +100,12 @@ struct PipelineSelection {
     std::optional<Shader::Gcn::FetchShaderData> fetch_shader{};
     GraphicsPipelineKey graphics_key{};
     bool motion = false;
+    /// bbport (Apple): ES and GS of an emulated geometry stage (vk_gs_emulation.h).
+    struct GsEmulationProgram {
+        const Shader::Info* info{};
+        vk::ShaderModule module{};
+        size_t hash{};
+    } gs_es{}, gs_gs{};
     DrawIndirectParams draw_indirect_params{};
     struct PrepWorker* worker{}; ///< set: read-only selection for a draw-preparation worker
 };

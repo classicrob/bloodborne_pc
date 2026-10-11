@@ -869,6 +869,15 @@ void Rasterizer::PrintPipeStats() {
     const u64 tsc = __rdtsc();
     const double cycles = double(tsc - last_tsc);
     const u64 busy = draw_pipe->busy_cycles.load(std::memory_order_relaxed);
+    if (const u64 gs_draws = gs_stats.draws.exchange(0, std::memory_order_relaxed)) {
+        // bbport (Apple): emulated geometry stages (vk_gs_emulation.h).
+        std::printf("Geometry emulation: %.0f draws/s, %.0f dispatches/s, %.0f render passes "
+                    "ended/s, %.1f MB/s scratch\n",
+                    gs_draws / seconds,
+                    gs_stats.dispatches.exchange(0, std::memory_order_relaxed) / seconds,
+                    gs_stats.splits.exchange(0, std::memory_order_relaxed) / seconds,
+                    gs_stats.scratch_bytes.exchange(0, std::memory_order_relaxed) / seconds / 1e6);
+    }
     std::printf("Draw pipe: %.0f draws/s pipelined, %.0f drains/s that waited, stage A waited "
                 "%.1f%%, stage B handler elapsed %.1f%%\n",
                 (draw_pipe->packets - last_packets) / seconds,
@@ -993,6 +1002,15 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
         scene_debug_frame = scene_debug && std::remove(scene_debug) == 0;
         scene_targets->debug = scene_debug_frame;
     }
+#ifdef __APPLE__
+    // Emulated geometry stage: the ES and GS run first, as compute (vk_gs_emulation.cpp); the draw
+    // below is the copy shader over the GS's strip index runs.
+    GsEmulationDraw gs_draw{};
+    if (pipeline->GsEmulation()) {
+        gs_draw = RecordGsEmulation(pipeline, regs, is_indexed, index_offset);
+        is_indexed = false; // the guest index buffer was read by the ES
+    }
+#endif
     bind_prepared = used_prepared;
     motion_draw = pipeline->GetGraphicsKey().motion_vectors;
     motion_geometry = 0;
@@ -1142,6 +1160,18 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     const u32 num_instances = regs.num_instances.NumInstances();
     const u32 first_vertex = vertex_offset;
     const u32 first_instance = instance_offset;
+#ifdef __APPLE__
+    if (pipeline->GsEmulation()) {
+        scheduler.Record([=](vk::CommandBuffer cmdbuf) {
+            cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, handle);
+            if (gs_draw.index_count) {
+                cmdbuf.bindIndexBuffer(gs_draw.index_buffer, gs_draw.index_offset,
+                                       vk::IndexType::eUint32);
+                cmdbuf.drawIndexed(gs_draw.index_count, 1, 0, 0, 0);
+            }
+        });
+    } else
+#endif
     scheduler.Record([=](vk::CommandBuffer cmdbuf) {
         cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, handle);
         if (is_indexed) {
@@ -1211,6 +1241,9 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
     const u32 stride = indirect.stride;
     const u32 max_count = indirect.max_count;
 #ifdef __APPLE__
+    // The emulated geometry stage sizes its compute passes from the draw's counts on the CPU.
+    ASSERT_MSG(!pipeline->GsEmulation(),
+               "macOS geometry emulation does not cover indirect ES/GS draws");
     // Without the feature vkCmdDraw*IndirectCount is invalid. See docs/macos/feature-audit.md.
     if (FeatureChecks::DrawIndirectCountUnsupported(count_address,
                                                     instance.IsDrawIndirectCountSupported())) {
@@ -1561,8 +1594,12 @@ void Rasterizer::JoinBindHelper(void* context) {
 }
 
 bool Rasterizer::BindResources(const Pipeline* pipeline) {
-    if (IsComputeImageCopy(pipeline) || IsComputeMetaClear(pipeline) ||
-        IsComputeImageClear(pipeline)) {
+    // The ES/GS compute passes of an emulated geometry stage are not guest dispatches.
+    const bool gs_emulation_stage =
+        pipeline->IsCompute() &&
+        pipeline->GetStage(Shader::SwStage::Compute).hw_stage != Shader::HwStage::Compute;
+    if (!gs_emulation_stage && (IsComputeImageCopy(pipeline) || IsComputeMetaClear(pipeline) ||
+                                IsComputeImageClear(pipeline))) {
         return false;
     }
 
@@ -2246,6 +2283,12 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
             } else if (desc.buffer_type == Shader::BufferType::FaultBuffer) {
                 const auto* fault_buffer = buffer_cache.GetFaultBuffer();
                 buffer_infos.emplace_back(fault_buffer->Handle(), 0, fault_buffer->SizeBytes());
+            } else if (desc.buffer_type == Shader::BufferType::GsScratch) {
+                buffer_infos.emplace_back(gs_binding.scratch, gs_binding.scratch_offset,
+                                          gs_binding.scratch_size);
+            } else if (desc.buffer_type == Shader::BufferType::GsIndexInput) {
+                buffer_infos.emplace_back(gs_binding.index, gs_binding.index_offset,
+                                          gs_binding.index_size);
             } else if (desc.buffer_type == Shader::BufferType::SharedMemory) {
                 auto& lds_buffer = buffer_cache.GetStreamBuffer();
                 const auto& cs_program = CsRegs();
@@ -3798,6 +3841,22 @@ void Rasterizer::UpdatePrimitiveState(const bool is_indexed) const {
                                ? LiverpoolToVK::CullMode(regs.polygon_control.CullingMode())
                                : vk::CullModeFlagBits::eNone;
     const auto front_face = LiverpoolToVK::FrontFace(regs.polygon_control.front_face);
+#ifdef __APPLE__
+    if (regs.stage_enable.raw == AmdGpu::ShaderStageEnable::VgtStages::EsGs) {
+        // Emulated geometry stage (vk_gs_emulation.h): the draw is the GS's output strips,
+        // separated by restart indices; culling applies to the triangles the GS makes.
+        const auto raster = FeatureChecks::RasterizedPrimitive(
+            regs.primitive_type, true, regs.vgt_gs_out_prim_type.GetPrimitiveType(0), false,
+            regs.tess_config.topology);
+        dynamic_state.SetPrimitiveRestartEnabled(true);
+        dynamic_state.SetRasterizerDiscardEnabled(regs.clipper_control.dx_rasterization_kill);
+        dynamic_state.SetCullMode(FeatureChecks::FacesCullable(raster, true, false)
+                                      ? LiverpoolToVK::CullMode(regs.polygon_control.CullingMode())
+                                      : vk::CullModeFlagBits::eNone);
+        dynamic_state.SetFrontFace(front_face);
+        return;
+    }
+#endif
 
     dynamic_state.SetPrimitiveRestartEnabled(prim_restart);
     dynamic_state.SetRasterizerDiscardEnabled(regs.clipper_control.dx_rasterization_kill);

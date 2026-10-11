@@ -3,6 +3,7 @@
 
 #include "common/assert.h"
 #include "core/emulator_settings.h"
+#include "shader_recompiler/backend/spirv/emit_spirv_gs_emulation.h"
 #include "shader_recompiler/backend/spirv/emit_spirv_instructions.h"
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
 #include "shader_recompiler/ir/attribute.h"
@@ -220,6 +221,9 @@ Id EmitReadConstBuffer(EmitContext& ctx, u32 handle, Id index, Id previous) {
 }
 
 Id EmitGetAttribute(EmitContext& ctx, IR::Attribute attr, u32 comp, u32 index) {
+    if (const auto value = GsEmulationGetAttribute(ctx, attr, comp, index)) {
+        return *value;
+    }
     if (IR::IsParam(attr)) {
         const u32 param_index{u32(attr) - u32(IR::Attribute::Param0)};
         const auto& param{ctx.input_params.at(param_index)};
@@ -356,6 +360,9 @@ Id EmitGetAttributeU1(EmitContext& ctx, IR::Attribute attr, u32 comp) {
 }
 
 Id EmitGetAttributeU32(EmitContext& ctx, IR::Attribute attr, u32 comp) {
+    if (const auto value = GsEmulationGetAttributeU32(ctx, attr)) {
+        return *value;
+    }
     switch (attr) {
     case IR::Attribute::VertexId:
         return ctx.OpLoad(ctx.U32[1], ctx.vertex_index);
@@ -415,6 +422,9 @@ Id EmitGetAttributeU32(EmitContext& ctx, IR::Attribute attr, u32 comp) {
 }
 
 void EmitSetAttribute(EmitContext& ctx, IR::Attribute attr, Id value, u32 element) {
+    if (GsEmulationSetAttribute(ctx, attr, value, element)) {
+        return;
+    }
     const auto op_store = [&](Id pointer) {
         const auto [component_type, is_integer] = OutputAttrComponentType(ctx, attr);
         if (is_integer) {

@@ -845,6 +845,10 @@ public:
     void WaitDeferredSignals();
 
     /// Whether a render pass with exactly this state is open.
+    [[nodiscard]] bool IsRendering() const {
+        return is_rendering;
+    }
+
     [[nodiscard]] bool IsRenderingWith(const RenderState& state) const {
         return is_rendering && render_state == state;
     }

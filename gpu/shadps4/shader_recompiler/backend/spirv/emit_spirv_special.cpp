@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "shader_recompiler/backend/spirv/emit_spirv_gs_emulation.h"
 #include "shader_recompiler/backend/spirv/emit_spirv_instructions.h"
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
 #include "shader_recompiler/ir/debug_print.h"
@@ -215,6 +216,7 @@ static void EmitFragmentMotion(EmitContext& ctx) {
 }
 
 void EmitEpilogue(EmitContext& ctx) {
+    EmitGsEmulationEpilogue(ctx);
     if (Sirit::ValidId(ctx.motion_out_cur)) {
         EmitVertexMotion(ctx);
     }
@@ -246,10 +248,16 @@ void EmitDiscardCond(EmitContext& ctx, Id condition) {
 }
 
 void EmitEmitVertex(EmitContext& ctx) {
+    if (ctx.runtime_info.gs_role == GsEmulationRole::GsCompute) {
+        return GsEmulationEmitVertex(ctx);
+    }
     ctx.OpEmitVertex();
 }
 
 void EmitEmitPrimitive(EmitContext& ctx) {
+    if (ctx.runtime_info.gs_role == GsEmulationRole::GsCompute) {
+        return GsEmulationEmitPrimitive(ctx);
+    }
     ctx.OpEndPrimitive();
 }
 

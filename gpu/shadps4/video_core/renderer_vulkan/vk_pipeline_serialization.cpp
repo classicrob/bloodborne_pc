@@ -17,8 +17,8 @@ static constexpr u32 ShaderBinaryVersion = 21u; // PKRTZ packing uses explicit i
 #else
 static constexpr u32 ShaderBinaryVersion = 13u; // Atomic masked stores preserve concurrent subword LDS writes.
 #endif
-static constexpr u32 ShaderMetaVersion = 9u; // Each permutation stores its own translated resource metadata.
-static constexpr u32 PipelineKeyVersion = 10u; // Geometry runtime keys distinguish invocation counts, strides and modes.
+static constexpr u32 ShaderMetaVersion = 10u; // RuntimeInfo carries the geometry emulation role and GSVS layout.
+static constexpr u32 PipelineKeyVersion = 11u; // Keys name the ES/GS of an emulated geometry stage.
 } // namespace Serialization
 
 namespace Vulkan {

@@ -27,6 +27,7 @@
 #include "video_core/renderer_vulkan/vk_feature_checks.h"
 #include "video_core/renderer_vulkan/motion_history.h"
 #include "video_core/renderer_vulkan/vk_draw_prep.h"
+#include "video_core/renderer_vulkan/vk_gs_emulation.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_serialization.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -128,6 +129,9 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(PipelineSelection& se
     case HwStage::Export:
         BuildCommon(regs.es_program);
         info.hw.es.vertex_data_size = regs.vgt_esgs_ring_itemsize;
+        if (profile.emulate_geometry_stage) {
+            info.gs_role = Shader::GsEmulationRole::EsCompute;
+        }
         break;
     case HwStage::Geometry: {
         BuildCommon(regs.gs_program);
@@ -159,6 +163,11 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(PipelineSelection& se
         info.hw.gs.in_vertex_data_size = regs.vgt_esgs_ring_itemsize;
         info.hw.gs.out_vertex_data_size = regs.vgt_gs_vert_itemsize[0];
         info.hw.gs.mode = regs.vgt_gs_mode.mode;
+        if (profile.emulate_geometry_stage) {
+            info.gs_role = Shader::GsEmulationRole::GsCompute;
+            info.gs_max_vert_out = regs.vgt_gs_max_vert_out;
+            info.gs_vertex_dwords = regs.vgt_gs_vert_itemsize[0];
+        }
         const auto params_vc = AmdGpu::GetParams(regs.vs_program);
         info.hw.gs.vs_copy = params_vc.code;
         info.hw.gs.vs_copy_hash = params_vc.hash;
@@ -175,6 +184,13 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(PipelineSelection& se
             regs.clipper_control.clip_space == AmdGpu::ClipSpace::MinusWToW;
         info.hw.vs.clip_disable = regs.IsClipDisabled();
         info.hw.vs.motion_vectors = sel.motion;
+        if (profile.emulate_geometry_stage &&
+            regs.stage_enable.raw == AmdGpu::ShaderStageEnable::VgtStages::EsGs) {
+            // The hardware VS of an ES/GS draw is the copy shader.
+            info.gs_role = Shader::GsEmulationRole::CopyVertex;
+            info.gs_max_vert_out = regs.vgt_gs_max_vert_out;
+            info.gs_vertex_dwords = regs.vgt_gs_vert_itemsize[0];
+        }
         break;
     }
     case HwStage::Fragment: {
@@ -359,6 +375,7 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
 #ifdef __APPLE__
     profile.emulate_robust_buffer_access = true;
     profile.emulate_vertex_fetch = true;
+    profile.emulate_geometry_stage = true;
     profile.repair_mul_signed_zero = true;
     // 32-wide subgroups: GCN wave64 semantics are emulated (lower_wave64_pass.cpp).
     profile.emulate_wave64 = true;
@@ -393,6 +410,12 @@ bool PipelineCache::PrepareGraphicsPipeline(PipelineSelection& worker_sel) {
     if (worker_sel.regs->stage_enable.hs_en) {
         return false;
     }
+#ifdef __APPLE__
+    // Emulated geometry stages select three programs and compute pipelines: not prepared.
+    if (worker_sel.regs->stage_enable.gs_en) {
+        return false;
+    }
+#endif
     return RefreshGraphicsKey(worker_sel) && !worker_sel.worker->failed;
 }
 
@@ -462,7 +485,31 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
             instance, scheduler, desc_heap, profile, sel.graphics_key, *pipeline_cache, sel.infos,
             sel.runtime_infos, sel.fetch_shader, sel.modules, sdata, false);
 
-        RegisterPipelineData(sel.graphics_key, pipeline_hash, sdata);
+        if (sel.graphics_key.gs_es_hash) {
+            // Emulated geometry stage: the ES and GS compute pipelines. Not stored in the pipeline
+            // cache (its records cannot rebuild them); compiled again in each session.
+            const auto& regs = *sel.regs;
+            const auto compute = [&](const PipelineSelection::GsEmulationProgram& program) {
+                ComputePipeline::SerializationSupport compute_sdata{};
+                return std::make_unique<ComputePipeline>(
+                    instance, scheduler, desc_heap, profile, *pipeline_cache,
+                    ComputePipelineKey{program.hash}, *program.info, program.module, compute_sdata,
+                    false);
+            };
+            auto stages = std::make_unique<GsEmulationStages>();
+            stages->es = compute(sel.gs_es);
+            stages->gs = compute(sel.gs_gs);
+            stages->verts_per_prim = GsEmulationVerticesPerPrimitive(regs);
+            stages->invocations = 1;
+            stages->max_vert_out = regs.vgt_gs_max_vert_out;
+            stages->esgs_dwords = regs.vgt_esgs_ring_itemsize;
+            stages->vertex_dwords = regs.vgt_gs_vert_itemsize[0];
+            stages->run_length = Shader::GsEmulation::IndexRunLength(
+                stages->max_vert_out, regs.vgt_gs_out_prim_type.GetPrimitiveType(0));
+            it.value()->SetGsEmulation(std::move(stages));
+        } else {
+            RegisterPipelineData(sel.graphics_key, pipeline_hash, sdata);
+        }
         ++num_new_pipelines;
 
         if (EmulatorSettings.IsShaderCollect()) {
@@ -521,6 +568,14 @@ bool PipelineCache::RefreshGraphicsKey(PipelineSelection& sel) {
     key.provoking_vtx_last = regs.polygon_control.provoking_vtx_last;
     key.prim_type = regs.primitive_type;
 #ifdef __APPLE__
+    if (profile.emulate_geometry_stage &&
+        regs.stage_enable.raw == AmdGpu::ShaderStageEnable::VgtStages::EsGs) {
+        // The emulated draw rasterizes the GS output strips (vk_gs_emulation.h).
+        key.prim_type = regs.vgt_gs_out_prim_type.GetPrimitiveType(0) ==
+                                AmdGpu::GsOutputPrimitiveType::LineStrip
+                            ? AmdGpu::PrimitiveType::LineStrip
+                            : AmdGpu::PrimitiveType::TriangleStrip;
+    }
     // One Vulkan polygon mode: the visible faces' (vk_feature_checks.h; mismatches are errors).
     {
         const auto& poly = regs.polygon_control;
@@ -703,12 +758,12 @@ bool PipelineCache::RefreshGraphicsKey(PipelineSelection& sel) {
 
 #ifdef __APPLE__
 namespace {
-/// Apple has no geometry stage. Reports a draw's whole ES/GS configuration: the GS registers in
-/// the log, and the ES, GS and copy-shader binaries plus their user data under
-/// <shader dir>/gs_report. Stops the game, unless BB_GS_CENSUS=1 asks to record every distinct
-/// configuration and not draw them (a diagnostic run, which then renders incompletely and logs
-/// how many draws it dropped).
-bool ReportGeometryStages(const AmdGpu::Regs& regs) {
+/// Apple has no geometry stage; vk_gs_emulation.h covers ES/GS draws except `gap`. Reports such a
+/// draw's whole ES/GS configuration: the GS registers in the log, and the ES, GS and copy-shader
+/// binaries plus their user data under <shader dir>/gs_report. Stops the game, unless
+/// BB_GS_CENSUS=1 asks to record every distinct configuration and not draw them (a diagnostic run,
+/// which then renders incompletely and logs how many draws it dropped).
+bool ReportGeometryStages(const AmdGpu::Regs& regs, const char* gap) {
     static const bool census = [] {
         const char* value = std::getenv("BB_GS_CENSUS");
         return value && value[0] == '1';
@@ -751,13 +806,14 @@ bool ReportGeometryStages(const AmdGpu::Regs& regs) {
         dump("es", es);
         dump("gs", gs);
         dump("copy", vs);
-        LOG_ERROR(Render_Vulkan, "Geometry configuration: {} (instances {}, indices {})", key,
-                  regs.num_instances.NumInstances(), regs.num_indices);
+        LOG_ERROR(Render_Vulkan, "Geometry configuration: {} (instances {}, indices {}; not "
+                  "emulated: {})",
+                  key, regs.num_instances.NumInstances(), regs.num_indices, gap);
     } else if (std::has_single_bit(count)) {
         LOG_ERROR(Render_Vulkan, "Geometry configuration drawn {} times: {}", count, key);
     }
     if (!census) {
-        UNREACHABLE_MSG("macOS geometry shader emulation is not implemented: {}", key);
+        UNREACHABLE_MSG("macOS geometry shader emulation does not cover {}: {}", gap, key);
     }
     return false;
 }
@@ -799,6 +855,8 @@ bool PipelineCache::RefreshGraphicsStages(PipelineSelection& sel) {
 
     sel.infos.fill(nullptr);
     sel.modules.fill(nullptr);
+    sel.gs_es = {};
+    sel.gs_gs = {};
 
     bind_stage(HwStage::Fragment, SwStage::Fragment);
 
@@ -808,10 +866,41 @@ bool PipelineCache::RefreshGraphicsStages(PipelineSelection& sel) {
 
     switch (regs.stage_enable.raw) {
     case AmdGpu::ShaderStageEnable::VgtStages::EsGs:
-        if (!instance.IsGeometryStageSupported()) {
 #ifdef __APPLE__
-            return ReportGeometryStages(regs);
+        // No geometry stage: the ES and GS become compute pipelines (owned by the graphics
+        // pipeline, vk_gs_emulation.h) and the copy shader is the draw's vertex shader.
+        if (const char* gap = GsEmulationUnsupported(regs)) {
+            return ReportGeometryStages(regs, gap);
+        }
+        {
+            const auto bind_compute = [&](HwStage stage_in, SwStage stage_out,
+                                          PipelineSelection::GsEmulationProgram& out) {
+                const auto* pgm = regs.ProgramForStage(static_cast<u32>(stage_in));
+                ASSERT_MSG(pgm && pgm->Address<u32*>(),
+                           "macOS geometry emulation: ES/GS draw without a{} program",
+                           stage_in == HwStage::Export ? "n ES" : " GS");
+                // Each compute pipeline has its own layout: bindings start at 0.
+                Shader::Backend::Bindings compute_binding{};
+                const auto program =
+                    GetProgram(sel, stage_in, stage_out, AmdGpu::GetParams(*pgm), compute_binding);
+                out = {std::get<0>(program), std::get<1>(program), std::get<3>(program)};
+                ASSERT_MSG(out.info, "macOS geometry emulation: no {} program selected",
+                           stage_in == HwStage::Export ? "ES" : "GS");
+                return true;
+            };
+            if (!bind_compute(HwStage::Export, SwStage::Vertex, sel.gs_es) ||
+                !bind_compute(HwStage::Geometry, SwStage::Geometry, sel.gs_gs)) {
+                return false;
+            }
+            key.gs_es_hash = sel.gs_es.hash;
+            key.gs_gs_hash = sel.gs_gs.hash;
+            if (!bind_stage(HwStage::Vertex, SwStage::Vertex)) {
+                return false;
+            }
+        }
+        break;
 #endif
+        if (!instance.IsGeometryStageSupported()) {
             LOG_WARNING(Render_Vulkan, "Geometry shader stage unsupported, skipping");
             return false;
         }
@@ -855,7 +944,7 @@ bool PipelineCache::RefreshGraphicsStages(PipelineSelection& sel) {
         }
         if (!instance.IsGeometryStageSupported()) {
 #ifdef __APPLE__
-            return ReportGeometryStages(regs);
+            return ReportGeometryStages(regs, "tessellation feeding a geometry shader (LS/HS/ES/GS)");
 #endif
             LOG_WARNING(Render_Vulkan, "Geometry shader stage unsupported, skipping");
             return false;

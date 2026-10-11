@@ -84,6 +84,10 @@ enum class BufferType : u8 {
     GdsBuffer,
     SharedMemory,
     ClipPlanes,
+    /// Geometry emulation (GsEmulationRole): the draw's scratch (header, ESGS and GSVS records,
+    /// strip index runs) and the guest index buffer an EsCompute shader pulls vertex ids from.
+    GsScratch,
+    GsIndexInput,
 };
 
 struct BufferResource {
