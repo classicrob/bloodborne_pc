@@ -13,7 +13,7 @@ Facts come from the code (macos 9c2ead2) and Astra-2's guest lifetime audit
 (docs/macos/gpu-idle.md, "Guest lifetime audit"). Hypotheses are marked as such.
 
 R1 stays opt-in and unsafe until Astra-2's RE closes the teardown and chunk-status unknowns
-(section 2). Sol-2 reviewed revision 1. Opus-Renderer reviewed it too; their notes are folded in.
+(section 2). Revision 3 folds in Sol-2's and Opus-Renderer's reviews of revisions 1 and 2.
 
 ## 1. What the throttle does now
 
@@ -93,41 +93,69 @@ label (a tail that is not waited for), and by how many ticks.
 
 ### R1: release at "recorded" (opt-in, UNSAFE experiment)
 
+**Frame tickets.** Each frame gets a ticket at the guest's `sceGnmSubmitDone`: a boundary placed
+after the last submission admitted before it. The ticket is **sealed by the GPU thread** when
+it crosses that boundary, not at the guest call, whose PM4 may still be unparsed. It is sealed
+once:
+1. the parser has completed every submission before the boundary, graphics and compute (ASC),
+   in all participating queues;
+2. stage B has passed it;
+3. the recorder has flushed it to Metal.
+
+When sealed, the ticket records:
+- **the GPU timeline tick** of the frame's last submission, the **end-of-frame tick**. Its
+  completion means the GPU has completed every bit of work the frame submitted, with or
+  without labels, including the tail after its last label.
+- the **recorder-side prefix** (`recorder_issued`);
+- the **label prefix** (`labels_issued`).
+
+All three are issued counts reached at the boundary.
+
+ASC: compute submissions belong to the frame whose boundary follows them. If the parser cannot
+attribute an ASC submission to a frame (for example a compute queue still running across the
+boundary), R1 refuses it: a loud log, and that frame falls back to R0.
+
 **Admission.** Frame N's GpuIdle is raised under `submit_mutex` with no submission queued (the
-existing race protection), once:
-1. every queued submission is parsed;
-2. stage B has drained;
-3. every recorder-side write issued so far has completed;
-4. every completion label issued so far has been **issued and flushed** to Metal. It is not
-   necessarily written. At GpuIdle we assert that no stage-B batched label is left unflushed
-   (`labels_unflushed` is false), rather than relying on the flush order. A batched label must
-   never wait for a later frame's submission that the throttle holds back.
+existing race protection), once N's ticket is sealed and:
+1. the recorder-side writes up to its prefix have completed;
+2. every completion label up to its label prefix is **issued and flushed** to Metal. It is not
+   necessarily written. At GpuIdle we assert that no stage-B batched label is unflushed
+   (`labels_unflushed` false), rather than relying on the flush order: a batched label must
+   never wait for a submission the throttle holds back.
+
+The labels remain guest-visible obligations of their own, written by the label writer at their
+ticks.
 
 **Host cap (enforced, part of R1).** The submission after `SubmitDone(N)` also waits until:
-- **frame N-1 has retired on the GPU timeline**, so at most two frames are outstanding on the GPU.
-  At frame N-1's GpuIdle admission, after the flush SubmitDone already causes, record the draw
-  scheduler tick its last submission signals. The cap then waits for `IsFree(that tick)`.
-  - This is exact without labels: a frame that issued no completion label would otherwise meet a
-    label-count cap at once (Opus-Renderer).
-  - It covers the tail after a frame's last label (Sol-2 point 1).
-  - A completion label is written only after its own tick, so the tick also bounds the labels.
-- the queued snapshot bytes are below 64 MiB. That figure is a starting point, to be set from
-  R0's numbers.
+- **frame N-1's end-of-frame tick is free** (`IsFree`), so at most two frames are outstanding on
+  the GPU, labels or not (Opus-Renderer, Sol-2);
+- the snapshot budget allows it:
+  - a submission **reserves** its snapshot bytes before copying, and releases them when parsed;
+  - it waits while reserved bytes plus its own exceed 64 MiB (a start, to be set from R0);
+  - a single submission larger than the whole budget is admitted alone, once nothing else is
+    reserved, and counted.
 
 **Accounting.** Two separate monotonic pairs:
 - `recorder_issued`/`recorder_done`;
 - `labels_issued`/`labels_written`.
 
 In-flight callbacks count as issued until they complete. Today's single
-`deferred_signals_issued/done` remains their sum.
+`deferred_signals_issued/done` remains their sum. R0 (071cfc6) already keeps the label pair.
 
 **Live switching** (a new toggle bit, 56, and `BB_SUBMIT_THROTTLE=recorded|idle` for the whole
 run):
-- **Latched at a frame boundary** (`sceGnmSubmitDone`), never mid-frame.
-- **R1 to R0:** before raising the first R0 GpuIdle, wait until every completion label issued
-  so far is written. That is a completion fence through all previously admitted work.
+- **Latched at a frame boundary** (the ticket), never mid-frame.
+- **R1 to R0:** before raising the first R0 GpuIdle:
+  - drain through the end-of-frame ticks of every frame admitted under R1;
+  - complete their recorder-side writes;
+  - write their labels.
+
+  That is a full fence through all previously admitted work, not only the labels.
 - **R0 to R1:** pending obligations carry over. R1 is refused (loud log, stays R0) unless labels
   at GPU completion and flips at retire are both on at that boundary.
+- **Turning bit 59 or 60 off while R1 is active** forces the R1-to-R0 transition at the next
+  boundary, before the change takes effect for frames admitted after it. The prerequisites are
+  checked at every boundary, not only once.
 - **A/B statistics** exclude the frame containing a switch and the fence or drain it causes.
 
 **Teardown.** An R0 switch at the entry of a teardown free would be too late: the freeing thread
@@ -176,7 +204,9 @@ informative.
   - written ranges, and ranges marked GPU-modified at record;
   - buffers over 1 MB, for example whole vertex pools of about 3.8 MB;
   - pointer and BDA reads;
-  - textures. Those are safe by construction: the texture cache copies them at record.
+  - textures. The texture cache copies guest memory into images at record. That protects GPU
+    reads only after the copy has completed: it does not show that the guest could not reuse
+    the memory before a deferred copy ran. So textures are unobserved by this checker.
 - **Why it can be wrong either way:** a safe reuse after retirement can mismatch, and a
   mutate-then-restore can match.
 - **How to use it:** compare its counts, together with its coverage and drop counters, between
