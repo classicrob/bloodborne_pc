@@ -401,8 +401,8 @@ void AssembleWave(GcnAsm::Code& c, Wave w) {
         break;
     }
     // Ballots of exec inside an s_cbranch_execz scope of a multi-wave workgroup (workgroup-divergent
-    // flow): DivRank is exact by taking the ballot where the scope's condition is computed; the
-    // others must stay loud (a loop inside the scope, a ballot of a compare made inside the scope,
+    // flow): DivRank could be exact by taking the ballot where the scope's condition is computed;
+    // the others could not (a loop inside the scope, a ballot of a compare made inside the scope,
     // an inner exec change, an s_endpgm path inside the scope).
     case Wave::DivRank:
     case Wave::DivLoop:
@@ -1939,9 +1939,11 @@ void AddWaveCases() {
         NewJob("wave64", tt, RawV(64), 0);
     }
 #endif
-    // Ballots of exec in an s_cbranch_execz scope of multi-wave workgroups (0x40229f02's
-    // shape): taken at the uniform point that computes the scope's condition. Exec masks differ
-    // per wave (the mask is rotated by 7 per wave); "lanes0+37" puts one lane in each half-wave.
+    // Ballots of exec in an s_cbranch_execz scope of multi-wave workgroups: a ballot in
+    // workgroup-divergent flow, rejected loudly (taking it at the uniform point that computes the
+    // scope's condition is exact, see docs/macos/wave64.md, but no shader of this game needs it).
+    // Exec masks differ per wave (rotated by 7 per wave); "lanes0+37" puts one lane in each
+    // half-wave. The compile-only controls must stay loud even if that hoisting is revived.
     for (const std::array<u32, 3>& wg : {std::array<u32, 3>{128, 1, 1}, std::array<u32, 3>{64, 2, 1},
                                          std::array<u32, 3>{32, 4, 1}}) {
         const u32 threads = wg[0] * wg[1] * wg[2];
@@ -1951,6 +1953,7 @@ void AddWaveCases() {
         t.op.kind = GCN_LOAD;
         t.wave = Wave::DivRank;
         t.wg = wg;
+        t.wave_divergent = true;
         const u32 tt = AddTemplate(t);
         for (const M& m : masks) {
             const std::string mn = m.name;
