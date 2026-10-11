@@ -62,6 +62,11 @@ typedef struct GuestThread {
     struct GuestThread *next;
 } GuestThread;
 
+#ifdef __APPLE__
+static void (*profile_hook)(const char *,void *,size_t);
+/* Installed before guest or GPU workers start. */
+void runtime_thread_set_profile_hook(void (*hook)(const char *,void *,size_t)) { profile_hook=hook; }
+#endif
 static pthread_mutex_t lock=PTHREAD_MUTEX_INITIALIZER;
 static ThreadAttr *attributes;
 static GuestThread *threads;
@@ -224,7 +229,9 @@ void runtime_thread_run_host(void (*entry)(void *),void *arg) {
         }
     }
     HleCall call={entry,arg};
+    if(profile_hook)profile_hook(NULL,stack->base+HLE_STACK_GUARD,HLE_STACK_BYTES);
     bb_macos_call_on_stack(hle_low_entry,&call,stack->base+HLE_STACK_GUARD+HLE_STACK_BYTES);
+    if(profile_hook)profile_hook(NULL,NULL,0);
     pthread_mutex_lock(&hle_stack_lock);
     stack->next=hle_stacks; hle_stacks=stack;
     pthread_mutex_unlock(&hle_stack_lock);
@@ -344,6 +351,7 @@ static ABI int32_t attr_set_guard(ThreadAttr **slot,uint64_t size) {
 static void set_host_name(const char *name) {
 #ifdef __APPLE__
     int error=pthread_setname_np(name);
+    if(profile_hook)profile_hook(name,NULL,0);
     if (error) {
         fprintf(stderr,"macOS guest thread name '%s': pthread_setname_np failed: %d\n",name,error);
         abort();

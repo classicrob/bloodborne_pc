@@ -14,6 +14,10 @@
 #include <sys/ucontext.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#ifdef BB_TEST_CPU_PROFILE
+#include "../src/runtime_cpu_profile.c"
+void runtime_thread_set_profile_hook(void (*hook)(const char *,void *,size_t)) { (void)hook; }
+#endif
 typedef struct { uint64_t address,size,flags; } Segment;
 static pthread_key_t key;
 static uint32_t runtime_thread_tcb_offset(void) { return (uint32_t)key*8; }
@@ -28,6 +32,10 @@ extern void entry_call(uint64_t *);
 void *entry_code;
 static _Atomic int provenance_printed;
 static void trap(int sig,siginfo_t *info,void *context) {
+#ifdef BB_TEST_CPU_PROFILE
+    if(runtime_cpu_profile_fault(sig,context))return;
+    if(sig==SIGTRAP && atomic_load(&configured))raise(SIGPROF);
+#endif
     if (!atomic_exchange(&provenance_printed,1)) {
         char line[160], *end=entry_text(line,"INT3-PROVENANCE ");
         end=entry_field(end,"si_code",(unsigned)info->si_code);
@@ -59,6 +67,9 @@ static __attribute__((sysv_abi)) int32_t fake_avplayer_start(void *handle) {
 static void name_thread(const char *name,uint64_t id) {
     char actual[64];
     assert(!pthread_setname_np(name));
+#ifdef BB_TEST_CPU_PROFILE
+    runtime_cpu_profile_thread(name);
+#endif
     assert(!pthread_getname_np(pthread_self(),actual,sizeof(actual)));
     assert(!strcmp(actual,name));
     printf("IDENTITY thread=%" PRIu64 " pthread=%016" PRIxPTR " name=%s\n",
@@ -119,6 +130,11 @@ int main(int argc,char **argv) {
     assert(!entry_trace_handle(SIGTRAP,&info,&uc));
     struct sigaction sa={0}; sa.sa_sigaction=trap; sa.sa_flags=SA_SIGINFO;
     sigemptyset(&sa.sa_mask); assert(!sigaction(SIGTRAP,&sa,NULL));
+#ifdef BB_TEST_CPU_PROFILE
+    assert(!sigaction(SIGBUS,&sa,NULL));assert(!sigaction(SIGSEGV,&sa,NULL));
+    runtime_cpu_profile_init();
+    while(!atomic_load(&active))usleep(1000);
+#endif
     mach_port_t own_port=mach_thread_self();
     mach_port_urefs_t refs_before,refs_after;
     assert(!mach_port_get_refs(mach_task_self(),own_port,MACH_PORT_RIGHT_SEND,&refs_before));

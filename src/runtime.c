@@ -68,7 +68,13 @@ void runtime_start(uint64_t flags) {
 #endif
     stack_canary &= ~UINT64_C(255);
 }
+#ifdef __APPLE__
+#include "runtime_cpu_profile.h"
+#endif
 void runtime_report(void) {
+#ifdef __APPLE__
+    runtime_cpu_profile_stop();
+#endif
     runtime_hle_trace_dump();
     printf("Runtime: _init_env=%zu, atexit=%zu, __cxa_atexit=%zu, registered handlers=%zu\n",
            calls_init, calls_atexit, calls_cxa, handler_count);

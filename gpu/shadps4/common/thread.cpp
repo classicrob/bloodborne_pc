@@ -13,6 +13,7 @@
 #include "common/thread.h"
 #include "ntapi.h"
 #ifdef __APPLE__
+#include "../../../src/runtime_cpu_profile.h"
 #include <mach/mach.h>
 #include <mach/mach_time.h>
 #include <pthread.h>
@@ -189,6 +190,7 @@ void SetCurrentThreadName(const char* name) {
     // bbport: guest thread names are kept by the C runtime.
 #ifdef __APPLE__
     pthread_setname_np(name);
+    runtime_cpu_profile_thread(name);
 #elif defined(__Bitrig__) || defined(__DragonFly__) || defined(__FreeBSD__) || defined(__OpenBSD__)
     pthread_set_name_np(pthread_self(), name);
 #elif defined(__NetBSD__)
