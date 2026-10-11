@@ -269,8 +269,8 @@ private:
     bool BindResources(const Pipeline* pipeline);
     /// bbport (Apple): records the ES and GS compute passes of an emulated geometry stage and
     /// returns the strip draw (vk_gs_emulation.cpp).
-    GsEmulationDraw RecordGsEmulation(const GraphicsPipeline* pipeline, bool is_indexed,
-                                      u32 index_offset);
+    GsEmulationDraw RecordGsEmulation(const GraphicsPipeline* pipeline, const AmdGpu::Regs& regs,
+                                      bool is_indexed, u32 index_offset);
     void BindSamplers(const Shader::Info& stage, const PreparedStage* prepared,
                       Shader::Backend::Bindings& binding, u32& write_index);
     /// bbport: a stage's resolved textures remembered by its prepared T# hashes
@@ -492,11 +492,11 @@ private:
     /// bbport (Apple): scratch and index ranges of the emulated geometry draw being recorded.
     GsEmulationBinding gs_binding{};
     struct {
-        u64 draws = 0;
-        u64 dispatches = 0;
-        u64 splits = 0; ///< render passes ended for the compute passes
-        u64 scratch_bytes = 0;
-    } gs_stats;
+        std::atomic<u64> draws{0};
+        std::atomic<u64> dispatches{0};
+        std::atomic<u64> splits{0}; ///< render passes ended for the compute passes
+        std::atomic<u64> scratch_bytes{0};
+    } gs_stats; ///< written while recording, read by PrintPipeStats
     /// The memoized cache entry of each image binding (FindImage memo taken), else null.
     boost::container::static_vector<ImageDescCacheEntry*, Shader::NUM_IMAGES> image_binding_entries;
     bool fault_process_pending{};

@@ -74,9 +74,9 @@ u32 GsEmulationVerticesPerPrimitive(const AmdGpu::Regs& regs) {
 /// taken from is 128 MiB; a draw needing more stops with its sizes rather than being dropped.
 constexpr u64 MaxScratchBytes = 32_MB;
 
-GsEmulationDraw Rasterizer::RecordGsEmulation(const GraphicsPipeline* pipeline, bool is_indexed,
+GsEmulationDraw Rasterizer::RecordGsEmulation(const GraphicsPipeline* pipeline,
+                                              const AmdGpu::Regs& regs, bool is_indexed,
                                               u32 index_offset) {
-    const auto& regs = Regs();
     const auto& stages = *pipeline->GsEmulation();
 
     const u32 records = regs.num_indices;
@@ -153,12 +153,14 @@ GsEmulationDraw Rasterizer::RecordGsEmulation(const GraphicsPipeline* pipeline, 
     std::memcpy(data, header.data(), sizeof(header));
     stream.Commit();
 
-    ++gs_stats.draws;
-    gs_stats.scratch_bytes += bytes;
+    gs_stats.draws.fetch_add(1, std::memory_order_relaxed);
+    gs_stats.scratch_bytes.fetch_add(bytes, std::memory_order_relaxed);
     if (prims == 0) {
         return {};
     }
-    gs_stats.splits += scheduler.IsRendering() ? 1 : 0;
+    if (scheduler.IsRendering()) {
+        gs_stats.splits.fetch_add(1, std::memory_order_relaxed);
+    }
 
     const auto dispatch = [&](const ComputePipeline& compute, u32 groups_x, u32 groups_y) {
         const bool bound = BindResources(&compute);
@@ -175,7 +177,7 @@ GsEmulationDraw Rasterizer::RecordGsEmulation(const GraphicsPipeline* pipeline, 
             cmdbuf.dispatch(groups_x, groups_y, 1);
         });
         ResetBindings(true);
-        ++gs_stats.dispatches;
+        gs_stats.dispatches.fetch_add(1, std::memory_order_relaxed);
     };
     const auto barrier = [&](vk::PipelineStageFlags2 dst_stage, vk::AccessFlags2 dst_access) {
         scheduler.Record([=](vk::CommandBuffer cmdbuf) {

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Geometry emulation (Apple) tools: builds compile_roles against this checkout's shader recompiler
+# Geometry emulation (Apple) tools: builds compile_roles and conformance against this checkout's shader recompiler
 # (compiled into the executable, production flags) and the shared GPU library for everything else.
 #
 #   BB_GPU_BUILD=<tree>/out/gpu BB_GPU_THIRD_PARTY=<tree>/gpu/third_party tests/macos_gs/build.sh
@@ -40,10 +40,19 @@ for f in "${srcs[@]}"; do
     fi
 done
 for p in "${pids[@]}"; do wait "$p" || { echo "compile failed" >&2; exit 1; }; done
-"${cxx[@]}" -O1 -g -Wall -Wno-unused-parameter -c "$here/compile_roles.cpp" -o "$obj/compile_roles.o"
+"${cxx[@]}" -I"$root" -O1 -g -Wall -Wno-unused-parameter -c "$here/compile_roles.cpp" -o "$obj/compile_roles.o"
+"${cxx[@]}" -I"$root" -O1 -g -Wall -Wno-unused-parameter -c "$here/conformance.cpp" -o "$obj/conformance.o"
+for f in flat.frag list.vert; do
+    glslangValidator -V --target-env vulkan1.3 -o "$out/$f.spv" "$here/$f" >/dev/null
+done
 "${cxx[@]}" -O1 -c "$root/tests/test_gpu_runtime_stubs.cpp" -o "$obj/stubs.o"
 /usr/bin/clang++ -arch x86_64 -Wl,-export_dynamic "$obj/compile_roles.o" "$obj/stubs.o" "${objs[@]}" \
     "$gpu_build/libbbgpu.dylib" -L"$deps/lib" -lfmt \
     -Wl,-rpath,"$gpu_build" -Wl,-rpath,"$deps/lib" -o "$out/compile_roles"
-python3 "$root/packaging/macos/sign.py" "$out/compile_roles" >/dev/null
-echo "$out/compile_roles"
+/usr/bin/clang++ -arch x86_64 -Wl,-export_dynamic "$obj/conformance.o" "$obj/stubs.o" "${objs[@]}" \
+    "$gpu_build/libbbgpu.dylib" -L"$deps/lib" -lfmt -lvulkan \
+    -Wl,-rpath,"$gpu_build" -Wl,-rpath,"$deps/lib" -o "$out/conformance"
+for tool in compile_roles conformance; do
+    python3 "$root/packaging/macos/sign.py" "$out/$tool" >/dev/null
+    echo "$out/$tool"
+done

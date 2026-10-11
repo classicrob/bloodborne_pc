@@ -6,7 +6,7 @@
 //
 //   compile_roles DIR ES_HASH GS_HASH OUT_DIR prim=N out_prim=N max_vert_out=N esgs=N vert=N
 //                 [instances=N]
-//   compile_roles --negative DIR GS_HASH OUT_DIR
+//   compile_roles --negative DIR|- GS_HASH OUT_DIR
 //       compile-negative controls: hand-encoded ES/GS programs using what the compute roles cannot
 //       run must stop loudly (each in a child process), naming the feature.
 #include <mach/mach.h>
@@ -27,6 +27,7 @@
 #include "shader_recompiler/profile.h"
 #include "shader_recompiler/recompiler.h"
 #include "shader_recompiler/runtime_info.h"
+#include "tests/macos_gs/gs_asm.h"
 
 namespace {
 
@@ -146,9 +147,21 @@ struct Negative {
 
 int RunNegatives(const std::string& self, const std::filesystem::path& dir,
                  const std::string& gs_hash, const std::filesystem::path& out, int only) {
+    // DIR "-": a minimal synthetic copy shader (the GS role only parses it).
     std::vector<u32> copy_code;
     std::array<u32, 16> copy_ud{};
-    copy_code = ReadWords(dir / ("copy_" + gs_hash + ".bin"));
+    if (dir == "-") {
+        GsAsm::Code c;
+        c.SMovLiteral(GsAsm::VCC_HI, 0);
+        c.words.push_back(0xB0000000u | (4u << 16)); // s_movk_i32 s4, 0
+        c.RingDword(false, 1, 0, true, 0, 4);
+        c.SWaitcnt();
+        c.Exp(12, true, 1);
+        c.SEndpgm();
+        copy_code = c.words;
+    } else {
+        copy_code = ReadWords(dir / ("copy_" + gs_hash + ".bin"));
+    }
     const auto store = RingStore(0);
     const auto bad_store = RingStore(28 * 8 * 4); // component 28 of a 28-dword vertex, N = 8
     const std::vector<Negative> cases = {

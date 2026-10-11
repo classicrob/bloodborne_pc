@@ -869,6 +869,15 @@ void Rasterizer::PrintPipeStats() {
     const u64 tsc = __rdtsc();
     const double cycles = double(tsc - last_tsc);
     const u64 busy = draw_pipe->busy_cycles.load(std::memory_order_relaxed);
+    if (const u64 gs_draws = gs_stats.draws.exchange(0, std::memory_order_relaxed)) {
+        // bbport (Apple): emulated geometry stages (vk_gs_emulation.h).
+        std::printf("Geometry emulation: %.0f draws/s, %.0f dispatches/s, %.0f render passes "
+                    "ended/s, %.1f MB/s scratch\n",
+                    gs_draws / seconds,
+                    gs_stats.dispatches.exchange(0, std::memory_order_relaxed) / seconds,
+                    gs_stats.splits.exchange(0, std::memory_order_relaxed) / seconds,
+                    gs_stats.scratch_bytes.exchange(0, std::memory_order_relaxed) / seconds / 1e6);
+    }
     std::printf("Draw pipe: %.0f draws/s pipelined, %.0f drains/s that waited, stage A waited "
                 "%.1f%%, stage B handler elapsed %.1f%%\n",
                 (draw_pipe->packets - last_packets) / seconds,
@@ -998,7 +1007,7 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     // below is the copy shader over the GS's strip index runs.
     GsEmulationDraw gs_draw{};
     if (pipeline->GsEmulation()) {
-        gs_draw = RecordGsEmulation(pipeline, is_indexed, index_offset);
+        gs_draw = RecordGsEmulation(pipeline, regs, is_indexed, index_offset);
         is_indexed = false; // the guest index buffer was read by the ES
     }
 #endif
