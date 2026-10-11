@@ -176,11 +176,12 @@ public:
         return false;
     }
 
-    int WaitForSmallTimer(OrbisKernelEvent* ev, int num, u32 micros);
-
     bool EventExists(u64 id, s16 filter);
 
 private:
+    // These only write host staging storage; guest output is copied after unlocking.
+    int WaitForEventsStaged(OrbisKernelEvent* ev, int num, const OrbisKernelUseconds* timo);
+    int WaitForSmallTimer(OrbisKernelEvent* ev, int num, u32 micros);
     // All inspection, clearing and removal of triggered events requires m_mutex.
     int GetTriggeredEventsLocked(OrbisKernelEvent* ev, int num);
     OrbisKernelEqueue m_handle;

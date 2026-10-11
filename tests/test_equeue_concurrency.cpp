@@ -6,6 +6,9 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <csignal>
+#include <sys/mman.h>
+#include <sys/wait.h>
 #include <thread>
 #include <unistd.h>
 #include "core/libraries/kernel/equeue.h"
@@ -119,6 +122,79 @@ static void FilterSemantics() {
     std::puts("PASS: level/Clear/OneShot, EOP coalescing, VideoOut packed counts, timer accumulation");
 }
 
+static void BulkOutput() {
+    EqueueInternal q{5, "bulk-output"};
+    std::array<OrbisKernelEvent, 33> output;
+    for (u64 id = 1; id <= output.size(); ++id) {
+        Add(q, id, OrbisKernelEvent::GraphicsCore);
+        q.TriggerEvent(id, OrbisKernelEvent::GraphicsCore, reinterpret_cast<void*>(id + 100));
+    }
+    const OrbisKernelUseconds zero = 0;
+    Check(q.WaitForEvents(output.data(), output.size(), &zero) == static_cast<int>(output.size()),
+          "large staged request is not truncated");
+    for (unsigned i = 0; i < output.size(); ++i)
+        Check(output[i].ident == i + 1 && output[i].data == i + 101, "large staged payload");
+    Check(Poll(q, output[0]) == 0, "bulk consumption cleared all events");
+    std::puts("PASS: 33-event request retains full capacity and payloads");
+}
+
+static void* protected_output;
+static size_t output_page_size;
+static int fault_notify, fault_resume;
+static void OutputFault(int, siginfo_t* info, void*) {
+    const auto at = reinterpret_cast<uintptr_t>(info->si_addr);
+    const auto first = reinterpret_cast<uintptr_t>(protected_output);
+    if (at < first || at - first >= output_page_size) _exit(90);
+    char token = 'f';
+    // The producer must acquire the queue mutex before allowing this copy to resume.
+    if (write(fault_notify, &token, 1) != 1 || read(fault_resume, &token, 1) != 1 ||
+        mprotect(protected_output, output_page_size, PROT_READ | PROT_WRITE)) _exit(91);
+}
+
+static void ProtectedOutput(bool poll) {
+    const pid_t child = fork();
+    Check(child >= 0, "fork protected output control");
+    if (!child) {
+        alarm(5);
+        EqueueInternal q{4, "protected-output"};
+        Add(q, 1, OrbisKernelEvent::GraphicsCore);
+        Add(q, 2, OrbisKernelEvent::GraphicsCore);
+        q.TriggerEvent(1, OrbisKernelEvent::GraphicsCore, reinterpret_cast<void*>(7));
+        output_page_size = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+        protected_output = mmap(nullptr, output_page_size, PROT_READ,
+                                MAP_PRIVATE | MAP_ANON, -1, 0);
+        Check(protected_output != MAP_FAILED, "protected output mapping");
+        int notify[2], resume[2];
+        Check(!pipe(notify) && !pipe(resume), "fault coordination pipes");
+        fault_notify = notify[1]; fault_resume = resume[0];
+        struct sigaction sa{};
+        sa.sa_sigaction = OutputFault; sa.sa_flags = SA_SIGINFO;
+        sigemptyset(&sa.sa_mask);
+        Check(!sigaction(SIGBUS, &sa, nullptr) && !sigaction(SIGSEGV, &sa, nullptr), "output fault handler");
+        std::thread trigger([&] {
+            char token;
+            Check(read(notify[0], &token, 1) == 1, "wait for output fault");
+            Check(q.TriggerEvent(2, OrbisKernelEvent::GraphicsCore, reinterpret_cast<void*>(8)),
+                  "trigger while guest output copy is faulted");
+            Check(write(resume[1], &token, 1) == 1, "resume faulted output copy");
+        });
+        const OrbisKernelUseconds zero = 0;
+        auto* output = static_cast<OrbisKernelEvent*>(protected_output);
+        Check(q.WaitForEvents(output, 1, poll ? &zero : nullptr) == 1 && output->data == 7,
+              "protected output copy resumed");
+        trigger.join();
+        OrbisKernelEvent next{};
+        Check(Poll(q, next) == 1 && next.ident == 2 && next.data == 8 && Poll(q, next) == 0,
+              "concurrent trigger retained exactly once");
+        _exit(0);
+    }
+    int status = 0;
+    Check(waitpid(child, &status, 0) == child, "join protected output child");
+    Check(WIFEXITED(status) && WEXITSTATUS(status) == 0,
+          poll ? "poll output fault blocked concurrent trigger" : "blocking output fault blocked concurrent trigger");
+    std::printf("PASS: %s guest output fault allows concurrent trigger and resumes\n", poll ? "poll" : "blocking");
+}
+
 static void MixedConsumers() {
     constexpr unsigned slots = 32, rounds = 128, total = slots * rounds, consumers = 8;
     EqueueInternal q{3, "mixed"};
@@ -187,5 +263,8 @@ int main() {
     std::fflush(stdout);
     PollMustTakeLock();
     FilterSemantics();
+    BulkOutput();
+    ProtectedOutput(true);
+    ProtectedOutput(false);
     MixedConsumers();
 }
