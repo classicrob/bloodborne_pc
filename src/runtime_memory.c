@@ -1307,6 +1307,95 @@ int runtime_memory_layout(RuntimeMemoryView *views, size_t view_capacity, size_t
     *block_count=nb;
     return 0;
 }
+/* Perf replay files (gpu/shadps4/video_core/amdgpu/replay_format.h, mirrored here in C). */
+typedef struct { char magic[8]; uint32_t version, reserved; uint64_t records; } ReplayHeader;
+typedef struct { uint64_t start, size; int32_t type; uint32_t reserved; } ReplayBlock;
+typedef struct { uint64_t start, end, phys; uint32_t flexible; int32_t prot, type; uint32_t reserved; } ReplayView;
+typedef struct { uint64_t phys, bytes; } ReplayRun;
+_Static_assert(sizeof(ReplayHeader)==24 && sizeof(ReplayBlock)==24 && sizeof(ReplayView)==40 &&
+               sizeof(ReplayRun)==16, "perf replay record layout");
+static FILE *replay_open(const char *dir, const char *name, const char magic[8], ReplayHeader *h,
+                         char *why, size_t why_size) {
+    char path[4096];
+    snprintf(path,sizeof(path),"%s/%s",dir,name);
+    FILE *f=fopen(path,"rb");
+    if (!f) { snprintf(why,why_size,"cannot open %s",path); return NULL; }
+    if (fread(h,sizeof(*h),1,f)!=1 || memcmp(h->magic,magic,8) || h->version!=1) {
+        snprintf(why,why_size,"%s: not a version 1 perf replay file",path); fclose(f); return NULL;
+    }
+    return f;
+}
+int runtime_memory_replay_map(const char *dir, char *why, size_t why_size) {
+    ReplayHeader h;
+    FILE *f=replay_open(dir,"views.bin","BBRPVIEW",&h,why,why_size);
+    if (!f) return -1;
+    uint64_t counts[2];
+    if (fread(counts,sizeof(counts),1,f)!=1 || counts[0]+counts[1]!=h.records || counts[1]>(1u<<20)) {
+        snprintf(why,why_size,"views.bin: bad counts"); fclose(f); return -1;
+    }
+    for (uint64_t i=0;i<counts[0];++i) {
+        ReplayBlock b; int64_t phys=-1;
+        if (fread(&b,sizeof(b),1,f)!=1) { snprintf(why,why_size,"views.bin: truncated"); fclose(f); return -1; }
+        int32_t r=direct_allocate((int64_t)b.start,(int64_t)(b.start+b.size),b.size,PAGE,b.type,&phys);
+        if (r || (uint64_t)phys!=b.start) {
+            snprintf(why,why_size,"direct block [%#" PRIx64 ", +%#" PRIx64 ") not recreated at its offset (%#x, got %#" PRIx64 ")",
+                     b.start,b.size,(unsigned)r,(uint64_t)phys);
+            fclose(f); return -1;
+        }
+    }
+    ReplayView *views=calloc(counts[1] ? counts[1] : 1,sizeof(*views));
+    if (!views || (counts[1] && fread(views,sizeof(*views),counts[1],f)!=counts[1])) {
+        snprintf(why,why_size,"views.bin: truncated"); free(views); fclose(f); return -1;
+    }
+    fclose(f);
+    for (uint64_t i=0;i<counts[1];++i) {
+        const ReplayView *v=&views[i];
+        void *va=(void *)(uintptr_t)v->start;
+        int32_t r=v->flexible ? map_flexible(&va,v->end-v->start,v->prot,MAP_FIXED_FLAG)
+                              : direct_map(&va,v->end-v->start,v->prot,MAP_FIXED_FLAG,(int64_t)v->phys,PAGE);
+        if (r || (uintptr_t)va!=v->start) {
+            snprintf(why,why_size,"view [%#" PRIx64 ", %#" PRIx64 ") (%s) not mapped at its address (%#x)",
+                     v->start,v->end,v->flexible ? "flexible" : "direct",(unsigned)r);
+            free(views); return -1;
+        }
+    }
+    /* Backing runs reach guest memory through every captured view over them. */
+    f=replay_open(dir,"backing.bin","BBRPBACK",&h,why,why_size);
+    if (!f) { free(views); return -1; }
+    const uint64_t piece=UINT64_C(64)<<20;
+    unsigned char *buffer=malloc(piece);
+    uint64_t unreached=0;
+    for (uint64_t i=0;i<h.records && buffer;++i) {
+        ReplayRun run;
+        if (fread(&run,sizeof(run),1,f)!=1) { snprintf(why,why_size,"backing.bin: truncated"); goto fail; }
+        for (uint64_t done=0;done<run.bytes;) {
+            const uint64_t n=run.bytes-done<piece ? run.bytes-done : piece;
+            if (fread(buffer,1,n,f)!=n) { snprintf(why,why_size,"backing.bin: truncated"); goto fail; }
+            const uint64_t lo=run.phys+done, hi=lo+n;
+            int reached=0;
+            for (uint64_t k=0;k<counts[1];++k) {
+                const ReplayView *v=&views[k];
+                const uint64_t vlo=v->phys, vhi=v->phys+(v->end-v->start);
+                const uint64_t a=lo>vlo ? lo : vlo, b=hi<vhi ? hi : vhi;
+                if (a>=b) continue;
+                if (!runtime_memory_write_backing(v->start+(a-vlo),buffer+(a-lo),b-a)) {
+                    snprintf(why,why_size,"view %#" PRIx64 ": backing write failed",v->start); goto fail;
+                }
+                reached=1;
+            }
+            if (!reached) unreached+=n;
+            done+=n;
+        }
+    }
+    if (!buffer) { snprintf(why,why_size,"out of memory"); goto fail; }
+    free(buffer); free(views); fclose(f);
+    printf("Perf replay: %" PRIu64 " direct blocks and %" PRIu64 " views mapped; %" PRIu64 " MiB of backing under no view skipped\n",
+           counts[0],counts[1],unreached>>20);
+    return 0;
+fail:
+    free(buffer); free(views); fclose(f);
+    return -1;
+}
 const void *runtime_memory_backing(uint64_t *direct_bytes, uint64_t *total_bytes) {
     if (direct_bytes) *direct_bytes=POOL_SIZE;
     if (total_bytes) *total_bytes=POOL_SIZE+FLEX_SPAN;

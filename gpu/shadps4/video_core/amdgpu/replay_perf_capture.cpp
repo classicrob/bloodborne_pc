@@ -22,27 +22,9 @@
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/amdgpu/pm4_cmds.h"
 #include "video_core/amdgpu/replay_format.h"
+#include "video_core/amdgpu/replay_state_access.h"
 #include "../../../../src/runtime_memory.h"
 
-namespace AmdGpu {
-/// Liverpool's parse state for the perf replay (friend of Liverpool): read at the cut here,
-/// restored before every replayed iteration (replay_perf_run.cpp).
-class ReplayStateAccess {
-public:
-    static const Liverpool::ConstantEngine& Ce(const Liverpool& lp) {
-        return lp.cblock;
-    }
-    static const ComputeProgram& CsState(const Liverpool& lp, u32 queue) {
-        return lp.mapped_queues[queue].cs_state;
-    }
-    static VAddr IndirectArgs(const Liverpool& lp) {
-        return lp.indirect_args_addr;
-    }
-    static u32 CounterPairs(const Liverpool& lp) {
-        return lp.num_counter_pairs;
-    }
-};
-} // namespace AmdGpu
 
 namespace ReplayCapture::Perf {
 namespace {
@@ -278,7 +260,7 @@ bool WriteImage(const std::filesystem::path& dir, const Memory& m, std::string& 
 }
 
 bool WriteLiverpool(const std::filesystem::path& dir, const Liverpool& lp, std::string& why) {
-    static_assert(std::is_trivially_copyable_v<Liverpool::Regs>);
+    static_assert(std::is_trivially_copyable_v<AmdGpu::Regs>);
     static_assert(std::is_trivially_copyable_v<AmdGpu::ComputeProgram>);
     File f;
     if (!f.Open(dir / "liverpool.bin", LiverpoolMagic, why)) {
@@ -296,8 +278,8 @@ bool WriteLiverpool(const std::filesystem::path& dir, const Liverpool& lp, std::
     const VAddr indirect = ReplayStateAccess::IndirectArgs(lp);
     if (!section(LiverpoolSection::Regs, &lp.regs, sizeof(lp.regs)) ||
         !section(LiverpoolSection::CeCounters, counters, sizeof(counters)) ||
-        !section(LiverpoolSection::CeHeap, Liverpool::ConstantEngine::constants_heap.data(),
-                 Liverpool::ConstantEngine::constants_heap.size()) ||
+        !section(LiverpoolSection::CeHeap, ReplayStateAccess::CeHeap().data(),
+                 ReplayStateAccess::CeHeap().size()) ||
         !section(LiverpoolSection::IndirectArgs, &indirect, sizeof(indirect))) {
         return false;
     }

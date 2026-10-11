@@ -681,6 +681,15 @@ static int probe_main(int argc, char **argv) {
         gpu_enabled=1; /* page tracking starts while the rasterizer registers guest memory */
         if (bbgpu_init(&gpu)) fail("GPU initialization failed");
         printf("GPU: window and Vulkan presenter ready; SDK 0x%08x, %u HLE symbols\n",(unsigned)sdk,bbgpu_symbol_count());
+#ifdef __APPLE__
+        const char *replay_dir=getenv("BB_REPLAY_RUN");
+        if (replay_dir && *replay_dir) {
+            const int status=run_replay(replay_dir,image,size);
+            fflush(stdout);
+            fflush(stderr);
+            _exit(status);
+        }
+#endif
     }
     unsigned char *traps = allocate(round_host_page((import_count + 1) * 32));
     unsigned char *data_traps = allocate((import_count + 1) * page_size);
@@ -791,6 +800,55 @@ typedef struct { int argc; char **argv; } ProbeArguments;
 static int probe_worker(void *argument) {
     ProbeArguments *args=argument;
     return probe_main(args->argc,args->argv);
+}
+#endif
+#ifdef __APPLE__
+/* Perf replay v0 (BB_REPLAY_RUN=<capture dir>, BB_REPLAY_ITERATIONS=N, default 10): instead of
+ * running the guest, map the captured memory, restore the eboot image bytes and replay the
+ * captured frame (docs/macos/capture-replay.md). The image must load at its captured address. */
+static int run_replay(const char *dir, unsigned char *image_base, uint64_t image_size) {
+    char why[1024];
+    if (runtime_memory_replay_map(dir,why,sizeof(why))) {
+        fprintf(stderr,"STOP: perf replay: %s\n",why);
+        return 2;
+    }
+    char path[4096];
+    snprintf(path,sizeof(path),"%s/image.bin",dir);
+    FILE *f=fopen(path,"rb");
+    struct { char magic[8]; uint32_t version, reserved; uint64_t records; } h;
+    uint64_t range[2];
+    if (!f || fread(&h,sizeof(h),1,f)!=1 || memcmp(h.magic,"BBRPEBOT",8) || h.version!=1 ||
+        h.records!=1 || fread(range,sizeof(range),1,f)!=1) {
+        fprintf(stderr,"STOP: perf replay: %s is not a version 1 image file\n",path);
+        if (f) fclose(f);
+        return 2;
+    }
+    if (range[0]!=(uintptr_t)image_base || range[1]!=image_size) {
+        fprintf(stderr,"STOP: perf replay: the eboot image is at %p (%" PRIu64 " bytes) here and at %#" PRIx64
+                " (%" PRIu64 " bytes) in the capture; the replay needs the same address and eboot\n",
+                (void *)image_base,image_size,range[0],range[1]);
+        fclose(f);
+        return 2;
+    }
+    if (fread(image_base,1,image_size,f)!=image_size) {
+        fprintf(stderr,"STOP: perf replay: %s is truncated\n",path);
+        fclose(f);
+        return 2;
+    }
+    fclose(f);
+    unsigned iterations=10;
+    if (const char *env=getenv("BB_REPLAY_ITERATIONS")) {
+        char *end=NULL;
+        errno=0;
+        unsigned long n=strtoul(env,&end,10);
+        if (!*env || *end || errno || env[0]=='-' || env[0]=='+' || n<1 || n>10000) {
+            fprintf(stderr,"STOP: BB_REPLAY_ITERATIONS=%s: decimal digits, 1..10000\n",env);
+            return 2;
+        }
+        iterations=(unsigned)n;
+    }
+    fflush(stdout);
+    return bbgpu_replay_run(dir,iterations);
 }
 #endif
 int runtime_guest_image(uintptr_t *start, uint64_t *size) {
