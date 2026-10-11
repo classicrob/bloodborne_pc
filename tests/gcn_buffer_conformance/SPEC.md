@@ -111,3 +111,11 @@ game that uses that access.
   hardware. The renderer treats it as null; the suite doesn't assert it.
 - Heap bit (122), ATC, LDS-direct loads, ADDR64, TFE: not used by the recompiler.
 - 64-bit atomics with return (glc): the frontend has no path for them (UNREACHABLE).
+
+## V_CVT_PKRTZ_F16_F32 (group `alu`)
+Chapter 12: `D = {flt32_to_flt16(S1.f), flt32_to_flt16(S0.f)}, with round-toward-zero`. Truncation
+and overflow are therefore exact: finite values beyond the half range give the largest finite half
+(0x7BFF), never infinity. The text says nothing about half-precision denormal results (Sea Islands
+has no half-precision FP_DENORM field) or about NaN payloads. The suite accepts either reading for
+denormal results, kept or flushed (one reading for the whole job, reported), and any NaN for a NaN
+input.

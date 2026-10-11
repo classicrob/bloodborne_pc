@@ -327,3 +327,19 @@ uint32_t gcn_first_lane(uint64_t exec) {
     }
     return 0;
 }
+
+uint16_t gcn_f32_to_f16_rtz(uint32_t bits, int flush_out) {
+    const uint16_t sign = (uint16_t)((bits >> 16) & 0x8000u);
+    const int32_t exp = (int32_t)((bits >> 23) & 0xFFu);
+    const uint32_t frac = bits & 0x7FFFFFu;
+    if (exp == 0xFF) return (uint16_t)(sign | (frac ? 0x7E00u : 0x7C00u));
+    const int32_t e = exp - 127; /* unbiased; f32 denormals are far below the f16 range */
+    if (exp == 0) return sign;
+    if (e > 15) return (uint16_t)(sign | 0x7BFFu); /* toward zero: the largest finite half */
+    if (e >= -14) return (uint16_t)(sign | ((uint32_t)(e + 15) << 10) | (frac >> 13));
+    /* below the normal range: value / 2^-24, truncated */
+    const int32_t shift = -1 - e; /* (1.frac * 2^e) / 2^-24 = (0x800000 | frac) >> shift */
+    const uint32_t m = shift >= 32 ? 0u : ((0x800000u | frac) >> shift);
+    if (flush_out && m != 0) return sign;
+    return (uint16_t)(sign | m);
+}
