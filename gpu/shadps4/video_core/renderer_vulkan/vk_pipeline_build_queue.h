@@ -10,6 +10,8 @@
 #include <mutex>
 #include <thread>
 #include <vector>
+#include <fmt/format.h>
+#include "common/thread.h"
 #include "common/types.h"
 
 namespace Vulkan {
@@ -18,7 +20,11 @@ class PipelineBuildQueue {
 public:
     explicit PipelineBuildQueue(u32 num_threads) {
         for (u32 i = 0; i < num_threads; ++i) {
-            workers.emplace_back([this] { Run(); });
+            workers.emplace_back([this, i] {
+                // Named for profiles and crash reports (BB_CPU_PROFILE caches the name).
+                Common::SetCurrentThreadName(fmt::format("PipelineBuild {}", i).c_str());
+                Run();
+            });
         }
     }
 
