@@ -859,7 +859,8 @@ public:
     /// see it otherwise). Signals keep their order, and WaitDeferredSignals waits for them.
     void SignalAtGpuCompletion(std::function<void()> signal);
 
-    /// Whether BB_LABELS_AT_GPU_COMPLETE=1.
+    /// Whether labels are written at GPU completion now: BB_LABELS_AT_GPU_COMPLETE=1 for the
+    /// whole run, or toggle bit 59 (switchable live). Read when a label is issued.
     static bool LabelsAtGpuComplete();
 #endif
 

@@ -72,6 +72,11 @@ enum : std::uint64_t {
     // Apple: bit set builds new graphics pipelines on the GPU thread at selection, as before the
     // build workers (docs/macos/pipeline-compile.md); a diagnostic A/B, read per new pipeline.
     PipelineWorkers = 1ull << 58,
+    // Apple: bit set writes end-of-pipe labels once the GPU completed the work before them
+    // (BB_LABELS_AT_GPU_COMPLETE=1 sets it for the whole run). Switchable live: the first label
+    // after a switch waits for every label issued before it, and the switch is logged with the
+    // time (docs/macos/gpu-idle.md), so one run can alternate the modes for an A/B.
+    LabelsAtGpuComplete = 1ull << 59,
     // Bits 20-29 are used as raw debug toggles by the camera/object motion and the upscaler.
 };
 inline bool Disabled(std::uint64_t bit) {

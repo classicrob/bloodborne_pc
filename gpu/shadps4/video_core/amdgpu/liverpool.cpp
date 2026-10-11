@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <ctime>
 #include <memory>
 #include <thread>
 #include <pthread.h>
@@ -397,9 +398,38 @@ void WriteLabelBacking(void* address, u64 data, u32 num_bytes) {
 }
 #endif
 
-void SignalEop(const PM4CmdEventWriteEop& eop) {
+#ifdef __APPLE__
+/// The label mode for a label issued now. At a switch (toggle bit 59, live), first waits until
+/// every label issued before it was written, so labels of the two modes never reorder, and logs
+/// the switch with the time for A/B comparisons within one run. Called by the one thread issuing
+/// labels at a time (stage A, or B while A waits for it).
+bool LabelsAtGpuCompleteForIssue(Vulkan::Rasterizer& rasterizer) {
+    static std::atomic<int> last{-1}; // stage A and B issue labels, never at the same time
+    const bool now = Vulkan::Scheduler::LabelsAtGpuComplete();
+    const int previous = last.exchange(now ? 1 : 0, std::memory_order_acq_rel);
+    if (previous != -1 && previous != int(now)) {
+        rasterizer.WaitDeferredSignals();
+        const auto wall = std::chrono::system_clock::now();
+        const std::time_t seconds = std::chrono::system_clock::to_time_t(wall);
+        std::tm utc{};
+        gmtime_r(&seconds, &utc);
+        char stamp[32];
+        std::strftime(stamp, sizeof(stamp), "%Y-%m-%dT%H:%M:%S", &utc);
+        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            wall.time_since_epoch()).count() % 1000;
+        std::fprintf(stderr,
+                     "Labels at GPU completion: %s at %s.%03lldZ (switched; labels issued before "
+                     "it were written first)\n",
+                     now ? "ON" : "OFF", stamp, static_cast<long long>(ms));
+    }
+    return now;
+}
+#endif
+
+/// `backing_only`: the label was issued at GPU completion (written on the label writer).
+void SignalEop(const PM4CmdEventWriteEop& eop, bool backing_only = false) {
     eop.SignalFence(
-        [](void* address, u64 data, u32 num_bytes) {
+        [backing_only](void* address, u64 data, u32 num_bytes) {
             auto* memory = Core::Memory::Instance();
 #ifdef __APPLE__
             if (BbLabelCheck::Enabled()) {
@@ -408,7 +438,7 @@ void SignalEop(const PM4CmdEventWriteEop& eop) {
 #endif
             BbWriteLog::Note(reinterpret_cast<u64>(address), &data, num_bytes, BbWriteLog::Fence);
 #ifdef __APPLE__
-            if (Vulkan::Scheduler::LabelsAtGpuComplete()) {
+            if (backing_only) {
                 WriteLabelBacking(address, data, num_bytes);
             } else
 #endif
@@ -438,8 +468,8 @@ void RunEventWriteEop(Vulkan::Rasterizer& rasterizer, const u8* data) {
         return env && env[0] == '1';
     }();
 #ifdef __APPLE__
-    if (Vulkan::Scheduler::LabelsAtGpuComplete()) {
-        rasterizer.SignalAtGpuCompletion([eop] { SignalEop(eop); });
+    if (LabelsAtGpuCompleteForIssue(rasterizer)) {
+        rasterizer.SignalAtGpuCompletion([eop] { SignalEop(eop, true); });
         return;
     }
 #endif
@@ -520,12 +550,12 @@ void RunWriteData(Vulkan::Rasterizer& rasterizer, const u8* data) {
 #endif
 }
 
-void SignalEos(const PM4CmdEventWriteEos& event_eos) {
-    event_eos.SignalFence([](void* address, u64 value, u32 num_bytes) {
+void SignalEos(const PM4CmdEventWriteEos& event_eos, bool backing_only = false) {
+    event_eos.SignalFence([backing_only](void* address, u64 value, u32 num_bytes) {
         auto* memory = Core::Memory::Instance();
         BbWriteLog::Note(reinterpret_cast<u64>(address), &value, num_bytes, BbWriteLog::Fence);
 #ifdef __APPLE__
-        if (Vulkan::Scheduler::LabelsAtGpuComplete()) {
+        if (backing_only) {
             WriteLabelBacking(address, value, num_bytes);
             return;
         }
@@ -539,10 +569,10 @@ void SignalEos(const PM4CmdEventWriteEos& event_eos) {
 void RunEventWriteEos(Vulkan::Rasterizer& rasterizer, const u8* data) {
     const auto& event_eos = *reinterpret_cast<const PM4CmdEventWriteEos*>(data);
 #ifdef __APPLE__
-    if (Vulkan::Scheduler::LabelsAtGpuComplete() &&
+    if (LabelsAtGpuCompleteForIssue(rasterizer) &&
         event_eos.command != PM4CmdEventWriteEos::Command::GdsStore) {
         rasterizer.ProcessDownloadImages();
-        rasterizer.SignalAtGpuCompletion([event_eos] { SignalEos(event_eos); });
+        rasterizer.SignalAtGpuCompletion([event_eos] { SignalEos(event_eos, true); });
         return;
     }
 #endif
@@ -1994,7 +2024,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 // Compute end-of-pipe label: after the GPU completed the work before it, in
                 // order with the graphics labels, stored through the backing (it runs on the
                 // label writer).
-                if (Vulkan::Scheduler::LabelsAtGpuComplete()) {
+                if (LabelsAtGpuCompleteForIssue(*rasterizer)) {
                     const u32 pipe_id = queue.pipe_id;
                     const auto irq = [pipe_id] {
                         Platform::IrqC::Instance()->Signal(
