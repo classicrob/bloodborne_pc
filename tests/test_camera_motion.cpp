@@ -86,7 +86,8 @@ int main() {
     };
     const auto run=[&](const char* label,float depth,float translation,float rotation,
                        float object_depth,u32 mode,float expected,bool jitter=false,
-                       float rotation_y=0,float translation_y=0,float expected_y=0) {
+                       float rotation_y=0,float translation_y=0,float expected_y=0,
+                       const std::array<float,12>* reproject=nullptr,u32 py=3) {
         auto* pixels=static_cast<float*>(ai.pMappedData);
         for (u32 p=0;p<N;++p) {
             pixels[p*4]=depth;
@@ -116,7 +117,8 @@ int main() {
             writes[i]={.dstBinding=i,.descriptorCount=1,.descriptorType=bindings[i].descriptorType,
                 .pImageInfo=&infos[i]};
         }
-        Params params{{1,0,rotation,translation,0,1,rotation_y,translation_y,0,0,1,0},
+        Params params{reproject ? *reproject :
+            std::array<float,12>{1,0,rotation,translation,0,1,rotation_y,translation_y,0,0,1,0},
             {1,1,1,-0.05f},{1,1,1,-0.05f},{W,H},
             {jitter ? 0.37f : 0.f,jitter ? -0.29f : 0.f},{0,0},mode};
         cmd.bindPipeline(vk::PipelineBindPoint::eCompute,*pipeline,d);
@@ -126,7 +128,7 @@ int main() {
         barrier(cmd,vk::PipelineStageFlagBits2::eComputeShader,vk::AccessFlagBits2::eShaderWrite,
             vk::PipelineStageFlagBits2::eTransfer,vk::AccessFlagBits2::eTransferRead);
         const vk::BufferImageCopy region{.imageSubresource={vk::ImageAspectFlagBits::eColor,0,0,1},
-            .imageOffset={4,3,0},.imageExtent={1,1,1}};
+            .imageOffset={4,s32(py),0},.imageExtent={1,1,1}};
         cmd.copyImageToBuffer(vk::Image(images[1]),vk::ImageLayout::eGeneral,staging,region,d);
         barrier(cmd,vk::PipelineStageFlagBits2::eTransfer,vk::AccessFlagBits2::eTransferWrite,
             vk::PipelineStageFlagBits2::eHost,vk::AccessFlagBits2::eHostRead);
@@ -168,6 +170,21 @@ int main() {
         const auto expected=reference_motion(4,3,near,lift);
         assert(std::abs(expected[1])>0.1f);
         run("vertical translation moves rows",near,0,0,0,0,expected[0],false,0,0.5f,expected[1]);
+    }
+    // Off-centre (row 1: view y != 0), view y feeding the previous x and z: the reconstruction's
+    // y sign matters on its own here, not only together with the projection's (at the centre
+    // row y is 0 and only the projection sign shows).
+    {
+        const std::array<float,12> y_to_xz{1,0.3f,0,0,0,1,0,0,0,0.5f,1,0};
+        const auto expected=reference_motion(4,1,near,y_to_xz);
+        assert(std::abs(expected[0])>0.05f && std::abs(expected[1])>0.05f);
+        run("off-centre: view y moves x and depth",near,0,0,0,0,expected[0],false,0,0,
+            expected[1],&y_to_xz,1);
+    }
+    {
+        const std::array<float,12> pitch{1,0,0,0,0,1,0.2f,0,0,0,1,0};
+        const auto expected=reference_motion(4,1,near,pitch);
+        run("off-centre: camera pitch",near,0,0,0,0,expected[0],false,0,0,expected[1],&pitch,1);
     }
     vmaDestroyBuffer(instance.GetAllocator(),staging,allocation);
 }
