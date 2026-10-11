@@ -12,7 +12,7 @@ tools/macos/heavy.sh status
 | Pool | Slots | For |
 |---|---|---|
 | `build` | 1 (`BB_HEAVY_BUILD_SLOTS`) + 1 priority-only | builds, test suites, conformance runs, benchmarks, standalone GPU probes; `--priority` (shared builds) may also take the reserved slot |
-| `playtest` | 3 (`BB_HEAVY_PLAYTEST_SLOTS`) | game runs through play_route.py: parallel correctness runs, each with its own user dir and window |
+| `playtest` | 2 (`BB_HEAVY_PLAYTEST_SLOTS`) | game runs through play_route.py: parallel correctness runs, each with its own user dir and window |
 | `quick` | 2 (`BB_HEAVY_QUICK_SLOTS`) | short jobs: a one-TU compile check, a single test link or run, a driver-only build, a sweep step. Never a full GPU build |
 
 A quick job gets a parallelism hint (`BB_BUILD_JOBS=4`, `CMAKE_BUILD_PARALLEL_LEVEL=4`,
@@ -23,6 +23,21 @@ pool exists so one-minute jobs don't wait behind fifteen-minute builds.
 
 That is at most 4 translated (Rosetta) processes from game runs and one build-pool test, which is
 the team limit. Parallel runs are for correctness only; their FPS numbers mean nothing.
+
+## Sharing the Mac with the user
+
+The user works on this Mac while the team runs. Heavy jobs yield to them by default:
+
+| Jobs | Scheduling |
+|---|---|
+| build and quick pools (builds, tests, sweeps) | background QoS (`taskpolicy -b`: lowest CPU priority, efficiency cores, throttled I/O) and compile parallelism capped at `BB_HEAVY_BUILD_JOBS` (8) through `BB_BUILD_JOBS`, `CMAKE_BUILD_PARALLEL_LEVEL` and `MAKEFLAGS` (a lower hint is kept) |
+| playtest pool (correctness games) | nice 5 and a utility QoS clamp |
+| `--gpu exclusive` (perf_run, timing) | unchanged: the user approved perf runs separately |
+
+It is applied once, when the slot is taken; nested calls inherit it. Builds take longer this
+way, by the user's choice. `BB_HEAVY_POLITE=0` turns it off (perf or shared builds while the
+user is away). Plain `ninja` ignores the parallelism hint: pass `-j "$BB_BUILD_JOBS"`.
+The history records each job's scheduling.
 
 ## The GPU lock
 
