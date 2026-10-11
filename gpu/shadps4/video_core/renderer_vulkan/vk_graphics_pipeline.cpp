@@ -40,6 +40,13 @@ GraphicsPipeline::GraphicsPipeline(
     : Pipeline{instance, scheduler, desc_heap, profile, pipeline_cache}, key{key_},
       fetch_shader{std::move(fetch_shader_)} {
     std::ranges::copy(infos, stages.begin());
+#ifdef __APPLE__
+    std::ranges::copy(runtime_infos, built_runtime_infos.begin());
+    for (size_t i = 0; i < std::min(modules.size(), built_modules.size()); ++i) {
+        built_modules[i] = modules[i];
+    }
+    built_preloaded = preloading;
+#endif
     if (!deferred) {
         Build(pipeline_cache, runtime_infos, modules, sdata, preloading);
         return;

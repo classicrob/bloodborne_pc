@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <atomic>
+#include <cstdio>
+#include <xxhash.h>
 #include <bit>
 #include <chrono>
 #include <cstdlib>
@@ -451,6 +453,12 @@ struct CompileTimer {
 } // namespace
 
 bool PipelineCache::PrepareGraphicsPipeline(PipelineSelection& worker_sel) {
+#ifdef __APPLE__
+    // BB_PIPELINE_VERIFY checks selections made on the GPU thread only.
+    if (PipelineVerify()) {
+        return false;
+    }
+#endif
     // Tessellation stages read constant buffers from memory at selection time: not prepared.
     if (worker_sel.regs->stage_enable.hs_en) {
         return false;
@@ -509,6 +517,13 @@ const GraphicsPipeline* PipelineCache::TryPreparedPipeline(const PreparedDraw& p
 const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectParams params,
                                                            const PreparedDraw* prepared) {
     used_prepared = nullptr;
+#ifdef __APPLE__
+    // BB_PIPELINE_VERIFY: prepared selections skip GetProgram and the key path; take those.
+    if (prepared && PipelineVerify()) {
+        ++verify_prepared_bypassed;
+        prepared = nullptr;
+    }
+#endif
     if (prepared) {
         if (const auto* pipeline = TryPreparedPipeline(*prepared)) {
             used_prepared = prepared;
@@ -522,6 +537,11 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
         return nullptr;
     }
     const auto [it, is_new] = graphics_pipelines.try_emplace(sel.graphics_key);
+#ifdef __APPLE__
+    if (!is_new && it->second && PipelineVerify()) {
+        VerifyReusedPipeline(*it->second, std::hash<GraphicsPipelineKey>{}(sel.graphics_key));
+    }
+#endif
     if (is_new) {
         const auto pipeline_hash = std::hash<GraphicsPipelineKey>{}(sel.graphics_key);
         LOG_INFO(Render_Vulkan, "Compiling graphics pipeline {:#x}", pipeline_hash);
@@ -1274,6 +1294,13 @@ PipelineCache::Result PipelineCache::GetProgram(PipelineSelection& sel, HwStage 
         std::unique_lock lk{programs_mutex};
         program.AddPermut(module, std::move(spec), std::move(info));
     } else {
+#ifdef __APPLE__
+        if (auto& reused = program.modules[index]; reused.preloaded && !reused.verified &&
+                                                  PipelineVerify()) {
+            reused.verified = true;
+            VerifyPreloadedModule(reused, hw_stage, sw_stage, params, runtime_info, binding);
+        }
+#endif
         program.modules[index].info->AddBindings(binding);
     }
     program.last_used = index;
@@ -1281,6 +1308,169 @@ PipelineCache::Result PipelineCache::GetProgram(PipelineSelection& sel, HwStage 
     return {selected.info.get(), selected.module, selected.spec.fetch_shader_data,
             HashCombine(params.hash, index)};
 }
+
+#ifdef __APPLE__
+bool PipelineCache::PipelineVerify() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("BB_PIPELINE_VERIFY");
+        const bool on = env && env[0] == '1';
+        if (on) {
+            std::fprintf(stderr, "BB_PIPELINE_VERIFY=1: preloaded shader permutations are "
+                                 "translated again at first use and compared with the cache; "
+                                 "reused graphics pipelines are compared with the draw "
+                                 "(diagnostic)\n");
+        }
+        return on;
+    }();
+    return enabled;
+}
+
+void PipelineCache::VerifyReusedPipeline(const GraphicsPipeline& pipeline, u64 pipeline_hash) {
+    // A pipeline is reused for every draw with its key; its construction read these inputs. If
+    // the draw's differ, the key does not cover something construction depends on.
+    static constexpr const char* names[] = {"FS", "TCS", "TES", "VS", "GS", "CS"}; // SwStage
+    std::string differences;
+    for (u32 stage = 0; stage < MaxShaderStages; ++stage) {
+        if (!pipeline.GetStages()[stage] && !sel.infos[stage]) {
+            continue;
+        }
+        const char* name = stage < std::size(names) ? names[stage] : "stage";
+        if (pipeline.built_modules[stage] != sel.modules[stage]) {
+            differences += fmt::format("{}{} module", differences.empty() ? "" : ", ", name);
+        }
+        // A preloaded pipeline's tessellation stages carry the specialization's runtime info,
+        // with the fields it derives from the tess constants; the draw's has none of those.
+        const bool tess = stage == u32(Shader::SwStage::TessellationControl) ||
+                          stage == u32(Shader::SwStage::TessellationEval);
+        if (pipeline.built_preloaded && tess) {
+            ++verify_tess_unchecked; // not compared: see verify summary
+        } else if (!(pipeline.built_runtime_infos[stage] == sel.runtime_infos[stage])) {
+            differences += fmt::format("{}{} runtime info", differences.empty() ? "" : ", ", name);
+        }
+    }
+    ++verify_pipelines;
+    if (!differences.empty()) {
+        ++verify_pipeline_mismatches; // before the summary, which may print for this reuse
+    }
+    if ((verify_pipelines & 4095) == 0) {
+        LOG_INFO(Render_Vulkan,
+                 "PIPELINE-VERIFY summary: {} pipeline reuses checked, {} differ; {} preloaded "
+                 "modules checked, {} differ; {} preloaded tessellation-stage runtime infos not "
+                 "compared; {} prepared selections bypassed for the check",
+                 verify_pipelines, verify_pipeline_mismatches, verify_modules,
+                 verify_module_mismatches, verify_tess_unchecked, verify_prepared_bypassed);
+    }
+    if (differences.empty()) {
+        return;
+    }
+    if (verify_pipeline_mismatches <= 64 || (verify_pipeline_mismatches & 1023) == 0) {
+        LOG_CRITICAL(Render_Vulkan,
+                     "PIPELINE-VERIFY: {} pipeline {:#x} reused for a draw that differs in: {} "
+                     "({} of {} reuses differ so far)",
+                     pipeline.built_preloaded ? "preloaded" : "live", pipeline_hash, differences,
+                     verify_pipeline_mismatches, verify_pipelines);
+    }
+}
+
+void PipelineCache::VerifyPreloadedModule(const Program::Module& module, HwStage hw_stage,
+                                          SwStage sw_stage, const Shader::ShaderParams& params,
+                                          const Shader::RuntimeInfo& runtime_info,
+                                          const Shader::Backend::Bindings& start) {
+    // The same translation CompileModule does, without creating or storing anything.
+    Shader::Info fresh(hw_stage, sw_stage, params);
+    auto fresh_runtime = runtime_info;
+    auto bindings = start;
+    const auto ir_program = Shader::TranslateProgram(params.code, pools, fresh, fresh_runtime, profile);
+    const auto spv = Shader::Backend::SPIRV::EmitSPIRV(profile, fresh_runtime, ir_program, bindings);
+    const u64 fresh_hash = XXH3_64bits(spv.data(), spv.size() * sizeof(u32));
+    // As CompileModule: the specialization takes the runtime info as translation left it.
+    const auto fresh_spec = Shader::StageSpecialization(fresh, fresh_runtime, profile, start);
+    const auto& cached = *module.info;
+    std::string differences;
+    const auto differ = [&](const char* what) {
+        differences += differences.empty() ? what : fmt::format(", {}", what);
+    };
+    if (fresh_hash != module.binary_hash) differ("SPIR-V");
+    if (!(fresh_spec == module.spec)) differ("specialization");
+    if (fresh.buffers.size() != cached.buffers.size()) differ("buffer count");
+    for (size_t i = 0; i < std::min(fresh.buffers.size(), cached.buffers.size()); ++i) {
+        const auto& a = fresh.buffers[i];
+        const auto& b = cached.buffers[i];
+        if (!(a.sharp_fetch == b.sharp_fetch) || a.buffer_type != b.buffer_type ||
+            a.is_written != b.is_written || a.is_formatted != b.is_formatted ||
+            a.used_types != b.used_types || a.post_op != b.post_op ||
+            a.post_op_dw1_mask != b.post_op_dw1_mask ||
+            a.required_binding_bytes != b.required_binding_bytes) {
+            differ(fmt::format("buffer {}", i).c_str());
+        }
+    }
+    if (fresh.images.size() != cached.images.size()) differ("image count");
+    for (size_t i = 0; i < std::min(fresh.images.size(), cached.images.size()); ++i) {
+        const auto& a = fresh.images[i];
+        const auto& b = cached.images[i];
+        // The fresh Info has no permutation binding count yet: its specialization does.
+        const u32 fresh_bindings =
+            i < fresh_spec.images.size() ? fresh_spec.images[i].num_bindings : 0;
+        if (!(a.sharp_fetch == b.sharp_fetch) || a.is_depth != b.is_depth ||
+            a.is_atomic != b.is_atomic || a.is_array != b.is_array ||
+            a.is_written != b.is_written || a.is_r128 != b.is_r128 ||
+            a.needs_native != b.needs_native || a.constant_mip_index != b.constant_mip_index ||
+            a.mip_fallback_mode != b.mip_fallback_mode || a.post_op != b.post_op ||
+            fresh_bindings != b.permutation_bindings) {
+            differ(fmt::format("image {}", i).c_str());
+        }
+    }
+    if (fresh.samplers.size() != cached.samplers.size()) differ("sampler count");
+    for (size_t i = 0; i < std::min(fresh.samplers.size(), cached.samplers.size()); ++i) {
+        const auto& a = fresh.samplers[i];
+        const auto& b = cached.samplers[i];
+        if (!(a.sharp_fetch == b.sharp_fetch) || a.post_op != b.post_op ||
+            a.post_op_tsharp_dw3_off != b.post_op_tsharp_dw3_off || a.is_depth != b.is_depth) {
+            differ(fmt::format("sampler {}", i).c_str());
+        }
+    }
+    if (fresh.fmasks.size() != cached.fmasks.size()) differ("fmask count");
+    for (size_t i = 0; i < std::min(fresh.fmasks.size(), cached.fmasks.size()); ++i) {
+        if (fresh.fmasks[i].sharp_idx != cached.fmasks[i].sharp_idx) {
+            differ(fmt::format("fmask {}", i).c_str());
+        }
+    }
+    if (fresh.ud_mask.mask != cached.ud_mask.mask) differ("user-data mask");
+    if (fresh.mrt_mask != cached.mrt_mask) differ("MRT mask");
+    if (fresh.has_fetch_shader != cached.has_fetch_shader ||
+        fresh.fetch_shader_sgpr_base != cached.fetch_shader_sgpr_base) {
+        differ("fetch shader");
+    }
+    if (fresh.shared_memory_scratch_size != cached.shared_memory_scratch_size) differ("scratch");
+    if (fresh.uses_dma != cached.uses_dma) differ("DMA");
+    if (std::memcmp(fresh.loads.flags.data(), cached.loads.flags.data(),
+                    sizeof(fresh.loads.flags)) != 0 ||
+        std::memcmp(fresh.stores.flags.data(), cached.stores.flags.data(),
+                    sizeof(fresh.stores.flags)) != 0) {
+        differ("attribute loads/stores");
+    }
+    for (u32 i = 0; i < fresh.fs_interpolation.size(); ++i) {
+        if (fresh.fs_interpolation[i].primary != cached.fs_interpolation[i].primary ||
+            fresh.fs_interpolation[i].auxiliary != cached.fs_interpolation[i].auxiliary) {
+            differ("FS interpolation");
+            break;
+        }
+    }
+    if (fresh.srt_info.flattened_bufsize_dw != cached.srt_info.flattened_bufsize_dw) {
+        differ("flattened user data size");
+    }
+    ++verify_modules;
+    if (differences.empty()) {
+        return;
+    }
+    ++verify_module_mismatches;
+    LOG_CRITICAL(Render_Vulkan,
+                 "PIPELINE-VERIFY: preloaded {} shader {:#x} differs from a fresh translation: {} "
+                 "(cached SPIR-V {:#018x}, fresh {:#018x}; {} of {} preloaded modules differ so far)",
+                 hw_stage, params.hash, differences, module.binary_hash, fresh_hash,
+                 verify_module_mismatches, verify_modules);
+}
+#endif
 
 std::optional<vk::ShaderModule> PipelineCache::ReplaceShader(vk::ShaderModule module,
                                                              std::span<const u32> spv_code) {
