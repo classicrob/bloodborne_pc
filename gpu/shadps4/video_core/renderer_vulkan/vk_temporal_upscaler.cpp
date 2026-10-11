@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+#include <filesystem>
 #include "video_core/renderer_vulkan/vk_temporal_upscaler.h"
 #include "video_core/renderer_vulkan/vk_gpu_profiler.h"
 #include "video_core/renderer_vulkan/motion_history.h"
@@ -54,8 +55,14 @@ FfxVkPortableImage Describe(vk::Image image, vk::Format format, u32 width, u32 h
 /// the upscaler's images of the next BB_DUMP_FRAMES (8) frames as raw files
 /// <dir>/fNNN_<name>_<w>x<h>_<format>.raw, for checking temporal stability offline.
 /// Returns the frame number to dump, or -1.
-/// The dump session (one per consumed trigger): microseconds since the epoch at the trigger.
+/// The dump session (one per consumed trigger): microseconds since the epoch at the trigger. Its
+/// files go to <BB_DUMP_DIR>/session-<id>, created exclusively, so a session's files are only its
+/// own (a missing or pending write is missing, never an older capture's file of the same name).
 u64 dump_session = 0;
+const std::string& DumpDir();
+std::string SessionDir() {
+    return DumpDir() + "/session-" + std::to_string(dump_session);
+}
 
 int DumpFrame() {
     static const char* trigger = std::getenv("BB_DUMP_TRIGGER");
@@ -73,6 +80,15 @@ int DumpFrame() {
         dump_session = u64(std::chrono::duration_cast<std::chrono::microseconds>(
                                std::chrono::system_clock::now().time_since_epoch())
                                .count());
+        std::error_code error;
+        std::filesystem::create_directories(DumpDir(), error);
+        if (!std::filesystem::create_directory(SessionDir(), error)) {
+            std::printf("Dump: session directory %s not created (%s): no dump\n",
+                        SessionDir().c_str(), error ? error.message().c_str() : "exists");
+            remaining = 0;
+            return -1;
+        }
+        std::printf("Dump: %d frames to %s\n", remaining, SessionDir().c_str());
     }
     --remaining;
     return index++;
@@ -98,7 +114,7 @@ const std::string& DumpDir() {
 
 void DumpImages(const Instance& instance, Scheduler& scheduler, vk::CommandBuffer cmdbuf,
                 int frame, std::initializer_list<DumpImage> images) {
-    const std::string& dir = DumpDir();
+    const std::string dir = SessionDir();
     const vk::MemoryBarrier2 before{
         .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
         .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
@@ -1664,7 +1680,7 @@ void TemporalUpscaler::RunScaled() {
                 const auto record = camera_motion.LastRecord();
                 char meta_path[512];
                 std::snprintf(meta_path, sizeof(meta_path), "%s/f%03d_meta.json",
-                              DumpDir().c_str(), dump);
+                              SessionDir().c_str(), dump);
                 if (FILE* meta = std::fopen(meta_path, "w")) {
                     std::fprintf(meta,
                                  "{\"session\": %llu, \"frame\": %d, \"motion_size\": [%u, %u], "

@@ -15,7 +15,7 @@ failures = 0
 
 
 def dump(directory, frame=0, session=1, camera_only=True, mode=0, flip=1.0, object_valid=True,
-         motion_size=(W, H), extra_objects=False, short_depth=False):
+         motion_size=(W, H), extra_objects=False, short_depth=False, no_motion=False):
     prefix = f'f{frame:03d}'
     with open(os.path.join(directory, f'{prefix}_meta.json'), 'w') as f:
         json.dump({'session': session, 'frame': frame, 'motion_size': list(motion_size),
@@ -26,7 +26,8 @@ def dump(directory, frame=0, session=1, camera_only=True, mode=0, flip=1.0, obje
     obj[..., 0], obj[..., 1], obj[..., 2], obj[..., 3] = 0.4, 1.5, 1.0, 0.9
     camera = np.zeros((H, W, 2), np.float16)
     camera[..., 0], camera[..., 1] = 0.4, 1.5 * flip
-    camera.tofile(os.path.join(directory, f'{prefix}_motion_{W}x{H}_rg16f.raw'))
+    if not no_motion:  # a pending or failed write
+        camera.tofile(os.path.join(directory, f'{prefix}_motion_{W}x{H}_rg16f.raw'))
     obj.tofile(os.path.join(directory, f'{prefix}_objects_{W}x{H}_rgba32f.raw'))
     if extra_objects:  # an older dump of another size, same frame number
         np.zeros((24, 32, 4), np.float32).tofile(
@@ -35,13 +36,15 @@ def dump(directory, frame=0, session=1, camera_only=True, mode=0, flip=1.0, obje
         os.path.join(directory, f'{prefix}_depth_{W}x{H}_f32.raw'))
 
 
-def expect(label, expected, **frames):
+def expect(label, expected, frames=({},), options=(), directory_name='session-1'):
     global failures
-    with tempfile.TemporaryDirectory() as directory:
-        for spec in frames.get('frames', [{}]):
+    with tempfile.TemporaryDirectory() as parent:
+        directory = os.path.join(parent, directory_name)
+        os.mkdir(directory)
+        for spec in frames:
             dump(directory, **spec)
-        result = subprocess.run([sys.executable, SCRIPT, directory], capture_output=True,
-                                text=True)
+        result = subprocess.run([sys.executable, SCRIPT, directory, *options],
+                                capture_output=True, text=True)
     ok = result.returncode == expected
     failures += 0 if ok else 1
     last = result.stdout.strip().splitlines()[-1] if result.stdout.strip() else ''
@@ -56,9 +59,20 @@ expect('camera-only flag but merged mode', 3, frames=[{'mode': 1}])
 expect('ambiguous companion (two objects files)', 3, frames=[{'extra_objects': True}])
 expect('malformed companion (short depth)', 3, frames=[{'short_depth': True}])
 expect('motion size differs from the files', 3, frames=[{'motion_size': (32, 24)}])
-expect('mixed dump sessions', 3, frames=[{'frame': 0, 'session': 1}, {'frame': 1, 'session': 2}])
+expect('meta session differs from its session directory', 3,
+       frames=[{'frame': 0, 'session': 1}, {'frame': 1, 'session': 2}])
+expect('new session with a pending (missing) motion write', 3,
+       frames=[{'frame': 0}, {'frame': 1, 'no_motion': True}])
+expect('not a session-<id> directory', 3, directory_name='dump')
+expect('malformed motion_size', 3, frames=[{'motion_size': (W,)}])
+for option, value in (('--max-median', 'inf'), ('--max-median', 'nan'), ('--max-median', '-1'),
+                      ('--min-vertical', 'nan'), ('--min-vertical', '-0.5')):
+    expect(f'invalid threshold {option} {value} (y flipped)', 3, frames=[{'flip': -1.0}],
+           options=(option, value))
 expect('no object vectors: unjudged', 2, frames=[{'object_valid': False}])
-with tempfile.TemporaryDirectory() as empty:
+with tempfile.TemporaryDirectory() as parent:
+    empty = os.path.join(parent, 'session-7')
+    os.mkdir(empty)
     result = subprocess.run([sys.executable, SCRIPT, empty], capture_output=True, text=True)
     ok = result.returncode == 3
     failures += 0 if ok else 1
