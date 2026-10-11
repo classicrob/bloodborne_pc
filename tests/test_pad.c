@@ -1,7 +1,18 @@
 #define _GNU_SOURCE
 #include <assert.h>
 #include <unistd.h>
+#include <SDL3/SDL.h>
+static int fail_init;
+static bool test_pad_init(SDL_InitFlags flags) { return fail_init ? SDL_SetError("injected gamepad initialization failure") : SDL_InitSubSystem(flags); }
+#define SDL_InitSubSystem test_pad_init
 #include "../src/runtime_pad.c"
+#undef SDL_InitSubSystem
+static int fail_rumble, rumble_calls;
+static Uint16 rumble_low,rumble_high;
+static bool virtual_rumble(void *user,Uint16 low,Uint16 high) {
+    (void)user; ++rumble_calls; rumble_low=low; rumble_high=high;
+    return fail_rumble ? SDL_SetError("injected rumble failure") : true;
+}
 
 static int capture;
 int bbgpu_overlay_captures_input(void) { return capture; }
@@ -50,6 +61,7 @@ int main(void) {
     desc.name="bbport test controller";
     desc.vendor_id=0x1d50;
     desc.product_id=0x6189;
+    desc.Rumble=virtual_rumble;
     desc.ntouchpads=1;
     desc.touchpads=&touch;
     SDL_JoystickID id=SDL_AttachVirtualJoystick(&desc);
@@ -65,6 +77,15 @@ int main(void) {
     assert(gamepad && data.touch_count==2 && (data.buttons & BTN_TOUCHPAD));
     assert(data.touches[0].x==1439 && data.touches[0].y==471 && data.touches[0].id==0);
     assert(data.touches[1].x==480 && data.touches[1].y==942 && data.touches[1].id==1);
+    uint8_t motors[]={17,91};
+    assert(!pad_vibration(1,motors));
+    assert(rumble_calls && rumble_low==17*257 && rumble_high==91*257);
+    fail_rumble=1; motors[0]=18;
+    assert(!pad_vibration(1,motors));
+#ifdef __APPLE__
+    assert(atomic_load(&pad_failures)==1);
+#endif
+    fail_rumble=0;
     capture=1;
     assert(pad_read_state(1,&data)==0 && data.touch_count==0 && data.buttons==0);
     capture=0;
@@ -78,6 +99,11 @@ int main(void) {
     gamepad=NULL;
     assert(SDL_DetachVirtualJoystick(id));
     SDL_Quit();
+    fail_init=1; sdl_ready=0;
+    assert(!current_gamepad());
+#ifdef __APPLE__
+    assert(atomic_load(&pad_failures)==2);
+#endif
     unlink(path);
     puts("PASS: pad ABI, debug camera chord, left/right clicks, SDL touch coordinates, overlay capture");
 }
