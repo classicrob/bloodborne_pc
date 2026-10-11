@@ -134,3 +134,24 @@ later. If the G-buffer is malformed, inspect per-draw clip-space outputs and fet
 formats/strides, bone indices/weights and matrix ranges for the candidate vertex
 shaders. Per-pass shader lists and short CPU-side buffer prefixes cannot replace
 that evidence. No renderer edit or game launch was made for this update.
+
+### Actual fetch programs for the candidate geometry
+
+Static inspection of the four saved `.fetch.bin` files above finds only
+`BUFFER_LOAD_FORMAT_XY/XYZ/XYZW` MUBUF loads, not MTBUF immediate-format overrides.
+They use `idxen=1`, `offen=0`, `vaddr=v0` and zero instruction offset. Thus the
+format-conversion test must exercise **descriptor-formatted inline fetch**; the
+shader bytes do not specify the live data/number formats or destination swizzles.
+
+The descriptor table loads use `S_LOAD_DWORDX4` from `s[2:3]`, at dword offsets
+0, 4, 8, 12, 16, 20 and 24; `ddbe557e` additionally uses 28, 32, 36 and 40.
+Fetch destinations are v4/v8/v12/v16/v20/v24/v28, with v32/v36/v40/v44 added by
+`ddbe557e`. The corresponding old binding report includes strides 12, 20, 32,
+36 and 44, not just a contiguous float4 layout.
+
+Request all four raw descriptor dwords per draw, decoded dfmt/nfmt and all four
+`dst_sel` fields, record count/stride/base, and index/vertex offsets. This allows
+UINT bone-index bits to be distinguished from USCALED numeric floats and normalized
+weights. The existing report's float interpretation of packed bytes cannot do so.
+The verifier and Sol-2 are investigating these conversions; no specific faulty
+format is established from the fetch binaries alone.
