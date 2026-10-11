@@ -215,6 +215,9 @@ def main():
     parser.add_argument('--out', default='out/shader_sweep')
     parser.add_argument('--processes', type=int, default=2)
     parser.add_argument('--only', help='comma-separated hashes (debugging)')
+    parser.add_argument('--compare', metavar='BASE_TSV',
+                        help='print the delta against an earlier results.tsv (status, message, '
+                             'spirv-val, MSL) and exit 1 if a job that passed there does not now')
     parser.add_argument('--msl-tool', default='out/tools/shader-msl',
                         help='the MSL stage (tools/macos/shader_sweep/build_msl.sh builds it)')
     args = parser.parse_args()
@@ -325,6 +328,51 @@ def main():
             r['spirv'] = len(spv.get(shader_hash, []))
             r['spirv_failures'] = failures
     write_reports(out, jobs, keep, results, compile_seconds, time.monotonic() - start)
+    if args.compare and compare(args.compare, os.path.join(out, 'results.tsv')):
+        sys.exit(1)
+
+
+def compare(base_path, new_path):
+    """Prints what changed per job (hash, kind) and the totals; True when a PASS regressed."""
+    def load(path):
+        rows = {}
+        with open(path) as f:
+            header = f.readline().rstrip('\n').split('\t')
+            for line in f:
+                row = dict(zip(header, line.rstrip('\n').split('\t')))
+                rows[(row['hash'], row['kind'])] = row
+        return rows
+    base, new = load(base_path), load(new_path)
+    changes = collections.Counter()
+    regressed = []
+    lines = []
+    for key in sorted(set(base) | set(new)):
+        b, n = base.get(key), new.get(key)
+        if not b or not n:
+            lines.append(f'  {key[0]} {key[1]}: only in {"new" if n else "base"}')
+            continue
+        for column in ('status', 'spirv_val', 'msl'):
+            was = b.get(column, 'ok') if column != 'status' else b[column]
+            now = n.get(column, 'ok') if column != 'status' else n[column]
+            if column != 'status':
+                was, now = ('ok' if was == 'ok' else 'fail'), ('ok' if now == 'ok' else 'fail')
+            if was != now:
+                changes[f'{column} {was} -> {now}'] += 1
+                if column == 'status' and was == 'PASS':
+                    regressed.append(f'  {key[0]} {key[1]}: {n["message"][:200]}')
+        if b['status'] == n['status'] != 'PASS' and b['message'] != n['message']:
+            changes['different stop message'] += 1
+            lines.append(f'  {key[0]} {key[1]}: message now {n["message"][:160]}')
+    print(f'Compared with {base_path}:')
+    for change, count in sorted(changes.items()):
+        print(f'  {count:5d}  {change}')
+    if not changes:
+        print('  no changes')
+    if regressed:
+        print('NEW non-PASS jobs:', *regressed, sep='\n')
+    if lines:
+        print(*lines[:40], sep='\n')
+    return bool(regressed)
 
 
 def write_reports(out, jobs, keep, results, compile_seconds, total_seconds):

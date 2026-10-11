@@ -10,7 +10,9 @@ tools/macos/shader_sweep/build_msl.sh      # once: the MSL stage (fetches SPIRV-
 tools/macos/heavy.sh --pool build "shader sweep" -- \
     python3 -I tools/macos/shader_sweep/sweep.py --game "$BB_GAME_DIR" --out out/shader_sweep
 ```
-Options: `--gpu-build DIR` (default `out/gpu`), `--only HASH,...`. The game data is only read.
+Options: `--gpu-build DIR` (default `out/gpu`), `--only HASH,...`, `--compare BASE.tsv` (prints the
+delta against an earlier `results.tsv` and exits 1 when a job that passed there no longer does).
+The game data is only read. A recompiler change states its delta against the merge base's results.
 
 ## What it runs
 1. `extract.py` decompresses `dvdroot_ps4/shader/*.shaderbnd*.dcx` (DCX zlib, BND4 binders;
