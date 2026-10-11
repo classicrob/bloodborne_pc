@@ -138,3 +138,12 @@ layouts. The model uses the D3D10+/AMD conventions:
   multiply: within 1 ulp, same sign).
 - dst_sel ONE: integer 1 for UINT/SINT (§8.1.3), 1.0f for every other number format (decided;
   1.0f for an integer format FAILs: a bone index swizzled to ONE would read 0x3F800000).
+
+## Per-shader choice of the SMEM reading (Apple wave64)
+Production follows the literal reading (out-of-range scalar dwords leave SDST unwritten), except
+in shaders where that old value would be a 64-lane compare mask built in workgroup-divergent flow,
+which the wave64 emulation cannot exchange without a barrier. Those shaders take SMEM_ZERO for all
+their scalar buffer loads (docs/macos/wave64.md). The suite accepts both readings; the `wave64`
+cases "divergent VOP3 compare into s[30:31]" check that such a shader reads 0 for every
+out-of-range dword (also an unrelated load whose old value was nonzero) and that any other use of
+the mask stays loud.
