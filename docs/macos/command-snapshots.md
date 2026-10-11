@@ -69,6 +69,8 @@ snapshots' own copies and reads no guest memory. Each read falls into one of the
   - The selected region is the current submission's, else the newest. The line says first
     whether the **selected** copy matches the read, then how many other held copies differ. This
     is a byte comparison, not an order: it does not say which copy was written last.
+  - A region not copied at submit (unreadable then; a valid stream never executes it) has no
+    copy of its own. It is located and named "not copied at submit", never compared.
   - A resubmitted chunk shows up as several copies. A difference shows that a held copy differs
     from the read, not by itself which submission's bytes the PS4 would have used.
 - **Straddling** a held region's boundary, when no held region contains the range (a containing
@@ -90,9 +92,10 @@ snapshots' own copies and reads no guest memory. Each read falls into one of the
   a candidate tail;
 - a summary every 65536 reads across all kinds, with counts per read kind and shader hash.
 
-The `CheckNumberConversion` stop appends this thread's latest instrumented read, **as observed
-then** (it never re-reads guest memory). That read is not necessarily the descriptor that stopped:
-it may have come from the uninstrumented flat buffer.
+The `CheckNumberConversion` stop appends this thread's latest instrumented read for the descriptor
+that stopped, **as observed then** (it never re-reads guest memory). The latest read is forgotten
+before each descriptor is read, so when that descriptor came from direct user data or the
+uninstrumented flat buffer, the stop says so instead of naming an earlier read.
 
 **Limits:**
 - Supporting evidence only.

@@ -225,6 +225,9 @@ struct StageSpecialization {
     void ForEachSharp(auto& spec_list, auto& desc_list, auto&& func) {
         for (const auto& desc : desc_list) {
             auto& spec = spec_list.emplace_back();
+#ifdef __APPLE__
+            BbCmdData::ForgetLastRead(); // a stop names only this descriptor's reads
+#endif
             const auto sharp = desc.GetSharp(*info);
             if (!sharp && !emulate_null_descriptors) {
                 continue;
@@ -236,6 +239,9 @@ struct StageSpecialization {
     void ForEachSharp(u32& binding, auto& spec_list, auto& desc_list, auto&& func) {
         for (const auto& desc : desc_list) {
             auto& spec = spec_list.emplace_back();
+#ifdef __APPLE__
+            BbCmdData::ForgetLastRead(); // a stop names only this descriptor's reads
+#endif
             const auto sharp = desc.GetSharp(*info);
             if (emulate_null_descriptors) {
                 if constexpr (std::is_same_v<std::remove_cvref_t<decltype(sharp)>, AmdGpu::Buffer>) {

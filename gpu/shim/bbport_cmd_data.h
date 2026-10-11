@@ -146,7 +146,8 @@ inline bool Enabled() {
 /// Bytes compared per region; a longer range is located but not compared.
 constexpr std::size_t MaxCompared = 256;
 
-/// A held submitted region, valid while the owner holds its snapshot lock.
+/// A held submitted region, valid while the owner holds its snapshot lock. `copy` is null for
+/// a region not copied at submit (unreadable then): located, never compared.
 struct HeldRegion {
     std::uint64_t start = 0, bytes = 0, submission = 0;
     const std::uint8_t* copy = nullptr;
@@ -160,9 +161,11 @@ struct Result {
     bool compared = false;       ///< size <= MaxCompared
     std::uint32_t matches = 0;   ///< held regions containing the range
     std::uint32_t differing = 0; ///< of those, copies that differ from the bytes read
+    std::uint32_t uncopied = 0;  ///< of those, regions with no copy (not compared)
     /// The selected copy (current, else newest) differs from the bytes read. A mismatch only, not
     /// an order: with the current one selected, other differing copies need not be older.
     bool selected_differs = false;
+    bool selected_uncopied = false; ///< the selected region has no copy: not compared
     bool current = false;        ///< one of them is the parser's current submission
     std::uint64_t submission = 0, region_start = 0, region_bytes = 0; ///< a selected region
     // ChunkTail:
@@ -206,8 +209,10 @@ inline Result Classify(std::uint64_t address, std::uint64_t size, const void* by
                 r.region_bytes = h.bytes;
             }
             r.current = r.current || is_current;
-            if (r.compared && h.copy &&
-                std::memcmp(h.copy + (address - h.start), bytes_read, size) != 0) {
+            if (!h.copy) {
+                ++r.uncopied;
+            } else if (r.compared &&
+                       std::memcmp(h.copy + (address - h.start), bytes_read, size) != 0) {
                 ++r.differing;
             }
         } else if (address < h_end && h.start < end && !straddled) {
@@ -216,6 +221,7 @@ inline Result Classify(std::uint64_t address, std::uint64_t size, const void* by
     }
     if (r.matches) {
         r.where = Where::Inside;
+        r.selected_uncopied = !selected->copy;
         r.selected_differs = r.compared && selected && selected->copy &&
                              std::memcmp(selected->copy + (address - selected->start),
                                          bytes_read, size) != 0;
@@ -344,6 +350,12 @@ inline std::string Describe(const Result& r) {
         break;
     case Where::Inside: {
         const std::uint32_t others_differing = r.differing - (r.selected_differs ? 1 : 0);
+        const std::uint32_t others_uncopied = r.uncopied - (r.selected_uncopied ? 1 : 0);
+        char uncopied_text[64] = "";
+        if (others_uncopied) {
+            std::snprintf(uncopied_text, sizeof(uncopied_text), ", %u not copied at submit",
+                          others_uncopied);
+        }
         if (!r.compared) {
             std::snprintf(text, sizeof(text),
                           "inside %u held region(s) (selected %#llx, submission %llu%s); not "
@@ -353,13 +365,18 @@ inline std::string Describe(const Result& r) {
                           r.current ? ", the parser's current one" : "");
         } else {
             std::snprintf(text, sizeof(text),
-                          "the %s copy (submission %llu, region %#llx) %s the read; %u other "
-                          "held cop%s, %u of them differ",
+                          "the %s %s (submission %llu, region %#llx) %s; %u other held "
+                          "region%s, %u of them differ%s",
                           r.current ? "current submission's" : "newest held",
+                          r.selected_uncopied ? "region" : "copy",
                           static_cast<unsigned long long>(r.submission),
                           static_cast<unsigned long long>(r.region_start),
-                          r.selected_differs ? "DIFFERS from" : "matches", r.matches - 1,
-                          r.matches - 1 == 1 ? "y" : "ies", others_differing);
+                          r.selected_uncopied
+                              ? "was not copied at submit (unreadable then): not compared"
+                          : r.selected_differs ? "DIFFERS from the read"
+                                               : "matches the read",
+                          r.matches - 1, r.matches - 1 == 1 ? "" : "s", others_differing,
+                          uncopied_text);
         }
         break;
     }
@@ -462,11 +479,21 @@ inline void NoteRead(const char* kind, std::uint64_t shader_hash, const void* ad
     }
 }
 
-/// For a stop: this thread's latest instrumented read as observed then; not necessarily the
-/// descriptor that stopped (it may come from the uninstrumented flat buffer). Empty when off.
+/// Before each descriptor read (StageSpecialization): a stop then reports only reads made for
+/// that descriptor.
+inline void ForgetLastRead() {
+    last.kind = nullptr;
+}
+
+/// For a stop: this thread's latest instrumented read for the current descriptor, as observed
+/// then. Empty when off.
 inline std::string LastRead() {
-    if (!Enabled() || !last.kind) {
+    if (!Enabled()) {
         return {};
+    }
+    if (!last.kind) {
+        return "; no instrumented read for this descriptor (it came from direct user data or the "
+               "uninstrumented flat buffer)";
     }
     char text[160];
     std::snprintf(text, sizeof(text),
