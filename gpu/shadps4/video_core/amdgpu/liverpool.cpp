@@ -270,8 +270,8 @@ void Liverpool::Process(std::stop_token stoken) {
 #ifdef __APPLE__
         // The frame-end flag and its sceGnmSubmitDone time, sampled together (a later
         // SubmitDone may overwrite submit_done_at before GpuIdle); this iteration's frame-end
-        // body and the GpuIdle split use this same flag. A SubmitDone after the sample is the
-        // next iteration's.
+        // body and the GpuIdle split use this same flag. (The body's submit_done reset is
+        // unchanged: a SubmitDone during OnSubmit/Flush can still be cleared by it.)
         bool frame_ended;
         {
             std::scoped_lock lk{submit_mutex};
