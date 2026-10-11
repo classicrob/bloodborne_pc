@@ -88,7 +88,8 @@ u8 CanaryByte(u64 va) { return u8(Hash32(va ^ 0xC0FFEE123ull) % 255 + 1); }
 enum class SoffSrc { Inline, Sgpr };
 enum class SmemSrc { None, Imm, Sgpr };
 // Wave64 lane-semantics programs (no buffer access under test).
-enum class Wave { None, Lane, MbcntMask, Readlane, Exec1, Exec2, LoopReadFirstLane, Lds, CtrlPhi, CtrlBreak, Pkrtz, Pkrtz3, SmemFallback, Exec3, Exec3Out, WriteLane };
+enum class Wave { None, Lane, MbcntMask, Readlane, Exec1, Exec2, LoopReadFirstLane, Lds, CtrlPhi, CtrlBreak, Pkrtz, Pkrtz3, SmemFallback, Exec3, Exec3Out, WriteLane,
+                  RlBeforeDiv, RlCselect, RlBareFf1, RlEmptyExec };
 
 struct Template {
     std::string name;
@@ -351,6 +352,48 @@ void AssembleWave(GcnAsm::Code& c, Wave w) {
         c.Vop2(2, 10, 21, 20); // v_writelane_b32 v10, s20, s21
         c.Vop2(2, 11, 22, 20); // v_writelane_b32 v11, s20, s22
         break;
+    // v_readlane lanes the one-subgroup lowering must reject (only v_readfirstlane's own selector,
+    // with an exec that cannot be empty or lane 0 executing, names a lane that executes the read).
+    case Wave::RlBeforeDiv: { // exec saved before an execz scope, its first lane read inside it
+        c.SMovB64(30, EXEC_LO);
+        c.VCmpNeU32(Inline(0), 2);
+        c.SAndSaveexecB64(22, VCC_LO);
+        const size_t br = c.words.size();
+        c.Sopp(8, 0);
+        c.Sop1(20, 20, 30); // s_ff1_i32_b64 s20, s[30:31]: may name a lane outside the scope
+        c.VReadlane(21, 3, 20);
+        c.VMov(10, 21);
+        c.words[br] |= u32(int32_t(c.words.size()) - int32_t(br + 1)) & 0xFFFF;
+        c.SMovB64(EXEC_LO, 22);
+        break;
+    }
+    case Wave::RlCselect: // s_ff1 of exec behind an unrelated s_cselect
+        c.Sop1(20, 20, EXEC_LO);
+        c.SCmpLtU32Literal(20, 2);
+        c.Sop2(10, 20, Inline(0), 20); // s_cselect_b32 s20, 0, s20
+        c.VReadlane(21, 3, 20);
+        c.VMov(10, 21);
+        break;
+    case Wave::RlBareFf1: // s_ff1 of exec as the lane: ~0 (lane 63) for an empty exec
+        c.Sop1(20, 20, EXEC_LO);
+        c.VReadlane(21, 3, 20);
+        c.VMov(10, 21);
+        break;
+    case Wave::RlEmptyExec: { // v_readfirstlane after an inner exec change, inside an execz scope
+        c.VCmpNeU32(Inline(0), 2);
+        c.SAndSaveexecB64(22, VCC_LO);
+        const size_t br = c.words.size();
+        c.Sopp(8, 0);
+        c.VCmpNeU32(Inline(0), 5);
+        c.SAndSaveexecB64(24, VCC_LO);
+        c.VMov(13, Vgpr(3));     // the last exec-masked instruction of the inner scope
+        c.VReadfirstlane(21, 3); // after it: exec may be empty, and lane 0 may be outside the scope
+        c.SMovB64(EXEC_LO, 24);
+        c.VMov(10, 21);
+        c.words[br] |= u32(int32_t(c.words.size()) - int32_t(br + 1)) & 0xFFFF;
+        c.SMovB64(EXEC_LO, 22);
+        break;
+    }
     case Wave::Exec2: // exec as a 64-bit value; mbcnt over exec inside the scope
         c.VCmpNeU32(Inline(0), 2);
         c.SAndSaveexecB64(22, VCC_LO);
@@ -1606,6 +1649,7 @@ void AddWaveCases() {
         for (auto [name, w] : {std::pair{"wave1sg: v_mbcnt(-1) lane id + VOPC ballot + s_bcnt1", Wave::Lane},
                                std::pair{"wave1sg: v_mbcnt over VCC + s_mov_b64 vcc + v_cndmask", Wave::MbcntMask},
                                std::pair{"wave1sg: s_cbranch_execz scope: v_readfirstlane, VOPC ballot s_bcnt1", Wave::Exec3},
+                               std::pair{"wave1sg: s_and_saveexec, then v_readfirstlane + s_bcnt1 exec (empty exec reads lane 0)", Wave::Exec1},
                                std::pair{"wave1sg: v_writelane lane 5 and lane 37", Wave::WriteLane}}) {
             Template t;
             t.name = std::string(name) + shape;
@@ -1615,13 +1659,13 @@ void AddWaveCases() {
             const u32 tt = AddTemplate(t);
             for (const M& m : masks) {
                 const std::string mn = m.name;
-                if (mn != "all" && mn != "even" && mn != "lanes5+40") continue;
+                if (mn != "all" && mn != "even" && mn != "lanes5+40" && !(mn == "none" && w == Wave::Exec1)) continue;
                 if (w == Wave::WriteLane && mn != "all") continue;
                 Job& j = NewJob("wave64", tt, RawV(64), 0);
                 j.label += " mask=" + mn;
                 for (u32 l = 0; l < threads; ++l) {
                     const u32 bit = u32((m.mask >> (l % 64)) & 1);
-                    if (w == Wave::Exec3) {
+                    if (w == Wave::Exec3 || w == Wave::Exec1) {
                         SetLane(j, l, value(l), 0, {u32(l % 3 != 1), 0, 0, 0});
                         j.lanes[l].active = bit;
                     } else {
@@ -1815,6 +1859,26 @@ void AddWaveCases() {
         const u32 tt = AddTemplate(t);
         NewJob("wave64", tt, RawV(64), 0);
     }
+#ifdef BB_MIRROR_PROFILE_WAVE64
+    // Dynamic v_readlane lanes a one-subgroup workgroup cannot read exactly (Sol-2's review of
+    // 5df42f2): a lane taken before the divergence, an unrelated selector, a bare s_ff1, and
+    // v_readfirstlane where exec may be empty and lane 0 may not execute. All must be rejected.
+    for (auto [name, w] : {std::pair{"s_ff1 of exec saved before an execz scope, v_readlane inside it", Wave::RlBeforeDiv},
+                           std::pair{"s_ff1 of exec behind an unrelated s_cselect, v_readlane", Wave::RlCselect},
+                           std::pair{"bare s_ff1 of exec as the v_readlane lane", Wave::RlBareFf1},
+                           std::pair{"v_readfirstlane after an inner exec change in an execz scope", Wave::RlEmptyExec}}) {
+        Template t;
+        t.name = std::string("wave1sg: ") + name + " [16x1] (compile)";
+        t.op.kind = GCN_LOAD;
+        t.wave = w;
+        t.compile_only = true;
+        t.compute_compile = true;
+        t.wg = {16, 1, 1};
+        t.expect_loud = true;
+        const u32 tt = AddTemplate(t);
+        NewJob("wave64", tt, RawV(64), 0);
+    }
+#endif
     // Divergent exit hidden behind a uniform break condition (if (c) { break; }), compile-only.
     for (u32 x : {64u, 128u}) {
 #ifndef BB_MIRROR_PROFILE_WAVE64
