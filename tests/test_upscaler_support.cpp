@@ -37,6 +37,10 @@ int main() {
     for (bool fsr4 : {false, true}) {
         for (bool fsr411 : {false, true}) {
             for (int requested = 0; requested < UpscalerCount; ++requested) {
+#ifndef __APPLE__
+                // MetalFX exists only on macOS; elsewhere selecting it is a startup abort.
+                if (requested == UpscalerMetalFx) continue;
+#endif
                 FILE* config = std::fopen(path, "w");
                 assert(config);
                 std::fprintf(config, "upscaler=%s\npreset=3\noutput_res=2560x1440\n",
@@ -46,7 +50,10 @@ int main() {
                 Load();
                 assert(s.upscaler == requested);
 #ifdef __APPLE__
-                if (requested == UpscalerFsr4 || requested == UpscalerFsr411) {
+                // FSR 4 is AMD-only; MetalFX stops until its provider is complete
+                // (metalfx_supported, docs/macos/metalfx-integration.md).
+                if (requested == UpscalerFsr4 || requested == UpscalerFsr411 ||
+                    (requested == UpscalerMetalFx && !s.metalfx_supported)) {
                     std::fflush(nullptr);
                     const pid_t child = fork();
                     assert(child >= 0);
