@@ -1263,15 +1263,16 @@ int runtime_memory_inventory(RuntimeMemoryInventory *out) {
     out->flexible_in_use_bytes=flexible_bytes;
     read_unlock();
     qsort(spans,count,sizeof *spans,phys_span_cmp);
+    /* Sorted by start: a view overlaps an earlier one iff it starts before their furthest end,
+     * and a later one iff the next view starts before its own end. */
     uint64_t end=0;
     for (size_t i=0;i<count;++i) {
-        if (i && spans[i].start<end) {
-            ++out->aliased_vmas;
-            if (spans[i].end>end) { out->unique_backing_bytes+=spans[i].end-end; end=spans[i].end; }
-        } else {
-            out->unique_backing_bytes+=spans[i].end-spans[i].start;
-            end=spans[i].end;
-        }
+        const int shares_earlier=i && spans[i].start<end;
+        const int shares_later=i+1<count && spans[i+1].start<spans[i].end;
+        out->shared_backing_views+=shares_earlier || shares_later;
+        if (!shares_earlier) out->unique_backing_bytes+=spans[i].end-spans[i].start;
+        else if (spans[i].end>end) out->unique_backing_bytes+=spans[i].end-end;
+        if (spans[i].end>end) end=spans[i].end;
     }
     free(spans);
     return 0;

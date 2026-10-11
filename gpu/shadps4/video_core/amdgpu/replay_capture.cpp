@@ -290,12 +290,12 @@ void HoldEnded(Vulkan::Rasterizer* rasterizer, bool frame_ended,
     fmt::print("  G2 asynchronous compute submissions in window: {}\n", asc);
     if (memory_ok) {
         fmt::print("  G2 memory: {} direct views ({:.1f} MiB), {} flexible views ({:.1f} MiB), {} "
-                   "reservations; unique backing {:.1f} MiB ({} aliased views); allocator: direct "
+                   "reservations; unique backing {:.1f} MiB ({} views share backing); allocator: direct "
                    "live {:.1f} MiB, flexible in use {:.1f} MiB; low/untracked allocations not "
                    "counted\n",
                    memory.direct_vmas, memory.direct_view_bytes / 1048576.0, memory.flexible_vmas,
                    memory.flexible_view_bytes / 1048576.0, memory.reserved_vmas,
-                   memory.unique_backing_bytes / 1048576.0, memory.aliased_vmas,
+                   memory.unique_backing_bytes / 1048576.0, memory.shared_backing_views,
                    memory.live_direct_bytes / 1048576.0, memory.flexible_in_use_bytes / 1048576.0);
     } else {
         rejected.push_back("runtime memory inventory failed");
