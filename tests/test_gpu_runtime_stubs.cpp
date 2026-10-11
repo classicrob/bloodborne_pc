@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <cstddef>
 #include <setjmp.h>
+#include "../src/runtime_hle_trace.h"
 #include "../src/runtime_memory.h"
 // Renderer tests have no guest process. Clock/host-thread services work; guest accesses abort.
 extern "C" {
@@ -19,6 +20,7 @@ int runtime_memory_region(uintptr_t, uintptr_t*, uintptr_t*, int*) { std::abort(
 int runtime_memory_backing_region(uintptr_t, uintptr_t*, uintptr_t*, uint64_t*) { std::abort(); }
 void runtime_memory_set_gpu_lifetime_hooks(void (*)(void), void (*)(uintptr_t, uint64_t), void (*)(void)) { std::abort(); }
 int runtime_memory_alias_snapshot(uintptr_t, RuntimeMemoryAlias*, size_t, RuntimeMemoryAliasSnapshot*) { std::abort(); }
+void runtime_hle_trace_dump(void) { std::abort(); }
 #endif
 void runtime_memory_set_gpu_hooks(void (*)(uintptr_t, uint64_t),
     void (*)(uintptr_t, uint64_t), void (*)(uintptr_t, uint64_t)) { std::abort(); }
