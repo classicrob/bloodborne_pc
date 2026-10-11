@@ -4,7 +4,9 @@
 // binder mirroring Rasterizer::BindBuffers. Results are compared against ref.c (written from the
 // Sea Islands ISA; see SPEC.md and README.md).
 #include <algorithm>
+#include <array>
 #include <cassert>
+#include <cctype>
 #include <cerrno>
 #include <cinttypes>
 #include <csignal>
@@ -4582,6 +4584,210 @@ int Bench(const Options& opt) {
 
 // --disasm FILE: decode a GCN binary with the production decoder and flag wave-level operations
 // (results depend on the 64-lane wave; see the wave64 group).
+// --census-sgpr FILE...: static scan for SGPRs (and VCC/M0) written inside an s_cbranch_execz
+// scope (between a forward execz branch and its target) and read at or after the target before
+// being rewritten. The recompiler builds such a scope as a per-lane if, so lanes that skipped it
+// read the old value where GCN gives every lane the new one (SGPRs are wave-wide). A linear scan:
+// candidates, not proof (no loops, no SCC, implicit M0/VCC reads not seen). Writers are tagged
+// "value" (smem, v_readlane/v_readfirstlane, 32-bit and arithmetic s_* ops: one number per wave)
+// or "mask" (v_cmp, carry-outs, s_*saveexec and 64-bit bitwise s_* ops, which the recompiler
+// keeps as one bit per lane; there only lanes whose bit GCN would change can differ). Readers are
+// tagged the same way: a value written in the scope and used as a value after it is the live-out
+// bug class; a value read only by mask operations is a register the game reuses (typically a dead
+// value feeding a mask that is cleared later).
+int CensusSgpr(int argc, char** argv, int first) {
+    using namespace Shader::Gcn;
+    using OF = OperandField;
+    // S_ names end in one or two type tokens: dst type then src type (S_BCNT1_I32_B64).
+    auto is_type = [](const std::string& tok) {
+        return tok.size() == 3 && std::strchr("BUIF", tok[0]) && std::isdigit(u8(tok[1])) && std::isdigit(u8(tok[2]));
+    };
+    auto type_width = [](const std::string& tok) -> u32 { return tok.size() == 3 && tok.substr(1) == "64" ? 2 : 1; };
+    auto tokens = [](const std::string& name) {
+        std::vector<std::string> t;
+        size_t p = 0, q;
+        while ((q = name.find('_', p)) != std::string::npos) { t.push_back(name.substr(p, q - p)); p = q + 1; }
+        t.push_back(name.substr(p));
+        return t;
+    };
+    auto smem_count = [](const std::string& name) -> u32 {
+        const auto x = name.rfind('X');
+        return name.find("DWORDX") != std::string::npos ? u32(std::stoul(name.substr(x + 1))) : 1;
+    };
+    auto add = [](const InstOperand& op, u32 base, u32 w, std::vector<u32>& out) {
+        if (op.field == OF::ScalarGPR) for (u32 k = 0; k < w; ++k) out.push_back(base + k);
+        else if (op.field == OF::VccLo) { out.push_back(106); if (w > 1) out.push_back(107); }
+        else if (op.field == OF::VccHi) out.push_back(107);
+        else if (op.field == OF::M0) out.push_back(124);
+    };
+    auto dsts = [&](const GcnInst& in, const std::string& name, std::vector<u32>& out) {
+        const auto t = tokens(name);
+        for (u32 d = 0; d < in.dst_count; ++d) {
+            const auto& op = in.dst[d];
+            u32 w = 1;
+            if (in.encoding == InstEncoding::SMRD) w = smem_count(name);
+            else if (name.rfind("S_", 0) == 0) {
+                const bool two = t.size() >= 2 && is_type(t[t.size() - 2]) && is_type(t.back());
+                w = type_width(two ? t[t.size() - 2] : t.back());
+            } else if (name.rfind("V_", 0) == 0 && name.find("READLANE") == std::string::npos &&
+                       name.find("READFIRSTLANE") == std::string::npos) w = 2; // lane mask / carry-out
+            add(op, op.code, w, out);
+        }
+    };
+    auto srcs = [&](const GcnInst& in, const std::string& name, std::vector<u32>& out) {
+        const auto t = tokens(name);
+        const bool mem = in.encoding == InstEncoding::SMRD || in.encoding == InstEncoding::MUBUF ||
+                         in.encoding == InstEncoding::MTBUF || in.encoding == InstEncoding::MIMG;
+        for (u32 i = 0; i < (mem ? 4u : in.src_count); ++i) { // memory encodings fill fixed slots
+            const auto& op = in.src[i];
+            if (op.field == OF::Undefined) continue;
+            u32 base = op.code, w = 1;
+            if (in.encoding == InstEncoding::SMRD && i == 0) { base = op.code * 2; w = name.find("BUFFER") != std::string::npos ? 4 : 2; }
+            else if ((in.encoding == InstEncoding::MUBUF || in.encoding == InstEncoding::MTBUF) && i == 2) { base = op.code * 4; w = 4; }
+            else if (in.encoding == InstEncoding::MIMG && i == 2) { base = op.code * 4; w = 8; }
+            else if (in.encoding == InstEncoding::MIMG && i == 3) { base = op.code * 4; w = 4; }
+            else if (name.rfind("S_", 0) == 0) w = type_width(t.back());
+            else if (name.rfind("V_", 0) == 0 && (name.find("CNDMASK") != std::string::npos || name.find("ADDC") != std::string::npos ||
+                                                  name.find("SUBB") != std::string::npos || name.find("DIV_FMAS") != std::string::npos) &&
+                     (op.field == OF::VccLo || i == 2)) w = 2;
+            add(op, base, w, out);
+        }
+        if (in.opcode == Opcode::S_CBRANCH_VCCZ || in.opcode == Opcode::S_CBRANCH_VCCNZ) { out.push_back(106); out.push_back(107); }
+    };
+    auto is_mask_writer = [](const std::string& w) {
+        if (w.rfind("V_", 0) == 0) return w.find("READLANE") == std::string::npos && w.find("READFIRSTLANE") == std::string::npos;
+        if (w.find("SAVEEXEC") != std::string::npos) return true;
+        static const char* bitwise[] = {"S_AND_B64", "S_OR_B64", "S_XOR_B64", "S_ANDN2_B64", "S_ORN2_B64", "S_NAND_B64",
+                                        "S_NOR_B64", "S_XNOR_B64", "S_NOT_B64", "S_MOV_B64", "S_CSELECT_B64"};
+        return std::find(std::begin(bitwise), std::end(bitwise), w) != std::end(bitwise);
+    };
+    auto reg_name = [](u32 r) {
+        if (r == 106) return std::string("vcc_lo");
+        if (r == 107) return std::string("vcc_hi");
+        if (r == 124) return std::string("m0");
+        return "s" + std::to_string(r);
+    };
+    std::map<std::string, std::array<u32, 4>> by_stage; // stage -> scanned, value->value, value->mask, mask
+    std::vector<std::string> value_hashes, reuse_hashes, mask_hashes;
+    // Controls, scanned first: the Exec3Out shape (s_readfirstlane and s_bcnt1 results written in
+    // the scope, read after it) must be value->value; Exec3 (copied inside the scope) must be clean.
+    std::vector<std::pair<std::string, std::vector<u32>>> inputs;
+    for (bool out : {true, false}) {
+        using GcnAsm::Inline, GcnAsm::VCC_LO, GcnAsm::EXEC_LO;
+        GcnAsm::Code c;
+        c.SMovLiteral(21, 0xDEAD0000u);
+        c.SMovLiteral(24, 0xDEAD0001u);
+        c.VCmpNeU32(Inline(0), 2);
+        c.SAndSaveexecB64(22, VCC_LO);
+        const size_t br = c.words.size();
+        c.Sopp(8, 0);
+        c.VReadfirstlane(21, 3);
+        c.VCmpNeU32(Inline(0), 5);
+        c.SBcnt1B64(24, VCC_LO);
+        if (!out) { c.VMov(10, 21); c.VMov(11, 24); }
+        c.words[br] |= u32(int32_t(c.words.size()) - int32_t(br + 1)) & 0xFFFF;
+        c.SMovB64(EXEC_LO, 22);
+        if (out) { c.VMov(10, 21); c.VMov(11, 24); }
+        c.SEndpgm();
+        inputs.emplace_back(out ? "control_read-after-scope" : "control_copied-in-scope", c.words);
+    }
+    for (int a = first; a < argc; ++a) {
+        FILE* f = std::fopen(argv[a], "rb");
+        if (!f) { std::perror(argv[a]); return 2; }
+        std::vector<u32> code;
+        u32 w;
+        while (std::fread(&w, 4, 1, f) == 1) code.push_back(w);
+        std::fclose(f);
+        inputs.emplace_back(std::filesystem::path(argv[a]).filename().string(), std::move(code));
+    }
+    for (const auto& [base, code] : inputs) {
+        struct D { u32 pc; GcnInst inst; std::string name; };
+        std::vector<D> insts;
+        GcnCodeSlice slice(code.data(), code.data() + code.size());
+        GcnDecodeContext decoder;
+        for (u32 pc = 0; !slice.atEnd();) {
+            const auto inst = decoder.decodeInstruction(slice);
+            insts.push_back({pc, inst, std::string(magic_enum::enum_name(inst.opcode))});
+            pc += inst.length / 4;
+            if (inst.opcode == Opcode::S_ENDPGM) break;
+        }
+        const bool control = base.rfind("control_", 0) == 0;
+        std::array<u32, 4> scratch{};
+        auto& st = control ? scratch : by_stage[base.substr(0, base.find('_'))];
+        ++st[0];
+        if (std::getenv("BB_CENSUS_LIST")) { // the scalar registers each instruction reads and writes
+            for (const auto& d : insts) {
+                std::vector<u32> rd, wr;
+                srcs(d.inst, d.name, rd);
+                dsts(d.inst, d.name, wr);
+                std::printf("%s %5x: %-28s", base.c_str(), d.pc * 4, d.name.c_str());
+                if (d.inst.opcode == Opcode::S_CBRANCH_EXECZ) std::printf(" -> %x", (d.pc + 1 + d.inst.control.sopp.simm) * 4);
+                for (u32 r : wr) std::printf(" w:%s", reg_name(r).c_str());
+                for (u32 r : rd) std::printf(" r:%s", reg_name(r).c_str());
+                std::printf("\n");
+            }
+        }
+        bool value_hit = false, mask_hit = false, reuse_hit = false;
+        for (size_t i = 0; i < insts.size(); ++i) {
+            if (insts[i].inst.opcode != Opcode::S_CBRANCH_EXECZ || insts[i].inst.control.sopp.simm <= 0) continue;
+            const u32 target = insts[i].pc + 1 + u32(insts[i].inst.control.sopp.simm);
+            std::map<u32, std::string> written; // reg -> last writer inside the scope
+            size_t j = i + 1;
+            for (; j < insts.size() && insts[j].pc < target; ++j) {
+                std::vector<u32> rs;
+                dsts(insts[j].inst, insts[j].name, rs);
+                for (u32 r : rs) written[r] = insts[j].name;
+            }
+            // Scan on from the target; follow each loop back-edge once (the loop head may read it).
+            std::set<size_t> followed;
+            for (size_t k = j; k < insts.size() && !written.empty(); ++k) {
+                std::vector<u32> reads, writes;
+                srcs(insts[k].inst, insts[k].name, reads);
+                for (u32 r : reads) {
+                    const auto it = written.find(r);
+                    if (it == written.end()) continue;
+                    const bool mask = is_mask_writer(it->second);
+                    const bool mask_reader = (insts[k].name.rfind("S_", 0) == 0 && is_mask_writer(insts[k].name)) ||
+                                             insts[k].name.find("CNDMASK") != std::string::npos;
+                    (mask ? mask_hit : mask_reader ? reuse_hit : value_hit) = true;
+                    std::printf("%s: %s execz @%#x..%#x: %s written by %s, read @%#x by %s\n", base.c_str(),
+                                mask ? "mask->any  " : mask_reader ? "value->mask" : "value->value", insts[i].pc * 4, target * 4, reg_name(r).c_str(),
+                                it->second.c_str(), insts[k].pc * 4, insts[k].name.c_str());
+                    written.erase(it);
+                }
+                dsts(insts[k].inst, insts[k].name, writes);
+                for (u32 r : writes) written.erase(r);
+                const auto& in = insts[k].inst;
+                if (in.encoding == InstEncoding::SOPP && insts[k].name.find("BRANCH") != std::string::npos &&
+                    in.control.sopp.simm < 0 && followed.insert(k).second) {
+                    const u32 head = insts[k].pc + 1 + in.control.sopp.simm;
+                    for (size_t h = 0; h < insts.size(); ++h)
+                        if (insts[h].pc == head) { k = h - 1; break; }
+                }
+            }
+        }
+        if (control) {
+            const bool want = base == "control_read-after-scope";
+            if (value_hit != want || reuse_hit || mask_hit) {
+                std::fprintf(stderr, "census: control %s misclassified (value %d reuse %d mask %d)\n", base.c_str(),
+                             value_hit, reuse_hit, mask_hit);
+                return 1;
+            }
+            continue;
+        }
+        if (value_hit) { ++st[1]; value_hashes.push_back(base); }
+        if (reuse_hit) { ++st[2]; reuse_hashes.push_back(base); }
+        if (mask_hit) { ++st[3]; mask_hashes.push_back(base); }
+    }
+    std::printf("census (%d shaders; controls passed):\n", argc - first);
+    for (auto& [stage, n] : by_stage)
+        std::printf("  %-4s scanned %4u: value->value %u, value->mask %u, mask->any %u\n", stage.c_str(), n[0], n[1], n[2], n[3]);
+    for (auto& h : value_hashes) std::printf("  value->value: %s\n", h.c_str());
+    for (auto& h : reuse_hashes) std::printf("  value->mask:  %s\n", h.c_str());
+    for (auto& h : mask_hashes) std::printf("  mask->any:    %s\n", h.c_str());
+    return 0;
+}
+
 int Disasm(const char* path) {
     FILE* f = std::fopen(path, "rb");
     if (!f) { std::perror(path); return 2; }
@@ -4629,6 +4835,7 @@ int Disasm(const char* path) {
 
 int main(int argc, char** argv) {
     if (argc == 3 && std::string(argv[1]) == "--disasm") return Disasm(argv[2]);
+    if (argc >= 3 && std::string(argv[1]) == "--census-sgpr") return CensusSgpr(argc, argv, 2);
     Options opt;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
