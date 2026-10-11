@@ -268,15 +268,23 @@ void Liverpool::Process(std::stop_token stoken) {
         }
 
 #ifdef __APPLE__
-        const bool frame_ended = submit_done;
-#endif
+        // The frame-end flag and its sceGnmSubmitDone time, sampled together (a later
+        // SubmitDone may overwrite submit_done_at before GpuIdle); this iteration's frame-end
+        // body and the GpuIdle split use this same flag. A SubmitDone after the sample is the
+        // next iteration's.
+        bool frame_ended;
+        {
+            std::scoped_lock lk{submit_mutex};
+            frame_ended = submit_done;
+            idle_split_frame_submit_done = submit_done_at;
+        }
+        if (frame_ended) {
+#else
         if (submit_done) {
+#endif
 #ifdef __APPLE__
             {
                 std::scoped_lock lk{submit_mutex};
-                // This frame end's own sceGnmSubmitDone time, taken with the flag it set (a
-                // later SubmitDone may overwrite submit_done_at before GpuIdle).
-                idle_split_frame_submit_done = submit_done_at;
                 if (++parse_lag.frames == 600) {
                     const double samples = parse_lag.samples ? double(parse_lag.samples) : 1.0;
                     // Printed like the Stall lines: Info-level logging is filtered in perf runs.

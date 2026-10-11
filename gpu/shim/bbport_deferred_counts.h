@@ -23,7 +23,9 @@ struct Count {
     void Complete(std::uint64_t n = 1) {
         done->fetch_add(n, std::memory_order_release);
     }
-    /// Every one issued up to `through` has completed.
+    /// At least `through` have completed. Completions are unordered, so this proves the first
+    /// `through` issued are complete only when nothing issued later can complete meanwhile
+    /// (R0: the issued count is stable after the draw pipe drained). R1 tickets need more.
     [[nodiscard]] bool CompleteThrough(std::uint64_t through) const {
         return done->load(std::memory_order_acquire) >= through;
     }
