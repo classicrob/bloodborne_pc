@@ -125,12 +125,15 @@ struct PipelineSelection {
     /// Why RefreshGraphicsKey refused the last draw it refused (BB_FRAME_STATS).
     DrawDrop refusal{DrawDrop::StageCombination};
     bool motion = false;
-    /// bbport (Apple): ES and GS of an emulated geometry stage (vk_gs_emulation.h).
+    /// bbport (Apple): ES and GS of an emulated geometry stage, and the copy shader's stream-out
+    /// kernel of a stream-out draw (vk_gs_emulation.h).
     struct GsEmulationProgram {
         const Shader::Info* info{};
         vk::ShaderModule module{};
         size_t hash{};
-    } gs_es{}, gs_gs{};
+    } gs_es{}, gs_gs{}, gs_so{};
+    /// BuildRuntimeInfo: the hardware VS (copy shader) as GsEmulationRole::CopyStreamOut.
+    bool gs_stream_out_kernel{};
     DrawIndirectParams draw_indirect_params{};
     struct PrepWorker* worker{}; ///< set: read-only selection for a draw-preparation worker
 };

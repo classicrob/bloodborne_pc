@@ -5,20 +5,31 @@
 // and emission order, into a dense index list at CompactBase, and writes the
 // VkDrawIndexedIndirectCommand of the point draw at CompactDraw. The order is the PS4 output
 // order, which stream-out writes and blending see.
+// A stream-out draw (so_buffers != 0): the vertices written are the leading ones that fit in every
+// enabled buffer (the VGT stops at the first that does not; the rest are dropped and counted).
+// This writes the stream-out kernel's dispatch, count and start offsets, then advances the
+// buffer offsets in the stream-out state (vk_gs_emulation.h SoState).
 #version 450
 
 layout(local_size_x = 256) in;
 
 layout(std430, binding = 0) buffer Scratch { uint scratch[]; };
+// Stream-out state: buffer offsets (dwords), overflowed draws, dropped vertices.
+layout(std430, binding = 1) buffer StreamOut { uint so_state[]; };
 
 layout(push_constant) uniform Params {
     uint invocations; // GS instances
     uint run_length;  // index entries per slot
+    uint so_buffers;  // stream-out buffers of stream 0 (bit n = buffer n); 0: no stream-out
+    uint so_size[4];   // VGT_STRMOUT_BUFFER_SIZE_n (dwords)
+    uint so_stride[4]; // VGT_STRMOUT_VTX_STRIDE_n (dwords)
 };
 
 // Header (gs_emulation.h)
 const uint PrimsPerInstance = 1, Instances = 2, IndexBase = 9, CompactBase = 10,
-           CompactDraw = 27;
+           CompactDraw = 27, SoDispatch = 32, SoCount = 35, SoOffset0 = 36;
+// SoState
+const uint SoOverflowDraws = 4, SoOverflowVertices = 5;
 const uint RestartIndex = 0xFFFFFFFFu;
 const uint Threads = 256;
 
@@ -62,5 +73,30 @@ void main() {
         scratch[CompactDraw + 2] = compact;
         scratch[CompactDraw + 3] = 0;
         scratch[CompactDraw + 4] = 0;
+        if (so_buffers != 0) {
+            uint fit = 0xFFFFFFFFu;
+            for (uint b = 0; b < 4; ++b) {
+                if ((so_buffers & (1u << b)) != 0) {
+                    const uint offset = so_state[b];
+                    const uint room = so_size[b] > offset ? so_size[b] - offset : 0u;
+                    fit = min(fit, room / so_stride[b]);
+                }
+            }
+            const uint count = min(written, fit);
+            for (uint b = 0; b < 4; ++b) {
+                scratch[SoOffset0 + b] = so_state[b];
+                if ((so_buffers & (1u << b)) != 0) {
+                    so_state[b] += count * so_stride[b];
+                }
+            }
+            scratch[SoCount] = count;
+            scratch[SoDispatch + 0] = (count + 63u) / 64u;
+            scratch[SoDispatch + 1] = 1;
+            scratch[SoDispatch + 2] = 1;
+            if (count < written) {
+                so_state[SoOverflowDraws] += 1;
+                so_state[SoOverflowVertices] += written - count;
+            }
+        }
     }
 }

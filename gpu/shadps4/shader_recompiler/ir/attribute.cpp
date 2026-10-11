@@ -172,6 +172,20 @@ std::string NameOf(Attribute attribute) {
         return "BaseVertex";
     case Attribute::BaseInstance:
         return "BaseInstance";
+    case Attribute::GsStreamOutConfig:
+        return "GsStreamOutConfig";
+    case Attribute::GsStreamOutWriteIndex:
+        return "GsStreamOutWriteIndex";
+    case Attribute::GsStreamOutOffset0:
+        return "GsStreamOutOffset0";
+    case Attribute::GsStreamOutOffset1:
+        return "GsStreamOutOffset1";
+    case Attribute::GsStreamOutOffset2:
+        return "GsStreamOutOffset2";
+    case Attribute::GsStreamOutOffset3:
+        return "GsStreamOutOffset3";
+    case Attribute::GsStreamOutLaneValid:
+        return "GsStreamOutLaneValid";
     case Attribute::IsHelperInvocation:
         return "IsHelperInvocation";
     default:
