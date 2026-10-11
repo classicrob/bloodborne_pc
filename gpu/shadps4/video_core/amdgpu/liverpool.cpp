@@ -188,9 +188,12 @@ BbCmdData::Result Liverpool::LookupCommandData(void* owner, u64 address, u64 siz
     std::scoped_lock lk{self->snapshots_mutex};
     for (const auto& snapshot : self->gfx_snapshots) {
         for (const auto& region : snapshot->Regions()) {
+            // An uncopied region (unreadable at submit) has no words of its own: no copy.
             held.push_back({reinterpret_cast<u64>(region.guest),
                             u64(region.size_dw) * sizeof(u32), snapshot->submit_number,
-                            reinterpret_cast<const u8*>(snapshot->Words(region).data())});
+                            region.copied
+                                ? reinterpret_cast<const u8*>(snapshot->Words(region).data())
+                                : nullptr});
         }
     }
     return BbCmdData::Classify(address, size, bytes_read, held, BbCmdData::Pools(),
@@ -1340,6 +1343,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
 #ifdef __APPLE__
         // BB_CMD_DATA_CHECK: the submission this thread parses (a coroutine; set per packet, as
         // other submissions' tasks run on this thread in between).
+        // CE packets (ProcessCeUpdate) run interleaved with this submission's DCB and keep its value.
         BbCmdData::current_submission = snapshot ? snapshot->submit_number : 0;
 #endif
 
