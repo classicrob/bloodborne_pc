@@ -143,12 +143,15 @@ frame time, called import-body CPU, or converted to CPU by subtracting a trivial
 call cost. In particular the condvar totals do not alone establish how much CPU
 main performs or which producer satisfies every wakeup.
 
-For future full-sync data, keep the paired no-summary control and append exact
-TLS names, because `sync` does not select them:
+Build confirmed the full-sync pair has not run yet: the previous artifact
+stopped in the clinic, and gameplay currently owns the GPU slots. The pair is
+queued for shared 33a8af0 at the next orchestrated quiet slot. Keep its matched
+no-summary control and append exact TLS/time names, because `sync` does not
+select these:
 
 ```sh
 BB_HLE_TRACE_SUMMARY=60
-BB_HLE_TRACE_SUMMARY_FILTER=sync,gnm,videoout,avplayer,scePthreadSelf,scePthreadGetspecific,__error,__tls_get_addr
+BB_HLE_TRACE_SUMMARY_FILTER=sync,gnm,videoout,avplayer,scePthreadSelf,scePthreadGetspecific,__error,__tls_get_addr,sceKernelGetProcessTime,sceKernelReadTsc
 ```
 
 This is still a selected-import census, not all imports. Report counts separately
