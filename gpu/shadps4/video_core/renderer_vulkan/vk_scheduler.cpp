@@ -225,23 +225,46 @@ void Scheduler::SignalAtGpuCompletion(std::function<void()> signal) {
     deferred_signals_issued.fetch_add(1, std::memory_order_relaxed);
     Record([this, tick, signal = std::move(signal),
             done = deferred_signals_done](vk::CommandBuffer) mutable {
-        // After the copies queued before it, then after the GPU passed `tick`: the priority
-        // runner waits for each op's tick in order.
+        // After the copies queued before it, then after the GPU passed `tick`: the label thread
+        // waits for each label's tick in order.
         BbCopy::AfterCopies([this, tick, signal = std::move(signal),
                              done = std::move(done)]() mutable {
             {
-                std::unique_lock lk(priority_pending_ops_mutex);
-                priority_pending_ops.emplace(
-                    [signal = std::move(signal), done = std::move(done)]() mutable {
-                        signal();
-                        done->fetch_add(1, std::memory_order_release);
-                    },
-                    tick);
+                std::scoped_lock lk{label_mutex};
+                auto write = [signal = std::move(signal), done = std::move(done)]() mutable {
+                    signal();
+                    done->fetch_add(1, std::memory_order_release);
+                };
+                label_ops.push_back({std::move(write), tick});
             }
-            priority_pending_ops_cv.notify_one();
+            label_cv.notify_one();
         });
     });
+    std::call_once(label_thread_once, [this] {
+        label_thread = std::jthread([this](std::stop_token stoken) { LabelThread(stoken); });
+    });
     Flush();
+}
+
+void Scheduler::LabelThread(std::stop_token stoken) {
+    Common::SetCurrentThreadName("shadPS4:GpuLabelWriter");
+    while (!stoken.stop_requested()) {
+        PendingOp op;
+        {
+            std::unique_lock lk{label_mutex};
+            label_cv.wait(lk, stoken, [this] { return !label_ops.empty(); });
+            if (stoken.stop_requested()) {
+                break;
+            }
+            op = std::move(label_ops.front());
+            label_ops.pop_front();
+        }
+        work_semaphore.Wait(op.gpu_tick); // submitted by SignalAtGpuCompletion's Flush
+        if (stoken.stop_requested()) {
+            break;
+        }
+        op.callback();
+    }
 }
 #endif
 

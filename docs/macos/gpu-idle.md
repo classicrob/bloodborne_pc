@@ -199,8 +199,9 @@ With `BB_LABELS_AT_GPU_COMPLETE=1`:
 - That command buffer is submitted at once, one submission per label, so a guest or a
   WAIT_REG_MEM waiting on the label is never left waiting for a submission that only comes at the
   frame's end.
-- The scheduler's priority runner waits for each submission's timeline tick in FIFO order, so
-  labels keep stream order across the graphics and compute queues.
+- A dedicated label writer thread waits for each submission's timeline tick in FIFO order, so
+  labels keep stream order across the graphics and compute queues. It is not the priority
+  runner, whose other ops may wait for ticks submitted only at the frame's end.
 - WaitDeferredSignals, and with it GpuIdle, waits for them.
 - A RELEASE_MEM GDS store needs a GPU copy, so it waits for the GPU synchronously
   (Rasterizer::Finish).

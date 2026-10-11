@@ -982,6 +982,17 @@ private:
     // compares thread ids, which on Windows (libc++ over winpthreads) costs two system calls.
     bool recording_threaded{false};
     std::jthread recorder_thread;
+#ifdef __APPLE__
+    /// SignalAtGpuCompletion's writer: labels only, FIFO, each after its own (already submitted)
+    /// timeline tick. Not the priority runner, whose other ops may wait for ticks that are only
+    /// submitted at the frame's end. Declared last: the thread stops before the queue goes.
+    void LabelThread(std::stop_token stoken);
+    std::mutex label_mutex;
+    std::condition_variable_any label_cv;
+    std::deque<PendingOp> label_ops;
+    std::once_flag label_thread_once;
+    std::jthread label_thread;
+#endif
     tracy::VkCtxScope* profiler_scope{};
 };
 
