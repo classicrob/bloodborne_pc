@@ -43,26 +43,34 @@ bool Armed();
 /// HoldEnded() (host commands still run).
 bool OnFrameRetired(Vulkan::Rasterizer* rasterizer);
 
-/// The hold bound left, while holding.
+/// The hold bound left, while holding; never negative (zero once the bound has passed, which the
+/// caller tests for).
 std::chrono::steady_clock::duration HoldRemaining();
 
 /// What the GPU command thread held, read when the hold ends. No queue task is resumed during
-/// the hold, so the queued task counts are exactly the work submitted since the cut.
+/// the hold, so the queued task counts are the work submitted since the cut, as observed when
+/// each queue was sampled; `asc_seen` (AscSubmitted() read before sampling) lets HoldEnded count
+/// asynchronous-compute submissions that arrive after sampling (up to its report checkpoint;
+/// later ones are reported when the window closes).
 struct Held {
     bool frame_ended;         ///< the guest ended the held frame (sceGnmSubmitDone)
     const char* ended_early;  ///< why the hold ended before that, if not the bound (else nullptr)
     std::span<const std::shared_ptr<AmdGpu::CmdSnapshot>> gfx; ///< unparsed gfx submits, in order
     u32 gfx_tasks;            ///< tasks queued on the graphics queue
-    u32 asc_tasks;            ///< tasks queued on asynchronous-compute queues
+    u32 asc_tasks;            ///< tasks queued on asynchronous-compute queues at sampling
+    u64 asc_seen;             ///< AscSubmitted() before the queues were sampled
     u32 host_commands;        ///< host commands run during the hold
 };
 
 /// GPU command thread, when the hold ends. Prints the inventory and releases the hold.
 void HoldEnded(Vulkan::Rasterizer* rasterizer, const Held& held);
 
-/// Any thread: an asynchronous-compute submission arrived (counted between release and the
-/// released frame's retirement, where v1 cannot tell which frame it belongs to).
+/// Any thread, after an asynchronous-compute submission was queued: counts it while a capture
+/// is in progress (monotonic, so no submission falls between two windows).
 void NoteAscSubmit();
+
+/// The asynchronous-compute submissions counted so far.
+u64 AscSubmitted();
 
 /// GPU command thread, at the GpuIdle after the released frame: closes the capture window.
 void OnReleasedFrameRetired();

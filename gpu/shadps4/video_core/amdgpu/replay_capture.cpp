@@ -15,7 +15,7 @@ std::optional<u64> ParseBounded(std::string_view text, u64 max) {
             return std::nullopt;
         }
         const u64 digit = static_cast<u64>(c - '0');
-        if (value > (max - digit) / 10) {
+        if (digit > max || value > (max - digit) / 10) {
             return std::nullopt; // above max (and so never wraps)
         }
         value = value * 10 + digit;
@@ -129,7 +129,8 @@ const Config& Settings() {
 }
 
 std::atomic<State> state{State::Off};
-std::atomic<u32> asc_submits{0};
+std::atomic<u64> asc_submits{0}; // monotonic while a capture is in progress
+u64 asc_at_checkpoint = 0;
 u64 frames_seen = 0;
 std::chrono::steady_clock::time_point hold_start, release_time;
 
@@ -214,9 +215,14 @@ std::chrono::steady_clock::duration HoldRemaining() {
 }
 
 void NoteAscSubmit() {
-    if (state.load(std::memory_order_relaxed) == State::Released) {
+    const State s = state.load(std::memory_order_relaxed);
+    if (s == State::Waiting || s == State::Holding || s == State::Released) {
         asc_submits.fetch_add(1, std::memory_order_relaxed);
     }
+}
+
+u64 AscSubmitted() {
+    return asc_submits.load();
 }
 
 void HoldEnded(Vulkan::Rasterizer* rasterizer, const Held& held) {
@@ -229,8 +235,8 @@ void HoldEnded(Vulkan::Rasterizer* rasterizer, const Held& held) {
         rejected.push_back(fmt::format("the hold ended early: {}", held.ended_early));
     } else if (!held.frame_ended) {
         rejected.push_back(fmt::format(
-            "the guest did not end the held frame within {} ms ({} submissions held): it waits on "
-            "GPU work it submitted before ending the frame, so a whole-frame hold cannot be a cut",
+            "the guest did not end the held frame within {} ms ({} submissions held): the cut was "
+            "not reached",
             Settings().hold_bound.count(), held.gfx.size()));
     }
     std::string quiesce_why;
@@ -270,9 +276,15 @@ void HoldEnded(Vulkan::Rasterizer* rasterizer, const Held& held) {
             "a truncated packet): the opcode counts cover only the scanned part",
             census.uncopied_regions, census.bad_header_regions, census.truncated_regions));
     }
-    if (held.asc_tasks) {
-        rejected.push_back(fmt::format("{} asynchronous-compute submissions held (v1 has no ASC "
-                                       "capture)", held.asc_tasks));
+    // ASC: queued at sampling, plus any counted from then to this report checkpoint (NoteAscSubmit
+    // runs after the enqueue and asc_seen was read before sampling, so none is missed; one may be
+    // counted in both). Later ones, including report-to-release time, are reported at closure.
+    asc_at_checkpoint = asc_submits.load();
+    const u64 asc_to_checkpoint = asc_at_checkpoint - held.asc_seen;
+    if (held.asc_tasks || asc_to_checkpoint) {
+        rejected.push_back(fmt::format("asynchronous-compute submissions in the window: {} queued at "
+                                       "sampling, {} counted from sampling to the report "
+                                       "checkpoint (v1 has no ASC capture)", held.asc_tasks, asc_to_checkpoint));
     }
     if (census.opcodes[0x59]) {
         rejected.push_back(fmt::format("{} potential REWIND packets (v1 rejects live command "
@@ -336,7 +348,8 @@ void HoldEnded(Vulkan::Rasterizer* rasterizer, const Held& held) {
         }
     }
     fmt::print("  G2 opcodes:{}\n  G2 other opcodes:{}\n", named, others.empty() ? " none" : others);
-    fmt::print("  G2 asynchronous compute submissions held: {}\n", held.asc_tasks);
+    fmt::print("  G2 asynchronous compute submissions: {} queued at sampling, {} counted from "
+               "sampling to this report (may overlap)\n", held.asc_tasks, asc_to_checkpoint);
     if (memory_ok) {
         fmt::print("  G2 memory: {} direct views ({:.1f} MiB), {} flexible views ({:.1f} MiB), {} "
                    "reservations; unique backing {:.1f} MiB ({} views share backing); allocator: "
@@ -364,7 +377,7 @@ void HoldEnded(Vulkan::Rasterizer* rasterizer, const Held& held) {
                    "guest CPU and HLE writers are not rendezvoused at the cut; low/untracked host "
                    "memory is omitted; images without a reject are writeback-eligible only; the "
                    "command census counts potential, not executed, packets; asynchronous compute "
-                   "submitted after release is reported when the window closes\n");
+                   "submitted after this report is reported when the window closes\n");
     } else {
         fmt::print("  VERDICT: cut REJECTED:\n");
         for (const auto& why : rejected) {
@@ -372,7 +385,6 @@ void HoldEnded(Vulkan::Rasterizer* rasterizer, const Held& held) {
         }
     }
     std::fflush(stdout);
-    asc_submits = 0;
     release_time = std::chrono::steady_clock::now();
     state = State::Released;
 }
@@ -381,9 +393,10 @@ void OnReleasedFrameRetired() {
     if (state.load() != State::Released) {
         return;
     }
-    const u32 asc = asc_submits.load();
+    const u64 asc = asc_submits.load() - asc_at_checkpoint;
     fmt::print("Replay capture: released frame retired {:.1f} ms after release; {} asynchronous "
-               "compute submissions between release and retirement{}; capture done\n",
+               "compute submissions between the report checkpoint (before release) and "
+               "retirement{}; capture done\n",
                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
                                                          release_time).count(),
                asc, asc ? " (v1 cannot tell whether the held frame depends on them: NOT qualified)"
@@ -408,6 +421,9 @@ std::chrono::steady_clock::duration HoldRemaining() {
 }
 void HoldEnded(Vulkan::Rasterizer*, const Held&) {}
 void NoteAscSubmit() {}
+u64 AscSubmitted() {
+    return 0;
+}
 void OnReleasedFrameRetired() {}
 } // namespace ReplayCapture
 

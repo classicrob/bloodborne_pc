@@ -68,6 +68,12 @@ int main() {
     Parse("18446744073709551616", max64, std::nullopt); // wraps to 0 without the check
     Parse("99999999999999999999999", max64, std::nullopt);
     Parse("60001", 60000, std::nullopt);
+    Parse("0", 0, 0);
+    Parse("9", 0, std::nullopt); // max - digit would wrap
+    Parse("5", 5, 5);
+    Parse("6", 5, std::nullopt);
+    Parse("05", 5, 5);
+    Parse("10", 5, std::nullopt);
 
     {
         const auto c = Scan({Type3(DrawIndexAuto, 2), 3, 0, Type2, Type0(0x2000, 1), 7,

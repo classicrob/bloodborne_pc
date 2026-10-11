@@ -157,17 +157,22 @@ stops parsing until the guest ends the next frame, then prints:
 - G1: whether the cut was reached, renderer quiescence, and blocking host commands that
   ran during the hold (buffer synchronize, import pause; they must run or the guest
   never ends the frame, and each one rejects the cut). A CPU (non-EOP) flip ends the
-  hold and rejects the cut: it would present a framebuffer whose draws are held.
+  hold and rejects the cut: it would present a framebuffer whose draws are held. The
+  flip, and commands queued behind it, then wait until the held work has parsed, so
+  the game does not present or publish the frame early. A held submission waiting on
+  memory that only a command behind the flip would write cannot finish (as with any
+  command queued behind a flip).
 - G2: a raw scan of the held frame's copied command regions (potential packets,
   including untaken COND_EXEC/predicated ranges; uncopied, invalid or truncated regions
   make it incomplete and reject), graphics and asynchronous-compute tasks queued at the
-  cut (from the queues themselves), the runtime memory inventory and every GPU-modified
+  cut (sampled from the queues, plus asynchronous compute counted from sampling to
+  the report), the runtime memory inventory and every GPU-modified
   image with its writeback reject reason.
 
 The best verdict is "no inventoried blocker found; capture NOT yet qualified": the run
 does not rendezvous guest CPU or HLE writers (step 2), omits low/untracked memory, does
 not exercise image writeback, and cannot attribute asynchronous compute submitted
-between release and the released frame's retirement (reported when the window closes).
+between the report and the released frame's retirement (reported when the window closes).
 
 ### Authoritative images are a separate checkpoint problem
 

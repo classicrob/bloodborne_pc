@@ -106,6 +106,11 @@ struct Liverpool {
     /// GPU command thread: a replay capture holds the next frame's submissions (replay_capture.h).
     bool replay_hold{};
     u32 replay_hold_commands{};
+    /// After a hold ended on a CPU flip: per queue, the held tasks still to complete. Until they
+    /// have, ProcessCommands leaves a CPU flip (and what is queued behind it) waiting, so the flip
+    /// does not present or publish the held frame before its draws parse.
+    std::array<u32, NumTotalQueues> replay_held_tasks{};
+    u32 replay_held_left{};
     /// A stream write the PS4 command processor would see in command memory a copy hides.
     void CheckCommandMemoryWrite(VAddr address, u64 size, const char* writer);
     static u64 HashRegisterPacket(u64 checksum, const u32* words, u32 count);
@@ -254,7 +259,8 @@ private:
     Task ProcessCompute(std::span<const u32> acb, u32 vqid);
 
     /// Runs queued host commands; returns how many ran. With `stopped_at_cpu_flip` (replay
-    /// capture hold) a CPU flip at the front stays queued and sets it.
+    /// capture hold) a CPU flip at the front stays queued and sets it; so it does while held
+    /// work from a hold that ended on a CPU flip is still parsing (replay_held_left).
     u32 ProcessCommands(bool* stopped_at_cpu_flip = nullptr);
     void Process(std::stop_token stoken);
 

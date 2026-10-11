@@ -194,12 +194,15 @@ u32 Liverpool::ProcessCommands(bool* stopped_at_cpu_flip) {
     }
     // Process incoming commands with high priority
     u32 ran = 0;
+    const bool stop_at_cpu_flip = stopped_at_cpu_flip || replay_held_left;
     while (num_commands) {
         Common::UniqueFunction<void> callback{};
         {
             std::scoped_lock lk{submit_mutex};
-            if (stopped_at_cpu_flip && command_queue.front().cpu_flip) {
-                *stopped_at_cpu_flip = true;
+            if (stop_at_cpu_flip && command_queue.front().cpu_flip) {
+                if (stopped_at_cpu_flip) {
+                    *stopped_at_cpu_flip = true;
+                }
                 break;
             }
             callback = std::move(command_queue.front().func);
@@ -267,6 +270,7 @@ void Liverpool::Process(std::stop_token stoken) {
                 // Gfx queue lock before snapshots_mutex, as SubmitGfx.
                 std::vector<std::shared_ptr<CmdSnapshot>> held_gfx;
                 u32 gfx_tasks = 0, asc_tasks = 0;
+                const u64 asc_seen = ReplayCapture::AscSubmitted(); // before sampling
                 {
                     auto& gfx_queue = mapped_queues[GfxQueueId];
                     std::scoped_lock lk{gfx_queue.m_access, snapshots_mutex};
@@ -277,9 +281,19 @@ void Liverpool::Process(std::stop_token stoken) {
                         }
                     }
                 }
+                std::array<u32, NumTotalQueues> queued{};
+                queued[GfxQueueId] = gfx_tasks;
                 for (u32 qid = GfxQueueId + 1; qid < NumTotalQueues; ++qid) {
                     std::scoped_lock lk{mapped_queues[qid].m_access};
-                    asc_tasks += static_cast<u32>(mapped_queues[qid].submits.size());
+                    queued[qid] = static_cast<u32>(mapped_queues[qid].submits.size());
+                    asc_tasks += queued[qid];
+                }
+                if (cpu_flip) {
+                    // The flip waits until the held work has parsed (as it would have, unheld).
+                    // A held task that waits on memory only a command behind the flip would write
+                    // cannot finish: the same as a command queued behind any flip.
+                    replay_held_tasks = queued;
+                    replay_held_left = gfx_tasks + asc_tasks;
                 }
                 ReplayCapture::HoldEnded(
                     rasterizer,
@@ -290,6 +304,7 @@ void Liverpool::Process(std::stop_token stoken) {
                      .gfx = held_gfx,
                      .gfx_tasks = gfx_tasks,
                      .asc_tasks = asc_tasks,
+                     .asc_seen = asc_seen,
                      .host_commands = replay_hold_commands});
                 replay_hold = false;
             }
@@ -320,6 +335,12 @@ void Liverpool::Process(std::stop_token stoken) {
 
             if (task.done()) {
                 task.destroy();
+#ifdef __APPLE__
+                if (replay_held_tasks[curr_qid]) { // held tasks are each queue's oldest
+                    --replay_held_tasks[curr_qid];
+                    --replay_held_left;
+                }
+#endif
 
                 std::scoped_lock lock{queue.m_access};
                 queue.submits.pop();
@@ -2299,9 +2320,6 @@ void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
 
 void Liverpool::SubmitAsc(u32 gnm_vqid, std::span<const u32> acb) {
     ASSERT_MSG(gnm_vqid > 0 && gnm_vqid < NumTotalQueues, "Invalid virtual ASC queue index");
-#ifdef __APPLE__
-    ReplayCapture::NoteAscSubmit();
-#endif
     auto& queue = mapped_queues[gnm_vqid];
 
     const auto vqid = gnm_vqid - 1;
@@ -2310,6 +2328,9 @@ void Liverpool::SubmitAsc(u32 gnm_vqid, std::span<const u32> acb) {
         std::scoped_lock lock{queue.m_access};
         queue.submits.emplace(task.handle);
     }
+#ifdef __APPLE__
+    ReplayCapture::NoteAscSubmit(); // after the enqueue: a replay capture's queue sample or count
+#endif
 
     std::scoped_lock lk{submit_mutex};
     num_mapped_queues = std::max(num_mapped_queues, gnm_vqid + 1);
