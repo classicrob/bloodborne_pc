@@ -229,9 +229,11 @@ static uint64_t patch_tcb_loads(const Segment *segments, uint64_t count) {
 #ifdef __APPLE__
 #include "probe_fault_dump_mac.h"
 #include "probe_entry_trace_mac.h"
+#include "runtime_cpu_profile.h"
 #endif
 static void fault(int sig, siginfo_t *info, void *context) {
 #ifdef __APPLE__
+    if (runtime_cpu_profile_fault(sig,context)) return;
     if (entry_trace_handle(sig,info,context)) return;
 #endif
     /* GPU page tracking (write-protected guest pages) is resolved first. */
@@ -557,6 +559,10 @@ static int probe_main(int argc, char **argv) {
     sigemptyset(&alarm_action.sa_mask); sigaction(SIGALRM, &alarm_action, NULL);
     alarm(timeout_seconds); /* 0 disables the watchdog */
 #endif
+#ifdef __APPLE__
+    runtime_cpu_profile_init();
+    runtime_cpu_profile_thread("bb-probe");
+#endif
     FILE *f = fopen(argv[1], "rb");
     if (!f) fail("cannot open boot file; run prepare.py first");
     char magic[8];
@@ -751,6 +757,10 @@ static int probe_main(int argc, char **argv) {
             if (result) fail("module initializer failed");
         }
     }
+#ifdef __APPLE__
+    runtime_cpu_profile_guest((uintptr_t)image,size,-1);
+    for(uint64_t m=0;m<module_count;m++)runtime_cpu_profile_guest((uintptr_t)image+modules[m].base,modules[m].size,(int)m);
+#endif
     printf("Entering original x86-64 code at guest offset 0x%" PRIx64 "\n", entry);
     entered_game=1;
     struct { uint64_t argc; const char *argv[2]; } params = {1, {"/app0/eboot.bin", NULL}};
@@ -762,6 +772,9 @@ static int probe_main(int argc, char **argv) {
     enum { MAIN_STACK=8*1024*1024 };
     unsigned char *stack=runtime_low_map_named(MAIN_STACK,PROT_READ|PROT_WRITE,"main-stack");
     if (!stack) fail("cannot allocate guest main stack");
+#ifdef __APPLE__
+    runtime_cpu_profile_stack(stack,MAIN_STACK);
+#endif
     enter_on_stack(image+entry,&params,(void *)guest_exit,stack+MAIN_STACK-64);
 #endif
     fail("entry unexpectedly returned");

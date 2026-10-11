@@ -32,6 +32,27 @@ static inline int guest_backtrace_frame(uintptr_t frame, uintptr_t bottom, uintp
                KERN_SUCCESS && got == 16;
 }
 
+/* Signal-path variant: caller-cached live stack ranges and an owned, recoverable
+ * direct reader. No pthread/Mach lookup. A failed read never publishes a frame. */
+static inline size_t guest_backtrace_bounded(uintptr_t frame, uintptr_t *out, size_t max,
+                                            const uintptr_t low[2], const uintptr_t high[2],
+                                            int (*read_frame)(uintptr_t, uintptr_t *), int *failed) {
+    size_t n = 0;
+    while (n < max && frame && !(frame & 7)) {
+        int in_range = 0;
+        for (unsigned i = 0; i < 2; ++i)
+            if (high[i] >= 16 && frame >= low[i] && frame <= high[i] - 16) in_range = 1;
+        if (!in_range) break;
+        uintptr_t record[2];
+        if (!read_frame(frame, record)) { *failed = 1; break; }
+        if (!record[1]) break;
+        out[n++] = record[1];
+        if (record[0] <= frame) break;
+        frame = record[0];
+    }
+    return n;
+}
+
 /* Return addresses of up to `max` callers, starting with the one `frame` returns to. `frame` is
  * a frame pointer of the calling thread (e.g. __builtin_frame_address(0) in a function the guest
  * called, or the guest rbp of a trapped thread). The walk follows strictly ascending frames, at
