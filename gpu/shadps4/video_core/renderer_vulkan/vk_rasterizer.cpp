@@ -3510,6 +3510,17 @@ void Rasterizer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds
     runtime.FillBuffer(buffer, offset, num_bytes, value);
 }
 
+#ifdef __APPLE__
+void Rasterizer::StreamOutUpdate(u32 buffer, AmdGpu::SourceSelect source, u64 value_or_address,
+                                 u64 dst_or_0) {
+    // The GS emulation does not cover stream-out yet: its draws stop too ("does not cover
+    // stream-out"). The state and its ordering come with the copy kernels (GS-DESIGN section 11).
+    UNREACHABLE_MSG("macOS: stream-out state not implemented: buffer {}, source {}, value {:#x}, "
+                    "store to {:#x}",
+                    buffer, magic_enum::enum_name(source), value_or_address, dst_or_0);
+}
+#endif
+
 void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds) {
     DrainDrawPipe();
     if (!dst_gds && !buffer_cache.IsRegionGpuModified(dst, num_bytes)) {

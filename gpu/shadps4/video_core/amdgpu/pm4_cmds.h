@@ -288,6 +288,24 @@ struct PM4CmdStrmoutBufferUpdate {
     };
     u32 src_address_hi;
 
+    /// bbport: the form Gnm's stream-out setup emits (Bloodborne, before each stream-out draw):
+    /// BUFFER_OFFSET of buffer_select from the packet (buffer_offset, dwords), no filled-size
+    /// store. The game emits no other form.
+    bool SetsOffsetFromPacket() const {
+        return update_memory.Value() == 0 && source_select.Value() == SourceSelect::BufferOffset;
+    }
+
+#ifdef __APPLE__
+    /// Stops on any other form: not emitted by this game, and its units are unverified.
+    void AssertImplementedForm() const {
+        ASSERT_MSG(SetsOffsetFromPacket(),
+                   "macOS: IT_STRMOUT_BUFFER_UPDATE form not implemented: update_memory {}, "
+                   "source_select {}, buffer {}",
+                   update_memory.Value(), static_cast<u32>(source_select.Value()),
+                   buffer_select.Value());
+    }
+#endif
+
     template <typename T = u64>
     T DstAddress() const {
         ASSERT(update_memory.Value() == 1);
@@ -718,6 +736,27 @@ struct PM4CmdWaitRegMem {
     bool Test(std::span<const u32> regs) const {
         return TestValue(mem_space.Value() == MemSpace::Memory ? *Address() : regs[Reg()]);
     }
+
+#ifdef __APPLE__
+    /// A register wait's index must be inside the register file (Reg() has 16 bits).
+    void AssertRegisterInRange(size_t num_regs) const {
+        ASSERT_MSG(mem_space.Value() != MemSpace::Register || Reg() < num_regs,
+                   "macOS: WAIT_REG_MEM on register {:#x}, outside the register file", Reg());
+    }
+
+    /// bbport: on the graphics queue a register wait reads registers only that queue's packets
+    /// set. Compute queues write SH registers of their own pipelines. The one register the
+    /// hardware sets, CP_STRMOUT_CNTL.OFFSET_UPDATE_DONE, is set when its EVENT_WRITE
+    /// (SO_VGTSTREAMOUT_FLUSH) is parsed. So a wait unmet when reached is never met: stop instead
+    /// of spinning.
+    void AssertRegisterWaitMet(std::span<const u32> regs) const {
+        AssertRegisterInRange(regs.size());
+        ASSERT_MSG(mem_space.Value() != MemSpace::Register || Test(regs),
+                   "macOS: WAIT_REG_MEM on register {:#x} can never be met on the graphics queue: "
+                   "value {:#x}, mask {:#x}, function {}, reference {:#x}",
+                   Reg(), regs[Reg()], mask, static_cast<u32>(function.Value()), ref);
+    }
+#endif
 
     bool TestValue(u32 value) const {
         switch (function.Value()) {

@@ -237,6 +237,16 @@ struct StreamOutBufferConfig {
     u32 stream_3_buf_en : 4;
 };
 
+/// VGT_STRMOUT_BUFFER_SIZE_n / VTX_STRIDE_n / BUFFER_OFFSET_n (0xA2B4 + 4n). The buffer's base
+/// address is not a register on GCN: the copy shader's stream-out V#s carry it. Gnm writes SIZE and
+/// VTX_STRIDE with SET_CONTEXT_REG (sizes in dwords) and the offset with IT_STRMOUT_BUFFER_UPDATE.
+struct StreamOutBuffer {
+    u32 size_dw;
+    u32 vtx_stride_dw;
+    u32 : 32;
+    u32 offset_dw;
+};
+
 struct LsHsConfig {
     u32 num_patches : 8;
     u32 hs_input_control_points : 6;
