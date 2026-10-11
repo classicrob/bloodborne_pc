@@ -95,3 +95,65 @@ and saved registers with the existing event log before connecting either guest
 null dereference to an AvPlayer state transition. Mutex EINVAL diagnostics must
 identify whether the guest destroyed sentinel or the native mutex rejected an
 operation; the earlier panic alone did not distinguish them.
+
+## Entry-trace tear: 20261010-222038
+
+Playtest's `20261010-222038-1080p-PAR-ep1-entry/game.log` used the six-site
+entry probe (`7faf6831` probe SHA prefix) with the `4e7622b` GPU library
+(`d7ee57b6` SHA prefix). It contains 21,615 entry records and a real two-writer
+PM4 tear. The second builder thread has an empty pthread name and no backtrace.
+Neither property identifies an AvPlayer callback thread:
+
+- `runtime_thread_attach_main` previously changed only the GuestThread name;
+  it did not name the pthread. The main guest executes on a switched low stack.
+- `guest_backtrace.h` at that build accepts only the native pthread stack range,
+  so it rejects both main's switched stack and HLE switched stacks.
+- AvPlayer's controller, demuxer and decoder bodies explicitly name their
+  pthreads before callback work. An empty name is therefore not affirmative
+  evidence for any of those workers.
+
+The entry records provide a more specific result:
+
+| Guest handle | Entries | Identification |
+|---|---|---|
+| `0x80593c680` | 21,539 out-of-space callbacks; 13 each factory/init-from-parent/initializer/copy/destructor | initial main attachment, allocated at log line 96 before native module initialization |
+| `0x805973740` | one each init-from-parent/initializer/copy/destructor | allocation at lines 5334–5336 beside GXRenderThread creation |
+
+All 14 copy assignments occur at startup, lines 5350–5451. The 13 child copy
+sources have zero begin/end/cmdptr. The other copy initializes destination
+`0x70282a2850` from stack object `0x806b28660`, whose command pointer is
+`0x7039440410`. No selected copy-site hit occurs during the movie, and no third
+handle occurs at any of these six sites. This rules out the claimed observation
+of a movie-time live-chunk copy at this particular function; it does not rule
+out another copy path or direct concurrent use of an existing object. The
+identity-enabled probe and low-stack-aware builder walk are needed to join the
+builder writer to the entry records directly.
+
+### Callback paths checked against source
+
+`GuestBuffer` construction is the only frame-memory allocation callback path.
+`AvPlayerSource::Start` allocates the video and audio pools synchronously, before
+launching the decoder and demuxer threads. Normal decoder loops pop and recycle
+those buffers; they do not invoke allocation callbacks per frame. A buffer
+abandoned on an error path can invoke its deallocator on that worker. Stop joins
+workers and then drains pools/current frames on the Stop caller.
+
+Auto-start can execute Start on the controller via Ready -> AutoPlay callback.
+However, Bloodborne's static initialization above explicitly disables auto-start
+and supplies its own event callback. Its normal Start therefore allocates on the
+explicit Start caller, after guest Ready processing. Ready/Buffering notifications
+still originate on the controller, while explicit Play/Stop originate on their
+calling thread. The guest event callback enqueues a record rather than building
+GPU commands directly.
+
+File replacement open/size run in source initialization; read callbacks can run
+on initialization, controller stream discovery, Start seeking, and demux reads;
+close runs on source destruction. This movie log explicitly selects the host
+file path at line 942754, so that run does not use guest file callbacks.
+
+The current [upstream shadPS4 controller implementation](https://raw.githubusercontent.com/shadps4-emu/shadPS4/main/src/core/libraries/avplayer/avplayer_state.cpp)
+also separates controller auto-start from explicit Start and names the controller
+thread. That is implementation corroboration, not a PS4 callback-affinity
+contract. No authoritative PS4 threading specification or console measurement
+was found that justifies moving these callbacks to another thread. No callback
+threading behavior was changed as part of this investigation.
