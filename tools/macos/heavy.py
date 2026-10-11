@@ -186,11 +186,13 @@ def status():
             print(f'{name}: held by {describe(holder(name))}')
 
 
-def polite(pool, gpu, command):
+def polite(pool, priority, gpu, command):
     """The user shares this Mac and their apps were being starved: heavy jobs yield. Builds, tests
     and sweeps (build and quick pools) run as background QoS (taskpolicy -b: low CPU priority,
     efficiency cores, throttled I/O; slower, by the user's choice); correctness games (playtest
-    pool) at nice 5 with a utility QoS clamp. Exclusive-GPU jobs (perf_run, timing) are exempt.
+    pool) at nice 5 with a utility QoS clamp. Priority-lane jobs (P0 previews, shared builds) run
+    at nice 5 with a utility clamp too: background QoS made a preview take 37 minutes. They keep
+    the parallelism cap. Exclusive-GPU jobs (perf_run, timing) are exempt.
     Applied once, when the slot is taken, so nested calls inherit it. BB_HEAVY_POLITE=0 turns it
     off."""
     if os.environ.get('BB_HEAVY_POLITE', '1') == '0' or gpu == 'exclusive':
@@ -207,6 +209,9 @@ def polite(pool, gpu, command):
         current = os.environ.get(name, '')
         os.environ[name] = str(min(int(current), int(cap))) if current.isdigit() else cap
     os.environ['MAKEFLAGS'] = f'-j{os.environ["BB_BUILD_JOBS"]}'
+    if priority:
+        os.nice(5)
+        return ['taskpolicy', '-c', 'utility', *command], f'nice 5, utility QoS, {os.environ["BB_BUILD_JOBS"]} jobs'
     return ['taskpolicy', '-b', *command], f'background QoS, {os.environ["BB_BUILD_JOBS"]} jobs'
 
 
@@ -237,7 +242,7 @@ def run(pool, priority, gpu, label, command):
             os.pwrite(fd, json.dumps(info).encode(), 0)
             os.fsync(fd)
             waited = time.monotonic() - started
-            command, policy = polite(pool, gpu, command)
+            command, policy = polite(pool, priority, gpu, command)
             record({'event': 'start', 'label': label, 'pool': pool, 'slot': name, 'priority': priority,
                     'waited_s': round(waited, 1), 'load': [round(x, 2) for x in os.getloadavg()],
                     'held': busy_slots(), 'pid': os.getpid(), 'policy': policy})

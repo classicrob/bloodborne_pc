@@ -127,7 +127,7 @@ err=$("$heavy" --pool playtest G11 -- true 2>&1 >/dev/null)
 [[ $err != *running* ]] || fail "announced without BB_HEAVY_ANNOUNCE ('$err')"
 
 # Scheduling: builds/tests (build, quick) as background QoS (scheduler priority 4) with compile
-# parallelism capped at 8, correctness games (playtest) at nice +5 with a utility clamp (priority
+# parallelism capped at 8, the priority lane (P0 previews) at nice +5 with a utility clamp and the cap, correctness games (playtest) at nice +5 with a utility clamp (priority
 # 20), exclusive-GPU jobs unchanged; applied once; BB_HEAVY_POLITE=0 turns it off. Niceness is
 # relative to this shell's. The QoS checks need a normal-priority shell: under build.sh --test
 # this test itself runs as background QoS, and they are reported as not checked.
@@ -138,6 +138,8 @@ read -r pri nic jobs <<< "$(probe N1)"
 (( jobs == 8 )) || fail "build job parallelism not capped at 8 ('$jobs')"
 read -r _ _ jobs <<< "$(BB_BUILD_JOBS=4 probe --pool quick N2)"
 (( jobs == 4 )) || fail "a lower parallelism hint was raised ('$jobs')"
+read -r rpri rnic rjobs <<< "$(probe --priority NP)"
+[[ $rnic == $(want 5) && $rjobs == 8 ]] || fail "priority-lane job not at nice +5 with 8 jobs ('$rnic' '$rjobs')"
 read -r gpri gnic _ <<< "$(probe --pool playtest N3)"
 [[ $gnic == $(want 5) ]] || fail "game not at nice +5"
 read -r xpri xnic _ <<< "$(probe --pool playtest --gpu exclusive N4)"
@@ -149,6 +151,7 @@ read -r ppri pnic _ <<< "$(BB_HEAVY_POLITE=0 probe --pool playtest N7)"
 if (( base_pri >= 20 )); then
     (( pri == 4 )) || fail "build job not background QoS (priority $pri)"
     (( gpri == 20 )) || fail "game not utility QoS (priority $gpri)"
+    (( rpri == 20 )) || fail "priority-lane job not utility QoS (priority $rpri)"
     (( xpri == base_pri )) || fail "exclusive-GPU job QoS changed (priority $xpri)"
     qos=checked
 else

@@ -31,6 +31,7 @@ The user works on this Mac while the team runs. Heavy jobs yield to them by defa
 | Jobs | Scheduling |
 |---|---|
 | build and quick pools (builds, tests, sweeps) | background QoS (`taskpolicy -b`: lowest CPU priority, efficiency cores, throttled I/O) and compile parallelism capped at `BB_HEAVY_BUILD_JOBS` (8) through `BB_BUILD_JOBS`, `CMAKE_BUILD_PARALLEL_LEVEL` and `MAKEFLAGS` (a lower hint is kept) |
+| `--priority` (P0 previews, shared builds) | nice 5 and a utility QoS clamp, parallelism capped as above (background QoS made a preview take 37 min) |
 | playtest pool (correctness games) | nice 5 and a utility QoS clamp |
 | `--gpu exclusive` (perf_run, timing) | unchanged: the user approved perf runs separately |
 
