@@ -27,6 +27,17 @@ uintptr_t runtime_lookup(const RuntimeExport *table,size_t count,const char *nam
     for (size_t i=0;i<count;++i) if (!strcmp(table[i].name,name)) return (uintptr_t)table[i].function;
     return 0;
 }
+static volatile uint64_t *watched;
+static int stop_reader, torn;
+/* Reads a label the writer alternates between all-zero and all-one bits. */
+static void *read_labels(void *unused) {
+    (void)unused;
+    while (!__atomic_load_n(&stop_reader,__ATOMIC_ACQUIRE)) {
+        const uint64_t v=__atomic_load_n(watched,__ATOMIC_ACQUIRE);
+        if (v!=0 && v!=UINT64_MAX) torn=1;
+    }
+    return NULL;
+}
 static vm_prot_t protection(const void *p) {
     mach_vm_address_t address=(mach_vm_address_t)p;
     mach_vm_size_t size;
@@ -160,6 +171,32 @@ int main(void) {
     assert(protection(code)==(VM_PROT_READ|VM_PROT_EXECUTE));
     assert(!release(physical,PAGE));
     puts("PASS: executable shared views and automatic Rosetta translation invalidation across aliases");
+
+    // GPU labels: an aligned 2/4/8-byte backing write is one store. A reader of the guest view
+    // racing a writer that alternates two values sees no torn value. (Darwin's memcpy did not
+    // tear here either; this guards the guarantee, it does not reproduce a failure.)
+    assert(!allocate(0,INT64_MAX,PAGE,PAGE,0,&physical));
+    void *labels=NULL;
+    assert(!map(&labels,PAGE,3,0,physical,PAGE));
+    memset(labels,0xee,64);
+    const uint64_t q=0x1122334455667788ull; const uint32_t d=0x99aabbcc; const uint16_t h=0xddee;
+    assert(runtime_memory_write_backing((uintptr_t)labels+8,&q,8));
+    assert(runtime_memory_write_backing((uintptr_t)labels+20,&d,4));
+    assert(runtime_memory_write_backing((uintptr_t)labels+26,&h,2));
+    assert(runtime_memory_write_backing((uintptr_t)labels+33,&q,8)); // unaligned: plain copy
+    assert(!memcmp((char *)labels+8,&q,8) && !memcmp((char *)labels+20,&d,4) &&
+           !memcmp((char *)labels+26,&h,2) && !memcmp((char *)labels+33,&q,8));
+    assert(((unsigned char *)labels)[7]==0xee && ((unsigned char *)labels)[16]==0xee &&
+           ((unsigned char *)labels)[24]==0xee && ((unsigned char *)labels)[28]==0xee);
+    watched=(volatile uint64_t *)labels;
+    pthread_t reader;
+    assert(!pthread_create(&reader,NULL,read_labels,NULL));
+    const uint64_t values[2]={0,UINT64_MAX};
+    for (int i=0;i<2000000;++i) assert(runtime_memory_write_backing((uintptr_t)labels,&values[i&1],8));
+    __atomic_store_n(&stop_reader,1,__ATOMIC_RELEASE);
+    assert(!pthread_join(reader,NULL));
+    assert(!torn);
+    puts("PASS: aligned 2/4/8-byte backing writes land whole (no torn value seen); unaligned copy");
     runtime_memory_report();
     return 0;
 }

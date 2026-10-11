@@ -15,6 +15,7 @@
 #include <thread>
 #include <vector>
 #include "bbport_label_check.h"
+#include "bbport_label_store.h"
 #include "bbport_label_sequencer.h"
 
 namespace {
@@ -148,6 +149,25 @@ int main() {
         Expect("stopping with labels pending writes none past the gap and reports both as "
                "outstanding",
                written.size() == 2 && sequencer.Outstanding() == 2);
+    }
+
+    // A label stored through the guest mapping (bbport_label_store.h): its bytes only.
+    {
+        alignas(16) static std::uint8_t bytes[32];
+        std::memset(bytes, 0xEE, sizeof(bytes));
+        BbLabelStore::StoreOnce(&bytes[8], 0x1122334455667788ull, 8);
+        BbLabelStore::StoreOnce(&bytes[20], 0xFFFF'FFFF'99AA'BBCCull, 4);
+        BbLabelStore::StoreOnce(&bytes[26], 0xDDEEull, 2);
+        std::uint64_t q;
+        std::uint32_t d;
+        std::uint16_t h;
+        std::memcpy(&q, &bytes[8], 8);
+        std::memcpy(&d, &bytes[20], 4);
+        std::memcpy(&h, &bytes[26], 2);
+        Expect("label stores of 8, 4 and 2 bytes write their value and nothing around it",
+               q == 0x1122334455667788ull && d == 0x99AABBCCu && h == 0xDDEE &&
+                   bytes[7] == 0xEE && bytes[16] == 0xEE && bytes[24] == 0xEE &&
+                   bytes[28] == 0xEE);
     }
 
     std::fprintf(stderr, "%s: %u failures\n", failures ? "FAIL" : "PASS", failures);
