@@ -267,6 +267,7 @@ private:
                       Shader::Backend::Bindings& binding, u32& write_index, bool& barrier,
                       bool on_helper = false);
     bool BindResources(const Pipeline* pipeline);
+    void NoteRecordContext(const char* kind, const Pipeline* pipeline);
     /// bbport (Apple): records the ES and GS compute passes of an emulated geometry stage and
     /// returns the strip draw (vk_gs_emulation.cpp).
     GsEmulationDraw RecordGsEmulation(const GraphicsPipeline* pipeline, const AmdGpu::Regs& regs,
