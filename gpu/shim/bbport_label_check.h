@@ -5,9 +5,10 @@
 // offset 0) once the submitDone throttle releases it. A label written after that lands in freed
 // memory, where the allocator's free-list link at offset 0 receives the label value (Guest fault
 // 0x263b8e7, docs/history/SESSION_2026-09-30.md). So the value at a label address is sampled when
-// its EOP is parsed, and again just before the write. A change in between that is not one of our
-// own completed writes is reported (LABEL-CHECK): something other than this EOP changed the
-// memory, e.g. the guest freeing or reusing the object, or resetting the label.
+// its EOP is parsed, and again just before the write. A change in between that does not match one
+// of our recorded EOP writes is reported (LABEL-CHECK): something else changed the memory, e.g.
+// the guest freeing or reusing the object, resetting the label, or a write this check does not
+// track (WRITE_DATA, EOS, DMA).
 //
 // Supporting evidence only. A change need not be a guest free (other writers exist), and no
 // change does not prove the lifetime is right (a free that leaves the value equal, ABA, or a change
@@ -167,7 +168,8 @@ inline bool BeforeWrite(std::uint64_t address, std::uint32_t num_bytes) {
                 SafeRead(address & ~std::uint64_t{15}, block, sizeof(block));
             std::fprintf(stderr,
                          "LABEL-CHECK #%llu: label %#llx (%u bytes) changed between its EOP's "
-                         "parse and write, not by our writes: %#llx when parsed, %#llx now "
+                         "parse and write, not matched to our recorded EOP writes: %#llx when "
+                         "parsed, %#llx now "
                          "(pending %.1f ms since the parse sample); block %s %#llx %#llx %#llx "
                          "%#llx %#llx %#llx\n",
                          static_cast<unsigned long long>(n),
