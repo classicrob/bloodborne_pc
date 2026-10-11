@@ -539,6 +539,11 @@ private:
     /// shader tests it (docs/macos/depth-bounds.md). After BeginRendering.
     void BindDepthBoundsSource(const GraphicsPipeline* pipeline);
     bool render_reduced = false; ///< the current pass renders into reduced-size scene proxies
+    /// Frame capture only: the pass was redirected to the upscaler's output-size images, and the
+    /// first effective viewport and scissor of the current draw.
+    bool pass_redirected = false;
+    mutable vk::Viewport capture_viewport{};
+    mutable vk::Rect2D capture_scissor{};
     void DumpSampledImages();
     bool PendingWriteOverlaps(VAddr address, u64 size);
     /// Stage B: the ring bindings of the stages of the packet being recorded.

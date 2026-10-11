@@ -1183,6 +1183,52 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     if (FrameCapture::Active()) {
         const auto* ps = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
         FrameCapture::Draw(vs_info.pgm_hash, ps ? ps->pgm_hash : 0, num_indices, num_instances);
+        {
+            // Where the draw lands: guest viewport 0, the effective Vulkan viewport and scissor,
+            // and the pass extent and scaling (upscaler redirect, reduced scene proxies).
+            const auto& vp = regs.viewports[0];
+            const auto& v = capture_viewport;
+            const auto& sc = capture_scissor;
+            char note[384];
+            std::snprintf(note, sizeof(note),
+                          "\n  where: guest vp0 x %.1f%+.1f y %.1f%+.1f ctl %#x clip_disabled %u; "
+                          "vk vp %.1f,%.1f %.1fx%.1f scissor %d,%d %ux%u; pass %ux%u scale "
+                          "%.3fx%.3f jitter %.3f,%.3f redirected %u reduced %u",
+                          vp.xoffset, vp.xscale, vp.yoffset, vp.yscale,
+                          std::bit_cast<u32>(regs.viewport_control), u32(regs.IsClipDisabled()),
+                          v.x, v.y, v.width, v.height, sc.offset.x, sc.offset.y, sc.extent.width,
+                          sc.extent.height, state.width, state.height, target_scale[0],
+                          target_scale[1], draw_jitter[0], draw_jitter[1], u32(pass_redirected),
+                          u32(render_reduced));
+            FrameCapture::Note(note);
+            // What the vertex fetch reads: each attribute's raw V# and its decoded format.
+            std::snprintf(note, sizeof(note),
+                          "\n  inputs: indexed %u type %u base %#llx offset %u, VGT_INDX_OFFSET %u",
+                          u32(is_indexed), u32(regs.index_buffer_type.index_type),
+                          static_cast<unsigned long long>(
+                              regs.index_base_address.Address<VAddr>()),
+                          index_offset, regs.index_offset);
+            FrameCapture::Note(note);
+            if (fetch_shader) {
+                for (const auto& attribute : fetch_shader->attributes) {
+                    const auto vsharp = attribute.GetSharp(vs_info);
+                    const auto raw = std::bit_cast<std::array<u32, 4>>(vsharp);
+                    std::snprintf(note, sizeof(note),
+                                  "\n  vsharp loc %u vgpr %u s[%u] dw %u inst %u: %08x %08x %08x "
+                                  "%08x base %#llx stride %u records %u dfmt %u nfmt %u dst_sel "
+                                  "%u%u%u%u",
+                                  u32(attribute.semantic), u32(attribute.dest_vgpr),
+                                  u32(attribute.sgpr_base), u32(attribute.dword_offset),
+                                  u32(attribute.instance_data), raw[0], raw[1], raw[2], raw[3],
+                                  static_cast<unsigned long long>(vsharp.base_address),
+                                  u32(vsharp.stride), vsharp.num_records,
+                                  u32(vsharp.data_format), u32(vsharp.num_format),
+                                  u32(vsharp.dst_sel_x), u32(vsharp.dst_sel_y),
+                                  u32(vsharp.dst_sel_z), u32(vsharp.dst_sel_w));
+                    FrameCapture::Note(note);
+                }
+            }
+        }
         if (const auto& bc = regs.blend_control[0]; bc.enable && regs.color_buffers[0]) {
             char note[128];
             std::snprintf(note, sizeof(note), "\n  blend ps %08x idx %u: src %u dst %u func %u z %u%u",
@@ -3202,6 +3248,7 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
     // bbport: a pass drawn into the upscaler's output-size images (UI, display pass): every
     // attachment must be redirected, viewports and scissors are scaled.
     target_scale = {1.0f, 1.0f};
+    pass_redirected = false;
     if (color_redirected || depth_redirected) {
         u32 color_targets = 0;
         for (u32 cb = 0; cb < state.num_color_attachments; ++cb) {
@@ -3238,6 +3285,7 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
                 state.depth_stencil_attachment.image_layout = depth_image.backing->state.layout;
             }
         } else {
+            pass_redirected = true;
             state.width = redirect.width;
             state.height = redirect.height;
             // The UI movie viewport is now 1920x1080 even when the scene is 960x540.
@@ -3677,6 +3725,10 @@ void Rasterizer::UpdateViewportScissorState() const {
         scissors.push_back(empty_scissor);
     }
 
+    if (FrameCapture::Active()) {
+        capture_viewport = viewports[0];
+        capture_scissor = scissors[0];
+    }
     auto& dynamic_state = scheduler.GetDynamicState();
     dynamic_state.SetViewports(viewports);
     dynamic_state.SetScissors(scissors);
