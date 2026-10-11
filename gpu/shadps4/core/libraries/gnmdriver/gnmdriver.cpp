@@ -111,10 +111,11 @@ struct PacingStats {
 static PacingStats pacing; ///< under m_submit_lock
 #endif
 
-/// Returns the microseconds it blocked (0 if the throttle was not set).
+/// Returns the microseconds it blocked on Apple (0 if the throttle was not set; elsewhere 0).
 static u64 WaitGpuIdle() {
     HLE_TRACE;
     std::unique_lock lock{m_wait_idle};
+#ifdef __APPLE__
     if (submission_lock == 0) {
         return 0;
     }
@@ -123,6 +124,10 @@ static u64 WaitGpuIdle() {
     return std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() -
                                                                  start)
         .count();
+#else
+    cv_lock.wait(lock, [] { return submission_lock == 0; });
+    return 0;
+#endif
 }
 
 /// A submission's wait for the submitDone throttle (counted on Apple).
