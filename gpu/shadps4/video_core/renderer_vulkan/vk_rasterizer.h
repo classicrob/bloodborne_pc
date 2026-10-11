@@ -271,6 +271,17 @@ private:
     /// returns the strip draw (vk_gs_emulation.cpp).
     GsEmulationDraw RecordGsEmulation(const GraphicsPipeline* pipeline, const AmdGpu::Regs& regs,
                                       bool is_indexed, u32 index_offset);
+    GsEmulationDraw RecordGsEmulationIndirect(const GraphicsPipeline* pipeline,
+                                              const AmdGpu::Regs& regs, bool is_indexed,
+                                              VAddr args, u32 stride, u32 max_count,
+                                              VAddr count_address);
+    /// ES or GS compute pass of an emulated geometry stage: binds, ends the render pass, dispatches
+    /// (indirectly when `indirect` is set).
+    void RecordGsDispatch(const ComputePipeline& compute, u32 groups_x, u32 groups_y,
+                          vk::Buffer indirect = {}, u64 indirect_offset = 0);
+    void RecordGsBarrier(vk::PipelineStageFlags2 dst_stage, vk::AccessFlags2 dst_access);
+    /// Stops loudly once the indirect setup kernel has reported a draw it could not emulate.
+    void CheckGsEmulationErrors();
     void BindSamplers(const Shader::Info& stage, const PreparedStage* prepared,
                       Shader::Backend::Bindings& binding, u32& write_index);
     /// bbport: a stage's resolved textures remembered by its prepared T# hashes
@@ -491,6 +502,8 @@ private:
     u64 helper_full = 0, helper_partial = 0, helper_serial = 0;
     /// bbport (Apple): scratch and index ranges of the emulated geometry draw being recorded.
     GsEmulationBinding gs_binding{};
+    std::unique_ptr<VideoCore::StreamBuffer> gs_indirect_scratch; ///< indirect ES/GS draws
+    std::unique_ptr<VideoCore::Buffer> gs_errors;                 ///< setup kernel reports
     struct {
         std::atomic<u64> draws{0};
         std::atomic<u64> dispatches{0};

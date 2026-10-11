@@ -1248,11 +1248,16 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
     const u32 stride = indirect.stride;
     const u32 max_count = indirect.max_count;
 #ifdef __APPLE__
-    // The emulated geometry stage sizes its compute passes from the draw's counts on the CPU.
-    ASSERT_MSG(!pipeline->GsEmulation(),
-               "macOS geometry emulation does not cover indirect ES/GS draws");
+    // Emulated geometry stage: a setup kernel reads the guest's indirect command and feeds the
+    // ES/GS compute passes and the strip draw indirectly (vk_gs_emulation.cpp).
+    GsEmulationDraw gs_draw{};
+    if (pipeline->GsEmulation()) {
+        gs_draw = RecordGsEmulationIndirect(pipeline, Regs(), is_indexed, indirect.args, stride,
+                                            max_count, count_address);
+        is_indexed = false; // the guest index buffer is read by the ES
+    }
     // Without the feature vkCmdDraw*IndirectCount is invalid. See docs/macos/feature-audit.md.
-    if (FeatureChecks::DrawIndirectCountUnsupported(count_address,
+    if (!gs_draw.indirect && FeatureChecks::DrawIndirectCountUnsupported(count_address,
                                                     instance.IsDrawIndirectCountSupported())) {
         UNREACHABLE_MSG("macOS: indirect draw with a GPU count at {:#x} (max {} draws) needs "
                         "drawIndirectCount, which this device lacks",
@@ -1274,6 +1279,11 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
         return;
     }
     const auto state = BeginRendering(pipeline);
+#ifdef __APPLE__
+    if (gs_draw.ended_pass && *gs_draw.ended_pass == state) {
+        gs_stats.splits.fetch_add(1, std::memory_order_relaxed);
+    }
+#endif
 
     BindVertexBuffers(pipeline);
     if (is_indexed) {
@@ -1310,6 +1320,22 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
     MarkPass(pipeline, state);
     scheduler.BeginRendering(state);
 
+#ifdef __APPLE__
+    if (gs_draw.indirect) {
+        const vk::Pipeline gs_handle = pipeline->Handle();
+        scheduler.Record([=](vk::CommandBuffer cmdbuf) {
+            cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, gs_handle);
+            cmdbuf.bindIndexBuffer(gs_draw.index_buffer, gs_draw.index_offset,
+                                   vk::IndexType::eUint32);
+            cmdbuf.drawIndexedIndirect(gs_draw.index_buffer, gs_draw.indirect_offset, 1,
+                                       sizeof(VkDrawIndexedIndirectCommand));
+        });
+        DebugState.IncDrawCall();
+        ResetBindings(false);
+        scheduler.KickRecording();
+        return;
+    }
+#endif
     ASSERT(stride == (is_indexed ? sizeof(VkDrawIndexedIndirectCommand)
                                  : sizeof(VkDrawIndirectCommand)));
     const vk::Pipeline handle = pipeline->Handle();
@@ -1474,6 +1500,9 @@ void Rasterizer::Finish() {
 }
 
 void Rasterizer::OnSubmit() {
+#ifdef __APPLE__
+    CheckGsEmulationErrors();
+#endif
     DrainDrawPipe();
     if (fault_process_pending) {
         fault_process_pending = false;

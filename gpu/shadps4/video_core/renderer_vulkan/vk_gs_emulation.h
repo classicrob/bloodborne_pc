@@ -45,11 +45,14 @@ struct GsEmulationBinding {
     u64 index_size{};
 };
 
-/// The emulated draw: an indexed strip draw over the GS's index runs.
+/// The emulated draw: an indexed strip draw over the GS's index runs. Indirect ES/GS draws take the
+/// count from a VkDrawIndexedIndirectCommand the setup kernel wrote (`indirect_offset`).
 struct GsEmulationDraw {
     vk::Buffer index_buffer{};
     u64 index_offset{};
     u32 index_count{};
+    bool indirect{};
+    u64 indirect_offset{};
     /// The render pass the compute passes ended, if one was open: a split only if the draw then
     /// begins the same pass again.
     std::optional<RenderState> ended_pass{};

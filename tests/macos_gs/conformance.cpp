@@ -73,6 +73,18 @@ struct Case {
     u32 instances;
     Index index;
     u32 index_skip_bytes; // guest index data starts this far into the bound range
+    // Indirect draw: the production setup kernel (gs_indirect_setup.comp) reads a
+    // VkDraw[Indexed]IndirectCommand; indexed ones use firstIndex = IndirectFirst.
+    bool indirect = false;
+    bool overflow = false; // scratch too small: must draw nothing and report
+};
+constexpr u32 IndirectFirst = 3;
+
+/// Push constants of gs_indirect_setup.comp (vk_gs_emulation.cpp SetupParams).
+struct SetupParams {
+    u32 args_skip, indexed, index_kind, index_skip, index_count;
+    u32 verts_per_prim, invocations, max_vert_out, esgs_dwords, vertex_dwords, run_length;
+    u32 capacity_dwords;
 };
 
 u32 VertsPerPrim(AmdGpu::PrimitiveType t) {
@@ -664,10 +676,11 @@ bool RunCase(const Case& k, const std::string& spv_dir) {
 
     // Scratch, laid out as RecordGsEmulation does.
     const u64 slots = u64(prims) * k.instances;
-    const u64 esgs_base = GsEmu::HeaderDwords;
+    const u64 esgs_base = k.indirect ? GsEmu::IndirectDwords : GsEmu::HeaderDwords;
     const u64 gsvs_base = esgs_base + u64(k.records) * k.instances * EsDwords;
     const u64 index_base = gsvs_base + slots * n * OutDwords;
-    const u64 bytes = (index_base + slots * run_length) * 4;
+    const u64 needed_bytes = (index_base + slots * run_length) * 4;
+    const u64 bytes = k.overflow ? needed_bytes - 4 : needed_bytes;
     Buffer scratch = MakeBuffer(bytes);
     std::memset(scratch.data, 0xCD, bytes); // unwritten records stay recognisable
     u32* header = reinterpret_cast<u32*>(scratch.data);
@@ -682,15 +695,16 @@ bool RunCase(const Case& k, const std::string& spv_dir) {
     // Guest index buffer: data starts index_skip_bytes into the bound range, which is rounded up to
     // whole dwords and padded with a canary dword.
     const u32 index_size = k.index == Index::U16 ? 2 : 4;
-    const u64 index_bytes = u64(k.index_skip_bytes) + u64(k.records) * index_size;
+    const u32 gap = k.indirect && k.index != Index::None ? IndirectFirst : 0;
+    const u64 index_bytes = u64(k.index_skip_bytes) + u64(gap + k.records) * index_size;
     Buffer index_buffer = MakeBuffer((index_bytes + 3) / 4 * 4 + 4);
     std::memset(index_buffer.data, 0xEE, index_buffer.size);
     for (u32 i = 0; i < k.records; ++i) {
         if (k.index == Index::U16) {
             const u16 v = u16(indices[i]);
-            std::memcpy(index_buffer.data + k.index_skip_bytes + i * 2, &v, 2);
+            std::memcpy(index_buffer.data + k.index_skip_bytes + (gap + i) * 2, &v, 2);
         } else {
-            std::memcpy(index_buffer.data + k.index_skip_bytes + i * 4, &indices[i], 4);
+            std::memcpy(index_buffer.data + k.index_skip_bytes + (gap + i) * 4, &indices[i], 4);
         }
     }
     header[GsEmu::IndexKind] = u32(k.index == Index::None  ? GsEmu::IndexKind::None
@@ -744,36 +758,87 @@ bool RunCase(const Case& k, const std::string& spv_dir) {
                          tris ? VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST : VK_PRIMITIVE_TOPOLOGY_LINE_LIST,
                          false, true);
 
-    const Expected want = Model(k, vertex_ids);
+    Expected want = k.overflow ? Expected{} : Model(k, vertex_ids);
     Buffer vertices = MakeBuffer(std::max<u64>(want.list.size(), 1) * sizeof(Vertex));
     std::memcpy(vertices.data, want.list.data(), want.list.size() * sizeof(Vertex));
+    // Indirect: the guest command, the error words and the production setup kernel.
+    Buffer args = MakeBuffer(64), errors = MakeBuffer(16);
+    VkPipeline setup_pipe = VK_NULL_HANDLE;
+    Layout setup_layout{};
+    SetupParams setup{};
+    if (k.indirect) {
+        const u32 base_vertex = BaseVertex + (g_control == "base-vertex" ? 1 : 0);
+        const u32 command[5] = {k.records, k.instances,
+                                k.index != Index::None ? IndirectFirst : base_vertex,
+                                k.index != Index::None ? base_vertex : 0u, 0u};
+        std::memcpy(args.data + 4, command, sizeof(command)); // one dword in: args_skip
+        setup = {.args_skip = 1,
+                 .indexed = k.index != Index::None,
+                 .index_kind = u32(k.index == Index::U16 ? GsEmu::IndexKind::U16
+                                                         : GsEmu::IndexKind::U32),
+                 .index_skip = k.index_skip_bytes / index_size,
+                 .index_count = gap + k.records,
+                 .verts_per_prim = per,
+                 .invocations = 1,
+                 .max_vert_out = n,
+                 .esgs_dwords = EsDwords,
+                 .vertex_dwords = OutDwords,
+                 .run_length = run_length,
+                 .capacity_dwords = u32(bytes / 4)};
+        // The CPU header is not used: the kernel writes it.
+        std::memset(scratch.data, 0xCD, GsEmu::IndirectDwords * 4);
+        std::vector<VkDescriptorBufferInfo> r = {{args.buffer, 0, 64},
+                                                 {scratch.buffer, 0, bytes},
+                                                 {errors.buffer, 0, 16}};
+        setup_layout = MakeLayout(VK_SHADER_STAGE_COMPUTE_BIT, r);
+        // MakeLayout's push range is PushData-sized, which covers SetupParams.
+        setup_pipe = ComputePipeline(Module(ReadFile(spv_dir + "/gs_indirect_setup.comp.spv")),
+                                     setup_layout.layout);
+    }
     const Target target = MakeTarget();
     Buffer image = MakeBuffer(u64(Size) * Size * 16), ref_image = MakeBuffer(u64(Size) * Size * 16);
     const Shader::PushData push{};
 
     // Emulated draw.
     Begin();
+    if (k.indirect) {
+        vkCmdBindPipeline(g.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, setup_pipe);
+        vkCmdBindDescriptorSets(g.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, setup_layout.layout, 0, 1,
+                                &setup_layout.set, 0, nullptr);
+        vkCmdPushConstants(g.cmd, setup_layout.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                           sizeof(setup), &setup);
+        vkCmdDispatch(g.cmd, 1, 1, 1);
+        Barrier(VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
+    }
     vkCmdBindPipeline(g.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, es_pipe);
     vkCmdBindDescriptorSets(g.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, es_layout.layout, 0, 1,
                             &es_layout.set, 0, nullptr);
     vkCmdPushConstants(g.cmd, es_layout.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
-    vkCmdDispatch(g.cmd, (k.records + GsEmu::WorkgroupSize - 1) / GsEmu::WorkgroupSize,
-                  k.instances, 1);
+    if (k.indirect) {
+        vkCmdDispatchIndirect(g.cmd, scratch.buffer, GsEmu::EsDispatch * 4);
+    } else {
+        vkCmdDispatch(g.cmd, (k.records + GsEmu::WorkgroupSize - 1) / GsEmu::WorkgroupSize,
+                      k.instances, 1);
+    }
     Barrier(VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
     vkCmdBindPipeline(g.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, gs_pipe);
     vkCmdBindDescriptorSets(g.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, gs_layout.layout, 0, 1,
                             &gs_layout.set, 0, nullptr);
     vkCmdPushConstants(g.cmd, gs_layout.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
-    if (prims) {
+    if (k.indirect) {
+        vkCmdDispatchIndirect(g.cmd, scratch.buffer, GsEmu::GsDispatch * 4);
+    } else if (prims) {
         vkCmdDispatch(g.cmd, (prims + GsEmu::WorkgroupSize - 1) / GsEmu::WorkgroupSize, k.instances,
                       1);
     }
     Barrier(VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
             VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_2_INDEX_INPUT_BIT |
-                VK_PIPELINE_STAGE_2_COPY_BIT,
+                VK_PIPELINE_STAGE_2_COPY_BIT | VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT,
             VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_INDEX_READ_BIT |
-                VK_ACCESS_2_TRANSFER_READ_BIT);
+                VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT);
     Render(target, image, [&] {
         vkCmdBindPipeline(g.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, draw_pipe);
         vkCmdBindDescriptorSets(g.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, draw_layout.layout, 0, 1,
@@ -781,7 +846,11 @@ bool RunCase(const Case& k, const std::string& spv_dir) {
         vkCmdPushConstants(g.cmd, draw_layout.layout,
                            VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
                            sizeof(push), &push);
-        if (slots) {
+        if (k.indirect) {
+            vkCmdBindIndexBuffer(g.cmd, scratch.buffer, 0, VK_INDEX_TYPE_UINT32);
+            vkCmdDrawIndexedIndirect(g.cmd, scratch.buffer, GsEmu::StripDraw * 4, 1,
+                                     sizeof(VkDrawIndexedIndirectCommand));
+        } else if (slots) {
             vkCmdBindIndexBuffer(g.cmd, scratch.buffer, index_base * 4, VK_INDEX_TYPE_UINT32);
             vkCmdDrawIndexed(g.cmd, u32(slots * run_length), 1, 0, 0, 0);
         }
@@ -809,9 +878,26 @@ bool RunCase(const Case& k, const std::string& spv_dir) {
 
     // Compare.
     std::string failures;
+    if (k.indirect) {
+        const u32* e = reinterpret_cast<const u32*>(errors.data);
+        const bool want_report = k.overflow;
+        if ((e[0] != 0) != want_report || (want_report && e[1] != needed_bytes / 4)) {
+            char line[200];
+            std::snprintf(line, sizeof line,
+                          "    setup kernel reports %u (largest need %u dwords, %u index overruns); "
+                          "want %s %llu\n",
+                          e[0], e[1], e[2], want_report ? "a report of" : "none, need",
+                          (unsigned long long)(needed_bytes / 4));
+            failures += line;
+        }
+        if (k.overflow) {
+            // Nothing else is meaningful: the draw must be empty.
+            want.runs.clear();
+        }
+    }
     const u32* runs = reinterpret_cast<const u32*>(scratch.data) + index_base;
     u32 run_diffs = 0;
-    for (size_t i = 0; i < want.runs.size(); ++i) {
+    for (size_t i = 0; i < want.runs.size() && !k.overflow; ++i) {
         if (runs[i] != want.runs[i] && run_diffs++ < 8) {
             char line[160];
             std::snprintf(line, sizeof line, "    index run entry %zu (slot %zu): got %#x want %#x\n",
@@ -837,7 +923,7 @@ bool RunCase(const Case& k, const std::string& spv_dir) {
     }
     u32 esgs_diffs = 0;
     const float* esgs = reinterpret_cast<const float*>(scratch.data) + esgs_base;
-    for (u32 inst = 0; inst < k.instances; ++inst) {
+    for (u32 inst = 0; inst < (k.overflow ? 0 : k.instances); ++inst) {
         for (u32 i = 0; i < k.records; ++i) {
             const float* got = esgs + (u64(inst) * k.records + i) * EsDwords;
             const float want_rec[EsDwords] = {float(vertex_ids[i]), float(inst), 0.0f, 1.0f};
@@ -864,14 +950,15 @@ bool RunCase(const Case& k, const std::string& spv_dir) {
             failures += line;
         }
     }
-    const bool pass = run_diffs == 0 && record_diffs == 0 && esgs_diffs == 0 && pixel_diffs == 0;
+    const bool pass = failures.empty();
     std::printf("%-58s %s  (%u slots, %zu emitted, %zu list vertices, %u px covered)\n", k.name,
                 pass ? "PASS" : "FAIL", u32(slots), want.records.size(), want.list.size(), covered);
     if (!pass) {
         std::printf("    %u index-run, %u GSVS record, %u ESGS record, %u pixel differences\n%s",
                     run_diffs, record_diffs, esgs_diffs, pixel_diffs, failures.c_str());
     }
-    for (Buffer* buf : {&scratch, &index_buffer, &zero, &vertices, &image, &ref_image}) {
+    for (Buffer* buf : {&scratch, &index_buffer, &zero, &vertices, &image, &ref_image, &args,
+                        &errors}) {
         FreeBuffer(*buf);
     }
     return pass;
@@ -910,6 +997,10 @@ int main(int argc, char** argv) {
         {"points -> line strips, N=8", P::PointList, O::LineStrip, 8, 64, 1, Index::None, 0},
         {"points, 5000: many workgroups, partial last group", P::PointList, O::TriangleStrip, 8, 5000, 1, Index::None, 0},
         {"points, N=32", P::PointList, O::TriangleStrip, 32, 256, 1, Index::None, 0},
+        {"indirect: points, N=8, 3 instances", P::PointList, O::TriangleStrip, 8, 64, 3, Index::None, 0, true},
+        {"indirect: u16, firstIndex 3, 2-byte skip, 2 instances", P::PointList, O::TriangleStrip, 8, 37, 2, Index::U16, 2, true},
+        {"indirect: triangle list in, u32, N=4", P::TriangleList, O::TriangleStrip, 4, 60, 1, Index::U32, 0, true},
+        {"indirect: scratch one dword short -> empty + report", P::PointList, O::TriangleStrip, 8, 64, 1, Index::None, 0, true, true},
     };
     InitGpu();
     int failed = 0, ran = 0;
