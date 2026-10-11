@@ -16,6 +16,7 @@
 #include <time.h>
 #include <SDL3/SDL.h>
 #include <sys/stat.h>
+#include <stdatomic.h>
 
 #define ERR_INVALID_ARG ((int32_t)0x80920001)
 #define ERR_INVALID_HANDLE ((int32_t)0x80920003)
@@ -60,6 +61,14 @@ static int initialized, opened, sdl_ready;
 static SDL_Gamepad *gamepad;
 static size_t reads;
 static uint8_t connected_count;
+#ifdef __APPLE__
+static _Atomic size_t pad_failures;
+static void pad_failure(const char *operation) {
+    size_t n=atomic_fetch_add_explicit(&pad_failures,1,memory_order_relaxed)+1;
+    if (n<=16 || n%1024==0)
+        fprintf(stderr,"CONTROLLER FAILURE #%zu: %s: %s\n",n,operation,SDL_GetError());
+}
+#endif
 
 static uint64_t now_us(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return (uint64_t)t.tv_sec*1000000u+(uint64_t)t.tv_nsec/1000u; }
 static uint8_t axis(int16_t v) { int x=(v+32768)>>8; return (uint8_t)(x<0 ? 0 : x>255 ? 255 : x); }
@@ -75,15 +84,31 @@ static void touch_click(PadData *d, int right) {
 
 /* Opens the first gamepad SDL knows about; called under lock. */
 static SDL_Gamepad *current_gamepad(void) {
-    if (!sdl_ready) sdl_ready = SDL_WasInit(SDL_INIT_GAMEPAD) ? 1 : SDL_InitSubSystem(SDL_INIT_GAMEPAD) ? 1 : -1;
+    if (!sdl_ready) {
+        sdl_ready = SDL_WasInit(SDL_INIT_GAMEPAD) ? 1 : SDL_InitSubSystem(SDL_INIT_GAMEPAD) ? 1 : -1;
+#ifdef __APPLE__
+        if (sdl_ready<0) pad_failure("SDL gamepad initialization");
+#endif
+    }
     if (sdl_ready<0) return NULL;
     if (gamepad && !SDL_GamepadConnected(gamepad)) { SDL_CloseGamepad(gamepad); gamepad=NULL; }
     if (!gamepad) {
         int count=0;
         SDL_JoystickID *ids=SDL_GetGamepads(&count);
+#ifdef __APPLE__
+        if (!ids) pad_failure("SDL gamepad enumeration");
+#endif
         if (ids && count>0) {
             gamepad=SDL_OpenGamepad(ids[0]);
-            if (gamepad) { ++connected_count; printf("Runtime: gamepad connected: %s\n",SDL_GetGamepadName(gamepad)); }
+            if (gamepad) {
+                ++connected_count;
+                const char *name=SDL_GetGamepadName(gamepad);
+                printf("Runtime: gamepad connected: %s (vendor %04x product %04x)\n",
+                       name ? name : "<unavailable>",SDL_GetGamepadVendor(gamepad),SDL_GetGamepadProduct(gamepad));
+            }
+#ifdef __APPLE__
+            else pad_failure("SDL gamepad open");
+#endif
         }
         SDL_free(ids);
     }
@@ -346,7 +371,14 @@ static ABI int32_t pad_vibration(int32_t handle, const uint8_t *param) {
     if (!param) return ERR_INVALID_ARG;
     pthread_mutex_lock(&lock);
     SDL_Gamepad *g=current_gamepad();
-    if (g) SDL_RumbleGamepad(g,(uint16_t)(param[0]*257),(uint16_t)(param[1]*257),1000);
+    if (g) {
+        bool ok=SDL_RumbleGamepad(g,(uint16_t)(param[0]*257),(uint16_t)(param[1]*257),1000);
+#ifdef __APPLE__
+        if (!ok) pad_failure("SDL gamepad rumble");
+#else
+        (void)ok;
+#endif
+    }
     pthread_mutex_unlock(&lock);
     return 0;
 }
@@ -362,4 +394,9 @@ static const RuntimeExport exports[]={
     {"scePadSetMotionSensorState",pad_ok_handle_flag},
 };
 uintptr_t runtime_pad_resolve(const char *name) { return RUNTIME_LOOKUP(exports,name); }
-void runtime_pad_report(void) { printf("Runtime: pad reads=%zu, gamepad=%s\n",reads,gamepad ? SDL_GetGamepadName(gamepad) : "none"); }
+void runtime_pad_report(void) {
+    printf("Runtime: pad reads=%zu, gamepad=%s\n",reads,gamepad ? SDL_GetGamepadName(gamepad) : "none");
+#ifdef __APPLE__
+    printf("Runtime: controller backend failures=%zu\n",atomic_load_explicit(&pad_failures,memory_order_relaxed));
+#endif
+}
