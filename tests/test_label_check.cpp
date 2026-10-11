@@ -22,6 +22,7 @@
 #include "bbport_label_mode.h"
 #include "bbport_label_store.h"
 #include "bbport_parse_split.h"
+#include "bbport_compute_sh.h"
 #include "bbport_frame_marks.h"
 #include "bbport_label_sequencer.h"
 
@@ -394,9 +395,19 @@ int main() {
         });
         last.flips_parsed = 7;
         last.pointer = {true, true, 0x7039500100, 41, 5};
+        last.pointer_high = last.pointer;
         last.dump = {true, 0x70437a7200, 0x100, 40, 6};
         const std::string named = LastRead();
+        last.pointer_high = {true, true, 0x7039500180, 41, 6};
+        last.dump = {true, 0x70437a7200, 0x100, 40, 9}; // recorded after the read's sample
+        const std::string split = LastRead();
+        last.pointer_high = last.pointer;
+        last.dump = {true, 0x70437a7200, 0x100, 40, 6};
+        last.pointer = {true, true, 0x7039500200, 0, 7, 3};
+        last.pointer_high = last.pointer;
+        const std::string from_compute = LastRead();
         last.pointer = {true, false, 0, 0, 0};
+        last.pointer_high = last.pointer;
         last.dump = {};
         const std::string unwritten = LastRead();
         last.pointer = {};
@@ -404,13 +415,19 @@ int main() {
         region_lookup.store(nullptr);
         Expect("  ... the stop says which SET_SH_REG last wrote the table pointer and how long ago, "
                "and any DUMP_CONST_RAM of ours over the bytes",
-               named.find("last written by SET_SH_REG at 0x7039500100 (submission 41), 2 flip "
-                          "packet(s) before this read (an EARLIER frame)") != std::string::npos &&
-                   named.find("our DUMP_CONST_RAM to [0x70437a7200, +256) (submission 40), 1 "
-                              "flip packet(s) before") != std::string::npos &&
-                   unwritten.find("not written by any SET_SH_REG since the check started") !=
-                       std::string::npos &&
-                   elsewhere.find("not in the GPU command thread's register file") !=
+               named.find("(low word) was last written by a SET_SH_REG of the graphics stream "
+                          "at 0x7039500100 (submission 41), 2 flip packet(s) before this read "
+                          "(an EARLIER frame") != std::string::npos &&
+                   from_compute.find("a SET_SH_REG of compute queue 3 at") != std::string::npos &&
+                   named.find("went to [0x70437a7200, +256) (submission 40), 1 flip "
+                              "packet(s) before") != std::string::npos &&
+                   named.find("high word") == std::string::npos &&
+                   split.find("high word was written separately, by a SET_SH_REG of the "
+                              "graphics stream at 0x7039500180") != std::string::npos &&
+                   split.find("after this read's frame sample") != std::string::npos &&
+                   unwritten.find("not written by any tracked SET_SH_REG since the check "
+                                  "started") != std::string::npos &&
+                   elsewhere.find("not a tracked graphics user-data register") !=
                        std::string::npos);
         Expect("  ... the stop names the guest mapping holding the read and its other views",
                named.find("guest mapping [0x7043000000, 0x704b000000) (131072 KiB), 1 other") !=
@@ -551,6 +568,18 @@ int main() {
                WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT);
     }
 
+    {
+        const std::uint32_t vs_pointer[2] = {0x43400040, 0x70};
+        BbComputeSh::Note(2, 0x4E, 2, vs_pointer); // VS user data s[2:3]
+        BbComputeSh::Note(2, 0x260, 1, vs_pointer); // above the compute program (0x200..0x250)
+        Expect("compute SET_SH_REG: writes into graphics user data are counted and named",
+               BbComputeSh::IsGraphicsUserData(0x4E) && !BbComputeSh::IsGraphicsUserData(0x4B) &&
+                   !BbComputeSh::IsGraphicsUserData(0x15C) && BbComputeSh::into_graphics == 1 &&
+                   BbComputeSh::into_user_data == 1 && BbComputeSh::above_compute == 1 &&
+                   BbComputeSh::Describe().find("into graphics user data 1, latest: queue 2, SH "
+                                                "0x4e, 2 word(s), first 0x43400040") !=
+                       std::string::npos);
+    }
     BbFrameMarks::attempted.Note(12);
     BbFrameMarks::attempted.Note(13);
     BbFrameMarks::parsed.Note(0);

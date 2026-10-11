@@ -139,7 +139,9 @@ struct Liverpool {
     /// register file, and our latest DUMP_CONST_RAM over [address, address + size).
     static void LookupOrigin(void* owner, const void* pointer_word, u64 address, u64 size,
                              BbCmdData::PointerOrigin& pointer, BbCmdData::DumpOrigin& dump);
-    void NoteShWrite(const PM4Header* header, u64 guest_packet, u64 submission);
+    /// `compute_queue` -1: the graphics stream.
+    void NoteShWrite(const PM4Header* header, u64 guest_packet, u64 submission,
+                     s32 compute_queue = -1);
     void NoteConstDump(u64 dst, u64 bytes, u64 submission);
     std::mutex origin_mutex; ///< provenance: written by the GPU command thread, read by any
     static constexpr u32 OriginShWords = 0x200; ///< the graphics SH registers

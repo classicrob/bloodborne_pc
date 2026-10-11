@@ -307,16 +307,20 @@ struct PointerOrigin {
     std::uint64_t packet = 0;         ///< that packet's guest address
     std::uint64_t submission = 0;     ///< its submission (0: none known)
     std::uint64_t flips_parsed = 0;   ///< flip packets parsed when it was written
+    std::int32_t compute_queue = -1;  ///< the writer was this compute queue's SET_SH_REG
 };
 /// Our own latest write over the table's bytes, if a recent DUMP_CONST_RAM made one.
 struct DumpOrigin {
     bool found = false;
     std::uint64_t dst = 0, bytes = 0, submission = 0, flips_parsed = 0;
 };
-/// The owner's provenance lookup (Liverpool): `pointer_word` is the user-data word read for the
-/// table pointer (nullptr: none), [address, address + size) the table bytes read.
+/// The owner's provenance lookup (Liverpool): `pointer_word` is the low user-data word of the
+/// 64-bit table pointer (nullptr: none; the high word follows it), [address, address + size)
+/// the table bytes read. `flips_now` is the flip sample of this read, taken under the owner's
+/// lock so that no recorded origin is newer than it.
 using OriginFn = void (*)(void* owner, const void* pointer_word, std::uint64_t address,
-                          std::uint64_t size, PointerOrigin& pointer, DumpOrigin& dump);
+                          std::uint64_t size, PointerOrigin& low, PointerOrigin& high,
+                          DumpOrigin& dump, std::uint64_t& flips_now);
 
 namespace detail {
 // Lifetime: a lookup holds `registry` shared for its whole use of the owner, so Unregister
@@ -354,10 +358,12 @@ inline Result Lookup(std::uint64_t address, std::uint64_t size, const void* byte
 
 /// Provenance through the registered owner (nothing known when none).
 inline void LookupOrigin(const void* pointer_word, std::uint64_t address, std::uint64_t size,
-                         PointerOrigin& pointer, DumpOrigin& dump) {
+                         PointerOrigin& low, PointerOrigin& high, DumpOrigin& dump,
+                         std::uint64_t& flips_now) {
     std::shared_lock lk{detail::registry};
     if (detail::origin_fn) {
-        detail::origin_fn(detail::lookup_owner, pointer_word, address, size, pointer, dump);
+        detail::origin_fn(detail::lookup_owner, pointer_word, address, size, low, high, dump,
+                          flips_now);
     }
 }
 
@@ -468,7 +474,7 @@ struct Observation {
     const char* kind = nullptr;
     std::uint64_t shader = 0, address = 0, size = 0;
     Result result;
-    PointerOrigin pointer;
+    PointerOrigin pointer, pointer_high; ///< the table pointer's low and high words
     DumpOrigin dump;
     std::uint64_t flips_parsed = 0; ///< flip packets parsed at the read
 };
@@ -486,8 +492,9 @@ inline void NoteRead(const char* kind, std::uint64_t shader_hash, const void* ad
     const auto at = reinterpret_cast<std::uint64_t>(address);
     Result r = Lookup(at, size, bytes_read);
     ReadStatus(r);
-    last = {kind, shader_hash, at, size, r, {}, {}, flips_parsed.load(std::memory_order_relaxed)};
-    LookupOrigin(pointer_word, at, size, last.pointer, last.dump);
+    last = {kind, shader_hash, at, size, r, {}, {}, {}, flips_parsed.load(std::memory_order_relaxed)};
+    LookupOrigin(pointer_word, at, size, last.pointer, last.pointer_high, last.dump,
+                 last.flips_parsed);
     const bool notable = (r.where == Where::Inside && r.selected_differs) ||
                          r.where == Where::ChunkTail || r.where == Where::Straddles;
     std::scoped_lock lk{detail::mutex};
@@ -552,33 +559,73 @@ inline std::string LastRead() {
                   static_cast<unsigned long long>(last.address),
                   static_cast<unsigned long long>(last.size));
     std::string out = text + Describe(last.result);
-    char origin[256];
+    char origin[320];
+    // Frames between an origin and this read; origins are recorded under the owner's lock the
+    // read's flip sample was taken under, so none should be newer: say so if one is.
+    const auto age = [](std::uint64_t then, std::uint64_t now) {
+        char text[96];
+        if (then > now) {
+            std::snprintf(text, sizeof(text), "after this read's frame sample");
+        } else {
+            std::snprintf(text, sizeof(text), "%llu flip packet(s) before this read%s",
+                          static_cast<unsigned long long>(now - then),
+                          now == then ? " (this frame)"
+                                      : " (an EARLIER frame: retained state is a candidate, not "
+                                        "by itself a defect)");
+        }
+        return std::string(text);
+    };
+    const auto writer = [](const PointerOrigin& p) {
+        char text[64] = "the graphics stream";
+        if (p.compute_queue >= 0) {
+            std::snprintf(text, sizeof(text), "compute queue %d", p.compute_queue);
+        }
+        return std::string(text);
+    };
     const auto& p = last.pointer;
     if (!p.in_register_file) {
         std::snprintf(origin, sizeof(origin),
-                      "; its table pointer is not in the GPU command thread's register file");
+                      "; its table pointer is not a tracked graphics user-data register (a host "
+                      "snapshot such as stage B or draw preparation, compute queue state, or a "
+                      "spilled slot; not by itself proof of a spill)");
     } else if (!p.written) {
         std::snprintf(origin, sizeof(origin),
-                      "; its table pointer was not written by any SET_SH_REG since the check "
-                      "started (state older than the check)");
+                      "; its table pointer (low word) was not written by any tracked SET_SH_REG "
+                      "since the check started (state older than the check)");
     } else {
         std::snprintf(origin, sizeof(origin),
-                      "; its table pointer was last written by SET_SH_REG at %#llx (submission "
-                      "%llu), %llu flip packet(s) before this read%s",
-                      static_cast<unsigned long long>(p.packet),
+                      "; its table pointer (low word) was last written by a SET_SH_REG of %s at "
+                      "%#llx (submission %llu), %s",
+                      writer(p).c_str(), static_cast<unsigned long long>(p.packet),
                       static_cast<unsigned long long>(p.submission),
-                      static_cast<unsigned long long>(last.flips_parsed - p.flips_parsed),
-                      last.flips_parsed == p.flips_parsed ? " (this frame)" : " (an EARLIER frame)");
+                      age(p.flips_parsed, last.flips_parsed).c_str());
     }
     out += origin;
+    const auto& h = last.pointer_high;
+    if (p.in_register_file &&
+        (h.written != p.written || h.packet != p.packet || h.compute_queue != p.compute_queue)) {
+        if (!h.written) {
+            std::snprintf(origin, sizeof(origin),
+                          "; its high word was not written by any tracked SET_SH_REG");
+        } else {
+            std::snprintf(origin, sizeof(origin),
+                          "; its high word was written separately, by a SET_SH_REG of %s at "
+                          "%#llx (submission %llu), %s",
+                          writer(h).c_str(), static_cast<unsigned long long>(h.packet),
+                          static_cast<unsigned long long>(h.submission),
+                          age(h.flips_parsed, last.flips_parsed).c_str());
+        }
+        out += origin;
+    }
     if (last.dump.found) {
         std::snprintf(origin, sizeof(origin),
-                      "; the table bytes were last written by our DUMP_CONST_RAM to [%#llx, +%llu) "
-                      "(submission %llu), %llu flip packet(s) before this read",
+                      "; our newest observed DUMP_CONST_RAM overlapping the table bytes (not "
+                      "necessarily their last writer: CPU and other writes are not tracked) went "
+                      "to [%#llx, +%llu) (submission %llu), %s",
                       static_cast<unsigned long long>(last.dump.dst),
                       static_cast<unsigned long long>(last.dump.bytes),
                       static_cast<unsigned long long>(last.dump.submission),
-                      static_cast<unsigned long long>(last.flips_parsed - last.dump.flips_parsed));
+                      age(last.dump.flips_parsed, last.flips_parsed).c_str());
         out += origin;
     }
     std::uint64_t start = 0, end = 0;
