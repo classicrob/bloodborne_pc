@@ -1,6 +1,7 @@
 // window_tool: helpers for tools/macos/play_route.py (native arm64, never translated).
 //   window_tool window <pid>   prints the CGWindowID of the largest on-screen layer-0 window
 //                              owned by <pid>; exits 2 when there is none.
+//   window_tool diff <a> <b>   prints the fraction of changed pixels (largest channel delta > 24).
 //   window_tool stats <png>    prints JSON image statistics: width, height, the fraction of
 //                              pixels with any RGB channel above 16, and the mean luma (0..255).
 import CoreGraphics
@@ -13,7 +14,7 @@ func fail(_ message: String, _ code: Int32) -> Never {
 }
 
 let args = CommandLine.arguments
-guard args.count == 3 else { fail("usage: window_tool window <pid> | stats <png>", 64) }
+guard args.count >= 3 else { fail("usage: window_tool window <pid> | stats <png> | diff <a> <b>", 64) }
 
 switch args[1] {
 case "window":
@@ -54,6 +55,31 @@ case "stats":
     }
     let count = Double(width * height)
     print("{\"width\": \(width), \"height\": \(height), \"nonblack\": \(Double(nonblack) / count), \"mean_luma\": \(luma / count)}")
+case "diff":
+    // window_tool diff <a.png> <b.png>: the fraction of pixels whose largest channel difference
+    // exceeds 24 (same-size images; a size change counts as fully changed).
+    guard args.count == 4 else { fail("usage: window_tool diff <a> <b>", 64) }
+    func load(_ path: String) -> (Int, Int, [UInt8]) {
+        guard let source = CGImageSourceCreateWithURL(URL(fileURLWithPath: path) as CFURL, nil),
+              let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else { fail("diff: cannot read \(path)", 1) }
+        let w = image.width, h = image.height
+        var px = [UInt8](repeating: 0, count: w * h * 4)
+        px.withUnsafeMutableBytes { b in
+            CGContext(data: b.baseAddress, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
+                      space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                      bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue)!
+                .draw(image, in: CGRect(x: 0, y: 0, width: w, height: h))
+        }
+        return (w, h, px)
+    }
+    let a = load(CommandLine.arguments[2]), b = load(CommandLine.arguments[3])
+    if a.0 != b.0 || a.1 != b.1 { print("{\"changed\": 1.0}"); exit(0) }
+    var changed = 0
+    for i in stride(from: 0, to: a.2.count, by: 4) {
+        let d = max(abs(Int(a.2[i]) - Int(b.2[i])), abs(Int(a.2[i + 1]) - Int(b.2[i + 1])), abs(Int(a.2[i + 2]) - Int(b.2[i + 2])))
+        if d > 24 { changed += 1 }
+    }
+    print("{\"changed\": \(Double(changed) / Double(a.0 * a.1))}")
 default:
-    fail("usage: window_tool window <pid> | stats <png>", 64)
+    fail("usage: window_tool window <pid> | stats <png> | diff <a> <b>", 64)
 }

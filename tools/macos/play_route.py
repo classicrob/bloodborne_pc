@@ -73,6 +73,8 @@ STEPS = {
 #   ('wait_draws', minimum, windows, timeout) that many frame-stats windows since the last press with at least
 #                                             minimum draws/frame in a row
 #   ('press', tokens) / ('sleep', seconds)
+#   ('press_screen', token, min_changed, tries, settle)  press until the window changes that much
+#   ('press_log', token, regex, tries, timeout)          press until a log line matches
 #   ('capture', stage, min_nonblack)          screenshot; fails when the window is darker
 #   ('check_user_cache',)                     the GPU pipeline cache is inside the run's --user
 # A stage that times out, or a game that exits or logs a fatal line, stops the route loudly.
@@ -84,10 +86,10 @@ WORLD = ('world', [('wait_draws', 400, 3, 900), ('sleep', 5), ('capture', 'world
 # New game: Options skips the opening movie (--movie plays it to the end for movie-path coverage).
 NEW_GAME = [
     TITLE, OFFLINE,
-    ('new-game', [('press', 'cross'), ('sleep', 5), ('capture', 'brightness', 0.05)]),
-    ('brightness', [('press', 'down'), ('press', 'cross'), ('sleep', 3), ('capture', 'controls', 0.05)]),
-    ('controls', [('press', 'down')] * 6 + [('capture', 'controls-next', 0.05), ('press', 'cross'),
-                  ('wait_log', r'Init: Opening .*sprj_opening\.mp4', 60), ('sleep', 15),
+    ('new-game', [('press_screen', 'cross', 0.04, 3, 3), ('sleep', 2), ('capture', 'brightness', 0.05)]),
+    ('brightness', [('press', 'down'), ('press_screen', 'cross', 0.04, 3, 3), ('capture', 'controls', 0.05)]),
+    ('controls', [('press', 'down')] * 6 + [('capture', 'controls-next', 0.05),
+                  ('press_log', 'cross', r'Init: Opening .*sprj_opening\.mp4', 2, 30), ('sleep', 15),
                   ('capture', 'opening-movie', 0.05)]),
     ('movie-end', [('wait_log', r'DemuxerThread: Demuxer Thread exited normally', 300), ('sleep', 5),
                    ('capture', 'after-movie', None)]),
@@ -102,8 +104,8 @@ NEW_GAME = [
     WORLD,
 ]
 SKIP_MOVIE = ('controls', [('press', 'down')] * 6 + [
-    ('capture', 'controls-next', 0.05), ('press', 'cross'),
-    ('wait_log', r'Init: Opening .*sprj_opening\.mp4', 60), ('sleep', 3), ('press', 'options'), ('sleep', 3),
+    ('capture', 'controls-next', 0.05), ('press_log', 'cross', r'Init: Opening .*sprj_opening\.mp4', 2, 30),
+    ('sleep', 3), ('press', 'options'), ('sleep', 3),
     ('capture', 'movie-skipped', None)])
 # From a save fixture the title cursor starts on Play Offline (Down would select Play Online), and
 # the offline menu's first entry is Continue.
@@ -438,6 +440,23 @@ def press(run, tokens, seconds=0.12, gap=0.8):
     time.sleep(gap)
 
 
+def snapshot(run, name):
+    """A full-resolution window capture into <run>/tmp (for comparisons, not kept as evidence)."""
+    pid = game_pid(run)
+    tool = window_tool()
+    window = subprocess.run([str(tool), 'window', str(pid)], capture_output=True, text=True)
+    if window.returncode:
+        die('no game window: ' + window.stderr.strip())
+    (run / 'tmp').mkdir(exist_ok=True)
+    target = run / 'tmp' / f'{name}.png'
+    run_checked(['/usr/sbin/screencapture', '-x', '-o', '-l', window.stdout.strip(), str(target)], 'screencapture')
+    return target
+
+
+def screen_changed(a, b):
+    return json.loads(run_checked([str(window_tool()), 'diff', str(a), str(b)], 'image diff'))['changed']
+
+
 def capture(run, stage, min_nonblack=None):
     pid = game_pid(run)
     tool = window_tool()
@@ -605,6 +624,40 @@ def route(run, until, hold=0, stages=NEW_GAME):
             elif op[0] == 'press':
                 mark = len(log_lines(run))
                 press(run, op[1])
+            elif op[0] == 'press_screen':
+                # A press that must change the screen: retried when it was dropped (heavy host load).
+                token, min_changed, tries, settle = op[1:]
+                before = snapshot(run, 'before')
+                for attempt in range(1, tries + 1):
+                    mark = len(log_lines(run))
+                    press(run, token)
+                    time.sleep(settle)
+                    changed = screen_changed(before, snapshot(run, 'after'))
+                    if changed < min_changed:  # a slow fade: look again before pressing again
+                        time.sleep(settle)
+                        changed = screen_changed(before, snapshot(run, 'after'))
+                    event(run, 'press-screen', token=token, attempt=attempt, changed=changed)
+                    if changed >= min_changed:
+                        break
+                else:
+                    die(f'{token} did not change the screen after {tries} presses (stage {name})')
+            elif op[0] == 'press_log':
+                # A press that must produce a log line: retried when it was dropped.
+                token, regex, tries, timeout = op[1:]
+                pattern = re.compile(regex)
+                for attempt in range(1, tries + 1):
+                    mark = len(log_lines(run))
+                    press(run, token)
+                    deadline = time.time() + timeout
+                    while time.time() < deadline and not any(pattern.search(l) for l in log_lines(run)[mark:]):
+                        check_running(run, mark)
+                        time.sleep(1)
+                    hit = any(pattern.search(l) for l in log_lines(run)[mark:])
+                    event(run, 'press-log', token=token, attempt=attempt, matched=hit)
+                    if hit:
+                        break
+                else:
+                    die(f'{token} did not produce {regex!r} after {tries} presses (stage {name})')
             elif op[0] == 'sleep':
                 time.sleep(op[1])
             elif op[0] == 'capture':
