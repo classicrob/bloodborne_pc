@@ -99,6 +99,54 @@ int gcn_format_layout(uint32_t dfmt, uint32_t* ncomp, uint32_t* comp_bytes) {
     }
 }
 
+/* A typed store's VGPR value converted to one component of the number format (§8.1.3 names the
+ * conversions, not their rounding): modelled only where every rounding reading agrees, i.e. the
+ * value is exactly representable. Returns 0 otherwise (the outcome is then unknown).
+ *   UINT/SINT, byte-sized components: the low bits (as the integer stores already modelled).
+ *   FLOAT: 32 bits as is; 16 bits (s5e10), 11 bits (e5m6) and 10 bits (e5m5, both unsigned):
+ *     zero or a normal value whose mantissa needs no rounding; no denormal, Inf/NaN, or a
+ *     negative value for the unsigned widths (-0 included).
+ *   UNORM, byte-sized components: a value in [0, 1] with value * (2^n - 1) an integer. */
+static int store_component(uint32_t data, uint32_t width, uint32_t nfmt, int byte_comp, uint32_t* raw) {
+    if (nfmt == GCN_NFMT_UINT || nfmt == GCN_NFMT_SINT) {
+        if (!byte_comp) return 0;
+        *raw = width >= 32 ? data : data & ((1u << width) - 1);
+        return 1;
+    }
+    if (nfmt == GCN_NFMT_FLOAT) {
+        if (width == 32) {
+            *raw = data;
+            return 1;
+        }
+        const uint32_t mant_bits = width == 16 ? 10 : width == 11 ? 6 : width == 10 ? 5 : 0;
+        if (!mant_bits) return 0;
+        const int has_sign = width == 16;
+        const uint32_t sign = data >> 31;
+        const uint32_t exp = (data >> 23) & 0xFFu, frac = data & 0x7FFFFFu;
+        if (sign && !has_sign) return 0;
+        if (exp == 0 && frac == 0) {
+            *raw = sign << (width - 1);
+            return 1;
+        }
+        const int32_t e = (int32_t)exp - 127;
+        if (exp == 0 || exp == 0xFF || e < -14 || e > 15) return 0;
+        if (frac & ((1u << (23 - mant_bits)) - 1)) return 0;
+        *raw = (has_sign ? sign << 15 : 0) | ((uint32_t)(e + 15) << mant_bits) | (frac >> (23 - mant_bits));
+        return 1;
+    }
+    if (nfmt == GCN_NFMT_UNORM) {
+        if (!byte_comp || width > 16) return 0;
+        float f;
+        memcpy(&f, &data, 4);
+        if (!(f >= 0.0f && f <= 1.0f)) return 0;
+        const double scaled = (double)f * (double)((1u << width) - 1); /* exact in a double */
+        if (scaled != floor(scaled)) return 0;
+        *raw = (uint32_t)scaled;
+        return 1;
+    }
+    return 0;
+}
+
 typedef struct {
     int in_range;
     uint64_t addr; /* touched start (after §8.1.6 alignment for dword+ units) */
@@ -312,10 +360,14 @@ void gcn_execute(const gcn_vsharp* v, const gcn_addr* a, const gcn_op* op, const
             return;
         }
         const int byte_comps = gcn_format_layout(dfmt, &k, &cb);
-        if (op->kind == GCN_STORE && (!byte_comps || (nfmt != GCN_NFMT_UINT && nfmt != GCN_NFMT_SINT &&
-                                                      !(nfmt == GCN_NFMT_FLOAT && cb == 4)))) {
-            out->unknown = 1; /* typed stores model only integer and 32-bit float formats */
-            return;
+        uint32_t stored[4] = {0, 0, 0, 0};
+        if (op->kind == GCN_STORE) {
+            for (uint32_t c = 0; c < k; c++) {
+                if (!store_component(data[c], width[c], nfmt, byte_comps, &stored[c])) {
+                    out->unknown = 1; /* a conversion the model does not decide */
+                    return;
+                }
+            }
         }
         /* A whole element of 4 bytes or more is a "Dword or larger" access (§8.1.6). */
         const unit u = check_unit(v, a, 0, elem, elem >= 4, r);
@@ -330,9 +382,18 @@ void gcn_execute(const gcn_vsharp* v, const gcn_addr* a, const gcn_op* op, const
                 return;
             }
             if (op->kind == GCN_STORE) {
-                for (uint32_t c = 0; c < k; c++) {
-                    write_le(p + c * cb, data[c], cb);
+                if (byte_comps) {
+                    for (uint32_t c = 0; c < k; c++) {
+                        write_le(p + c * cb, stored[c], cb);
+                    }
+                    return;
                 }
+                uint64_t word = 0; /* packed: one element of elem bytes */
+                for (uint32_t c = 0; c < k; c++) {
+                    const uint32_t sh = (r & GCN_R_PACK_MIRROR) ? 32 - shift[c] - width[c] : shift[c];
+                    word |= (uint64_t)stored[c] << sh;
+                }
+                write_le(p, word, elem);
                 return;
             }
             const uint64_t lo = read_le(p, elem < 8 ? elem : 8);
@@ -437,4 +498,27 @@ uint16_t gcn_f32_to_f16_rtz(uint32_t bits, int flush_out) {
     const uint32_t m = shift >= 32 ? 0u : ((0x800000u | frac) >> shift);
     if (flush_out && m != 0) return sign;
     return (uint16_t)(sign | m);
+}
+
+uint32_t gcn_f32_to_ufloat(uint32_t bits, uint32_t mant_bits, unsigned readings) {
+    const uint32_t sign = bits >> 31, e8 = (bits >> 23) & 0xFFu, frac = bits & 0x7FFFFFu;
+    const uint32_t inf = 0x1Fu << mant_bits, max_finite = inf - 1;
+    if (e8 == 0xFF && frac) return (sign && (readings & GCN_UF_NEGNAN0)) ? 0 : GCN_UF_ANY_NAN;
+    if (sign) return 0;          /* -0, negative finite, -Inf: the unsigned clamp */
+    if (e8 == 0xFF) return inf;  /* +Inf */
+    if (e8 == 0) return 0;       /* +0 and f32 denormals (far below 2^-24) */
+    const int32_t e = (int32_t)e8 - 127;
+    if (e < -14 && (readings & GCN_UF_FLUSH)) return 0;
+    const uint64_t sig = (1ull << 23) | frac; /* 1.frac in 24 bits */
+    /* Normal: keep mant_bits below the hidden bit. Denormal: scale to units of 2^(-14-mant_bits). */
+    uint32_t shift = (23 - mant_bits) + (e < -14 ? (uint32_t)(-14 - e) : 0u);
+    if (shift > 40) shift = 40;
+    uint64_t q = sig >> shift;
+    const uint64_t rem = sig & ((1ull << shift) - 1), half = 1ull << (shift - 1);
+    if (!(readings & GCN_UF_RTZ) && (rem > half || (rem == half && (q & 1)))) ++q;
+    /* Normal: biased exponent plus the rounded mantissa (a carry moves into the exponent). Denormal:
+     * q itself (rounding up to 2^mant_bits is the smallest normal, the same encoding). */
+    const uint64_t enc = e < -14 ? q : ((uint64_t)(e + 15) << mant_bits) + (q - (1ull << mant_bits));
+    if (e > 15 || enc > max_finite) return (readings & GCN_UF_INF) ? inf : max_finite;
+    return (uint32_t)enc;
 }

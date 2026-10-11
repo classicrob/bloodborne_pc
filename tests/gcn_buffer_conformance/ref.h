@@ -112,6 +112,20 @@ uint32_t gcn_popcount64(uint64_t x);
  * flushed reading; NaN inputs return 0x7E00 | sign and callers accept any NaN. */
 uint16_t gcn_f32_to_f16_rtz(uint32_t bits, int flush_out);
 
+/* f32 -> unsigned small float (5-bit exponent, bias 15, `mant_bits` 6 or 5: the 11/10-bit fields
+ * of 10_11_11 / 11_11_10). Table 8.13 gives no conversion rules; the readings name each choice
+ * (0 = the EXT_packed_float/Mesa convention): */
+enum {
+    GCN_UF_RTZ = 1 << 0,     /* round toward zero (else to nearest, ties to even) */
+    GCN_UF_INF = 1 << 1,     /* finite overflow gives +Inf (else the largest finite value) */
+    GCN_UF_FLUSH = 1 << 2,   /* results below 2^-14 flush to 0 (else denormals kept) */
+    GCN_UF_NEGNAN0 = 1 << 3, /* a negative NaN gives 0 (else a NaN) */
+    GCN_UF_READINGS = 1 << 4,
+};
+#define GCN_UF_ANY_NAN 0xFFFFFFFFu /* any NaN encoding (exponent all ones, mantissa nonzero) */
+/* Negative values, -0 and -Inf give 0; +Inf gives Inf; f32 denormals give 0. */
+uint32_t gcn_f32_to_ufloat(uint32_t bits, uint32_t mant_bits, unsigned readings);
+
 #ifdef __cplusplus
 }
 #endif

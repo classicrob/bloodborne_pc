@@ -37,6 +37,10 @@
 #if __has_include("video_core/renderer_vulkan/vk_feature_checks.h")
 #include "video_core/renderer_vulkan/vk_feature_checks.h"
 #endif
+#if __has_include("video_core/renderer_vulkan/fill_clear.h")
+#include "video_core/renderer_vulkan/fill_clear.h" // the RT fill replacement's gate (Opus-Renderer)
+#define BB_HAVE_FILL_CLEAR 1
+#endif
 
 #include "gcn_asm.h"
 #include "shader_recompiler/frontend/decode.h"
@@ -148,6 +152,8 @@ struct Template {
     bool fs_count = false;           // pushud-style FS: buffer_atomic_add 1 at its V# (side-effect count)
     u32 smemfb = 0;                  // SmemFallback: 0 in range, 1 mask also stored, 2 mask also a branch, 3 OOB too, 5 OOB through bitwise ops,
                                      // 4 in range with the mask carried around a uniform loop (phi cycle)
+    bool fill = false;               // the SDK fill kernel (FillKernel): 12 user SGPRs + TGID_X, EvaluateFill
+    u32 ufloat = 0;                  // unsigned small floats (EvaluateUfloat): 1 store, 2 load, 3 store then reload
     u32 Threads() const { return wg[0] * wg[1] * wg[2]; }
     std::vector<u32> code;
     u64 hash = 0;
@@ -202,6 +208,8 @@ struct Job {
     u32 db_binding = ~0u;      // fragment: Info::depth_bounds_binding when the tree emulates depth bounds
     std::vector<VertexAttr> vattrs; // fixed-function vertex inputs of the permutation
     std::array<u32, 8> vtable{};    // vertex/srt jobs: table at s[2:3] (V# in dwords 0..3, constant in 4)
+    std::array<u32, 4> fill_value{}; // fill: the float4 the kernel loads and stores (bits)
+    u32 groups = 0;                  // compute dispatch width when not the template's
 };
 
 std::vector<Template> g_templates;
@@ -1000,6 +1008,12 @@ void Assemble(Template& t) {
             c.Mtbuf(t.opcode, t.op.inst_dfmt, t.op.inst_nfmt, f);
         } else {
             c.Mubuf(t.opcode, f);
+        }
+        if (t.ufloat == 3) { // reload the stored element: the quantization must survive
+            c.SWaitcntAll();
+            Code::BufFields r = f;
+            r.vdata = 10;
+            c.Mubuf(BUFFER_LOAD_FORMAT_XYZ, r);
         }
         c.SWaitcntAll();
         if (t.op.kind == GCN_ATOMIC && t.glc) c.VMov(10, Vgpr(5));
@@ -2764,6 +2778,169 @@ void AddDepthBoundsCases() {
 // checks zero in-range accesses. The renderer binds Apple guest pipelines with allocated sets;
 // these jobs bind with push descriptors on purpose. FAIL here is KNOWN-MOLTENVK; a PASS means
 // MoltenVK fixed it.
+// The SDK render-target fill kernel 0x8b355b5a (Opus-Renderer's RT fill replacement, Opus-GS
+// disassembly), re-encoded word for word with gcn_asm.h (BB_FILL_KERNEL_BIN=<.bin> checks the
+// words against the game's binary): s0 = s12 << 6 (s12 = TGID_X after 12 user SGPRs);
+// v0 = s0 + v0; S_BUFFER_LOAD_DWORDX4 s[0:3] from the V# at s[8:11]; v1 = v0 >> 6 (the group);
+// v0 += (0 - v1) << 6; v0 += v1 << 7 (v0 = g*128 + t); two BUFFER_STORE_FORMAT_XYZW (idxen, V# at
+// s[4:7]) of s[0:3] at elements v0 and v0 + 64.
+std::vector<u32> FillKernel() {
+    using namespace GcnAsm;
+    Code c;
+    c.SMovLiteral(VCC_HI, 0xf);
+    c.Sop2(30, 0, 12, Inline(6));     // s_lshl_b32 s0, s12, 6
+    c.Vop2(37, 0, 0, 0);              // v_add_i32 v0, s0, v0
+    c.SBufferLoad(4, 0, 8, true, 0);  // s_buffer_load_dwordx4 s[0:3], s[8:11], 0
+    c.Vop2(22, 1, 0, Inline(6));      // v_lshrrev_b32 v1, 6, v0
+    c.Vop2(38, 2, 1, Inline(0));      // v_sub_i32 v2, 0, v1
+    c.Vop2(26, 2, 2, Inline(6));      // v_lshlrev_b32 v2, 6, v2
+    c.Vop2(37, 0, 2, Vgpr(0));        // v_add_i32 v0, v0, v2
+    c.Vop2(26, 1, 1, Inline(7));      // v_lshlrev_b32 v1, 7, v1
+    c.Vop2(37, 0, 1, Vgpr(0));        // v_add_i32 v0, v0, v1
+    c.words.push_back(0xBF8C007Fu);   // s_waitcnt lgkmcnt(0)
+    for (u32 k = 0; k < 4; ++k) c.VMov(1 + k, k);
+    c.Vop2(37, 5, 0, Inline(64));     // v_add_i32 v5, 64, v0
+    for (u32 k = 0; k < 4; ++k) c.VMov(6 + k, k);
+    c.Mubuf(BUFFER_STORE_FORMAT_XYZW, Code::BufFields{.idxen = true, .vaddr = 0, .vdata = 1, .srsrc = 4});
+    c.Mubuf(BUFFER_STORE_FORMAT_XYZW, Code::BufFields{.idxen = true, .vaddr = 5, .vdata = 6, .srsrc = 4});
+    c.SEndpgm();
+    if (const char* bin = std::getenv("BB_FILL_KERNEL_BIN")) {
+        FILE* f = std::fopen(bin, "rb");
+        if (!f) { std::perror(bin); std::exit(2); }
+        std::vector<u32> game;
+        u32 w;
+        while (game.size() < c.words.size() && std::fread(&w, 4, 1, f) == 1) game.push_back(w);
+        std::fclose(f);
+        if (game != c.words) {
+            std::fprintf(stderr, "fill: the re-encoded kernel differs from %s\n", bin);
+            for (size_t k = 0; k < c.words.size(); ++k) {
+                std::fprintf(stderr, "  %2zu %08x %s\n", k, c.words[k],
+                             k < game.size() ? Hex(game[k]).c_str() : "(missing)");
+            }
+            std::exit(2);
+        }
+        std::printf("fill: the re-encoded kernel matches %s (%zu code words)\n", bin, c.words.size());
+    }
+    return c.words;
+}
+
+constexpr u64 FillConstOffset = 0x1000; // fill: the S_BUFFER_LOAD source, in the job's arena
+
+u32 FloatBits(float f) {
+    u32 u;
+    std::memcpy(&u, &f, 4);
+    return u;
+}
+
+// Opus-Renderer's differential for the RT fill replacement (Sol-2's requirement): the original
+// kernel through the production recompiler, per supported target format, for zero, equal and
+// unequal exactly representable values, over 200 records (256 element slots: the tail dropped) and
+// 256 records, against ref.c's typed stores (check 1) and FillClear::Texel/Pattern (check 2).
+void AddFillCases() {
+    Template t;
+    t.name = "fill-kernel-0x8b355b5a";
+    t.fill = true;
+    t.code = FillKernel();
+    t.hash = 0x8b355b5aull;
+    g_templates.push_back(std::move(t));
+    const u32 tmpl = u32(g_templates.size() - 1);
+#ifndef BB_HAVE_FILL_CLEAR
+    std::printf("fill: video_core/renderer_vulkan/fill_clear.h is not in this tree: check 2 "
+                "(FillClear::Texel/Pattern) is NOT run, check 1 (ref.c) only\n");
+#endif
+    if (std::getenv("BB_FILL_CONTROL")) {
+        std::printf("fill: BB_FILL_CONTROL: expectations use the value's channels rotated; the "
+                    "unequal-value jobs must FAIL\n");
+    }
+    struct F { const char* name; u32 dfmt, nfmt, stride; std::array<float, 4> unequal; };
+    const F formats[] = {{"16_16_16_16 float", GCN_DFMT_16_16_16_16, GCN_NFMT_FLOAT, 8, {1.0f, 0.5f, 0.25f, 2.0f}},
+                         {"10_11_11 float", GCN_DFMT_10_11_11, GCN_NFMT_FLOAT, 4, {1.0f, 0.0f, 2.0f, 0.75f}},
+                         {"8_8_8_8 unorm", GCN_DFMT_8_8_8_8, GCN_NFMT_UNORM, 4, {1.0f, 0.0f, 1.0f, 1.0f}}};
+    for (const F& f : formats) {
+        const std::array<float, 4> values[] = {{0.0f, 0.0f, 0.0f, 0.0f}, {1.0f, 1.0f, 1.0f, 1.0f}, f.unequal};
+        const char* value_names[] = {"zero", "equal 1.0", "unequal"};
+        for (u32 vi = 0; vi < 3; ++vi) {
+            for (u32 records : {200u, 256u}) {
+                Job& j = NewJob("fill", tmpl, StructV(f.stride, records, f.dfmt, f.nfmt), 0);
+                for (u32 c = 0; c < 4; ++c) j.fill_value[c] = FloatBits(values[vi][c]);
+                j.groups = 2;
+                j.label = "fill-kernel-0x8b355b5a | " + std::string(f.name) + " | " +
+                          value_names[vi] + " (" + std::to_string(values[vi][0]) + ", " +
+                          std::to_string(values[vi][1]) + ", " + std::to_string(values[vi][2]) + ", " +
+                          std::to_string(values[vi][3]) + ") | " + std::to_string(records) +
+                          " records, 2 groups";
+            }
+        }
+    }
+}
+
+// 10_11_11 / 11_11_10 FLOAT (orchestrator P0, Sol-2's fix): typed stores of f32 values across the
+// unsigned 11/10-bit float range (exact, ties-even at mantissa carry, the normal/denormal boundary
+// and the top of the range, overflow, denormal results, negatives, -0, +-Inf, +-NaN, f32
+// denormals), typed loads of every special code, and a store reloaded in the same shader. One lane
+// per value, element = lane; one lane past num_records (dropped, reads 0).
+void AddUfloatCases() {
+    using namespace GcnAsm;
+    const TArgs ix{.idxen = true, .offen = false};
+    auto make = [&](const char* name, gcn_kind kind, u32 opcode, u32 mode) {
+        Template t = Base(name, kind, opcode, ix);
+        t.name += " [ufloat]";
+        t.op.typed = 1;
+        t.op.ncomp = 3;
+        t.ufloat = mode;
+        return AddTemplate(t);
+    };
+    const u32 store = make("buffer_store_format_xyz", GCN_STORE, BUFFER_STORE_FORMAT_XYZ, 1);
+    const u32 load = make("buffer_load_format_xyz", GCN_LOAD, BUFFER_LOAD_FORMAT_XYZ, 2);
+    const u32 reload = make("buffer_store_format_xyz, buffer_load_format_xyz", GCN_STORE, BUFFER_STORE_FORMAT_XYZ, 3);
+    auto f = [](float x) { return FloatBits(x); };
+    const std::vector<u32> values = {
+        0x00000000u, f(1.0f), f(0.5f), f(2.0f), f(0.25f), f(3.0f), f(1.5f), f(1234.0f),
+        f(65024.0f), f(64512.0f),                                // 11-bit / 10-bit largest finite
+        f(65025.0f), f(65280.0f), f(65535.0f), f(65536.0f), f(1e10f), 0x7F7FFFFFu, // overflow; 65280 ties at the top
+        f(1.0f + 1.0f / 128), f(1.0f + 3.0f / 128), f(1.0f + 1.0f / 64), f(1.0f + 3.0f / 64), // ties (11 / 10 bit)
+        f(2.0f - 1.0f / 128), f(2.0f - 1.0f / 256), f(1.0f + 5.0f / 256),                     // carry into the exponent
+        f(0x1p-14f), f(0x1p-15f), f(0x1p-20f), f(0x1p-21f), f(0x3p-21f), f(0x1p-19f * 1.5f),  // boundary and denormals
+        f(0x1p-14f * (1.0f - 0x1p-7f)), f(0x1p-25f), f(0x1.234p-17f),                         // denormal rounding
+        f(-1.0f), 0x80000000u, f(-65536.0f), f(-1e-30f),           // negatives, -0
+        0x7F800000u, 0xFF800000u,                                  // +-Inf
+        0x7FC00000u, 0x7F800001u, 0xFFC00000u, 0xFF800001u,        // +-NaN (quiet, signalling)
+        0x00000001u, 0x007FFFFFu,                                  // f32 denormals
+    };
+    const u32 n = u32(values.size());
+    for (u32 dfmt : {u32(GCN_DFMT_10_11_11), u32(GCN_DFMT_11_11_10)}) {
+        const std::string fmt = dfmt == GCN_DFMT_10_11_11 ? "10_11_11" : "11_11_10";
+        for (u32 tmpl : {store, reload}) {
+            for (u32 rot = 0; rot < 2; ++rot) { // all channels equal, then each channel a different value
+                Job& j = NewJob("ufloat", tmpl, StructV(4, n, dfmt, GCN_NFMT_FLOAT), 0);
+                for (u32 k = 0; k < n; ++k) {
+                    SetLane(j, k, k, 0, {values[k], values[(k + rot * 7) % n], values[(k + rot * 13) % n], 0x3F800000u});
+                }
+                SetLane(j, n, n, 0, {values[1], values[1], values[1], 0}); // past num_records: dropped
+                j.label = g_templates[tmpl].name + " | " + fmt + " float | " + std::to_string(n) +
+                          " values" + (rot ? ", channels differ" : ", channels equal");
+            }
+        }
+        // Loads: every special code in each field (x/y 11 or 10 bits by format).
+        const u32 c11[] = {0x000u, 0x001u, 0x03Fu, 0x040u, 0x3C0u, 0x3C1u, 0x7BFu, 0x7C0u, 0x7C1u, 0x7FFu, 0x400u, 0x2AAu};
+        const u32 c10[] = {0x000u, 0x001u, 0x01Fu, 0x020u, 0x1E0u, 0x1E1u, 0x3DFu, 0x3E0u, 0x3E1u, 0x3FFu, 0x200u, 0x155u};
+        u32 shift[4], width[4], elem = 0, k = 0;
+        gcn_format_bits(dfmt, &elem, &k, shift, width);
+        Job& j = NewJob("ufloat", load, StructV(4, 12, dfmt, GCN_NFMT_FLOAT), 0);
+        for (u32 e = 0; e < 12; ++e) {
+            u32 word = 0;
+            for (u32 c = 0; c < 3; ++c) {
+                const u32 code = width[c] == 11 ? c11[(e + c * 5) % 12] : c10[(e + c * 5) % 12];
+                word |= code << shift[c];
+            }
+            j.init_words.push_back(word);
+            SetLane(j, e, e, 0);
+        }
+        SetLane(j, 12, 12, 0);
+        j.label = g_templates[load].name + " | " + fmt + " float | 12 elements of special codes";
+    }
+}
+
 void AddPushDescriptorCases() {
     using namespace GcnAsm;
     const u32 dw = RawOp("buffer_load_dword", GCN_LOAD, BUFFER_LOAD_DWORD, 4, 1, false, TArgs{});
@@ -3085,6 +3262,11 @@ void CompileJob(std::vector<ProgramState>& programs, Shader::Pools& pools, u32 i
     auto rt = MakeRuntime(t.vertex, t.fragment, t.indirect, t.wg, t.clip_planes, t.lds_bytes ? t.lds_bytes : t.Threads() * t.lds_bits / 8,
                           t.rect_list, t.helper ? RenderFsInputs() : 1,
                           t.fragment && t.depth_bounds && DepthBoundsNeedsFeature(t.db_min, t.db_max));
+    if (t.fill) {
+        // COMPUTE_PGM_RSRC2 of the fill dispatch: 12 user SGPRs, then TGID_X in s12.
+        rt.props.num_user_data = 12;
+        rt.hw.cs.tgid_enable = {true, false, false};
+    }
     const auto hw = t.fragment ? Shader::HwStage::Fragment
                                : (t.vertex ? Shader::HwStage::Vertex : Shader::HwStage::Compute);
     const auto sw = t.fragment ? Shader::SwStage::Fragment
@@ -4012,6 +4194,9 @@ void FillPristine(Gpu& g, const std::vector<u32>& jobs) {
         const u64 lo = v.base, hi = std::min<u64>(v.base + BoundSize(v), SlotBase(j.slot) + Arena);
         for (u64 va = lo; va < hi; ++va) g.pristine[va - GuestVa] = BufferByte(va);
         if (!j.init_words.empty()) std::memcpy(&g.pristine[lo - GuestVa], j.init_words.data(), j.init_words.size() * 4);
+        if (g_templates[j.tmpl].fill) {
+            std::memcpy(&g.pristine[SlotBase(j.slot) + FillConstOffset - GuestVa], j.fill_value.data(), 16);
+        }
     }
 }
 
@@ -4779,6 +4964,202 @@ JobResult EvaluateLdsContend(const Job& j, const u32* res) {
 }
 
 // Run one batch of jobs; returns per-job results (jobs that cannot run get loud/error verdicts).
+// The fill kernel's whole arena after the dispatch. (1) ref.c: every thread's two typed stores
+// under each reading of the packed layout; the arena must equal one reading's result byte for byte
+// (records written, the tail and canaries untouched). (2) FillClear::Texel (and Pattern where
+// defined) repeated over num_records equals the bytes written. BB_FILL_CONTROL rotates the value's
+// channels in both expectations (the unequal jobs must FAIL).
+JobResult EvaluateFill(Gpu& g, const Job& j) {
+    const gcn_vsharp v = ActualV(j);
+    const u64 lo = SlotBase(j.slot);
+    const u8* got = g.guest.data + (lo - GuestVa);
+    std::array<u32, 4> value = j.fill_value;
+    if (std::getenv("BB_FILL_CONTROL")) std::rotate(value.begin(), value.begin() + 1, value.end());
+    std::string detail;
+    // (1)
+    std::vector<u32> matched;
+    std::vector<u8> literal;
+    bool all_same = true;
+    for (u32 reading : {0u, u32(GCN_R_PACK_MIRROR)}) {
+        std::vector<u8> mem(g.pristine.begin() + (lo - GuestVa), g.pristine.begin() + (lo - GuestVa) + Arena);
+        gcn_mem m{lo, Arena, mem.data()};
+        gcn_op op{};
+        op.kind = GCN_STORE;
+        op.typed = 1;
+        op.ncomp = 4;
+        bool unknown = false;
+        for (u32 group = 0; group < j.groups; ++group) {
+            for (u32 tid = 0; tid < 64; ++tid) {
+                for (u32 second : {0u, 64u}) {
+                    gcn_addr a{};
+                    a.idxen = 1;
+                    a.vgpr_index = group * 128 + tid + second;
+                    a.lane = tid;
+                    gcn_result r{};
+                    gcn_execute(&v, &a, &op, value.data(), reading, &m, &r);
+                    unknown |= r.unknown != 0;
+                }
+            }
+        }
+        if (unknown) {
+            return {Verdict::HarnessError, "  ref.c does not decide this value's conversion (not exactly representable)\n"};
+        }
+        if (reading == 0) {
+            literal = mem;
+        } else {
+            all_same = mem == literal;
+        }
+        if (std::memcmp(got, mem.data(), Arena) == 0) matched.push_back(reading);
+    }
+    if (matched.empty()) {
+        u32 shown = 0, diffs = 0;
+        const u64 rec_lo = v.base - lo, rec_hi = rec_lo + BoundSize(v);
+        for (u32 k = 0; k < Arena; ++k) {
+            if (got[k] == literal[k]) continue;
+            ++diffs;
+            if (shown++ < 24) {
+                char b[160];
+                std::snprintf(b, sizeof(b), "    arena +%#06x: got %#04x want %#04x (reading 0)%s\n", k, got[k],
+                              literal[k], k >= rec_lo && k < rec_hi ? "" : " (outside the records: canary)");
+                detail += b;
+            }
+        }
+        detail = "  check 1 (ref.c typed stores): " + std::to_string(diffs) + " bytes differ\n" + detail;
+    }
+    // (2)
+#ifdef BB_HAVE_FILL_CLEAR
+    namespace FC = Vulkan::FillClear;
+    const auto format = FC::TargetFormat(v.dfmt, v.nfmt);
+    std::array<float, 4> fv;
+    std::memcpy(fv.data(), value.data(), 16);
+    const auto texel = format ? FC::Texel(*format, fv) : std::nullopt;
+    if (!format || !texel) {
+        detail += std::string("  check 2: FillClear ") + (!format ? "TargetFormat" : "Texel") +
+                  " refused a value the kernel stores exactly\n";
+    } else {
+        const u32 bytes = FC::TexelBytes(*format);
+        const u8* rec = got + (v.base - lo);
+        u32 bad = 0;
+        for (u32 e = 0; e < v.num_records; ++e) bad += std::memcmp(rec + e * bytes, texel->data(), bytes) != 0;
+        if (bad) {
+            detail += "  check 2: " + std::to_string(bad) + " of " + std::to_string(v.num_records) +
+                      " elements differ from FillClear::Texel\n";
+        }
+        if (const auto pattern = FC::Pattern(*format, *texel)) {
+            u32 bad_words = 0;
+            for (u32 w = 0; w < v.num_records * bytes / 4; ++w) {
+                u32 x;
+                std::memcpy(&x, rec + w * 4, 4);
+                bad_words += x != *pattern;
+            }
+            if (bad_words) {
+                detail += "  check 2: " + std::to_string(bad_words) + " words differ from FillClear::Pattern " +
+                          Hex(*pattern) + "\n";
+            }
+        }
+    }
+#endif
+    if (!detail.empty()) return {Verdict::Fail, detail};
+    if (all_same) return {Verdict::Strict, ""};
+    return {Verdict::Ambiguous, "  matched reading: " + DescribeReadings(matched) + "\n"};
+}
+
+// Unsigned small-float jobs: every component of every lane's element against gcn_f32_to_ufloat
+// (stores) and the exact widening (loads, reloads), under one combination of the GCN_UF_*
+// readings and the packed layout for the whole job; the rest of the arena unchanged.
+JobResult EvaluateUfloat(Gpu& g, const Job& j, const u32* res) {
+    const Template& t = g_templates[j.tmpl];
+    const gcn_vsharp v = ActualV(j);
+    const u64 lo = SlotBase(j.slot);
+    const u8* got = g.guest.data + (lo - GuestVa);
+    const u8* before = g.pristine.data() + (lo - GuestVa);
+    u32 elem = 0, k = 0, shift[4], width[4];
+    gcn_format_bits(v.dfmt, &elem, &k, shift, width);
+    const bool stores = t.ufloat != 2, loads = t.ufloat != 1;
+    auto nan_code = [](u32 code, u32 w) { const u32 m = w - 5; return (code >> m) == 0x1Fu && (code & ((1u << m) - 1)); };
+    auto nan32 = [](u32 x) { return (x & 0x7F800000u) == 0x7F800000u && (x & 0x7FFFFFu); };
+    std::string detail;
+    // Memory outside the stored elements (all of it for loads) is unchanged.
+    std::vector<bool> written(Arena, false);
+    if (stores) {
+        for (u32 l = 0; l < 64; ++l) {
+            if (j.lanes[l].active && j.lanes[l].vindex < v.num_records) {
+                for (u32 b = 0; b < 4; ++b) written[v.base - lo + j.lanes[l].vindex * 4 + b] = true;
+            }
+        }
+    }
+    u32 stray = 0;
+    for (u32 b = 0; b < Arena; ++b) {
+        if (!written[b] && got[b] != before[b] && stray++ < 8) {
+            char line[120];
+            std::snprintf(line, sizeof(line), "    arena +%#06x changed: %#04x -> %#04x (not a stored element)\n", b, before[b], got[b]);
+            detail += line;
+        }
+    }
+    std::vector<u32> matched;
+    std::string first_why;
+    for (u32 combo = 0; combo < GCN_UF_READINGS * 2; ++combo) {
+        const unsigned uf = combo & (GCN_UF_READINGS - 1);
+        const bool mirror = combo & GCN_UF_READINGS;
+        u32 bad = 0;
+        std::string why;
+        auto note = [&](const char* fmt, u32 l, u32 c, u32 a, u32 b2, u32 in) {
+            if (bad++ < 10) {
+                char line[200];
+                std::snprintf(line, sizeof(line), fmt, l, "xyz"[c], a, b2, in);
+                why += line;
+            }
+        };
+        for (u32 l = 0; l < 64; ++l) {
+            const Lane& L = j.lanes[l];
+            if (!L.active) continue;
+            const bool in = L.vindex < v.num_records;
+            u32 word = 0;
+            if (in) std::memcpy(&word, got + (v.base - lo) + L.vindex * 4, 4);
+            for (u32 c = 0; c < 3; ++c) {
+                const u32 sh = mirror ? 32 - shift[c] - width[c] : shift[c];
+                const u32 code = (word >> sh) & ((1u << width[c]) - 1);
+                if (stores && in) {
+                    const u32 want = gcn_f32_to_ufloat(L.data[c], width[c] - 5, uf);
+                    if (want == GCN_UF_ANY_NAN ? !nan_code(code, width[c]) : code != want) {
+                        note("    lane %u %c: stored %#05x, want %#05x (f32 %#010x)\n", l, c, code, want == GCN_UF_ANY_NAN ? 0x7FFu : want, L.data[c]);
+                    }
+                }
+                if (loads) {
+                    int unk = 0;
+                    const u32 want = in ? gcn_convert_component(code, width[c], GCN_NFMT_FLOAT, &unk) : 0u;
+                    const u32 reg = res[l * 4 + c];
+                    if (in && nan_code(code, width[c]) ? !nan32(reg) : reg != want) {
+                        note("    lane %u %c: loaded %#010x, want %#010x (code %#05x)\n", l, c, reg, want, code);
+                    }
+                }
+            }
+            for (u32 r = loads ? 3 : 0; r < 4; ++r) {
+                if (res[l * 4 + r] != VgprMarker + r) note("    lane %u %c: marker VGPR clobbered (%#010x, want %#010x, %u)\n", l, r < 3 ? r : 2, res[l * 4 + r], VgprMarker + r, 0);
+            }
+        }
+        if (!bad) {
+            matched.push_back(combo);
+        } else if (combo == 0) {
+            first_why = "  literal reading (RTNE, overflow to max finite, denormals kept, NaN to NaN, X in the low bits): " +
+                        std::to_string(bad) + " mismatches\n" + why;
+        }
+    }
+    if (!detail.empty()) return {Verdict::Fail, detail};
+    if (matched.empty()) return {Verdict::Fail, "  no combination of readings matches\n" + first_why};
+    if (matched.size() == GCN_UF_READINGS * 2) return {Verdict::Strict, ""};
+    const u32 m = matched.front();
+    std::string name;
+    if (m & GCN_UF_RTZ) name += "+rtz";
+    if (m & GCN_UF_INF) name += "+overflow-inf";
+    if (m & GCN_UF_FLUSH) name += "+flush";
+    if (m & GCN_UF_NEGNAN0) name += "+negnan-zero";
+    if (m & GCN_UF_READINGS) name += "+pack-mirror";
+    return {Verdict::Ambiguous, "  matched reading: " + (name.empty() ? std::string("literal") : name.substr(1)) + " (" +
+                                    std::to_string(matched.size()) + " of " + std::to_string(GCN_UF_READINGS * 2) +
+                                    " combinations match)\n"};
+}
+
 std::map<u32, JobResult> RunBatch(Gpu& g, const std::vector<u32>& jobs) {
     std::map<u32, JobResult> out;
     FillPristine(g, jobs);
@@ -4876,7 +5257,7 @@ std::map<u32, JobResult> RunBatch(Gpu& g, const std::vector<u32>& jobs) {
         cmd.bindPipeline(vk::PipelineBindPoint::eCompute, *pipe.pipeline);
         BindStorageBuffers(g, cmd, vk::PipelineBindPoint::eCompute, pipe, infos);
         cmd.pushConstants(*pipe.playout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
-        cmd.dispatch(g_templates[j.tmpl].workgroups, 1, 1);
+        cmd.dispatch(j.groups ? j.groups : g_templates[j.tmpl].workgroups, 1, 1);
         ran.push_back(ji);
     }
     const vk::MemoryBarrier barrier{.srcAccessMask = vk::AccessFlagBits::eShaderWrite,
@@ -4909,7 +5290,15 @@ std::map<u32, JobResult> RunBatch(Gpu& g, const std::vector<u32>& jobs) {
             out[ji] = EvaluateRender(g, j);
             continue;
         }
+        if (g_templates[j.tmpl].fill) {
+            out[ji] = EvaluateFill(g, j);
+            continue;
+        }
         const u32* res = reinterpret_cast<const u32*>(g.results.data + u64(j.slot) * ResultSlot);
+        if (g_templates[j.tmpl].ufloat) {
+            out[ji] = EvaluateUfloat(g, j, res);
+            continue;
+        }
         if (g_templates[j.tmpl].lds_contend) {
             out[ji] = EvaluateLdsContend(j, res);
             continue;
@@ -5560,6 +5949,8 @@ int main(int argc, char** argv) {
     AddDepthBoundsCases();
     AddPushUdCases();
     AddTinyCases();
+    AddFillCases();
+    AddUfloatCases();
     AddPushDescriptorCases();
     if (!opt.only.empty()) {
         std::vector<Job> kept;
@@ -5599,6 +5990,16 @@ int main(int argc, char** argv) {
             for (u32 k = 0; k < 4; ++k) j.ud[4 + k] = t[k];
             j.ud[8] = 0x1234;
             j.ud[9] = 16;
+        } else if (g_templates[j.tmpl].fill) {
+            // s[4:7] the target V#, s[8:11] the value's V# (the kernel's SGPR ABI); s12 is TGID_X
+            gcn_vsharp cv = RawV(16);
+            cv.base = SlotBase(j.slot) + FillConstOffset;
+            const auto ck = Pack(cv);
+            j.ud = {};
+            for (u32 k = 0; k < 4; ++k) {
+                j.ud[4 + k] = t[k];
+                j.ud[8 + k] = ck[k];
+            }
         } else if (g_templates[j.tmpl].srt) {
             std::copy_n(t.begin(), 4, j.vtable.begin());
             j.vtable[4] = 0x5A17C0DEu ^ i;
