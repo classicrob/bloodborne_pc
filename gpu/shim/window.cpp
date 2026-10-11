@@ -1,6 +1,8 @@
 // bbport: SDL3 window for the Vulkan swapchain.
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 #include <tuple>
 #include <utility>
 #include <cstring>
@@ -18,16 +20,33 @@ namespace Frontend {
 
 #ifdef __APPLE__
 namespace {
-/// "AxB" (separator `sep`) as two integers, or a stop: a malformed value is a setup error.
+/// "AxB" (separator `sep`) as two ints, or a stop: a malformed or out-of-range value is a setup
+/// error.
 std::pair<int, int> ParsePair(const char* name, const char* value, char sep) {
-    char* end = nullptr;
-    const long first = std::strtol(value, &end, 10);
-    ASSERT_MSG(end != value && *end == sep, "{}={} is not of the form A{}B", name, value, sep);
-    const char* second_start = end + 1;
-    const long second = std::strtol(second_start, &end, 10);
-    ASSERT_MSG(end != second_start && *end == 0, "{}={} is not of the form A{}B", name, value,
-               sep);
-    return {int(first), int(second)};
+    const auto parse = [&](const char* start, char terminator, const char** next) {
+        char* end = nullptr;
+        errno = 0;
+        const long number = std::strtol(start, &end, 10);
+        ASSERT_MSG(end != start && *end == terminator && errno != ERANGE &&
+                       number >= std::numeric_limits<int>::min() &&
+                       number <= std::numeric_limits<int>::max(),
+                   "{}={} is not of the form A{}B with A and B integers", name, value, sep);
+        *next = end;
+        return int(number);
+    };
+    const char* end = nullptr;
+    const int first = parse(value, sep, &end);
+    const int second = parse(end + 1, '\0', &end);
+    return {first, second};
+}
+
+/// "1" or "0" (or unset/empty: off); anything else stops.
+bool ParseFlag(const char* name, const char* value) {
+    if (!value || !*value || !std::strcmp(value, "0")) {
+        return false;
+    }
+    ASSERT_MSG(!std::strcmp(value, "1"), "{}={} must be 0 or 1", name, value);
+    return true;
 }
 } // namespace
 #endif
@@ -43,12 +62,20 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, const char* title) : width{width_}
     // takes no focus: input comes from BB_PAD_FILE). Off by default; malformed values stop.
     const char* size_env = std::getenv("BB_WINDOW_SIZE");
     const char* pos_env = std::getenv("BB_WINDOW_POS");
-    const char* background_env = std::getenv("BB_WINDOW_BACKGROUND");
-    const bool background = background_env && background_env[0] == '1';
+    const bool background = ParseFlag("BB_WINDOW_BACKGROUND", std::getenv("BB_WINDOW_BACKGROUND"));
     if (background) {
-        // Before the video subsystem registers the app with Cocoa.
-        SDL_SetHint(SDL_HINT_MAC_BACKGROUND_APP, "1");
-        SDL_SetHint(SDL_HINT_WINDOW_ACTIVATE_WHEN_SHOWN, "0");
+        // Before the video subsystem registers the app with Cocoa. Override priority, and checked:
+        // a hint set elsewhere (environment) must not quietly bring activation back.
+        for (const auto& [hint, value] : {std::pair{SDL_HINT_MAC_BACKGROUND_APP, "1"},
+                                          std::pair{SDL_HINT_WINDOW_ACTIVATE_WHEN_SHOWN, "0"}}) {
+            ASSERT_MSG(SDL_SetHintWithPriority(hint, value, SDL_HINT_OVERRIDE),
+                       "BB_WINDOW_BACKGROUND: SDL refused hint {}={}: {}", hint, value,
+                       SDL_GetError());
+            const char* effective = SDL_GetHint(hint);
+            ASSERT_MSG(effective && !std::strcmp(effective, value),
+                       "BB_WINDOW_BACKGROUND: hint {} is {}, not {}", hint,
+                       effective ? effective : "(unset)", value);
+        }
     }
     if (size_env && *size_env) {
         const auto [w, h] = ParsePair("BB_WINDOW_SIZE", size_env, 'x');
