@@ -36,6 +36,10 @@ ROOT = Path(__file__).resolve().parents[2]
 BASE = ROOT / 'out' / 'macos_route'
 DATA = BASE / 'data'  # run.sh generated files (boot images, patches), shared by all runs
 TOOL_SOURCE = Path(__file__).resolve().parent / 'window_tool.swift'
+# Save fixtures are user data: outside git, next to the game files (BB_SAVE_FIXTURES overrides).
+FIXTURES = Path(os.environ.get('BB_SAVE_FIXTURES', Path.home() / 'bbport-game' / 'saves'))
+# Warm shader/pipeline caches from completed runs, for runs that are not about compilation.
+CACHES = Path(os.environ.get('BB_CACHE_FIXTURES', Path.home() / 'bbport-game' / 'caches'))
 TOOL = BASE / 'bin' / 'window_tool'
 DEFAULT_GAME = Path.home() / 'CUSA03173'
 DEFAULT_DEPS = Path.home() / 'bbport-deps' / 'x86_64'
@@ -71,10 +75,14 @@ STEPS = {
 #   ('capture', stage, min_nonblack)          screenshot; fails when the window is darker
 #   ('check_user_cache',)                     the GPU pipeline cache is inside the run's --user
 # A stage that times out, or a game that exits or logs a fatal line, stops the route loudly.
-ROUTE = [
-    ('title', [('wait_log', r'^Runtime: pad opened', 120), ('wait_draws', 14, 3, 240), ('sleep', 3),
-               ('capture', 'title', 0.2), ('check_user_cache',)]),
-    ('offline', [('press', 'down'), ('press', 'cross'), ('sleep', 4), ('capture', 'offline-menu', 0.2)]),
+TITLE = ('title', [('wait_log', r'^Runtime: pad opened', 120), ('wait_draws', 14, 3, 240), ('sleep', 3),
+                   ('capture', 'title', 0.2), ('check_user_cache',)])
+OFFLINE = ('offline', [('press', 'down'), ('press', 'cross'), ('sleep', 4), ('capture', 'offline-menu', 0.2)])
+# The world is loaded when the scene draws far more than the menus and loading screens (<= ~210).
+WORLD = ('world', [('wait_draws', 400, 3, 900), ('sleep', 5), ('capture', 'world', 0.05)])
+# New game: Options skips the opening movie (--movie plays it to the end for movie-path coverage).
+NEW_GAME = [
+    TITLE, OFFLINE,
     ('new-game', [('press', 'cross'), ('sleep', 5), ('capture', 'brightness', 0.05)]),
     ('brightness', [('press', 'down'), ('press', 'cross'), ('sleep', 3), ('capture', 'controls', 0.05)]),
     ('controls', [('press', 'down')] * 6 + [('capture', 'controls-next', 0.05), ('press', 'cross'),
@@ -90,7 +98,27 @@ ROUTE = [
     ('finish', [('press', 'up'), ('capture', 'finish-selected', 0.05), ('press', 'cross'), ('sleep', 2),
                 ('capture', 'finalise-prompt', 0.05), ('press', 'left'), ('press', 'cross'), ('sleep', 10),
                 ('capture', 'contract-finalised', None)]),
+    WORLD,
 ]
+SKIP_MOVIE = ('controls', [('press', 'down')] * 6 + [
+    ('capture', 'controls-next', 0.05), ('press', 'cross'),
+    ('wait_log', r'Init: Opening .*sprj_opening\.mp4', 60), ('sleep', 3), ('press', 'options'), ('sleep', 3),
+    ('capture', 'movie-skipped', None)])
+# From a save fixture the title cursor starts on Play Offline (Down would select Play Online), and
+# the offline menu's first entry is Continue.
+CONTINUE = [TITLE, ('offline', [('press', 'cross'), ('sleep', 4), ('capture', 'offline-menu', 0.2)]),
+            ('continue', [('press', 'cross'), ('sleep', 5), ('capture', 'continue', None)]), WORLD]
+
+
+def route_stages(args):
+    if getattr(args, 'fixture', None):
+        return CONTINUE
+    if getattr(args, 'movie', False):
+        return NEW_GAME
+    return [SKIP_MOVIE if name == 'controls' else (name, ops) for name, ops in NEW_GAME if name != 'movie-end']
+
+
+ROUTE = NEW_GAME  # stage names for help text; route_stages() picks the variant
 
 
 def die(message):
@@ -277,6 +305,24 @@ def launch(args):
     run = BASE / f'{stamp}-{args.output}{"-" + args.label if args.label else ""}'
     run.mkdir(parents=True)
     (run / 'user').mkdir()
+    fixture = None
+    if args.fixture:
+        source = FIXTURES / args.fixture / 'savedata'
+        if not source.is_dir():
+            die(f'no save fixture {args.fixture} ({source})')
+        shutil.copytree(source, run / 'user' / 'savedata')
+        fixture = json.loads((FIXTURES / args.fixture / 'fixture.json').read_text())
+    warm = None
+    if args.warm_cache:
+        source = CACHES / args.warm_cache
+        if not (source / 'cache').is_dir():
+            die(f'no cache fixture {args.warm_cache} ({source})')
+        shutil.copytree(source / 'cache', run / 'user' / 'cache')
+        warm = json.loads((source / 'fixture.json').read_text())
+        # The game validates the cache version itself and rebuilds an incompatible one (logged).
+        if warm['libbbgpu'] != artifacts['libbbgpu.dylib']['sha256']:
+            print(f'play_route: cache fixture {args.warm_cache} comes from libbbgpu {warm["libbbgpu"][:12]}, '
+                  f'this build is {artifacts["libbbgpu.dylib"]["sha256"][:12]}', file=sys.stderr)
     (run / 'shots').mkdir()
     (run / 'pad.txt').write_text('\n')
     (run / 'bbport.ini').write_text(SETTINGS[args.output])
@@ -317,7 +363,9 @@ def launch(args):
                              + args.diag_env,
               'disabled_optimizations': args.disable_optimizations,
               'perf': args.perf, 'perf_phases': args.perf_phases,
-              'shader_cache': 'empty (fresh user directory)', 'saves': 'none (fresh user directory)',
+              'shader_cache': {'warm': args.warm_cache, 'from': warm} if args.warm_cache
+                              else 'empty (fresh user directory)',
+              'saves': {'fixture': args.fixture, 'from': fixture} if args.fixture else 'none (fresh user directory)',
               'host': {'load_average': os.getloadavg(), 'other_bb_probe': running}}
     (run / 'manifest.json').write_text(json.dumps(record, indent=2) + '\n')
     current = BASE / 'current'
@@ -389,6 +437,73 @@ def capture(run, stage, min_nonblack=None):
     return data
 
 
+REPORT = {
+    'pm4_tears': r'NextPacket|Unimplemented PM4|Wrong PM4',
+    'flip_irq': r'Out of order flip IRQ',
+    'cmd_snapshot': r'CMD-SNAPSHOT',
+    'gpuidle_held_back': r'GpuIdle held back:',
+    'sync_einval': r'Runtime sync EINVAL',
+    'guest_panic': r'Dantelion2 Panic|Guest fault',
+    'cache_rebuilt': r'Pipeline cache isn.t compatible|Pipeline cache cleared',
+}
+
+
+def report(run):
+    """Counts of the known diagnostic lines, the periodic parse-lag summaries and the stop reason."""
+    lines = log_lines(run)
+    counts = {name: [i + 1 for i, l in enumerate(lines) if re.search(rx, l)] for name, rx in REPORT.items()}
+    stop_at = next((i for i, l in enumerate(lines) if l.startswith('STOP:')), None)
+    print(json.dumps({
+        'run': str(run), 'exit': json.loads((run / 'exit.json').read_text()) if (run / 'exit.json').exists() else None,
+        'counts': {k: len(v) for k, v in counts.items()}, 'first_lines': {k: v[:5] for k, v in counts.items() if v},
+        'parse_lag': [l.split('Parse lag, ', 1)[1] for l in lines if 'Parse lag, ' in l],
+        'stop': lines[max(stop_at - 2, 0):stop_at + 1] if stop_at is not None else None,
+        'frame_stats': summarize(frame_stats(lines))}, indent=1))
+
+
+def save_fixture(run, name):
+    """Copies a stopped run's save data to FIXTURES/name (never overwrites)."""
+    info = manifest(run)
+    if info.get('pid') and alive(info['pid']):
+        die('stop the game before saving a fixture (saves may be mid-write)')
+    source = run / 'user' / 'savedata'
+    if not source.is_dir() or not any(source.rglob('userdata*')):
+        die(f'run has no save data: {source}')
+    target = FIXTURES / name
+    if target.exists():
+        die(f'fixture {name} already exists: {target}')
+    shutil.copytree(source, target / 'savedata')
+    stages = [json.loads(l).get('stage') for l in (run / 'events.jsonl').read_text().splitlines()
+              if json.loads(l).get('kind') == 'capture']
+    (target / 'fixture.json').write_text(json.dumps({
+        'name': name, 'saved': now(), 'run': str(run), 'last_capture': stages[-1] if stages else None,
+        'artifacts': {k: v['sha256'] for k, v in info['artifacts'].items() if isinstance(v, dict) and 'sha256' in v},
+        'output': info.get('output')}, indent=2) + '\n')
+    event(run, 'save-fixture', name=name, path=str(target))
+    print(json.dumps({'fixture': name, 'path': str(target), 'last_capture': stages[-1] if stages else None}))
+
+
+def save_cache(run, name):
+    """Copies a stopped run's pipeline cache to CACHES/name with the build it came from."""
+    info = manifest(run)
+    if info.get('pid') and alive(info['pid']):
+        die('stop the game before saving its cache')
+    source = run / 'user' / 'cache'
+    if not source.is_dir() or not any(source.rglob('*')):
+        die(f'run has no pipeline cache: {source}')
+    target = CACHES / name
+    if target.exists():
+        die(f'cache fixture {name} already exists: {target}')
+    shutil.copytree(source, target / 'cache')
+    (target / 'fixture.json').write_text(json.dumps({
+        'name': name, 'saved': now(), 'run': str(run),
+        'libbbgpu': info['artifacts']['libbbgpu.dylib']['sha256'],
+        'bb_probe': info['artifacts']['bb-probe']['sha256'],
+        'source_head': info['artifacts'].get('source_tree', {}).get('head')}, indent=2) + '\n')
+    event(run, 'save-cache', name=name, path=str(target))
+    print(json.dumps({'cache': name, 'path': str(target)}))
+
+
 def stop(run):
     info = manifest(run)
     pid = info.get('pid')
@@ -435,12 +550,12 @@ def wait_until(run, timeout, what, done, start_line):
     die(f'timed out after {timeout} s waiting for {what}')
 
 
-def route(run, until, hold=0):
-    names = [name for name, _ in ROUTE]
+def route(run, until, hold=0, stages=NEW_GAME):
+    names = [name for name, _ in stages]
     if until and until not in names:
-        die('known stages: ' + ', '.join(names))
+        die('known stages for this route: ' + ', '.join(names))
     mark = len(log_lines(run))  # waits look at log lines from here: set before every press
-    for name, ops in ROUTE:
+    for name, ops in stages:
         event(run, 'stage', stage=name)
         print(f'play_route: stage {name}', file=sys.stderr, flush=True)
         for op in ops:
@@ -498,6 +613,9 @@ def main():
         p.add_argument('--gpu-log', help='BB_GPU_LOG level (default: the build default)')
         p.add_argument('--frame-capture', action='store_true', help='arm BB_CAPTURE_TRIGGER (frame analyzer)')
         p.add_argument('--dump-shaders', action='store_true', help='BB_DUMP_SHADERS=1 (diagnostic: writes every shader)')
+        p.add_argument('--fixture', metavar='NAME', help='seed the fresh --user with save fixture NAME (route: Continue)')
+        p.add_argument('--warm-cache', metavar='NAME',
+                       help='seed the pipeline cache from cache fixture NAME (not for compile/cache/acceptance runs)')
         p.add_argument('--diag-env', action='append', default=[], metavar='BB_NAME=VALUE',
                        help='extra diagnostic BB_ variable (recorded; repeatable)')
         p.add_argument('--disable-optimizations', type=int, metavar='MASK',
@@ -506,7 +624,11 @@ def main():
         p.add_argument('--perf-phases', action='store_true',
                        help='BB_PERF_PHASES=1 (needs --perf; perturbed timing, not for FPS claims)')
         if command == 'route':
-            p.add_argument('--until', help='last stage to run: ' + ', '.join(name for name, _ in ROUTE))
+            p.add_argument('--until', help='last stage: ' + ', '.join(name for name, _ in NEW_GAME) +
+                           ' (with --fixture: title, offline, continue, world)')
+            p.add_argument('--movie', action='store_true', help='play the opening movie to the end (movie coverage)')
+            p.add_argument('--save-fixture', metavar='NAME',
+                           help='after the route, store the save data as fixture NAME (FIXTURES/NAME)')
             p.add_argument('--keep', action='store_true', help='leave the game running after the route')
             p.add_argument('--hold', type=int, default=0, metavar='SECONDS',
                            help='after the last stage, stay idle this long (fails loudly if the game dies)')
@@ -521,6 +643,11 @@ def main():
     sub.add_parser('frame-capture')
     sub.add_parser('stats')
     sub.add_parser('status')
+    sub.add_parser('report')
+    p = sub.add_parser('save-fixture')
+    p.add_argument('name')
+    p = sub.add_parser('save-cache')
+    p.add_argument('name')
     sub.add_parser('stop')
     p = sub.add_parser('_supervise')
     p.add_argument('dir')
@@ -531,10 +658,16 @@ def main():
     elif args.command == 'route':
         run = launch(args)
         try:
-            route(run, args.until, args.hold)
+            route(run, args.until, args.hold, route_stages(args))
         finally:
             if not args.keep:
                 stop(run)
+            # A run that died later (e.g. in world load) still leaves the save it reached.
+            if args.save_fixture and not args.keep:
+                try:
+                    save_fixture(run, args.save_fixture)
+                except SystemExit as error:
+                    print(error, file=sys.stderr)
     elif args.command == '_supervise':
         supervise(Path(args.dir))
     else:
@@ -557,6 +690,12 @@ def main():
             print(json.dumps(summarize(frame_stats(log_lines(run))), indent=2))
         elif args.command == 'status':
             status(run)
+        elif args.command == 'report':
+            report(run)
+        elif args.command == 'save-fixture':
+            save_fixture(run, args.name)
+        elif args.command == 'save-cache':
+            save_cache(run, args.name)
         elif args.command == 'stop':
             stop(run)
 
