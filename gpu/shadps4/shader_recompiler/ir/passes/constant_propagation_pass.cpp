@@ -408,9 +408,9 @@ void ConstantPropagation(IR::Block& block, IR::Inst& inst) {
         return FoldInverseFunc(inst, IR::Opcode::PackSint4x8);
     // 10_11_11
     case IR::Opcode::PackUfloat10_11_11:
-        return FoldInverseFunc(inst, IR::Opcode::UnpackUfloat10_11_11);
     case IR::Opcode::UnpackUfloat10_11_11:
-        return FoldInverseFunc(inst, IR::Opcode::PackUfloat10_11_11);
+        // Unpack(Pack(x)) quantizes x; Pack(Unpack(x)) may canonicalize a NaN.
+        return;
     // 2_10_10_10
     case IR::Opcode::PackUnorm2_10_10_10:
         return FoldInverseFunc(inst, IR::Opcode::UnpackUnorm2_10_10_10);
