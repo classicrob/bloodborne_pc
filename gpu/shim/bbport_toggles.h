@@ -79,11 +79,12 @@ enum : std::uint64_t {
     // for every label issued before it, and the switch is logged with the time
     // (docs/macos/gpu-idle.md), so one run can alternate the modes for an A/B.
     LabelsAtSubmit = 1ull << 59,
-    // Apple: bit set publishes a flip (status and count, flip event, previous buffer released)
-    // once the GPU retired the presenter's copy of the guest framebuffer, its last read of it
-    // (BB_FLIP_AT_GPU_RETIRE=1 sets it for the whole run). Publications stay in flip order across
-    // a switch (docs/macos/gpu-idle.md).
-    FlipAtGpuRetire = 1ull << 60,
+    // Apple, diagnosis: bit set publishes a flip (status and count, flip event, previous buffer
+    // released) when it is enqueued (the old behaviour) instead of once the GPU retired the
+    // presenter's copy of the guest framebuffer (the default; gpu/shim/bbport_flip_mode.h).
+    // BB_FLIP_AT_GPU_RETIRE=0 or =1 fixes the mode for the whole run, whatever this bit says.
+    // Publications stay in flip order across a switch (docs/macos/gpu-idle.md).
+    FlipAtEnqueue = 1ull << 60,
     // Diagnostic A/B (Apple): bit set releases staging allocations at their request tick, as
     // before 6850bc0 (Retire finds them released). This can free a buffer before its last use
     // (the device-loss bug), so it is only for load A/Bs. BB_STAGING_RELEASE_AT_REQUEST=1 sets

@@ -4,7 +4,8 @@ The GpuIdle throttle's wait has been 70-96% of the frame at the clinic pose. Thi
 1. states what the throttle does now;
 2. lists what it still protects, assuming labels at GPU completion are the default
    (46fe3e6, `bb/macos-opus-pm4-labels-default`) and flips publish at GPU retirement
-   (toggle bit 60, merged);
+   (the default on the flip-default branch; toggle bit 60, FlipAtEnqueue, restores publishing
+   at enqueue);
 3. proposes a measurement (R0) and an **explicitly unsafe opt-in experiment** (R1), plus later
    steps;
 4. says how to measure them.
