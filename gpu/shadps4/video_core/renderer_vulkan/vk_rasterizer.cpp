@@ -4761,11 +4761,12 @@ bool Rasterizer::QuiesceForCapture(std::string& why) {
         return false;
     }
     JoinBindHelper(this);
-    // Everything recorded is submitted and complete (Finish blocks until the GPU is done; a GPU
-    // that never finishes is a device loss, stopped there). Then what runs after GPU completion
-    // on other threads (priority operations such as downloads, deferred signals such as labels)
-    // must have run to the end, counted issued-minus-completed and checked unconditionally
-    // (WaitDeferredSignals returns early with OrderedGuestWrites off): polled for at most 2 s.
+    // Everything recorded is submitted and complete (Finish blocks until the GPU is done, without
+    // a bound: a GPU wait can hang without a reported device loss). Then what runs after GPU
+    // completion on other threads (priority operations such as downloads, deferred signals such
+    // as labels) must have run to the end, counted issued-minus-completed and checked
+    // unconditionally (WaitDeferredSignals returns early with OrderedGuestWrites off): polled
+    // until a 2 s deadline.
     scheduler.Finish();
     scheduler.PopPendingOperations();
     return scheduler.WaitQuiescentForCapture(std::chrono::seconds(2), why);

@@ -940,8 +940,9 @@ public:
     }
     /// The frame capture's completion check (Rasterizer::QuiesceForCapture calls it after
     /// Finish): true once no deferred operation, priority operation or deferred signal issued
-    /// so far is left; polled without blocking (1 ms sleeps) for at most `limit`, then false
-    /// and `why` with the counts. It does not run or help the work it waits for.
+    /// so far is left; polled without blocking (1 ms sleeps) until a `limit` deadline (sleep
+    /// scheduling can overshoot it slightly), then false and `why` with the counts. It does not
+    /// run or help the work it waits for.
     bool WaitQuiescentForCapture(std::chrono::milliseconds limit, std::string& why);
 #endif
 
