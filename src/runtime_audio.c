@@ -53,7 +53,7 @@ _Static_assert(sizeof(PortState)==32,"AudioOut port state layout");
 
 static pthread_mutex_t table_lock=PTHREAD_MUTEX_INITIALIZER;
 static Port ports[PORTS];
-static int initialized, sdl_ready=-1;
+static int initialized, sdl_ready=-1, null_output;
 static _Atomic size_t buffers_out, ports_opened;
 #ifdef __APPLE__
 static _Atomic uint64_t input_starvation, inserted_silence_frames;
@@ -105,6 +105,18 @@ static void sleep_until(uint64_t deadline) {
 }
 static int sdl_audio(void) {
     if (sdl_ready<0) {
+        const char *output=getenv("BB_AUDIO_OUTPUT");
+        if (output && *output) {
+            if (strcmp(output,"null")) {
+                fprintf(stderr,"STOP: BB_AUDIO_OUTPUT must be null or unset\n");
+                abort();
+            }
+            null_output=1;
+            sdl_ready=0;
+            puts("Audio: null output (BB_AUDIO_OUTPUT=null), no sound");
+            fflush(stdout);
+            return 0;
+        }
         const char *mode=getenv("BB_AUDIO");
         sdl_ready = (!mode || strcmp(mode,"none")) && SDL_InitSubSystem(SDL_INIT_AUDIO);
 #ifdef __APPLE__
@@ -247,7 +259,10 @@ static int32_t output_port(int32_t handle, const void *data, int pace) {
                 if (queued==0) ++p->stat_starved;
             }
             if (now-p->stat_start_ns>=5000000000u) {
-                printf("Audio stats port %d: %u buffers/5s (expected %u), max gap %.2f ms, min queued %d bytes, starved %u\n",
+                if (null_output)
+                    printf("Audio stats port %d: null output, %u buffers/5s (expected %u), max gap %.2f ms; device queue health unavailable\n",
+                           (int)(p-ports),p->stat_buffers,(unsigned)(5u*48000u/(unsigned)p->frames),p->stat_max_gap_ns/1e6);
+                else printf("Audio stats port %d: %u buffers/5s (expected %u), max gap %.2f ms, min queued %d bytes, starved %u\n",
                        (int)(p-ports),p->stat_buffers,(unsigned)(5u*48000u/(unsigned)p->frames),p->stat_max_gap_ns/1e6,
                        p->stat_min_queued,p->stat_starved);
                 p->stat_start_ns=now; p->stat_max_gap_ns=0; p->stat_starved=0; p->stat_buffers=0; p->stat_min_queued=1<<30;
@@ -364,6 +379,10 @@ uintptr_t runtime_audio_resolve(const char *name) { return RUNTIME_LOOKUP(export
 void runtime_audio_report(void) {
     printf("Runtime: audio ports opened=%zu, buffers output=%zu\n",
            atomic_load_explicit(&ports_opened,memory_order_relaxed),atomic_load_explicit(&buffers_out,memory_order_relaxed));
+    if (null_output) {
+        puts("Runtime: null audio output paced at 48000 Hz; device queue health unavailable");
+        return;
+    }
 #ifdef __APPLE__
     uint64_t starved=atomic_load_explicit(&input_starvation,memory_order_relaxed);
     uint64_t silence=atomic_load_explicit(&inserted_silence_frames,memory_order_relaxed);
