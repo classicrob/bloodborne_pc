@@ -86,11 +86,43 @@ for _ in $(seq 50); do "$heavy" status | grep -q '^build0: free' && break; sleep
 # The command's exit status is the job's.
 set +e; "$heavy" F -- sh -c 'exit 7'; status=$?; set -e
 (( status == 7 )) || fail "exit status $status, expected 7"
+# The GPU lock: games share it; a timing job takes it exclusively after the running games end;
+# a game started while that job waits starts only after it; a game under the job runs directly;
+# exclusive inside a shared hold is an error.
+export BB_HEAVY_PLAYTEST_SLOTS=3
+"$heavy" --pool playtest G4 -- sleep 3 &
+g4=$!
+"$heavy" --pool playtest G5 -- sleep 3 &
+g5=$!
+for _ in $(seq 100); do "$heavy" status | grep -q '^gpu: shared' && break; sleep 0.1; done
+"$heavy" status | grep -q '^gpu: shared' || fail "games did not hold the GPU shared"
+start=$(date +%s)
+( "$heavy" --pool quick --gpu exclusive T1 -- sh -c 'echo "$BB_HEAVY_GPU"; sleep 2' > "$dir/t1" ) &
+t1=$!
+sleep 1
+( "$heavy" --pool playtest G6 -- sh -c 'date +%s' > "$dir/g6" ) &
+g6=$!
+wait "$t1"
+t1_done=$(date +%s)
+[[ $(cat "$dir/t1") == exclusive ]] || fail "timing job did not hold the GPU exclusive"
+(( t1_done - start >= 4 )) || fail "exclusive GPU job ran while games held the GPU ($((t1_done - start)) s)"
+wait "$g6"
+(( $(cat "$dir/g6") >= t1_done - 1 )) || fail "a game started while an exclusive GPU job waited or ran"
+wait "$g4" "$g5"
+out=$("$heavy" --pool quick --gpu exclusive T2 -- "$heavy" --pool playtest G7 -- sh -c 'echo "$BB_HEAVY_GPU"')
+[[ $out == exclusive ]] || fail "a game under an exclusive GPU job did not run directly ('$out')"
+if "$heavy" --pool playtest G8 -- "$heavy" --gpu exclusive T3 -- true 2>/dev/null; then
+    fail "exclusive GPU inside a shared hold accepted"
+fi
+"$heavy" status | grep -q '^gpu: free' || fail "GPU lock not free after the jobs"
+export BB_HEAVY_PLAYTEST_SLOTS=2
+
 # Bad usage is an error, not a silent no-op.
 if "$heavy" G true 2>/dev/null; then fail "missing -- accepted"; fi
 if BB_HEAVY_BUILD_SLOTS=0 "$heavy" H -- true 2>/dev/null; then fail "zero slots accepted"; fi
 if "$heavy" --pool playtest --priority I -- true 2>/dev/null; then fail "priority accepted for the playtest pool"; fi
 if "$heavy" --pool other J -- true 2>/dev/null; then fail "unknown pool accepted"; fi
+if "$heavy" --gpu some K -- true 2>/dev/null; then fail "unknown GPU mode accepted"; fi
 # Every acquisition is in the history; quick jobs also record their end.
 python3 - "$dir/history.jsonl" <<'PY' || fail "history.jsonl"
 import json, sys
@@ -101,4 +133,4 @@ assert any(l['label'] == 'B' and l['waited_s'] >= 1 for l in starts), 'B waited'
 assert all({'pool', 'slot', 'waited_s', 'load', 'held'} <= set(l) for l in starts)
 assert any(l['label'] == 'Q4' and l['status'] == 124 for l in ends), 'Q4 killed'
 PY
-echo "heavy.sh: history log, build/playtest/quick pools, quick hints and time limit, waiting, priority slot, release on SIGKILL, nesting, exit status, usage errors PASS"
+echo "heavy.sh: history log, build/playtest/quick pools, quick hints and time limit, waiting, priority slot, GPU shared/exclusive lock with gate, release on SIGKILL, nesting, exit status, usage errors PASS"

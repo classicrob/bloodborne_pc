@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Machine-wide limit on heavy jobs (GPU builds, test suites, game runs, benchmarks).
 
-  tools/macos/heavy.sh [--pool build|playtest|quick] [--priority] LABEL -- COMMAND [ARG...]
+  tools/macos/heavy.sh [--pool build|playtest|quick] [--priority] [--gpu shared|exclusive]
+                       LABEL -- COMMAND [ARG...]
   tools/macos/heavy.sh status
 
 Pools of slots, each slot an flock on a file in BB_HEAVY_DIR (default ~/bbport-deps/locks):
@@ -15,6 +16,13 @@ Pools of slots, each slot an flock on a file in BB_HEAVY_DIR (default ~/bbport-d
             exit 124 after BB_HEAVY_QUICK_LIMIT (600) s: a long job belongs in the build pool.
 Each slot acquisition (pool, slot, wait, load average, slots held) is appended to
 BB_HEAVY_DIR/history.jsonl; quick jobs also record their duration and exit status.
+The GPU is a separate lock (BB_HEAVY_DIR/gpu). Games (the playtest pool) hold it shared; a
+GPU-timing job (perf_run.sh, the timestamp gate) asks for it exclusive with --gpu exclusive and
+waits until no game runs, so its numbers are never taken on a shared GPU. While an exclusive
+request waits it holds BB_HEAVY_DIR/gpu-gate, which every shared request passes first, so new
+games wait behind it instead of starving it. --gpu works inside a slot too (build.sh --test
+asks for it around the timestamp gate). A command started under an exclusive GPU hold (a game
+under perf_run.sh) runs directly; asking for exclusive under a shared hold is an error.
 A job takes a slot of its pool, then execs COMMAND with the locked descriptor inherited: the slot
 stays held by the job and every process it starts, and the kernel releases it when the last of
 them exits or is killed. There is no lease to expire and nothing to clean up. A command started
@@ -77,6 +85,66 @@ def holder(name):
         return {}
 
 
+def lock_file(name):
+    return os.open(os.path.join(lock_dir(), name), os.O_RDWR | os.O_CREAT, 0o644)
+
+
+def wait_flock(fd, mode, label, what):
+    """Blocks until flock(fd, mode) succeeds, reporting every WAIT_REPORT_SECONDS; returns the wait."""
+    started = reported = time.monotonic()
+    while True:
+        try:
+            fcntl.flock(fd, mode | fcntl.LOCK_NB)
+            return time.monotonic() - started
+        except BlockingIOError:
+            pass
+        if time.monotonic() - reported >= WAIT_REPORT_SECONDS:
+            print(f'heavy: {label}: waiting for {what} ({gpu_state()})', file=sys.stderr, flush=True)
+            reported = time.monotonic()
+        time.sleep(0.2)
+
+
+def gpu_state():
+    """free, shared (games running) or exclusive (a timing job), from a non-blocking probe."""
+    fd = lock_file('gpu')
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return 'free'
+        except BlockingIOError:
+            pass
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            return 'shared'
+        except BlockingIOError:
+            return 'exclusive'
+    finally:
+        os.close(fd)
+
+
+def take_gpu(mode, label):
+    """Holds the GPU lock in MODE for the rest of the job (the descriptor is inherited)."""
+    held = os.environ.get('BB_HEAVY_GPU')
+    if held == 'exclusive' or (held == 'shared' and mode == 'shared'):
+        return
+    if held == 'shared':
+        fail(f'{label}: --gpu exclusive inside a shared GPU hold would wait for itself')
+    gate = lock_file('gpu-gate')
+    if mode == 'exclusive':
+        gate_wait = wait_flock(gate, fcntl.LOCK_EX, label, 'the GPU gate')
+    else:
+        gate_wait = wait_flock(gate, fcntl.LOCK_SH, label, 'a waiting GPU-exclusive job')
+    fd = lock_file('gpu')
+    waited = gate_wait + wait_flock(fd, fcntl.LOCK_EX if mode == 'exclusive' else fcntl.LOCK_SH, label,
+                                    'the GPU (exclusive)' if mode == 'exclusive' else 'the GPU')
+    os.close(gate)
+    os.set_inheritable(fd, True)
+    os.environ['BB_HEAVY_GPU'] = mode
+    record({'event': 'gpu', 'label': label, 'mode': mode, 'waited_s': round(waited, 1), 'pid': os.getpid()})
+    if waited >= 1:
+        print(f'heavy: {label}: got the GPU ({mode}) after {waited:.0f} s', file=sys.stderr, flush=True)
+
+
 def record(event):
     """One line in BB_HEAVY_DIR/history.jsonl (append; one write per line). Losing a history line
     must never stop a job, but a failure is reported."""
@@ -108,6 +176,7 @@ def describe(info):
 
 
 def status():
+    print(f'gpu: {gpu_state()}')
     for name in ['build-priority'] + slot_names('build') + slot_names('quick') + slot_names('playtest'):
         fd = try_lock(name)
         if fd is not None:
@@ -117,8 +186,10 @@ def status():
             print(f'{name}: held by {describe(holder(name))}')
 
 
-def run(pool, priority, label, command):
+def run(pool, priority, gpu, label, command):
     if os.environ.get('BB_HEAVY_HELD'):
+        if gpu:
+            take_gpu(gpu, label)
         os.execvp(command[0], command)
     names = (['build-priority'] if priority else []) + slot_names(pool)
     started, reported = time.monotonic(), time.monotonic()
@@ -141,6 +212,8 @@ def run(pool, priority, label, command):
                 print(f'heavy: {label}: got {name} after {waited:.0f} s', file=sys.stderr, flush=True)
             os.set_inheritable(fd, True)
             os.environ['BB_HEAVY_HELD'] = f'{name}:{label}'
+            if gpu:
+                take_gpu(gpu, label)
             if pool == 'quick':
                 supervise_quick(label, command)
             try:
@@ -205,19 +278,24 @@ def supervise_quick(label, command):
 def main(argv):
     if argv == ['status']:
         return status()
-    pool, priority = 'build', False
+    pool, priority, gpu = 'build', False, None
     while argv and argv[0].startswith('--') and argv[0] != '--':
         if argv[0] == '--priority':
             priority, argv = True, argv[1:]
         elif argv[0] == '--pool' and len(argv) > 1 and argv[1] in POOLS:
             pool, argv = argv[1], argv[2:]
+        elif argv[0] == '--gpu' and len(argv) > 1 and argv[1] in ('shared', 'exclusive'):
+            gpu, argv = argv[1], argv[2:]
         else:
-            fail(f'unknown option {argv[0]} (--pool build|playtest|quick, --priority)')
+            fail(f'unknown option {argv[0]} (--pool build|playtest|quick, --priority, --gpu shared|exclusive)')
+    if pool == 'playtest' and gpu is None:
+        gpu = 'shared'  # a game uses the GPU
     if priority and pool != 'build':
         fail('--priority is for the build pool (shared builds); the playtest pool is dedicated already')
     if len(argv) < 3 or argv[1] != '--' or not argv[0]:
-        fail('usage: heavy.sh [--pool build|playtest|quick] [--priority] LABEL -- COMMAND [ARG...] | heavy.sh status')
-    run(pool, priority, argv[0], argv[2:])
+        fail('usage: heavy.sh [--pool build|playtest|quick] [--priority] [--gpu shared|exclusive] LABEL -- '
+             'COMMAND [ARG...] | heavy.sh status')
+    run(pool, priority, gpu, argv[0], argv[2:])
 
 
 if __name__ == '__main__':

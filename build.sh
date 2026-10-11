@@ -313,7 +313,10 @@ if [[ ${1:-} == --test || ${1:-} == --test-dry ]]; then
         # Every tests/test_*.py (a skipped test fails).
         t bash tests/run_python_tests.sh
         # BB_PERF's GPU numbers rely on per-submission timestamps; qualify them on this device.
-        BB_DEPS_PREFIX="$deps" t bash tests/macos_perf/timestamps.sh
+        # It takes the GPU exclusively (heavy.sh): it waits for running games instead of measuring
+        # a shared GPU.
+        BB_DEPS_PREFIX="$deps" t tools/macos/heavy.sh --gpu exclusive "timestamp gate" -- \
+            bash tests/macos_perf/timestamps.sh
         t out/gpu/macos-perf-test
         BB_GPU_BUILD="$PWD/out/gpu" t sh tests/macos_float_modes/production.sh
         "$CC" "${platform_flags[@]}" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread -Isrc \

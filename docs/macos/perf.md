@@ -145,8 +145,9 @@ stick, alternating direction every 3 s, so the scene keeps changing without leav
 A segment's summary starts 6 s after the segment does, so no 5 s window spans two segments.
 `segments.txt` in the run directory records each segment's perf.jsonl line range.
 
-The script refuses to run while another `bb-probe` is running: the run needs the GPU to
-itself, and that also keeps within the team's limit on translated processes. It records `uptime`, the other translated processes, the commit, and the
+The script takes the GPU exclusively through `tools/macos/heavy.sh --gpu exclusive`
+(docs/macos/heavy-jobs.md): it waits until running games end, and games started meanwhile wait
+for it. As a backstop it still refuses to run while a `bb-probe` started outside heavy.sh runs. It records `uptime`, the other translated processes, the commit, and the
 `bb-probe`/`libbbgpu.dylib` SHA-256s before and after the route. Then it prints a summary of
 `perf.jsonl` and fails if the file has no window. Numbers from a loaded host are labelled
 with that load, and they are not a clean benchmark.
