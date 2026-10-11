@@ -45,7 +45,9 @@ output shows it.
 
 `build.sh --test` shares the GPU with whatever else is running, often a game. Interference
 only adds time, so the test takes the fastest of 11 samples per segment and uses one-sided
-bounds: x2 above 1.2, x4 above 2.0 and the repeat above 0.5 of the unit. Under load, real
+bounds on the memory-bound fills: x2 above 1.2, x4 above 2.0 and the repeat above 0.5 of the
+unit. Compute scaling is printed, not asserted: a busy loop's duration follows the GPU clock,
+and under three games it measured 1.77x for x4 while fills scaled 4.38x. Under load, real
 contention pushed compute to 2.8x, 6.5x and a 1.5x repeat. The empty segment must stay under
 0.1 ms and under 5% of the unit. That check is what separates the valid case (about
 0.004 ms) from the invalid one: in-buffer compute gave 0.26 to 2.7 ms, with repeats of 0.0 to
