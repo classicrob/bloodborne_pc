@@ -9,11 +9,11 @@ parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('log')
 parser.add_argument('--windows', type=int, default=3)
 parser.add_argument('--min-window-ms', type=float, default=10000)
-parser.add_argument('--boundary-ns', type=float, default=0,
-                    help='measured full trivial PLT call cost, including loop/return')
+parser.add_argument('--call-loop-ns', '--boundary-ns', dest='call_loop_ns', type=float, default=0,
+                    help='assumed warm complete PLT call-loop CPU ns; not an isolated boundary')
 parser.add_argument('--instrument-ns', type=float, default=357)
 args = parser.parse_args()
-if args.windows <= 0 or args.boundary_ns < 0 or args.instrument_ns < 0:
+if args.windows <= 0 or args.call_loop_ns < 0 or args.instrument_ns < 0:
     parser.error('windows must be positive; costs nonnegative')
 header = re.compile(r'HLE-SUMMARY window_ms=([\d.]+) flips=(\d+)')
 row = re.compile(r'HLE-SUMMARY pthread=(\S+) name="([^"]*)" import=(\S+) completed=(\d+) call_wall_ms=([\d.]+) max_ms=([\d.]+)')
@@ -48,10 +48,13 @@ for (thread, ident, symbol), (count, ms, maximum) in totals.items():
     result.append(dict(thread=thread, pthread=ident, symbol=symbol,
         completed=count, calls_per_flip=count/flips,
         inclusive_wall_ms_per_flip=ms/flips, max_call_wall_ms=maximum,
-        estimated_trivial_call_cpu_ms_per_flip=count*args.boundary_ns/1e6/flips,
+        hypothetical_trivial_call_loop_cpu_ms_per_flip=count*args.call_loop_ns/1e6/flips,
         estimated_instrument_cpu_ms_per_flip=count*args.instrument_ns/1e6/flips))
 result.sort(key=lambda r: r['inclusive_wall_ms_per_flip'], reverse=True)
 print(json.dumps(dict(log=args.log, windows=windows and len(windows), flips=flips,
     window_ms=wall_ms, all_threads_completed=all_count,
+    assumed_call_loop_cpu_ns=args.call_loop_ns,
+    assumed_instrument_cpu_ns=args.instrument_ns,
+    assumption_source="Caller inputs; 357ns instrumentation default is from a separate earlier benchmark, not this run.",
     note='Observed filtered imports only. Inclusive completion-charged wall durations are not CPU body times. Thread rows overlap and cannot be added as frame time.',
     ranked=result), indent=2))
