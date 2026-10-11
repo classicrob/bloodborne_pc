@@ -878,6 +878,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                                       : dcb.data();
             BuilderTrace::Report(guest);
             ReportCommandMemoryAliases(guest);
+            // BB_WRITE_LOG: GPU-side writes into the command chunk around it (256 KiB each way).
+            BbWriteLog::DumpNear(reinterpret_cast<u64>(guest) - 256_KB,
+                                 reinterpret_cast<u64>(guest) + 256_KB, "the malformed packet");
         }
 #endif
         switch (type) {

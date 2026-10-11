@@ -85,6 +85,37 @@ void Record(std::uint64_t address, const void* data, std::uint64_t size, Source 
         }
     }
 }
+void DumpNear(std::uint64_t begin, std::uint64_t end, const char* why) {
+    if (Mode() == 0) {
+        return;
+    }
+    const char* sources[] = {"backing",      "WriteData",           "fence",
+                             "EOP (decoded)", "WriteData (decoded)", "EOS (decoded)"};
+    const std::uint64_t now = __rdtsc();
+    const auto print = [&](const Entry& e, const char* what) {
+        std::fprintf(stderr, "Write log: %s %s %#llx +%llu first %#llx tid %u, %.3f s before %s\n",
+                     what, e.source < 6 ? sources[e.source] : "?", (unsigned long long)e.address,
+                     (unsigned long long)e.size, (unsigned long long)e.first, e.tid,
+                     double(now - e.tsc) / 3.0e9, why);
+    };
+    const std::uint64_t n = head.load();
+    const std::uint64_t oldest = n > Size ? n - Size : 0;
+    int shown = 0;
+    for (std::uint64_t i = n; i-- > oldest && shown < 200;) {
+        const Entry& e = ring[i % Size];
+        if (e.address < end && e.address + e.size > begin) {
+            print(e, "in range");
+            ++shown;
+        }
+    }
+    for (std::uint64_t i = n; i-- > oldest && i + 16 >= n;) {
+        print(ring[i % Size], "latest");
+    }
+    std::fprintf(stderr, "Write log: %llu writes logged, %d in %#llx-%#llx\n",
+                 (unsigned long long)n, shown, (unsigned long long)begin,
+                 (unsigned long long)end);
+}
+
 } // namespace BbWriteLog
 
 extern "C" void bbgpu_dump_guest_writes(void* ucontext) {
