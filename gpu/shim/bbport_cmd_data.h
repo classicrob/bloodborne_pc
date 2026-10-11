@@ -299,18 +299,39 @@ inline void ReadStatus(Result& r) {
 using LookupFn = Result (*)(void* owner, std::uint64_t address, std::uint64_t size,
                             const void* bytes_read);
 
+/// Where a table pointer came from: the user-data word holding it, if that word is in the GPU
+/// command thread's register file, and the SET_SH_REG that last wrote it while the check ran.
+struct PointerOrigin {
+    bool in_register_file = false;
+    bool written = false;             ///< a SET_SH_REG wrote it since the check started
+    std::uint64_t packet = 0;         ///< that packet's guest address
+    std::uint64_t submission = 0;     ///< its submission (0: none known)
+    std::uint64_t flips_parsed = 0;   ///< flip packets parsed when it was written
+};
+/// Our own latest write over the table's bytes, if a recent DUMP_CONST_RAM made one.
+struct DumpOrigin {
+    bool found = false;
+    std::uint64_t dst = 0, bytes = 0, submission = 0, flips_parsed = 0;
+};
+/// The owner's provenance lookup (Liverpool): `pointer_word` is the user-data word read for the
+/// table pointer (nullptr: none), [address, address + size) the table bytes read.
+using OriginFn = void (*)(void* owner, const void* pointer_word, std::uint64_t address,
+                          std::uint64_t size, PointerOrigin& pointer, DumpOrigin& dump);
+
 namespace detail {
 // Lifetime: a lookup holds `registry` shared for its whole use of the owner, so Unregister
 // (exclusive) returns only once no lookup uses it, and none starts after. Order: registry, then
 // the owner's locks; the owner must not hold its locks while unregistering.
 inline std::shared_mutex registry;
 inline LookupFn lookup_fn = nullptr;
+inline OriginFn origin_fn = nullptr;
 inline void* lookup_owner = nullptr;
 } // namespace detail
 
-inline void Register(LookupFn fn, void* owner) {
+inline void Register(LookupFn fn, OriginFn origin, void* owner) {
     std::unique_lock lk{detail::registry};
     detail::lookup_fn = fn;
+    detail::origin_fn = origin;
     detail::lookup_owner = owner;
 }
 
@@ -319,6 +340,7 @@ inline void Unregister(void* owner) {
     std::unique_lock lk{detail::registry};
     if (detail::lookup_owner == owner) {
         detail::lookup_fn = nullptr;
+        detail::origin_fn = nullptr;
         detail::lookup_owner = nullptr;
     }
 }
@@ -328,6 +350,15 @@ inline Result Lookup(std::uint64_t address, std::uint64_t size, const void* byte
     std::shared_lock lk{detail::registry};
     return detail::lookup_fn ? detail::lookup_fn(detail::lookup_owner, address, size, bytes_read)
                              : Result{};
+}
+
+/// Provenance through the registered owner (nothing known when none).
+inline void LookupOrigin(const void* pointer_word, std::uint64_t address, std::uint64_t size,
+                         PointerOrigin& pointer, DumpOrigin& dump) {
+    std::shared_lock lk{detail::registry};
+    if (detail::origin_fn) {
+        detail::origin_fn(detail::lookup_owner, pointer_word, address, size, pointer, dump);
+    }
 }
 
 /// One-line description of a result (no guest memory access).
@@ -437,16 +468,26 @@ struct Observation {
     const char* kind = nullptr;
     std::uint64_t shader = 0, address = 0, size = 0;
     Result result;
+    PointerOrigin pointer;
+    DumpOrigin dump;
+    std::uint64_t flips_parsed = 0; ///< flip packets parsed at the read
 };
 inline thread_local Observation last;
 
-/// One parse-time read of `size` bytes at `address`, whose bytes as read are `bytes_read`.
+/// Flip packets the GPU command thread has parsed (set by the owner), the frame clock of
+/// provenance. Counted always.
+inline std::atomic<std::uint64_t> flips_parsed{0};
+
+/// One parse-time read of `size` bytes at `address`, whose bytes as read are `bytes_read`;
+/// `pointer_word` is the user-data word the table pointer was read from (nullptr: none).
 inline void NoteRead(const char* kind, std::uint64_t shader_hash, const void* address,
-                     std::size_t size, const void* bytes_read) {
+                     std::size_t size, const void* bytes_read,
+                     const void* pointer_word = nullptr) {
     const auto at = reinterpret_cast<std::uint64_t>(address);
     Result r = Lookup(at, size, bytes_read);
     ReadStatus(r);
-    last = {kind, shader_hash, at, size, r};
+    last = {kind, shader_hash, at, size, r, {}, {}, flips_parsed.load(std::memory_order_relaxed)};
+    LookupOrigin(pointer_word, at, size, last.pointer, last.dump);
     const bool notable = (r.where == Where::Inside && r.selected_differs) ||
                          r.where == Where::ChunkTail || r.where == Where::Straddles;
     std::scoped_lock lk{detail::mutex};
@@ -511,6 +552,35 @@ inline std::string LastRead() {
                   static_cast<unsigned long long>(last.address),
                   static_cast<unsigned long long>(last.size));
     std::string out = text + Describe(last.result);
+    char origin[256];
+    const auto& p = last.pointer;
+    if (!p.in_register_file) {
+        std::snprintf(origin, sizeof(origin),
+                      "; its table pointer is not in the GPU command thread's register file");
+    } else if (!p.written) {
+        std::snprintf(origin, sizeof(origin),
+                      "; its table pointer was not written by any SET_SH_REG since the check "
+                      "started (state older than the check)");
+    } else {
+        std::snprintf(origin, sizeof(origin),
+                      "; its table pointer was last written by SET_SH_REG at %#llx (submission "
+                      "%llu), %llu flip packet(s) before this read%s",
+                      static_cast<unsigned long long>(p.packet),
+                      static_cast<unsigned long long>(p.submission),
+                      static_cast<unsigned long long>(last.flips_parsed - p.flips_parsed),
+                      last.flips_parsed == p.flips_parsed ? " (this frame)" : " (an EARLIER frame)");
+    }
+    out += origin;
+    if (last.dump.found) {
+        std::snprintf(origin, sizeof(origin),
+                      "; the table bytes were last written by our DUMP_CONST_RAM to [%#llx, +%llu) "
+                      "(submission %llu), %llu flip packet(s) before this read",
+                      static_cast<unsigned long long>(last.dump.dst),
+                      static_cast<unsigned long long>(last.dump.bytes),
+                      static_cast<unsigned long long>(last.dump.submission),
+                      static_cast<unsigned long long>(last.flips_parsed - last.dump.flips_parsed));
+        out += origin;
+    }
     std::uint64_t start = 0, end = 0;
     bool mapped = false;
     long long aliases = -1;

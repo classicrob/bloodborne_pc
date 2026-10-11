@@ -392,8 +392,26 @@ int main() {
             aliases = 1;
             return true;
         });
+        last.flips_parsed = 7;
+        last.pointer = {true, true, 0x7039500100, 41, 5};
+        last.dump = {true, 0x70437a7200, 0x100, 40, 6};
         const std::string named = LastRead();
+        last.pointer = {true, false, 0, 0, 0};
+        last.dump = {};
+        const std::string unwritten = LastRead();
+        last.pointer = {};
+        const std::string elsewhere = LastRead();
         region_lookup.store(nullptr);
+        Expect("  ... the stop says which SET_SH_REG last wrote the table pointer and how long ago, "
+               "and any DUMP_CONST_RAM of ours over the bytes",
+               named.find("last written by SET_SH_REG at 0x7039500100 (submission 41), 2 flip "
+                          "packet(s) before this read (an EARLIER frame)") != std::string::npos &&
+                   named.find("our DUMP_CONST_RAM to [0x70437a7200, +256) (submission 40), 1 "
+                              "flip packet(s) before") != std::string::npos &&
+                   unwritten.find("not written by any SET_SH_REG since the check started") !=
+                       std::string::npos &&
+                   elsewhere.find("not in the GPU command thread's register file") !=
+                       std::string::npos);
         Expect("  ... the stop names the guest mapping holding the read and its other views",
                named.find("guest mapping [0x7043000000, 0x704b000000) (131072 KiB), 1 other") !=
                    std::string::npos);
@@ -415,7 +433,7 @@ int main() {
             r.where = Where::Inside;
             return r;
         };
-        Register(blocking, &owner_object);
+        Register(blocking, nullptr, &owner_object);
         Result in_flight;
         std::thread reader([&] { in_flight = Lookup(1, 1, copy_a); });
         while (!entered.load()) {

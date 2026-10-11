@@ -98,6 +98,15 @@ before each descriptor is read, so when that descriptor came from direct user da
 uninstrumented flat buffer, the stop says so instead of naming an earlier read.
 
 The stop line also says:
+- **where the table pointer came from (with `BB_CMD_DATA_CHECK=1`):**
+  - The SET_SH_REG that last wrote the user-data word holding it: its guest address, its
+    submission, and how many flip packets the parser had passed between that write and the
+    read. "An EARLIER frame" means the parser used a pointer set before this frame. That could
+    be stale state on our side or a pointer the game legitimately kept.
+  - Or that no SET_SH_REG wrote it since the check started, or that the word is not in the GPU
+    command thread's register file.
+  - Also our own latest DUMP_CONST_RAM over the table's bytes, if one of the last 512 did.
+  - Liverpool records SET_SH_REG writes and dumps only while the check is on.
 - **where the read lies at the stop:** the guest mapping holding it, `[start, end)` and size, or
   the unmapped gap, and how many other guest mappings view the same backing. These come from
   runtime_memory's mapping table, a query and not a guest memory read. Stop hunt #1 found every

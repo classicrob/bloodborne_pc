@@ -135,6 +135,17 @@ struct Liverpool {
     /// `bytes_read`, lie relative to the submitted command memory snapshots still held.
     static BbCmdData::Result LookupCommandData(void* owner, u64 address, u64 size,
                                                const void* bytes_read);
+    /// BB_CMD_DATA_CHECK provenance: the SET_SH_REG that last wrote a user-data word of this
+    /// register file, and our latest DUMP_CONST_RAM over [address, address + size).
+    static void LookupOrigin(void* owner, const void* pointer_word, u64 address, u64 size,
+                             BbCmdData::PointerOrigin& pointer, BbCmdData::DumpOrigin& dump);
+    void NoteShWrite(const PM4Header* header, u64 guest_packet, u64 submission);
+    void NoteConstDump(u64 dst, u64 bytes, u64 submission);
+    std::mutex origin_mutex; ///< provenance: written by the GPU command thread, read by any
+    static constexpr u32 OriginShWords = 0x200; ///< the graphics SH registers
+    std::array<BbCmdData::PointerOrigin, OriginShWords> sh_origin{};
+    std::array<BbCmdData::DumpOrigin, 512> const_dumps{}; ///< ring of the latest dumps
+    u32 const_dump_next{};
 #endif
     /// A stream write the PS4 command processor would see in command memory a copy hides.
     void CheckCommandMemoryWrite(VAddr address, u64 size, const char* writer);

@@ -203,6 +203,45 @@ static std::span<const u32> NextPacket(std::span<const u32> span, size_t offset)
 }
 
 #ifdef __APPLE__
+void Liverpool::NoteShWrite(const PM4Header* header, u64 guest_packet, u64 submission) {
+    const auto* set_data = reinterpret_cast<const PM4CmdSetData*>(header);
+    const u32 words = header->type3.NumWords() - 1;
+    const u64 flips = BbCmdData::flips_parsed.load(std::memory_order_relaxed);
+    std::scoped_lock lk{origin_mutex};
+    for (u32 i = 0; i < words && set_data->reg_offset + i < OriginShWords; ++i) {
+        sh_origin[set_data->reg_offset + i] = {true, true, guest_packet, submission, flips};
+    }
+}
+
+void Liverpool::NoteConstDump(u64 dst, u64 bytes, u64 submission) {
+    const u64 flips = BbCmdData::flips_parsed.load(std::memory_order_relaxed);
+    std::scoped_lock lk{origin_mutex};
+    const_dumps[const_dump_next] = {true, dst, bytes, submission, flips};
+    const_dump_next = (const_dump_next + 1) % const_dumps.size();
+}
+
+void Liverpool::LookupOrigin(void* owner, const void* pointer_word, u64 address, u64 size,
+                             BbCmdData::PointerOrigin& pointer, BbCmdData::DumpOrigin& dump) {
+    // Under BbCmdData's registry lock: the owner outlives the call.
+    auto& self = *static_cast<Liverpool*>(owner);
+    std::scoped_lock lk{self.origin_mutex};
+    const u32* sh = self.regs.reg_array.data() + Regs::ShRegWordOffset;
+    const auto* word = static_cast<const u32*>(pointer_word);
+    if (word && word >= sh && word < sh + OriginShWords) {
+        pointer = self.sh_origin[word - sh];
+        pointer.in_register_file = true;
+    }
+    // The newest dump overlapping the bytes (the ring is in write order).
+    for (u32 i = 1; i <= self.const_dumps.size(); ++i) {
+        const auto& d = self.const_dumps[(self.const_dump_next + self.const_dumps.size() - i) %
+                                         self.const_dumps.size()];
+        if (d.found && address < d.dst + d.bytes && d.dst < address + size) {
+            dump = d;
+            break;
+        }
+    }
+}
+
 BbCmdData::Result Liverpool::LookupCommandData(void* owner, u64 address, u64 size,
                                                const void* bytes_read) {
     // Runs under BbCmdData's registry lock, so ~Liverpool's Unregister waits for it.
@@ -231,7 +270,7 @@ Liverpool::Liverpool() : guest_markers_enabled{EmulatorSettings.IsVkGuestMarkers
 #ifdef __APPLE__
     SetAssertStopHook(&ReportParserStop);
     if (BbCmdData::Enabled()) {
-        BbCmdData::Register(&Liverpool::LookupCommandData, this);
+        BbCmdData::Register(&Liverpool::LookupCommandData, &Liverpool::LookupOrigin, this);
         BbCmdData::region_lookup.store(
             [](u64 address, u64& start, u64& end, bool& mapped, long long& aliases) {
                 uintptr_t lo = 0, hi = 0;
@@ -1147,6 +1186,12 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb,
             const auto* dump_const = reinterpret_cast<const PM4DumpConstRam*>(header);
             memcpy(dump_const->Address<void*>(),
                    cblock.constants_heap.data() + dump_const->Offset(), dump_const->Size());
+#ifdef __APPLE__
+            if (BbCmdData::Enabled()) [[unlikely]] {
+                NoteConstDump(dump_const->Address<u64>(), dump_const->Size(),
+                              snapshot ? snapshot->submit_number : 0);
+            }
+#endif
             break;
         }
         case PM4ItOpcode::IncrementCeCounter: {
@@ -1514,6 +1559,15 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
 #endif
             ApplyGraphicsRegisterPacket(regs, header, gfx_reg_checksum, &pipe_dirty);
+#ifdef __APPLE__
+            if (opcode == PM4ItOpcode::SetShReg && BbCmdData::Enabled()) [[unlikely]] {
+                NoteShWrite(header,
+                            region ? reinterpret_cast<u64>(region->guest +
+                                                           (region->size_dw - dcb.size()))
+                                   : reinterpret_cast<u64>(header),
+                            snapshot ? snapshot->submit_number : 0);
+            }
+#endif
             // DmaData to 0x3022C does nothing here (skipped below): no need to wait.
             if (rasterizer && !PipelinedOpcode(opcode) &&
                 !(opcode == PM4ItOpcode::DmaData &&
@@ -1533,6 +1587,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 case PM4CmdNop::PayloadType::PatchedFlip: {
 #ifdef __APPLE__
                     BbFrameMarks::parsed.Note(0); // stop lines: the parser's flip frontier
+                    BbCmdData::flips_parsed.fetch_add(1, std::memory_order_relaxed);
 #endif
                     // There is no evidence that GPU CP drives flip events by parsing
                     // special NOP packets. For convenience lets assume that it does.
