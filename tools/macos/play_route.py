@@ -341,6 +341,11 @@ def launch(args):
         env['BB_PERF_PHASES'] = '1'  # one submit per phase: perturbs timing, never an FPS measurement
     if args.dump_shaders:
         env['BB_DUMP_SHADERS'] = '1'
+    for item in args.raw_env:
+        key, sep, value = item.partition('=')
+        if not sep or not key or key.startswith(('BB_', 'DYLD_')) or key in env:
+            die(f'--raw-env needs a new non-BB_, non-DYLD_ name and a value: {item}')
+        env[key] = value
     for item in args.diag_env:
         key, sep, value = item.partition('=')
         if not sep or not key.startswith('BB_') or key in env:
@@ -357,6 +362,7 @@ def launch(args):
               'artifacts': artifacts, 'pinned_probe': str(probe), 'repo_head': subprocess.run(
                   ['git', '-C', str(ROOT), 'rev-parse', 'HEAD'], capture_output=True, text=True).stdout.strip(),
               'env': {k: v for k, v in env.items() if k.startswith(('BB_', 'DYLD_'))}, 'env_removed': removed,
+              'raw_env': args.raw_env,
               'diagnostics': [n for n, on in (('BB_DUMP_SHADERS', args.dump_shaders),
                                               ('BB_CAPTURE_TRIGGER', args.frame_capture),
                                               ('BB_TOGGLE_FILE', args.disable_optimizations is not None)) if on]
@@ -616,6 +622,8 @@ def main():
         p.add_argument('--fixture', metavar='NAME', help='seed the fresh --user with save fixture NAME (route: Continue)')
         p.add_argument('--warm-cache', metavar='NAME',
                        help='seed the pipeline cache from cache fixture NAME (not for compile/cache/acceptance runs)')
+        p.add_argument('--raw-env', action='append', default=[], metavar='NAME=VALUE',
+                       help='extra non-BB_ variable, e.g. MVK_CONFIG_* (recorded; repeatable)')
         p.add_argument('--diag-env', action='append', default=[], metavar='BB_NAME=VALUE',
                        help='extra diagnostic BB_ variable (recorded; repeatable)')
         p.add_argument('--disable-optimizations', type=int, metavar='MASK',
