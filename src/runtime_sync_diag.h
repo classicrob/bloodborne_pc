@@ -54,10 +54,16 @@ static __attribute__((noinline)) void sync_report_invalid(const char *op, const 
     errno = saved_errno;
 }
 
+/* The guest's return slot of the sync import being run on this thread (the outer wrapper's):
+ * BB_COND_WAKE_CHECK names the guest caller from it, through the HLE trace when that replaced
+ * the slot. */
+static _Thread_local const uintptr_t *sync_return_slot;
+
 /* Resolve the outer ABI wrapper so POSIX forwarding retains the caller address. */
 #define SYNC_EXPORT(name) diagnostic_##name
 #define SYNC_WRAP(name, params, args, kind, slot, initialized, destroyed, mutex_slot) \
     static ABI __attribute__((noinline)) int32_t diagnostic_##name params { \
+        sync_return_slot = (const uintptr_t *)__builtin_frame_address(0) + 1; \
         const int32_t result = name args; \
         if (__builtin_expect(((uint32_t)result & 0xffff) == 22, 0)) \
             sync_report_invalid(#name, kind, slot, initialized, destroyed, mutex_slot, result, \

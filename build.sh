@@ -305,6 +305,7 @@ if [[ ${1:-} == --test || ${1:-} == --test-dry ]]; then
         t sh tests/test_guest_entry_macos.sh
         t sh tests/test_cpu_profile_macos.sh
         t sh tests/test_hle_trace_macos.sh
+        t sh tests/test_movie_handoff_macos.sh
         BB_DEPS_PREFIX="$deps" t bash tests/macos_external_host/run.sh
         BB_DEPS_PREFIX="$deps" t bash tests/macos_metalfx/signature.sh
         BB_DEPS_PREFIX="$deps" t bash tests/macos_metalfx/run.sh
@@ -360,6 +361,7 @@ if [[ ${1:-} == --test || ${1:-} == --test-dry ]]; then
         t bash tests/test_savedata_macos.sh
         t bash tests/test_heavy.sh
         t sh tests/test_sync_diagnostics_macos.sh
+        t sh tests/test_cond_wake_check_macos.sh
         t python3 tests/test_restart_macos.py
         # Last: every test file under tests/ is run above or excluded with a reason.
         python3 tools/macos/check_test_wiring.py
