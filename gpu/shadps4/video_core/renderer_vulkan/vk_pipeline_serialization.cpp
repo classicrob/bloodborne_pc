@@ -5,6 +5,7 @@
 #include <atomic>
 #include <chrono>
 #include <thread>
+#include <xxhash.h>
 #include "common/serdes.h"
 #include "common/thread.h"
 #include "core/emulator_settings.h"
@@ -337,6 +338,12 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
     // shader, the pre-raster/fragment interface checks.
     sel.runtime_infos[stage] = spec.runtime_info;
     it_pgm.value()->InsertPermut(module, std::move(spec), std::move(info), perm_idx);
+#ifdef __APPLE__
+    if (auto& inserted = it_pgm.value()->modules[perm_idx]; !inserted.preloaded) {
+        inserted.preloaded = true;
+        inserted.binary_hash = XXH3_64bits(spv.data(), spv.size() * sizeof(u32));
+    }
+#endif
 
     sel.infos[stage] = it_pgm.value()->modules[perm_idx].info.get();
     sel.modules[stage] = module;

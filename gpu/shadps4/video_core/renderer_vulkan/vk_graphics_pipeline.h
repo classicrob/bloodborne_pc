@@ -141,6 +141,13 @@ public:
                          VertexInputs<AmdGpu::Buffer>& guest_buffers, u32 step_rate_0,
                          u32 step_rate_1) const;
 
+#ifdef __APPLE__
+    /// BB_PIPELINE_VERIFY: what each stage was built from (PipelineCache::VerifyReusedPipeline).
+    std::array<Shader::RuntimeInfo, MaxShaderStages> built_runtime_infos{};
+    std::array<vk::ShaderModule, MaxShaderStages> built_modules{};
+    bool built_preloaded = false;
+#endif
+
 private:
     std::unique_ptr<GsEmulationStages> gs_emulation;
     void BuildDescSetLayout(bool preloading);

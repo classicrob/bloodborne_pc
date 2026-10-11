@@ -51,6 +51,13 @@ struct Program {
         std::unique_ptr<Shader::Info> info;
         // Workers refresh private copies; the GPU thread alone updates live user data.
         std::unique_ptr<const Shader::Info> info_template;
+#ifdef __APPLE__
+        /// BB_PIPELINE_VERIFY: a permutation loaded from the pipeline cache, the hash of its
+        /// stored SPIR-V, and whether it was compared with a fresh translation yet.
+        bool preloaded = false;
+        bool verified = false;
+        u64 binary_hash = 0;
+#endif
     };
     static constexpr size_t MaxPermutations = 8;
     using ModuleList = boost::container::small_vector<Module, MaxPermutations>;
@@ -167,6 +174,19 @@ public:
     bool LoadPipelineStage(Serialization::Archive& ar, size_t stage);
     /// bbport: clears the selection a pipeline record is loaded into.
     void ResetPreloadSelection();
+#ifdef __APPLE__
+    /// BB_PIPELINE_VERIFY=1 (diagnostic): compares preloaded permutations with a fresh
+    /// translation at first use, and reused graphics pipelines with the draw selecting them.
+    static bool PipelineVerify();
+    void VerifyPreloadedModule(const Program::Module& module, Shader::HwStage hw_stage,
+                               Shader::SwStage sw_stage, const Shader::ShaderParams& params,
+                               const Shader::RuntimeInfo& runtime_info,
+                               const Shader::Backend::Bindings& start);
+    void VerifyReusedPipeline(const GraphicsPipeline& pipeline, u64 pipeline_hash);
+    u64 verify_modules = 0, verify_module_mismatches = 0;
+    u64 verify_pipelines = 0, verify_pipeline_mismatches = 0;
+    u64 verify_tess_unchecked = 0, verify_prepared_bypassed = 0;
+#endif
 
     const GraphicsPipeline* GetGraphicsPipeline(const DrawIndirectParams params = {},
                                                 const PreparedDraw* prepared = nullptr);
