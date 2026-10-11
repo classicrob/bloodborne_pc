@@ -21,6 +21,7 @@
 #include "imgui/renderer/texture_manager.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "bbport_parse_split.h"
 #include "bbport_threads.h"
 
 namespace Vulkan {
@@ -366,6 +367,7 @@ void Scheduler::WaitDeferredSignals() {
         return;
     }
     BbStats::WaitTimer timer{BbStats::deferred_signals_wait_ns};
+    BB_SPLIT_SCOPE(KDeferred);
     KickRecording(true);
     while (deferred_signals_done->load(std::memory_order_acquire) < issued) {
         // Helps the copy threads the signals wait for.
@@ -382,6 +384,7 @@ void Scheduler::WaitRecorderSignals() {
         BbToggle::Disabled(BbToggle::OrderedGuestWrites)) {
         return;
     }
+    BB_SPLIT_SCOPE(KRecorderSignals);
     KickRecording(true);
     while (!recorder_signals.CompleteThrough(issued)) {
         BbCopy::WaitAsync();
@@ -393,6 +396,7 @@ void Scheduler::WaitRecorderSignals() {
 void Scheduler::WaitHostCopies() {
     if (host_copies_done.load(std::memory_order_acquire) < host_copies_issued) {
         BbStats::WaitTimer timer{BbStats::host_copy_record_wait_ns};
+        BB_SPLIT_SCOPE(KHostCopies);
         BbStats::host_copy_waits.fetch_add(1, std::memory_order_relaxed);
         KickRecording(true);
         while (host_copies_done.load(std::memory_order_acquire) < host_copies_issued) {
@@ -444,12 +448,16 @@ void Scheduler::SyncRecording() {
     }
     KickRecording(true);
     BbStats::WaitTimer timer{BbStats::sync_recording_ns};
+    BB_SPLIT_SCOPE(KRecorderSync);
     std::unique_lock lk{recorder_mutex};
     recorder_idle_cv.wait(lk, [this] { return recorder_queue.empty() && !recorder_busy; });
 }
 
 void Scheduler::RecorderThread(std::stop_token stoken) {
     Common::SetCurrentThreadName("bb:VkRecorder");
+#ifdef __APPLE__
+    BbSplit::Attach(BbSplit::recorder, BbSplit::RIdle);
+#endif
     while (true) {
         // Spin briefly before sleeping: the next chunk usually follows within microseconds,
         // and a sleeping recorder costs the GPU thread a wake-up syscall per kick. With few
@@ -483,8 +491,12 @@ void Scheduler::RecorderThread(std::stop_token stoken) {
         {
 #ifdef __APPLE__
             BbPerf::RecorderTimer perf_timer;
+            BbSplit::Mark(BbSplit::RExecute);
 #endif
             chunk->Execute(current_cmdbuf);
+#ifdef __APPLE__
+            BbSplit::Mark(BbSplit::RIdle);
+#endif
         }
         {
             std::scoped_lock lk{recorder_mutex};
@@ -499,6 +511,7 @@ void Scheduler::RecorderThread(std::stop_token stoken) {
 
 u64 Scheduler::Flush(SubmitInfo& info) {
     // When flushing, we only send data to the driver; no waiting is necessary.
+    BB_SPLIT_SCOPE(KFlush);
     return SubmitExecution(info);
 }
 
@@ -534,6 +547,7 @@ void Scheduler::Wait(u64 tick) {
         Flush(info);
     }
     BbStats::WaitTimer timer{BbStats::tick_wait_ns};
+    BB_SPLIT_SCOPE(KGpuTick);
     work_semaphore.Wait(tick);
 }
 

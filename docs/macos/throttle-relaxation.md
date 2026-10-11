@@ -1,4 +1,16 @@
-# Relaxing the GpuIdle submit throttle (design, for review; R0 diagnostic only, no R1 code yet)
+# Relaxing the GpuIdle submit throttle (design; R0 measured; R1-R3 shelved)
+
+> **Shelved, 2026-10-11 (R0 result).** Playtest ran R0 on PREVIEW-18 (c7fe336), alone, warm
+> cache, BB_FPS=60 (`out/macos_route/20261011-175746-1080p-R0-perf`). The run had 9 GpuIdle split
+> lines, idle and walking.
+> - sceGnmSubmitDone to GpuIdle was **86-135 ms mean, all of it "parse and queue"**. The stage B
+>   drain, recorder writes and completion labels were 0.00 ms in every window.
+> - The last completion label landed 2 ticks before the last submission in 600/600 frame ends.
+>
+> At the frame end the throttle waits for our own command processing, not the GPU. R1 (release at
+> "recorded"), R2 and R3 would remove none of that wait and would only add the guest-lifetime
+> exposure, so they are shelved. The time is now being split further: docs/macos/parse-split.md.
+> The rest of this note is the design as reviewed, kept for reference.
 
 The GpuIdle throttle's wait has been 70-96% of the frame at the clinic pose. This note:
 1. states what the throttle does now;
