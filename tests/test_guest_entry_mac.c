@@ -38,7 +38,9 @@ static void trap(int sig,siginfo_t *info,void *context) {
 }
 static void check_call(void) {
     uint64_t result[96]={0};
+    errno=EDOM;
     entry_call(result);
+    assert(errno==EDOM);
     const uint64_t expected[]={1,2,3,4,5,(uintptr_t)result,8,9,10,11,12,13,14,15};
     assert(!memcmp(result,expected,sizeof(expected)));
     assert(result[14]==result[15] && result[15]==result[20]-16);
@@ -46,10 +48,24 @@ static void check_call(void) {
     assert((result[16]&0xcd5)==0x45 && (result[23]&0xcd5)==0x45);
     for (unsigned i=32;i<96;++i) assert(result[i]==UINT64_MAX);
 }
+static void name_thread(const char *name,uint64_t id) {
+    char actual[64];
+    assert(!pthread_setname_np(name));
+    assert(!pthread_getname_np(pthread_self(),actual,sizeof(actual)));
+    assert(!strcmp(actual,name));
+    printf("IDENTITY thread=%" PRIu64 " pthread=%016" PRIxPTR " name=%s\n",
+           id,(uintptr_t)pthread_self(),actual);
+}
 static void *worker(void *arg) {
     uint64_t tcb[3]={0,0,100+(uintptr_t)arg};
     assert(!pthread_setspecific(key,tcb));
-    for (unsigned i=0;i<8;++i) check_call();
+    char name[64];
+    snprintf(name,sizeof(name),"entry-worker-%" PRIuPTR,(uintptr_t)arg);
+    name_thread((uintptr_t)arg ? name : "",tcb[2]);
+    for (unsigned i=0;i<4;++i) check_call();
+    snprintf(name,sizeof(name),"entry-renamed-%" PRIuPTR,(uintptr_t)arg);
+    name_thread(name,tcb[2]);
+    for (unsigned i=0;i<4;++i) check_call();
     return NULL;
 }
 int main(void) {
@@ -84,9 +100,17 @@ int main(void) {
     assert(!entry_trace_handle(SIGTRAP,&info,&uc));
     struct sigaction sa={0}; sa.sa_sigaction=trap; sa.sa_flags=SA_SIGINFO;
     sigemptyset(&sa.sa_mask); assert(!sigaction(SIGTRAP,&sa,NULL));
+    mach_port_t own_port=mach_thread_self();
+    mach_port_urefs_t refs_before,refs_after;
+    assert(!mach_port_get_refs(mach_task_self(),own_port,MACH_PORT_RIGHT_SEND,&refs_before));
+    name_thread("entry-main",0);
     check_call(); /* Missing guest TCB is reported safely. */
     uint64_t tcb[3]={0,0,42}; assert(!pthread_setspecific(key,tcb));
+    name_thread("entry-main-renamed",42);
     check_call();
+    assert(!mach_port_get_refs(mach_task_self(),own_port,MACH_PORT_RIGHT_SEND,&refs_after));
+    assert(refs_before==refs_after);
+    assert(!mach_port_deallocate(mach_task_self(),own_port));
     pthread_t threads[4];
     for (uintptr_t i=0;i<4;++i) assert(!pthread_create(&threads[i],NULL,worker,(void *)i));
     for (unsigned i=0;i<4;++i) assert(!pthread_join(threads[i],NULL));
