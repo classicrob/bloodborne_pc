@@ -9,6 +9,11 @@
 
 namespace Shader::IR {
 
+enum class AttributeReadFlags : u32 {
+    None,
+    RawVertexParameter,
+};
+
 enum class Attribute : u64 {
     // Export targets
     RenderTarget0 = 0,

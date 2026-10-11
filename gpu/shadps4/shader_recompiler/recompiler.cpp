@@ -14,6 +14,32 @@
 
 namespace Shader {
 
+static void LowerFlatVertexParameters(IR::Program& program, const RuntimeInfo& runtime,
+                                     const Profile& profile) {
+    if (profile.supports_fragment_per_vertex_inputs || program.info.sw_stage != SwStage::Fragment) {
+        return;
+    }
+    for (IR::Block* block : program.blocks) {
+        for (IR::Inst& inst : block->Instructions()) {
+            if (inst.GetOpcode() != IR::Opcode::GetAttribute ||
+                inst.Flags<IR::AttributeReadFlags>() != IR::AttributeReadFlags::RawVertexParameter) {
+                continue;
+            }
+            const u32 parameter = u32(inst.Arg(0).Attribute()) - u32(IR::Attribute::Param0);
+            const auto& input = runtime.hw.fs.inputs.at(parameter);
+            const u32 vertex = inst.Arg(2).U32();
+            ASSERT_MSG(vertex == 0 && input.is_flat && !input.IsPassthrough(),
+                       "Fragment shader {:#x}: raw parameter {} vertex {} cannot be lowered to "
+                       "Flat (SPI_PS_INPUT_CNTL param {} flat {} default {}); only P0 with "
+                       "FLAT_SHADE and without passthrough is supported on this device",
+                       program.info.pgm_hash, parameter, vertex, u32(input.param_index),
+                       input.is_flat, input.is_default);
+            program.info.fs_interpolation[parameter] = {Qualifier::Flat, Qualifier::None};
+            inst.SetFlags(IR::AttributeReadFlags::None);
+        }
+    }
+}
+
 IR::BlockList GenerateBlocks(const IR::AbstractSyntaxList& syntax_list) {
     size_t num_syntax_blocks{};
     for (const auto& [_, type] : syntax_list) {
@@ -143,6 +169,7 @@ IR::Program TranslateProgram(const std::span<const u32>& code, Pools& pools, Inf
     if (info.sw_stage == SwStage::Fragment && profile.needs_integer_interpolation_fix) {
         Shader::Optimization::InterpolatedIntegerPass(program);
     }
+    LowerFlatVertexParameters(program, runtime_info, profile);
     Shader::Optimization::GsEmulationPass(program, runtime_info);
     Shader::Optimization::CollectShaderInfoPass(program, profile);
     Shader::IR::DumpProgram(program, info);

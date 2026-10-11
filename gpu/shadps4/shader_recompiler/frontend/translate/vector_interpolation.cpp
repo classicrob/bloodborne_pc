@@ -102,6 +102,27 @@ void Translator::V_INTERP_MOV_F32(const GcnInst& inst) {
     auto& interp = info.fs_interpolation[attr_index];
     const u32 src_select = inst.src[0].code;
     ASSERT_MSG(src_select < 3, "Invalid V_INTERP_MOV_F32 selector {}", src_select);
+    if (!profile.supports_fragment_per_vertex_inputs) {
+        if (src_select == 2 && attr.IsDefault()) {
+            SetDst(inst.dst[0],
+                   ir.Imm32(DefaultValTable[attr.default_value][inst.control.vintrp.chan]));
+            return;
+        }
+        // Keep the raw read distinguishable from ordinary interpolation until DCE. A later
+        // P0 read must not hide an unsupported live P10/P20 read of this same parameter.
+        interp.primary = Qualifier::PerVertex;
+        const auto raw = [&](u32 vertex) {
+            auto value = ir.GetAttribute(attrib, inst.control.vintrp.chan, vertex);
+            value.Inst()->SetFlags(IR::AttributeReadFlags::RawVertexParameter);
+            return value;
+        };
+        IR::F32 result = raw((src_select + 1) % 3);
+        if (src_select != 2 && !attr.IsPassthrough()) {
+            result = ir.FPSub(result, raw(0));
+        }
+        SetDst(inst.dst[0], result);
+        return;
+    }
     ASSERT(attr.is_flat || src_select == 2 ||
            profile.supports_amd_shader_explicit_vertex_parameter ||
            profile.supports_fragment_shader_barycentric);

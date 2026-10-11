@@ -216,7 +216,7 @@ if [[ ${1:-} == --test ]]; then
         rm -rf out/shader-inputs-modules && mkdir -p out/shader-inputs-modules
         out/gpu/shader-inputs-test out/shader-inputs-modules
         input_spv=(out/shader-inputs-modules/*.spv)
-        [[ ${#input_spv[@]} == 5 ]] || { echo "shader-inputs-test wrote ${#input_spv[@]} SPIR-V files, expected 5" >&2; exit 1; }
+        [[ ${#input_spv[@]} == 12 ]] || { echo "shader-inputs-test wrote ${#input_spv[@]} SPIR-V files, expected 12" >&2; exit 1; }
         for spv in "${input_spv[@]}"; do spirv-val --target-env vulkan1.3 "$spv"; done
         # Default allocated descriptor sets only; --push reproduces a MoltenVK bug and exits 2.
         BB_DEPS_PREFIX="$deps" bash tests/macos_descriptor_sizes/run.sh

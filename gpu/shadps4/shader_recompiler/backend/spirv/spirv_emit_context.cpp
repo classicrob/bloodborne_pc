@@ -525,6 +525,9 @@ void EmitContext::DefineInputs() {
                 continue;
             }
             const IR::Attribute param = IR::Attribute::Param0 + i;
+            if (!profile.supports_fragment_per_vertex_inputs && !info.loads.GetAny(param)) {
+                continue;
+            }
             const u32 num_components = info.loads.NumComponents(param);
             const auto [primary, auxiliary] = info.fs_interpolation[i];
             if (primary == Qualifier::PerVertex && !profile.supports_fragment_per_vertex_inputs) {
