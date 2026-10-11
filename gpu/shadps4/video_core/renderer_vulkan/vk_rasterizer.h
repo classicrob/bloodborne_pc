@@ -121,6 +121,20 @@ public:
     /// in stream order with the draws (SignalFlip).
     void DrawBisectOnFlip();
 #endif
+#ifdef __APPLE__
+    /// bbport (frame capture, docs/macos/capture-replay.md): on the GPU command thread at the
+    /// capture hold point. Drains the draw pipe, joins the binding helper and waits for every
+    /// submission (these block, unbounded), runs deferred operations, then polls until a 2 s
+    /// deadline
+    /// (Scheduler::WaitQuiescentForCapture) until every priority operation and deferred signal
+    /// issued has run to the end; false and `why` if anything is still outstanding (the caller
+    /// rejects the cut).
+    bool QuiesceForCapture(std::string& why);
+    /// Empty if a capture may be armed, else the host features that are on and make a frame
+    /// depend on host-side history or redirect it (upscaler incl. TAA, reduced scene / live
+    /// resolution, camera or object motion vectors).
+    [[nodiscard]] std::string CaptureSettingsRefusal() const;
+#endif
     bool RunInOrder(OrderedTask task, const void* data, u32 size,
                     u64 toggle = BbToggle::PipelinedTasks);
     /// Stage A: the draw pipe position after the last handed-over packet, and whether the

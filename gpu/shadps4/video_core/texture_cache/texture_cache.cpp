@@ -23,6 +23,9 @@
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/texture_cache/host_compatibility.h"
 #include "video_core/texture_cache/texture_cache.h"
+#ifdef __APPLE__
+#include "video_core/renderer_vulkan/vk_scene_resolution.h"
+#endif
 #include "video_core/texture_cache/tile_manager.h"
 
 namespace VideoCore {
@@ -1355,5 +1358,42 @@ void TextureCache::DeleteImage(ImageId image_id) {
         slot_images.erase(image_id);
     });
 }
+
+#ifdef __APPLE__
+void TextureCache::ReportGpuModifiedForCapture(std::vector<CaptureImageRecord>& out) {
+    std::scoped_lock lock{mutex};
+    for (Image& image : slot_images) {
+        if (False(image.flags & ImageFlagBits::GpuModified)) {
+            continue;
+        }
+        const auto& info = image.info;
+        const u32 samples = std::max(info.num_samples, image.backing ? image.backing->num_samples : 1u);
+        const char* reject = nullptr;
+        if (samples > 1) {
+            reject = "msaa";
+        } else if (info.props.is_depth && info.props.has_stencil) {
+            reject = "depth+stencil"; // TileImage writes the depth plane only
+        } else if (info.meta_info.htile_addr || info.meta_info.cmask_addr ||
+                   info.meta_info.fmask_addr) {
+            reject = "metadata"; // no compressed metadata is kept
+        } else if (info.props.is_block) {
+            reject = "bc gpu-written";
+        } else if (runtime.scene_targets && runtime.scene_targets->Tracks(image.image_uid)) {
+            reject = "scene proxy"; // content at another resolution
+        }
+        out.push_back({
+            .addr = info.guest_address,
+            .size = info.guest_size,
+            .pixel_format = static_cast<u32>(info.pixel_format),
+            .tile_mode = static_cast<u32>(info.tile_mode),
+            .aspects = static_cast<u32>(image.aspect_mask),
+            .samples = samples,
+            .mips = info.resources.levels,
+            .layers = info.resources.layers,
+            .reject = reject,
+        });
+    }
+}
+#endif
 
 } // namespace VideoCore

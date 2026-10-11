@@ -4749,6 +4749,50 @@ Rasterizer::~Rasterizer() {
 #endif
 }
 
+#ifdef __APPLE__
+bool Rasterizer::QuiesceForCapture(std::string& why) {
+    if (!OnStageA()) {
+        why = "not on the GPU command thread";
+        return false;
+    }
+    DrainDrawPipe();
+    if (draw_pipe && !draw_pipe->Idle()) {
+        why = "draw pipe not idle after its drain";
+        return false;
+    }
+    JoinBindHelper(this);
+    // Everything recorded is submitted and complete (Finish blocks until the GPU is done, without
+    // a bound: a GPU wait can hang without a reported device loss). Then what runs after GPU
+    // completion on other threads (priority operations such as downloads, deferred signals such
+    // as labels) must have run to the end, counted issued-minus-completed and checked
+    // unconditionally (WaitDeferredSignals returns early with OrderedGuestWrites off): polled
+    // until a 2 s deadline.
+    scheduler.Finish();
+    scheduler.PopPendingOperations();
+    return scheduler.WaitQuiescentForCapture(std::chrono::seconds(2), why);
+}
+
+std::string Rasterizer::CaptureSettingsRefusal() const {
+    std::string on;
+    const auto add = [&](const char* name) {
+        on += on.empty() ? name : fmt::format(", {}", name);
+    };
+    if (upscaler && upscaler->Enabled()) {
+        add("upscaler (incl. TAA and DisplayOverride)");
+    }
+    if (scene_targets && scene_targets->Reduced()) {
+        add("reduced scene (live resolution)");
+    }
+    if (camera_motion && camera_motion->Enabled()) {
+        add("camera motion vectors");
+    }
+    if (object_motion && object_motion->Enabled()) {
+        add("object motion vectors");
+    }
+    return on;
+}
+#endif
+
 void Rasterizer::NoteFrameStart() {
     if (auto* profiler = GpuProfiler::Get()) {
         profiler->BeginFrame();

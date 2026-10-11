@@ -315,6 +315,32 @@ void Scheduler::LabelThread(std::stop_token stoken) {
 }
 #endif
 
+#ifdef __APPLE__
+bool Scheduler::WaitQuiescentForCapture(std::chrono::milliseconds limit, std::string& why) {
+    const auto deadline = std::chrono::steady_clock::now() + limit;
+    while ((num_pending_ops.load(std::memory_order_acquire) || PriorityOperationsOutstanding() ||
+            DeferredSignalsOutstanding()) &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    std::string outstanding;
+    if (const u32 ops = num_pending_ops.load(std::memory_order_acquire)) {
+        outstanding += fmt::format("{} deferred operations; ", ops);
+    }
+    if (const u64 ops = PriorityOperationsOutstanding()) {
+        outstanding += fmt::format("{} priority operations not finished; ", ops);
+    }
+    if (const u64 signals = DeferredSignalsOutstanding()) {
+        outstanding += fmt::format("{} deferred signals (labels) not written; ", signals);
+    }
+    if (outstanding.empty()) {
+        return true;
+    }
+    why = outstanding.substr(0, outstanding.size() - 2);
+    return false;
+}
+#endif
+
 void Scheduler::WaitDeferredSignals() {
     const u64 issued = deferred_signals_issued.load(std::memory_order_relaxed);
     if (deferred_signals_done->load(std::memory_order_acquire) >= issued ||
@@ -653,6 +679,9 @@ void Scheduler::PriorityPendingOpsThread(std::stop_token stoken) {
         }
 
         op.callback();
+#ifdef __APPLE__
+        priority_ops_completed.fetch_add(1, std::memory_order_acq_rel);
+#endif
     }
 }
 
