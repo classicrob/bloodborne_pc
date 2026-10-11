@@ -387,6 +387,12 @@ def launch(args):
     # never activated) and its window does not take focus when shown. SDL3 reads hints from the
     # environment. Input comes from BB_PAD_FILE, so the window never needs keyboard focus.
     env.update(SDL_MAC_BACKGROUND_APP='1', SDL_WINDOW_ACTIVATE_WHEN_SHOWN='0')
+    # A small window in the bottom-right corner of the main display (window-code flags; the render
+    # size is unchanged). Builds without the flags ignore them: the launch then says so.
+    screen_w, screen_h = map(int, run_checked([str(window_tool()), 'screen'], 'reading the screen size').split('x'))
+    win_w, win_h = 960, 540
+    env.update(BB_WINDOW_SIZE=f'{win_w}x{win_h}', BB_WINDOW_BACKGROUND='1',
+               BB_WINDOW_POS=f'{max(0, screen_w - win_w - 12)},{max(0, screen_h - win_h - 12)}')
     if args.gpu_log:
         env['BB_GPU_LOG'] = args.gpu_log
     if args.perf:
@@ -471,9 +477,27 @@ def launch(args):
             give_up(f'game exited during startup: {(run / "exit.json").read_text().strip()}; log {run / "game.log"}')
         if info.get('pid') and any(l.startswith('Runtime:') for l in log_lines(run)):
             fcntl.flock(lock, fcntl.LOCK_UN)
+            report_window(run)
             print(json.dumps({'run': str(run), 'pid': info['pid'], 'log': str(run / 'game.log')}))
             return run
     give_up(f'no runtime output within 60 s (Rosetta rule: report, do not retry); run {run}')
+
+
+def report_window(run, wait=60):
+    """Says whether the game honoured the small background window (BB_WINDOW_*): older builds
+    ignore the flags and open a full-size window, which is reported, not hidden."""
+    deadline = time.time() + wait
+    while time.time() < deadline and not (run / 'exit.json').exists():
+        lines = log_lines(run)
+        window = [l for l in lines if l.startswith('Window: ')]
+        if window:
+            print(f'play_route: {window[0].strip()}', file=sys.stderr)
+            return
+        if any(l.startswith('GPU: window and Vulkan presenter ready') for l in lines):
+            print('play_route: this build has no window flags (BB_WINDOW_*): the window is full size '
+                  'and centred; it still does not take focus', file=sys.stderr)
+            return
+        time.sleep(1)
 
 
 def supervise(run):
