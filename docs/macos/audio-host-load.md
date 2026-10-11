@@ -8,8 +8,8 @@ do not yet establish that bbport caused either load. No audio configuration was
 changed and no measurement job was started during this audit.
 
 The source does not support a tiny CoreAudio quantum or repeated device opening
-as the explanation. The first useful experiment is a matched idle / game audio /
-game timer-sink / idle comparison after the quiet window.
+as the explanation. The first idle / game audio / idle measurements below show no observable
+increase with the game in that sample. The timer-sink control remains unrun.
 
 ## Runtime and observed configuration
 
@@ -105,3 +105,38 @@ to compare eight-channel and stereo output, one and two logical streams, and
 the same quantum. A stereo production change would require a correct, tested
 downmix; dropping channels or disabling sound is not a fix. No such runtime
 change is justified by this source audit alone.
+
+
+## First post-window comparison
+
+Playtest reported cumulative `ps` CPU-time deltas on 2026-10-11, around one
+PREVIEW-3 clinic run with `BB_AUDIO_STATS=1`. Percentages are CPU seconds divided
+by elapsed seconds; 100% is one core.
+
+| Phase | Game processes | Interval | coreaudiod CPU delta / percentage | audioanalyticsd CPU delta / percentage |
+| --- | --- | --- | --- | --- |
+| Before game | 0 | 30 s | 42 s / 140% | 20.0 s / 67% |
+| Clinic, steady play stage | 1 | 31 s | 41 s / 132% | 16.8 s / 54% |
+| After stop | 0 | 31 s | 61 s / 197% | 24.8 s / 80% |
+
+The daemons were already busy without the game and did not increase while it
+ran in this comparison. The post-stop increase also shows substantial baseline
+variation. This does not establish zero incremental cost: host load averages
+were 121–215, the intervals were short, and coreaudiod's cumulative CPU display
+had one-second resolution. It does not establish which other audio client caused
+the load. The orchestrator separately observed Aqua Voice Helper consuming CPU
+with no game running; that application was left untouched.
+
+Run evidence: Playtest worktree
+`out/macos_route/20261011-015800-1080p-PREVIEW3-clinic-play2/game.log`.
+Source-side inspection of this log confirms the same two port opens and
+48 kHz/eight-channel/1,024-frame device configuration, 78 audio-stat reports and
+one software input-health warning. Late reports have 903–924 buffers per nominal
+five-second window and gaps up to 129 ms; those observations describe delayed
+input under contention, not an explanation of the daemon CPU.
+
+No `BB_AUDIO=none` control was launched. Defer that and any output-format change
+unless a less-contended paired measurement shows a reproducible game-dependent
+increase. The immediate performance investigation should continue with the
+measured game-side waits and uploads, rather than attributing these shared-daemon
+CPU totals to bbport.
