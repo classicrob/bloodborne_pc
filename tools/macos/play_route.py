@@ -451,6 +451,10 @@ REPORT = {
     'sync_einval': r'Runtime sync EINVAL',
     'guest_panic': r'Dantelion2 Panic|Guest fault',
     'cache_rebuilt': r'Pipeline cache isn.t compatible|Pipeline cache cleared',
+    'stream_write_waits': r'Command snapshot #\d+.*waited for',
+    'builder_rejected': r'rejected a \d+-dword command buffer request',
+    'gpu_copy_gap': r'runs on the GPU',
+    'cmd_overlap': r'CMD-OVERLAP',
 }
 
 
