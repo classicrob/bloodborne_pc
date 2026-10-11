@@ -303,8 +303,10 @@ int main(int argc, char **argv) {
     CHECK(vkCreateFence(device, &fci, NULL, &fence));
 
     // Calibrate the unit segment to at least 1 ms of GPU time. Short segments are less likely to
-    // be time-sliced with other GPU users. The calibration doubles as warm-up; the clock still
-    // varies, so the measured unit only has to stay above 0.4 ms, enough signal for the ratios.
+    // be time-sliced with other GPU users. The calibration doubles as warm-up. The GPU clock can
+    // rise about 5x between calibration and measurement (a contended --test measured 0.198 ms for
+    // a unit calibrated to 1 ms), and no compute ratio is asserted, so the compute unit only has
+    // to be clearly non-zero, as for fills; the empty-segment check scales with it.
     double ms[SEGMENTS];
     unsigned iterations = 256;
     for (;;) {
@@ -313,7 +315,7 @@ int main(int argc, char **argv) {
         iterations *= 2;
     }
     for (unsigned i = 0; i < 4; ++i) measure(run_per_submission, iterations, 0, ms);
-    int ok = check("per-submission compute", ms, measure(run_per_submission, iterations, 0, ms), 0.4, 0, 1);
+    int ok = check("per-submission compute", ms, measure(run_per_submission, iterations, 0, ms), 0.05, 0, 1);
     // Transfer work (Metal blit encoders): 64/128/256 MiB fills.
     ok &= check("per-submission fill", ms, measure(run_per_submission, 64u << 20, 1, ms), 0.05, 1, 1);
     printf("MEASURED (diagnostic, not used by BB_PERF):\n");
