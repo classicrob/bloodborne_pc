@@ -86,7 +86,7 @@ u8 CanaryByte(u64 va) { return u8(Hash32(va ^ 0xC0FFEE123ull) % 255 + 1); }
 enum class SoffSrc { Inline, Sgpr };
 enum class SmemSrc { None, Imm, Sgpr };
 // Wave64 lane-semantics programs (no buffer access under test).
-enum class Wave { None, Lane, MbcntMask, Readlane, Exec1, Exec2, LoopReadFirstLane, Lds, CtrlPhi, CtrlBreak, Pkrtz, Pkrtz3, SmemFallback, Exec3 };
+enum class Wave { None, Lane, MbcntMask, Readlane, Exec1, Exec2, LoopReadFirstLane, Lds, CtrlPhi, CtrlBreak, Pkrtz, Pkrtz3, SmemFallback, Exec3, Exec3Out, WriteLane };
 
 struct Template {
     std::string name;
@@ -326,6 +326,29 @@ void AssembleWave(GcnAsm::Code& c, Wave w) {
         c.SMovB64(EXEC_LO, 22); // END
         break;
     }
+    case Wave::Exec3Out: { // the same, read AFTER the scope by every lane: SGPRs are wave-wide
+        c.SMovLiteral(21, 0xDEAD0000u);
+        c.SMovLiteral(24, 0xDEAD0001u);
+        c.VCmpNeU32(Inline(0), 2);
+        c.SAndSaveexecB64(22, VCC_LO);
+        const size_t br = c.words.size();
+        c.Sopp(8, 0); // s_cbranch_execz END (patched)
+        c.VReadfirstlane(21, 3);
+        c.VCmpNeU32(Inline(0), 5);
+        c.SBcnt1B64(24, VCC_LO);
+        c.words[br] |= u32(int32_t(c.words.size()) - int32_t(br + 1)) & 0xFFFF;
+        c.SMovB64(EXEC_LO, 22); // END
+        c.VMov(10, 21);
+        c.VMov(11, 24);
+        break;
+    }
+    case Wave::WriteLane: // v_writelane_b32 to lane 5 (launched) and to lane 37 (absent in <=32)
+        c.SMovLiteral(20, 0xABCD1234u);
+        c.Sop1(3, 21, Inline(5));
+        c.Sop1(3, 22, Inline(37));
+        c.Vop2(2, 10, 21, 20); // v_writelane_b32 v10, s20, s21
+        c.Vop2(2, 11, 22, 20); // v_writelane_b32 v11, s20, s22
+        break;
     case Wave::Exec2: // exec as a 64-bit value; mbcnt over exec inside the scope
         c.VCmpNeU32(Inline(0), 2);
         c.SAndSaveexecB64(22, VCC_LO);
@@ -682,11 +705,17 @@ void Assemble(Template& t) {
     }
     Code c;
     c.SMovLiteral(VCC_HI, 0x5eed); // the recompiler expects s_mov_b32 vcc_hi, #imm first
-    // v15 = local invocation index = x + y * size_x (v0, v1 = local id x, y)
+    // v15 = local invocation index = x + y * size_x + z * size_x * size_y (v0..v2 = local id)
     u32 log2x = 0;
     while ((1u << log2x) < t.wg[0]) ++log2x;
     c.VLshlrevB32(15, Inline(log2x), 1);
     c.Vop2(37, 15, 15, Vgpr(0)); // v_add_i32 v15, v0, v15
+    if (t.wg[2] > 1) { // + z * size_x * size_y (v2 = local id z, read before the parameter load)
+        u32 log2y = 0;
+        while ((1u << log2y) < t.wg[1]) ++log2y;
+        c.VLshlrevB32(14, Inline(log2x + log2y), 2);
+        c.Vop2(37, 15, 15, Vgpr(14)); // v_add_i32 v15, v14, v15
+    }
     c.VLshlrevB32(1, Inline(5), 15);
     Code::BufFields p{.offen = true, .vaddr = 1, .vdata = 2, .srsrc = 4};
     c.Mubuf(BUFFER_LOAD_DWORDX4, p); // v2 active, v3 vindex, v4 voffset, v5 data0
@@ -1557,6 +1586,65 @@ void AddWaveCases() {
                 const std::string mn = m.name;
                 if (mn != "even" && mn != "lanes5+40" && mn != "lower32" && mn != "all") continue;
                 Job& j = NewJob("wave64", tt, RawV(64), 0);
+                j.label += " exec=" + mn;
+                for (u32 l = 0; l < x; ++l) {
+                    SetLane(j, l, value(l), 0, {u32(l % 3 != 1), 0, 0, 0});
+                    j.lanes[l].active = u32((m.mask >> (l % 64)) & 1);
+                }
+            }
+        }
+    }
+    // One-subgroup workgroups in 1D/2D/3D shapes: lane = LocalInvocationIndex & 63 in every shape,
+    // ballots/mbcnt/writelane and the execz-scope ballot.
+    for (const std::array<u32, 3>& wg : {std::array<u32, 3>{16, 1, 1}, std::array<u32, 3>{32, 1, 1},
+                                         std::array<u32, 3>{4, 4, 1}, std::array<u32, 3>{2, 4, 2},
+                                         std::array<u32, 3>{4, 4, 2}}) {
+        const u32 threads = wg[0] * wg[1] * wg[2];
+        const std::string shape = " [" + std::to_string(wg[0]) + "x" + std::to_string(wg[1]) + "x" + std::to_string(wg[2]) + "]";
+        for (auto [name, w] : {std::pair{"wave1sg: v_mbcnt(-1) lane id + VOPC ballot + s_bcnt1", Wave::Lane},
+                               std::pair{"wave1sg: v_mbcnt over VCC + s_mov_b64 vcc + v_cndmask", Wave::MbcntMask},
+                               std::pair{"wave1sg: s_cbranch_execz scope: v_readfirstlane, VOPC ballot s_bcnt1", Wave::Exec3},
+                               std::pair{"wave1sg: v_writelane lane 5 and lane 37", Wave::WriteLane}}) {
+            Template t;
+            t.name = std::string(name) + shape;
+            t.op.kind = GCN_LOAD;
+            t.wave = w;
+            t.wg = wg;
+            const u32 tt = AddTemplate(t);
+            for (const M& m : masks) {
+                const std::string mn = m.name;
+                if (mn != "all" && mn != "even" && mn != "lanes5+40") continue;
+                if (w == Wave::WriteLane && mn != "all") continue;
+                Job& j = NewJob("wave64", tt, RawV(64), 0);
+                j.label += " mask=" + mn;
+                for (u32 l = 0; l < threads; ++l) {
+                    const u32 bit = u32((m.mask >> (l % 64)) & 1);
+                    if (w == Wave::Exec3) {
+                        SetLane(j, l, value(l), 0, {u32(l % 3 != 1), 0, 0, 0});
+                        j.lanes[l].active = bit;
+                    } else {
+                        SetLane(j, l, value(l), 0, {bit, 0, 0, 0});
+                    }
+                }
+            }
+        }
+    }
+    // Opt-in repro (BB_REPRO_SGPR_LIVEOUT=1, group "repro"): SGPRs written inside an
+    // s_and_saveexec + s_cbranch_execz scope, read after it by lanes that were inactive in the
+    // scope. GCN: SGPRs are wave-wide, so every lane sees the new value. Promoted to the default
+    // suite once the recompiler keeps scope-written SGPRs wave-uniform.
+    if (std::getenv("BB_REPRO_SGPR_LIVEOUT")) {
+        for (u32 x : {16u, 32u}) {
+            Template t;
+            t.name = "repro: SGPRs written in an execz scope, read after it by every lane [" + std::to_string(x) + "x1]";
+            t.op.kind = GCN_LOAD;
+            t.wave = Wave::Exec3Out;
+            t.wg = {x, 1, 1};
+            const u32 tt = AddTemplate(t);
+            for (const M& m : masks) {
+                const std::string mn = m.name;
+                if (mn != "even" && mn != "lanes5+40" && mn != "all") continue;
+                Job& j = NewJob("repro", tt, RawV(64), 0);
                 j.label += " exec=" + mn;
                 for (u32 l = 0; l < x; ++l) {
                     SetLane(j, l, value(l), 0, {u32(l % 3 != 1), 0, 0, 0});
@@ -3204,6 +3292,14 @@ std::vector<u32> WaveExpected(const Job& j) {
         case Wave::Exec1:
             r[0] = value(gcn_first_lane(exec)); r[1] = gcn_popcount64(exec);
             if (exec >> lane & 1) r[3] = value(lane);
+            break;
+        case Wave::WriteLane:
+            if (lane == 5) r[0] = 0xABCD1234u;
+            if (lane == 37) r[1] = 0xABCD1234u;
+            break;
+        case Wave::Exec3Out: // GCN: every lane of the wave sees the scope's SGPR results
+            r[0] = exec ? value(gcn_first_lane(exec)) : 0xDEAD0000u;
+            r[1] = exec ? gcn_popcount64(ballot & exec) : 0xDEAD0001u;
             break;
         case Wave::Exec3:
             if (exec >> lane & 1) {
