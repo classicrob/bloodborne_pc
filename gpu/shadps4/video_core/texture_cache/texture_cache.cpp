@@ -988,6 +988,10 @@ void TextureCache::RefreshImage(Image& image) {
     }
 
     runtime.UploadImage(&image, buffer, image_copies);
+    // The upload is the detiled staging buffer's last use (no-op when the image was not tiled).
+    if (buffer != in_buffer) {
+        runtime.GetStagingPool().RetireLarge(buffer);
+    }
 }
 
 vk::Sampler TextureCache::GetSampler(const AmdGpu::Sampler& sampler,

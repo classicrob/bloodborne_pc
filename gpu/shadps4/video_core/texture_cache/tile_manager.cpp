@@ -249,7 +249,8 @@ std::pair<const Buffer*, u64> TileManager::DetileImage(const VideoCore::Buffer* 
         .range = sizeof(params),
     };
 
-    const auto staging = runtime.GetStagingPool().Request(info.guest_size, MemoryType::DeviceLocal);
+    const auto staging =
+        runtime.GetStagingPool().Request(info.guest_size, MemoryType::DeviceLocal, 0, false, true);
 
     scheduler.EndRendering();
     runtime.FlushBarriers();
@@ -306,7 +307,8 @@ void TileManager::TileImage(Image& in_image, std::span<vk::BufferImageCopy> buff
         .range = sizeof(params),
     };
 
-    const auto staging = runtime.GetStagingPool().Request(info.guest_size, MemoryType::DeviceLocal);
+    const auto staging =
+        runtime.GetStagingPool().Request(info.guest_size, MemoryType::DeviceLocal, 0, false, true);
     for (auto& copy : buffer_copies) {
         copy.bufferOffset += staging.offset;
     }
@@ -328,6 +330,8 @@ void TileManager::TileImage(Image& in_image, std::span<vk::BufferImageCopy> buff
     // bbport: recorded with copies of the descriptor infos (threaded recording).
     RecordTilingDispatch(GetTilingPipeline(info, true), tiled_buffer_info, linear_buffer_info,
                          params_buffer_info, dim_x);
+    // The tiling dispatch is the staging buffer's last use.
+    runtime.GetStagingPool().RetireLarge(staging.buffer);
 
     runtime.AccessBuffer(out_buffer, out_offset, info.guest_size,
                          vk::PipelineStageFlagBits2::eComputeShader,
