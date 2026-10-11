@@ -14,8 +14,9 @@ Pools of slots, each slot an flock on a file in BB_HEAVY_DIR (default ~/bbport-d
             4 jobs (BB_BUILD_JOBS, MAKEFLAGS, CMAKE_BUILD_PARALLEL_LEVEL), warned on stderr after
             BB_HEAVY_QUICK_WARN (300) s, and killed with its whole process group, reported, and
             exit 124 after BB_HEAVY_QUICK_LIMIT (600) s: a long job belongs in the build pool.
-            A small test-target build (one target and its run) belongs here, not behind a long
-            build-pool job;
+            A small test-target build (one target and its run) belongs here only when the library
+            it links is already built in that tree: in a cold tree it rebuilds libbbgpu first
+            (over 600 s) and is killed; use the build pool for that;
   sweep     BB_HEAVY_SWEEP_SLOTS (1) for the long shader-sweep phase, run as its own heavy.sh
             call after the build (a slot is held by the whole job, so a sweep inside a build job
             keeps the build slot; that is reported). Background QoS like builds, so it does not

@@ -13,7 +13,7 @@ tools/macos/heavy.sh status
 |---|---|---|
 | `build` | 1 (`BB_HEAVY_BUILD_SLOTS`) + 1 priority-only | builds, test suites, conformance runs, benchmarks, standalone GPU probes; `--priority` (shared builds) may also take the reserved slot |
 | `playtest` | 2 (`BB_HEAVY_PLAYTEST_SLOTS`) | game runs through play_route.py: parallel correctness runs, each with its own user dir and window |
-| `quick` | 2 (`BB_HEAVY_QUICK_SLOTS`) | short jobs: a one-TU compile check, a single test target built and run, a driver-only build. Never a full GPU build. A small test target does not wait behind a long build-pool job |
+| `quick` | 2 (`BB_HEAVY_QUICK_SLOTS`) | short jobs: a one-TU compile check, a single test target built and run **when the library it links is already built in that tree**, a driver-only build. Never a full GPU build: a test target in a cold tree first rebuilds libbbgpu (over 600 s), and the quick pool kills it; use the build pool for that (`--priority` for P0) |
 | `sweep` | 1 (`BB_HEAVY_SWEEP_SLOTS`) | the long shader-sweep phase, as its own heavy.sh call after the build (see below) |
 
 A quick job gets a parallelism hint (`BB_BUILD_JOBS=4`, `CMAKE_BUILD_PARALLEL_LEVEL=4`,
