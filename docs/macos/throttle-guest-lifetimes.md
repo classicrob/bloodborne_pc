@@ -53,8 +53,9 @@ Known caller distinctions matter:
   (for example 0x2165534 -> 0x21655b2 and 0x21677ea -> 0x216783a). A destructor hit alone
   does not prove that it frees a live payload: list contents and ownership transfer matter.
 - The large renderer cleanup at 0x2196e10 calls the flush/retirement helper 0x26af700 before
-  destroying several contexts. That helper queues resource nodes via 0x26aa5a0 and clears
-  their context list heads, and submits through 0x26b0b00. Queueing retirement is different
+  destroying several contexts. When its callback/list guards pass, that helper queues
+  resource nodes via 0x26aa5a0, clears their context list heads, and can submit through
+  0x26b0b00. Queueing retirement is different
   from waiting for its GPU completion; emptied lists also change what subsequent immediate
   cleanup can actually free. This is not a proof that every entry to cleanup is protected.
 
@@ -157,8 +158,10 @@ thereby proved unreachable.
 
 **Result: no completion-wait proof for all non-initialization callers.** Initialization
 rollback accounts for most pool-destruction sites. There is also a concrete cloth-manager
-teardown path that flushes a child context and then cleans it up without a CPU GPU-completion
-wait between those operations. Whether it destroys a chunk with outstanding GPU references
+teardown path that calls the flush helper and then cleans up the child without a CPU
+GPU-completion wait between those operations. Its mode-1 child normally fails the helper's
+submission guard; successful child finalization can instead transfer chunk ownership away.
+Whether teardown destroys a chunk with outstanding GPU references
 still depends on runtime ownership and pending work. This is a conditional existing hazard,
 not proof that R1 introduces a new hazard.
 
@@ -223,7 +226,7 @@ other destructor entry is `0x1e3a760`). The decoded chain is:
 0x1e3a780 --call 0x1e3a7f5--> 0xfd3050
 0xfd3050 --call 0xfd3096--> 0x10562d0
   for each child in owner[+0x10], when owner[+0x80] == 0:
-    0x1056396 -> 0x2168530(child)       // flush
+    0x1056396 -> 0x2168530(child)       // calls guarded flush helper
     0x10563cd -> 0x26d5810(child)       // destroy
       0x26d5819 -> 0x21682c0(child)
         0x216830a -> 0x26af3f0(child+0x10)
@@ -242,11 +245,47 @@ Thus this is a named no-local-wait path, not a demonstrated in-flight violation.
 `0x105671f/0x1056768` (construction rollback in `0x1056580`). The last two must not be
 counted as evidence of freeing submitted work.
 
+### Child finalization transfers ownership rather than waiting
+
+The cloth initializer `0x1056580` creates its children through `0x21676c0` at `0x10566c7`.
+That factory uses mode 1, whose initializer installs callback `0x26af230` at
+`0x26aeefe`. The submitting mode-0 callback is `0x26af030`, installed at `0x26aef52`.
+The flush guard below distinguishes them: merely calling `0x2168530` on this child does
+not establish that a submission occurred.
+
+The cloth child-finalization loop has this separate path:
+
+```
+0x10567e0 --call 0x1056812--> 0x26d5850(child, output, 0)
+  0x26d587b -> 0x216aca0
+    0x216acf7 -> 0x26afd30(child+0x10, output)
+```
+
+On the successful path, `0x26afd30` emits chunk-release packets into the command stream,
+appends the current CommandBuffer record if necessary, and clears the source's begin/end,
+cmdptr and saved begin at `0x26b0027/0x26b002b/0x26b0033`. It transfers the record allocator,
+head, current block, capacity and used count to the output at `0x26b00a7..0x26b00d8`, then
+zeros the source's used count and both record-list pointers at `0x26b00dc..0x26b00f2`.
+The source now has neither that current chunk nor those recorded chunks to reset during
+cleanup. This is a concrete ownership-transfer explanation for an empty cleanup without
+a GPU wait; it is not GPU retirement of the transferred chunks.
+
+The companion cloth loop `0x1056830` passes the outputs to the renderer's context through
+`0x105687d -> 0x21679a0 -> 0x216a7d0`. Establishing retirement of all their addressed data
+still requires following the receiving context's ownership and submissions. Moreover,
+error-9 exits in `0x26afd30` can precede its clear/transfer, and the loop at `0x1056812`
+does not branch on the returned error. Successful finalization therefore qualifies the
+transferred current/record chunks only; unfinished or failed finalization, resource-range
+nodes, and any separately retained chunks still need a lifetime argument. This audit does
+not prove that every cloth teardown follows successful finalization.
+
 ### What the flush proves, and what it does not
 
 `0x2168530` and the inlined renderer cleanup sequences call `0x26af700`. Its substantive
-retirement branch requires **both** context+`0xb4d8` nonnull and the expected callback
-identity (`0x26af72d..0x26af746`). Otherwise it returns. Inside that branch it queues the
+retirement branch requires **both** context+`0xb4d8` nonnull and callback `0x26af030`
+(`0x26af72d..0x26af746`, compared through relocated GOT slot `0x53e43c8`). Otherwise it
+returns after saving cmdptr at context+`0xb4b8`. In particular, a factory child retaining
+callback `0x26af230` does not enter this branch. Inside the branch it queues the
 resource nodes for label-governed retirement, clears those resource heads, emits chunk
 release packets and clears the saved-chunk list. It can submit through
 `0x26af9c2 -> 0x26b0b00 -> 0x1089a10` (SubmitCommandBuffers). No CPU completion wait
@@ -261,8 +300,10 @@ prove the remaining current chunk has no execution-time references. After the fl
 The renderer cleanup sites `0x21974ef/0x219768f/0x2197822` have this flush-then-destroy
 shape. Their outer lifecycle and any indirect callbacks still require qualification.
 
-R0's pre-submit GpuIdle throttle does not turn the flush's return into completion of that
-flush. If the direct reset frees a live current chunk here, it is possible under R0 too.
+For a context that actually submits through this guard, R0's pre-submit GpuIdle throttle
+does not turn the flush's return into completion of that flush. If the direct reset frees
+a live current chunk here, it is possible under R0 too. The cloth child's call to the
+helper alone does not demonstrate this submitting-context case.
 R1 may change the overlap window, but calling this an R1-only hole would be incorrect.
 Conversely, finding no change in a label checker does not prove the chain safe: a reset
 before parse, ABA, or destruction without a subsequent write can remain invisible.
