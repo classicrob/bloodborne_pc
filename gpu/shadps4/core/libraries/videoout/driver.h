@@ -40,6 +40,9 @@ struct VideoOutPort {
     std::condition_variable vblank_cv;
     int flip_rate = 0;
     int prev_index = -1;
+    /// bbport: bumped by Close; a flip published late (at GPU retirement) for an older
+    /// generation is dropped, not applied to the reopened port.
+    u64 generation = 0;
     bool is_open = false;
     bool is_hdr = false;
 
@@ -117,6 +120,8 @@ private:
     };
 
     void Flip(const Request& req);
+    /// The flip's guest-visible effects: status and count, flip events, previous buffer label.
+    void PublishFlip(const Request& req, u64 generation);
     void DrawBlankFrame(); // Video port out not open
     void DrawLastFrame();  // Used when there is no flip request
     void SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_arg, bool is_eop = false);
@@ -138,6 +143,21 @@ private:
     std::mutex mutex;
     std::condition_variable request_cv; ///< bbport: a flip was queued (immediate flips)
     VideoOutPort main_port{};
+#ifdef __APPLE__
+    /// bbport: flips published at GPU retirement of their frame copy, in flip order
+    /// (FlipAtGpuRetire). After main_port, before present_thread: stops after the present
+    /// thread that queues to it, before the port it publishes to.
+    struct PendingFlip {
+        Request request;
+        u64 tick; ///< the frame copy's draw-scheduler timeline value; 0: nothing to wait for
+        u64 generation;
+    };
+    void PublishThread(std::stop_token token);
+    std::mutex publish_mutex;
+    std::condition_variable_any publish_cv;
+    std::deque<PendingFlip> publish_queue;
+    std::jthread publish_thread;
+#endif
     std::jthread present_thread;
     std::queue<Request> requests;
 };

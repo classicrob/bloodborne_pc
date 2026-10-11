@@ -244,3 +244,26 @@ switch, the first label in the new mode waits until every label issued before it
 the two modes never reorder labels. The switch is logged as
 `Labels at GPU completion: ON|OFF at <UTC time> (switched; ...)`. One run can therefore alternate
 the modes, say every 60 s, and compare its halves under the same load, cache and location.
+
+## Flip publication at GPU retirement (`FlipAtGpuRetire`, toggle bit 60)
+
+A flip tells the guest that its previous display buffer may be reused. That means the flip
+status (count, flip_arg, current buffer, pending counters), the flip events, and the previous
+buffer's label reset to 0. The guest's frame gate (`FlipStatus.flip_arg >= F + 1 - B`) and its
+display-buffer reuse depend on it.
+
+The presenter reads the guest framebuffer only in the frame copy that PrepareFrame records and
+submits on the draw scheduler (`Frame::ready_tick`). Presenting to the swapchain reads our copy,
+not guest memory. So that copy's GPU retirement is the exact point. The moment the frame is
+actually on screen matters only for pacing, which vblank events model, and MoltenVK does not
+report it reliably.
+
+With bit 60 of `BB_TOGGLE_FILE` (or `BB_FLIP_AT_GPU_RETIRE=1` for the whole run):
+- VideoOutDriver::Flip queues the publication with the frame's ready_tick.
+- A FlipPublish thread waits for each tick in flip order, then publishes. Blank frames read no
+  guest memory and wait for nothing.
+- With the bit cleared, flips publish at once, unless publications are still queued. Then they
+  queue behind them, so order holds across a live switch.
+- Close bumps the port's generation, so a late publication for a closed port is dropped and
+  reported rather than applied to the reopened one.
+- Flips still queued at shutdown are reported.
