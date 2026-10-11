@@ -89,7 +89,7 @@ NEW_GAME = [
     ('new-game', [('press_screen', 'cross', 0.04, 3, 3), ('sleep', 2), ('capture', 'brightness', 0.05)]),
     ('brightness', [('press', 'down'), ('press_screen', 'cross', 0.04, 3, 3), ('capture', 'controls', 0.05)]),
     ('controls', [('press', 'down')] * 6 + [('capture', 'controls-next', 0.05),
-                  ('press_log', 'cross', r'Init: Opening .*sprj_opening\.mp4', 2, 30), ('sleep', 15),
+                  ('press_log', 'cross', r'Init: Opening .*sprj_opening\.mp4', 8, 12, 'down'), ('sleep', 15),
                   ('capture', 'opening-movie', None)]),
     ('movie-end', [('wait_log', r'DemuxerThread: Demuxer Thread exited normally', 300), ('sleep', 5),
                    ('capture', 'after-movie', None)]),
@@ -104,7 +104,7 @@ NEW_GAME = [
     WORLD,
 ]
 SKIP_MOVIE = ('controls', [('press', 'down')] * 6 + [
-    ('capture', 'controls-next', 0.05), ('press_log', 'cross', r'Init: Opening .*sprj_opening\.mp4', 2, 30),
+    ('capture', 'controls-next', 0.05), ('press_log', 'cross', r'Init: Opening .*sprj_opening\.mp4', 8, 12, 'down'),
     ('sleep', 3), ('press', 'options'), ('sleep', 3),
     ('capture', 'movie-skipped', None)])
 # From a save fixture the title cursor starts on Play Offline (Down would select Play Online), and
@@ -647,8 +647,10 @@ def route(run, until, hold=0, stages=NEW_GAME):
                 else:
                     die(f'{token} did not change the screen after {tries} presses (stage {name})')
             elif op[0] == 'press_log':
-                # A press that must produce a log line: retried when it was dropped.
-                token, regex, tries, timeout = op[1:]
+                # A press that must produce a log line: retried when it was dropped. With a fifth
+                # element, that token is pressed between attempts (a menu cursor that fell short).
+                token, regex, tries, timeout = op[1:5]
+                advance = op[5] if len(op) > 5 else None
                 pattern = re.compile(regex)
                 for attempt in range(1, tries + 1):
                     mark = len(log_lines(run))
@@ -661,6 +663,8 @@ def route(run, until, hold=0, stages=NEW_GAME):
                     event(run, 'press-log', token=token, attempt=attempt, matched=hit)
                     if hit:
                         break
+                    if advance:
+                        press(run, advance)
                 else:
                     die(f'{token} did not produce {regex!r} after {tries} presses (stage {name})')
             elif op[0] == 'sleep':
