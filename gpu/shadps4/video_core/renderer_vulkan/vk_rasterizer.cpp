@@ -2,6 +2,12 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <xxhash.h>
+#ifdef __APPLE__
+#include <sys/stat.h>
+#include <charconv>
+#include <fstream>
+#include <sstream>
+#endif
 #include "video_core/renderer_vulkan/ui_composition.h"
 #include "bbport_toggles.h"
 #include "video_core/renderer_vulkan/vk_frame_capture.h"
@@ -1047,6 +1053,9 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
         scene_targets->debug = scene_debug_frame;
     }
 #ifdef __APPLE__
+    if (DrawBisectSkip(pipeline, is_indexed, index_offset, nullptr)) {
+        return;
+    }
     // Emulated geometry stage: the ES and GS run first, as compute (vk_gs_emulation.cpp); the draw
     // below is the copy shader over the GS's strip index runs.
     GsEmulationDraw gs_draw{};
@@ -1349,6 +1358,9 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
     const u32 stride = indirect.stride;
     const u32 max_count = indirect.max_count;
 #ifdef __APPLE__
+    if (DrawBisectSkip(pipeline, is_indexed, 0, &indirect)) {
+        return;
+    }
     // Emulated geometry stage: a setup kernel reads the guest's indirect command and feeds the
     // ES/GS compute passes and the strip draw indirectly (vk_gs_emulation.cpp).
     GsEmulationDraw gs_draw{};
@@ -4201,6 +4213,256 @@ void Rasterizer::MarkPass(const GraphicsPipeline* pipeline, const RenderState& s
                            vs.pgm_hash, ps ? ps->pgm_hash : 0);
     });
 }
+
+#ifdef __APPLE__
+namespace {
+// bbport: BB_DRAW_BISECT=<control file> (diagnostic, off by default). Finds the draws that make
+// a stable bad frame: draws are numbered from 0 in each frame (flip to flip), in stream order
+// where they are recorded (direct and indirect draws; clears, resolves and copies FilterDraw
+// handles are not counted). The control file is re-read at each flip when it changed; a missing
+// file skips nothing. Lines (# starts a comment):
+//   skip 120-340        skip the frame's draws 120 to 340 (inclusive; "skip 7" is one draw)
+//   skip vs 0x1234abcd  skip every draw whose vertex shader has this hash ("ps": pixel shader)
+//   skip rt 0x...       skip every draw whose first color target is at this guest address
+//   list 7              a new value lists every draw of the frame that starts at the next flip
+// Rules add up. A line that does not parse, or a file that cannot be read, rejects the whole file
+// (nothing is skipped) loudly. Write the file elsewhere and rename it over the control file, so
+// that a flip never reads it half written.
+struct DrawBisect {
+    struct Range {
+        u32 first, last;
+    };
+    std::vector<Range> ranges;
+    std::vector<u64> vs_hashes, ps_hashes;
+    std::vector<VAddr> targets;
+    std::string list_value;
+    bool listing = false; ///< this frame's draws are printed
+    bool report = false;  ///< print this frame's counts at its end (the first after a change)
+    u32 draw = 0;         ///< index of the next draw in this frame
+    u64 frame = 0, skipped = 0, frames_since_note = 0;
+    timespec mtime{};
+    off_t size = -1;
+
+    bool Active() const {
+        return !ranges.empty() || !vs_hashes.empty() || !ps_hashes.empty() || !targets.empty();
+    }
+};
+
+const char* const draw_bisect_file = [] {
+    const char* file = std::getenv("BB_DRAW_BISECT");
+    if (!file || !*file) {
+        return static_cast<const char*>(nullptr);
+    }
+    std::printf("\n*** BB_DRAW_BISECT=%s: DIAGNOSTIC MODE. Draws that file names are skipped; "
+                "rendering is wrong by design while it names any. ***\n\n",
+                file);
+    return file;
+}();
+DrawBisect draw_bisect;
+
+/// An unsigned number, decimal or 0x hex, and nothing else (no sign, no overflow).
+bool ParseBisectNumber(std::string_view text, u64& value) {
+    int base = 10;
+    if (text.starts_with("0x") || text.starts_with("0X")) {
+        text.remove_prefix(2);
+        base = 16;
+    }
+    const char* const end = text.data() + text.size();
+    const auto result = std::from_chars(text.data(), end, value, base);
+    return !text.empty() && result.ec == std::errc{} && result.ptr == end;
+}
+
+/// Re-reads the control file when its time or size changed. True when it did.
+bool ReadDrawBisect(DrawBisect& b) {
+    struct stat st{};
+    const bool exists = stat(draw_bisect_file, &st) == 0;
+    const off_t size = exists ? st.st_size : -1;
+    if (size == b.size && (!exists || (st.st_mtimespec.tv_sec == b.mtime.tv_sec &&
+                                       st.st_mtimespec.tv_nsec == b.mtime.tv_nsec))) {
+        return false;
+    }
+    b.size = size;
+    b.mtime = exists ? st.st_mtimespec : timespec{};
+    const auto reject = [&b] {
+        b.ranges.clear();
+        b.vs_hashes.clear();
+        b.ps_hashes.clear();
+        b.targets.clear();
+    };
+    DrawBisect next;
+    next.list_value = b.list_value;
+    std::ifstream in(draw_bisect_file);
+    std::string line;
+    u32 number = 0;
+    while (exists && std::getline(in, line)) {
+        ++number;
+        if (const auto hash = line.find('#'); hash != std::string::npos) {
+            line.resize(hash);
+        }
+        std::istringstream words(line);
+        std::string verb, what, value;
+        words >> verb >> what >> value;
+        std::string rest;
+        words >> rest;
+        bool ok = rest.empty();
+        if (verb.empty()) {
+            continue;
+        } else if (ok && verb == "list" && !what.empty() && value.empty()) {
+            if (what != b.list_value) {
+                next.list_value = what;
+                next.listing = true;
+            }
+        } else if (ok && verb == "skip" && !what.empty() && value.empty()) {
+            const auto dash = what.find('-');
+            u64 first = 0, last = 0;
+            ok = ParseBisectNumber(std::string_view{what}.substr(0, dash), first);
+            last = first;
+            if (ok && dash != std::string::npos) {
+                ok = ParseBisectNumber(std::string_view{what}.substr(dash + 1), last);
+            }
+            ok = ok && first <= last && last <= std::numeric_limits<u32>::max();
+            if (ok) {
+                next.ranges.push_back({u32(first), u32(last)});
+            }
+        } else if (ok && verb == "skip" && (what == "vs" || what == "ps" || what == "rt") &&
+                   !value.empty()) {
+            u64 number_value = 0;
+            ok = ParseBisectNumber(value, number_value);
+            if (ok) {
+                if (what == "rt") {
+                    next.targets.push_back(number_value);
+                } else {
+                    (what == "vs" ? next.vs_hashes : next.ps_hashes).push_back(number_value);
+                }
+            }
+        } else {
+            ok = false;
+        }
+        if (!ok) {
+            std::printf("Draw bisect: %s line %u not understood: \"%s\"; the file is rejected, "
+                        "nothing is skipped\n",
+                        draw_bisect_file, number, line.c_str());
+            reject();
+            return true;
+        }
+    }
+    if (exists && (!in.is_open() || in.bad())) {
+        std::printf("Draw bisect: %s could not be read; nothing is skipped\n", draw_bisect_file);
+        reject();
+        return true;
+    }
+    b.ranges = std::move(next.ranges);
+    b.vs_hashes = std::move(next.vs_hashes);
+    b.ps_hashes = std::move(next.ps_hashes);
+    b.targets = std::move(next.targets);
+    b.list_value = next.list_value;
+    b.listing = next.listing;
+    std::string rules;
+    for (const auto& range : b.ranges) {
+        rules += fmt::format(" draws {}-{}", range.first, range.last);
+    }
+    for (const u64 hash : b.vs_hashes) {
+        rules += fmt::format(" vs {:#x}", hash);
+    }
+    for (const u64 hash : b.ps_hashes) {
+        rules += fmt::format(" ps {:#x}", hash);
+    }
+    for (const VAddr target : b.targets) {
+        rules += fmt::format(" rt {:#x}", target);
+    }
+    std::printf("Draw bisect: frame %llu: skipping%s%s\n", (unsigned long long)b.frame,
+                rules.empty() ? " nothing" : rules.c_str(),
+                b.listing ? "; listing this frame" : "");
+    return true;
+}
+} // namespace
+
+void Rasterizer::DrawBisectOnFlip() {
+    if (!draw_bisect_file) {
+        return;
+    }
+    auto& b = draw_bisect;
+    if (b.listing) {
+        std::printf("Draw bisect: frame %llu listed: %u draws\n", (unsigned long long)b.frame,
+                    b.draw);
+    }
+    if (b.report || (b.Active() && ++b.frames_since_note >= 300)) {
+        std::printf("Draw bisect: frame %llu: %u draws, %llu skipped\n",
+                    (unsigned long long)b.frame, b.draw, (unsigned long long)b.skipped);
+        b.frames_since_note = 0;
+    }
+    ++b.frame;
+    b.draw = 0;
+    b.skipped = 0;
+    b.listing = false;
+    b.report = ReadDrawBisect(b);
+    std::fflush(stdout);
+}
+
+bool Rasterizer::DrawBisectSkip(const GraphicsPipeline* pipeline, bool is_indexed,
+                                u32 index_offset, const IndirectDraw* indirect) {
+    if (!draw_bisect_file) {
+        return false;
+    }
+    auto& b = draw_bisect;
+    const u32 index = b.draw++;
+    const auto& regs = Regs();
+    const auto& vs = pipeline->GetStage(Shader::SwStage::Vertex);
+    const auto* ps = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
+    const u64 ps_hash = ps ? ps->pgm_hash : 0;
+    const VAddr target = regs.color_buffers[0] ? regs.color_buffers[0].Address() : 0;
+    const auto contains = [](const auto& values, u64 value) {
+        return std::ranges::find(values, value) != values.end();
+    };
+    const bool skip =
+        std::ranges::any_of(b.ranges,
+                            [&](const auto& r) { return r.first <= index && index <= r.last; }) ||
+        contains(b.vs_hashes, vs.pgm_hash) || (ps && contains(b.ps_hashes, ps_hash)) ||
+        (target && contains(b.targets, target));
+    if (b.listing) {
+        const VAddr depth =
+            regs.depth_buffer.DepthValid() ? regs.depth_buffer.DepthAddress() : VAddr{0};
+        std::string line = fmt::format(
+            "Draw bisect: frame {} draw {}{}: rt {:#x} depth {:#x} vs {:#x} ps {:#x} prim {}{} "
+            "count {} instances {}",
+            b.frame, index, skip ? " SKIPPED" : "", target, depth, vs.pgm_hash, ps_hash,
+            magic_enum::enum_name(regs.primitive_type), pipeline->GsEmulation() ? " gs" : "",
+            regs.num_indices, regs.num_instances.NumInstances());
+        if (indirect) {
+            line += fmt::format(" indirect args {:#x} count {:#x} stride {} max {}",
+                                indirect->args, indirect->count, indirect->stride,
+                                indirect->max_count);
+        }
+        if (is_indexed) {
+            const u32 index_size =
+                regs.index_buffer_type.index_type == AmdGpu::IndexType::Index16 ? 2u : 4u;
+            line += fmt::format(" index {:#x}+{} ({}-bit)",
+                                regs.index_base_address.Address<VAddr>() +
+                                    u64(index_offset) * index_size,
+                                u64(regs.num_indices) * index_size, index_size * 8);
+        }
+        // The copy shader of an emulated geometry stage has no fetch of its own here.
+        if (const auto& fetch = pipeline->GetFetchShader(); fetch && !pipeline->GsEmulation()) {
+            std::vector<VAddr> seen;
+            for (const auto& attribute : fetch->attributes) {
+                const auto sharp = attribute.GetSharp(vs);
+                if (contains(seen, sharp.base_address)) {
+                    continue;
+                }
+                seen.push_back(sharp.base_address);
+                line += fmt::format(" vb {:#x}+{} stride {}", sharp.base_address, sharp.GetSize(),
+                                    sharp.GetStride());
+            }
+        }
+        std::printf("%s\n", line.c_str());
+    }
+    if (skip) {
+        ++b.skipped;
+        CountDrawDrop(DrawDrop::Bisect);
+    }
+    return skip;
+}
+#endif
 
 void Rasterizer::NoteFrameStart() {
     if (auto* profiler = GpuProfiler::Get()) {

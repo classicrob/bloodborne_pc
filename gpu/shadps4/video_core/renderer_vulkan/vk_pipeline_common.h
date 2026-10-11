@@ -113,6 +113,7 @@ enum class DrawDrop : u32 {
     GsReported,
     PrimitiveNone,
     FmaskDecompress,
+    Bisect, ///< BB_DRAW_BISECT skipped it (diagnostic)
     Count,
 };
 extern std::array<std::atomic<u64>, static_cast<size_t>(DrawDrop::Count)> g_bb_draw_drops;
