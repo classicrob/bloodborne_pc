@@ -17,6 +17,17 @@
 #include <cstdlib>
 #include <memory>
 #include <utility>
+#include <csignal>
+#include <csetjmp>
+
+extern "C" __thread sigjmp_buf* runtime_fault_recover;
+
+static void RecoverWorkerRead(int, siginfo_t*, void*) {
+    if (runtime_fault_recover) {
+        siglongjmp(*runtime_fault_recover, 1);
+    }
+    std::_Exit(3);
+}
 
 static GcnAsm::Code Fetch(bool second) {
     GcnAsm::Code code;
@@ -237,6 +248,96 @@ int main() {
         assert(es_info->flattened_ud_buf == es_flat);
     }
     std::puts("Shared-hash compute/copy roles retain their own user-data banks PASS");
+    // Same-role permutations also retain their last selected draw's data when another
+    // permutation is probed and selected. Distinct strides force distinct specializations.
+    selection.worker = nullptr;
+    regs.stage_enable.raw = AmdGpu::ShaderStageEnable::VgtStages::Vs;
+    std::array<u32, 16> same_a_ud = es_ud, same_b_ud = copy_ud;
+    auto same_b_table = copy_table;
+    same_b_table[0].stride = 32;
+    std::memcpy(same_b_ud.data() + 4, same_b_table.data(), sizeof(same_b_table));
+    const auto same_select = [&](const std::array<u32, 16>& data) {
+        Shader::Backend::Bindings bindings{};
+        return cache.GetProgram(selection, Shader::HwStage::Vertex, Shader::SwStage::Vertex,
+            Shader::ShaderParams{data, shared_shader.words, 0x73616d65726f6c65ull}, bindings);
+    };
+    const auto same_a = same_select(same_a_ud);
+    const auto* same_a_info = std::get<0>(same_a);
+    const auto same_a_flat = same_a_info->flattened_ud_buf;
+    const auto same_b = same_select(same_b_ud);
+    const auto* same_b_info = std::get<0>(same_b);
+    const auto same_b_flat = same_b_info->flattened_ud_buf;
+    assert(same_a_info != same_b_info);
+    assert(std::get<1>(same_a) != std::get<1>(same_b));
+    assert(same_a_info->user_data.data() == same_a_ud.data());
+    assert(same_a_info->flattened_ud_buf == same_a_flat);
+    for (unsigned repeat = 0; repeat < 8; ++repeat) {
+        assert(std::get<0>(same_select(same_a_ud)) == same_a_info);
+        assert(same_b_info->user_data.data() == same_b_ud.data());
+        assert(same_b_info->flattened_ud_buf == same_b_flat);
+        assert(std::get<0>(same_select(same_b_ud)) == same_b_info);
+        assert(same_a_info->user_data.data() == same_a_ud.data());
+        assert(same_a_info->flattened_ud_buf == same_a_flat);
+    }
+    Vulkan::PrepWorker same_worker;
+    selection.worker = &same_worker;
+    const auto prepared_a = same_select(same_a_ud);
+    const auto prepared_a_flat = std::get<0>(prepared_a)->flattened_ud_buf;
+    const auto prepared_b = same_select(same_b_ud);
+    const auto prepared_b_flat = std::get<0>(prepared_b)->flattened_ud_buf;
+    assert(!same_worker.failed && same_worker.stages.size() == 2);
+    assert(std::get<1>(prepared_a) == std::get<1>(same_a));
+    assert(std::get<1>(prepared_b) == std::get<1>(same_b));
+    for (unsigned repeat = 0; repeat < 8; ++repeat) {
+        same_worker.stages.clear();
+        assert(std::get<0>(same_select(same_a_ud)) == std::get<0>(prepared_a));
+        assert(std::get<0>(prepared_b)->user_data.data() == same_b_ud.data());
+        assert(std::get<0>(prepared_b)->flattened_ud_buf == prepared_b_flat);
+        assert(std::get<0>(same_select(same_b_ud)) == std::get<0>(prepared_b));
+        assert(std::get<0>(prepared_a)->user_data.data() == same_a_ud.data());
+        assert(std::get<0>(prepared_a)->flattened_ud_buf == prepared_a_flat);
+    }
+    assert(same_a_info->flattened_ud_buf == same_a_flat);
+    assert(same_b_info->flattened_ud_buf == same_b_flat);
+    selection.worker = nullptr;
+    Shader::Info::ud_snapshots[0] = {same_a_info, same_b_ud.data(), u32(same_b_ud.size()),
+        same_b_flat.data(), u32(same_b_flat.size()), 0x1234};
+    Shader::Info::num_ud_snapshots = 1;
+    assert(std::get<0>(same_select(same_a_ud)) == same_a_info);
+    assert(Shader::Info::num_ud_snapshots == 1);
+    assert(same_a_info->ProgramBase() == 0x1234);
+    assert(same_a_info->UserData().data() == same_b_ud.data());
+    assert(same_a_info->FlatUserData().data() == same_b_flat.data());
+
+    // A speculative worker's table read can fault. Recovery must pop only its temporary
+    // view, retain the caller's view, and leave previously selected permutations untouched.
+    struct sigaction recover_action{}, old_segv{}, old_bus{};
+    recover_action.sa_sigaction = RecoverWorkerRead;
+    recover_action.sa_flags = SA_SIGINFO;
+    sigemptyset(&recover_action.sa_mask);
+    assert(sigaction(SIGSEGV, &recover_action, &old_segv) == 0);
+    assert(sigaction(SIGBUS, &recover_action, &old_bus) == 0);
+    const uintptr_t invalid_table = 1;
+    std::memcpy(ud.data() + 2, &invalid_table, sizeof(invalid_table));
+    Vulkan::PrepWorker fault_worker;
+    selection.worker = &fault_worker;
+    select(first_fetch);
+    assert(fault_worker.failed && fault_worker.stages.empty());
+    assert(runtime_fault_recover == nullptr);
+    assert(Shader::Info::num_ud_snapshots == 1);
+    assert(same_a_info->ProgramBase() == 0x1234);
+    assert(same_a_info->FlatUserData().data() == same_b_flat.data());
+    std::memcpy(ud.data() + 2, &table_address, sizeof(table_address));
+    fault_worker.failed = false;
+    assert(std::get<1>(select(first_fetch)) == std::get<1>(first));
+    assert(!fault_worker.failed && fault_worker.stages.size() == 1);
+    assert(Shader::Info::num_ud_snapshots == 1);
+    assert(sigaction(SIGSEGV, &old_segv, nullptr) == 0);
+    assert(sigaction(SIGBUS, &old_bus, nullptr) == 0);
+    Shader::Info::num_ud_snapshots = 0;
+    selection.worker = nullptr;
+    std::puts("Same-role rejected permutations retain user data: direct + worker PASS");
+    std::puts("Temporary specialization views preserve outer snapshots and recover faults PASS");
     // Tessellation specializations fill fields from the constant buffer after the raw
     // register state is built. Repeated lookups must compare the constructed specs.
     selection.worker = nullptr;

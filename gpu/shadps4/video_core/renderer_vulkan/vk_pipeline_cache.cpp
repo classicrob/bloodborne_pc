@@ -1101,26 +1101,49 @@ PipelineCache::Result PipelineCache::GetProgram(PipelineSelection& sel, HwStage 
                                                 const Shader::ShaderParams& params,
                                                 Shader::Backend::Bindings& binding) {
     auto runtime_info = BuildRuntimeInfo(sel, hw_stage, sw_stage);
-    const auto refresh = [&](Shader::Info& info, const Program::Module& module) {
+    const auto same_role = [&](const Program::Module& module) {
         // GS and copy VS can share a program hash. Reject incompatible stages/roles before
         // touching their live data: a previously selected module may still be used by this draw.
         // Full specialization compares derived tessellation constants after RefreshFlatBuf.
         // They are not populated in BuildRuntimeInfo, so only stage identity is valid here.
         const auto& stored = module.spec.runtime_info;
-        if (stored.hw_stage != runtime_info.hw_stage ||
-            stored.sw_stage != runtime_info.sw_stage || stored.gs_role != runtime_info.gs_role) {
-            return false;
+        return stored.hw_stage == runtime_info.hw_stage &&
+               stored.sw_stage == runtime_info.sw_stage && stored.gs_role == runtime_info.gs_role;
+    };
+    // Reuse staging storage without copying the module's resource metadata. The existing
+    // thread-local snapshot accessors give specialization a private view of this draw.
+    const u32 saved_snapshots = Shader::Info::num_ud_snapshots;
+    ASSERT(saved_snapshots < Shader::Info::MaxUdSnapshots);
+    static thread_local std::vector<u32> candidate_flat;
+    const auto matches_data = [&](const Shader::Info& info, const Program::Module& module) {
+        auto& view = Shader::Info::ud_snapshots[saved_snapshots];
+        view = {&info, params.user_data.data(), u32(params.user_data.size()), nullptr, 0,
+                params.Base()};
+        Shader::Info::num_ud_snapshots = saved_snapshots + 1;
+        bool matches = false;
+        try {
+            // A different fetch program can walk different tables. Reject it before the walker.
+            if (!info.has_fetch_shader ||
+                Shader::Gcn::ParseFetchShader(info) == module.spec.fetch_shader_data) {
+                info.RefreshFlatBuf(params.user_data, candidate_flat);
+                view.flat = candidate_flat.data();
+                view.flat_size = u32(candidate_flat.size());
+                matches = module.spec ==
+                    Shader::StageSpecialization(info, runtime_info, profile, binding);
+            }
+        } catch (...) {
+            Shader::Info::num_ud_snapshots = saved_snapshots;
+            throw;
         }
-        info.pgm_base = params.Base();
-        info.user_data = params.user_data;
-        // A different fetch program can walk different tables. Check its identity before
-        // running the previous permutation's flattened-data walker.
-        if (info.has_fetch_shader &&
-            Shader::Gcn::ParseFetchShader(info) != module.spec.fetch_shader_data) {
-            return false;
-        }
-        info.RefreshFlatBuf();
-        return true;
+        Shader::Info::num_ud_snapshots = saved_snapshots;
+        return matches;
+    };
+    const auto publish = [&](Shader::Info& destination) {
+        // Resource metadata and its address remain stable for cached pipelines. Rejected
+        // candidates never change live data, even temporarily. Recycle the previous flat buffer.
+        destination.pgm_base = params.Base();
+        destination.user_data = params.user_data;
+        destination.flattened_ud_buf.swap(candidate_flat);
     };
     if (sel.worker) {
         auto& worker = *sel.worker;
@@ -1133,27 +1156,25 @@ PipelineCache::Result PipelineCache::GetProgram(PipelineSelection& sel, HwStage 
         const Program* program = found->second.get();
         for (size_t index = 0; index < program->modules.size(); ++index) {
             const auto& module = program->modules[index];
-            if (!module.info || !module.info_template) {
+            if (!module.info || !module.info_template || !same_role(module)) {
                 continue;
             }
-            auto it = worker.infos.try_emplace(module.info.get(), *module.info_template).first;
-            auto& info = it->second;
             sigjmp_buf recover;
             if (sigsetjmp(recover, 0)) {
+                Shader::Info::num_ud_snapshots = saved_snapshots;
                 runtime_fault_recover = nullptr;
                 worker.failed = true;
                 return {};
             }
             runtime_fault_recover = &recover;
-            if (!refresh(info, module)) {
+            if (!matches_data(*module.info_template, module)) {
                 runtime_fault_recover = nullptr;
                 continue;
             }
-            const auto spec = Shader::StageSpecialization(info, runtime_info, profile, binding);
             runtime_fault_recover = nullptr;
-            if (!(module.spec == spec)) {
-                continue;
-            }
+            auto it = worker.infos.try_emplace(module.info.get(), *module.info_template).first;
+            auto& info = it->second;
+            publish(info);
             info.AddBindings(binding);
             worker.stages.push_back({program, module.info.get(), params.hash, hw_stage,
                                      info.pgm_base, &info.flattened_ud_buf});
@@ -1173,14 +1194,14 @@ PipelineCache::Result PipelineCache::GetProgram(PipelineSelection& sel, HwStage 
     auto& program = *found->second;
     const auto matches = [&](size_t index) {
         auto& module = program.modules[index];
-        if (!module.info) {
+        if (!module.info || !same_role(module)) {
             return false;
         }
-        if (!refresh(*module.info, module)) {
+        if (!matches_data(*module.info, module)) {
             return false;
         }
-        return module.spec ==
-               Shader::StageSpecialization(*module.info, runtime_info, profile, binding);
+        publish(*module.info);
+        return true;
     };
     size_t index = program.modules.size();
     if (program.last_used < program.modules.size() && matches(program.last_used)) {

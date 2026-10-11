@@ -183,9 +183,10 @@ struct Info : InfoPersistent {
     static inline thread_local u32 num_ud_snapshots = 0;
 
     const UdSnapshot* Snapshot() const noexcept {
-        for (u32 i = 0; i < num_ud_snapshots; ++i) {
-            if (ud_snapshots[i].info == this) {
-                return &ud_snapshots[i];
+        // A temporary specialization view can shadow a draw-packet snapshot on this thread.
+        for (u32 i = num_ud_snapshots; i > 0; --i) {
+            if (ud_snapshots[i - 1].info == this) {
+                return &ud_snapshots[i - 1];
             }
         }
         return nullptr;
@@ -256,11 +257,15 @@ struct Info : InfoPersistent {
     }
 
     void RefreshFlatBuf() {
-        flattened_ud_buf.resize(srt_info.flattened_bufsize_dw);
-        ASSERT(user_data.size() <= NUM_USER_DATA_REGS);
-        std::memcpy(flattened_ud_buf.data(), user_data.data(), user_data.size_bytes());
+        RefreshFlatBuf(user_data, flattened_ud_buf);
+    }
+
+    void RefreshFlatBuf(std::span<const u32> data, std::vector<u32>& flat) const {
+        flat.resize(srt_info.flattened_bufsize_dw);
+        ASSERT(data.size() <= NUM_USER_DATA_REGS);
+        std::memcpy(flat.data(), data.data(), data.size_bytes());
         if (srt_info.walker_func) {
-            srt_info.walker_func(user_data.data(), flattened_ud_buf.data());
+            srt_info.walker_func(data.data(), flat.data());
         }
     }
 
