@@ -35,11 +35,41 @@ GraphicsPipeline::GraphicsPipeline(
     vk::PipelineCache pipeline_cache, std::span<const Shader::Info*, MaxShaderStages> infos,
     std::span<const Shader::RuntimeInfo, MaxShaderStages> runtime_infos,
     std::optional<const Shader::Gcn::FetchShaderData> fetch_shader_,
-    std::span<const vk::ShaderModule> modules, SerializationSupport& sdata, bool preloading)
+    std::span<const vk::ShaderModule> modules, SerializationSupport& sdata, bool preloading,
+    bool deferred)
     : Pipeline{instance, scheduler, desc_heap, profile, pipeline_cache}, key{key_},
       fetch_shader{std::move(fetch_shader_)} {
-    const vk::Device device = instance.GetDevice();
     std::ranges::copy(infos, stages.begin());
+    if (!deferred) {
+        Build(pipeline_cache, runtime_infos, modules, sdata, preloading);
+        return;
+    }
+    ASSERT_MSG(!preloading, "Deferred graphics pipeline while preloading");
+    deferred_inputs = std::make_unique<DeferredInputs>(DeferredInputs{
+        .pipeline_cache = pipeline_cache,
+        .runtime_infos = {runtime_infos.begin(), runtime_infos.end()},
+        .modules = {modules.begin(), modules.end()},
+        .sdata = sdata,
+    });
+    built.store(false, std::memory_order_relaxed);
+}
+
+GraphicsPipeline::SerializationSupport& GraphicsPipeline::BuildDeferred() {
+    ASSERT(deferred_inputs && !IsBuilt());
+    auto& inputs = *deferred_inputs;
+    Build(inputs.pipeline_cache,
+          std::span<const Shader::RuntimeInfo, MaxShaderStages>{inputs.runtime_infos.data(),
+                                                                MaxShaderStages},
+          inputs.modules, inputs.sdata, false);
+    SetBuilt();
+    return deferred_inputs->sdata;
+}
+
+void GraphicsPipeline::Build(vk::PipelineCache pipeline_cache,
+                             std::span<const Shader::RuntimeInfo, MaxShaderStages> runtime_infos,
+                             std::span<const vk::ShaderModule> modules,
+                             SerializationSupport& sdata, bool preloading) {
+    const vk::Device device = instance.GetDevice();
     BuildDescSetLayout(preloading);
     const auto debug_str = GetDebugString();
 
@@ -204,7 +234,7 @@ GraphicsPipeline::GraphicsPipeline(
     boost::container::static_vector<vk::PipelineShaderStageCreateInfo, MaxShaderStages>
         shader_stages;
     auto stage = u32(Shader::SwStage::Vertex);
-    if (infos[stage]) {
+    if (stages[stage]) {
         shader_stages.emplace_back(vk::PipelineShaderStageCreateInfo{
             .stage = vk::ShaderStageFlagBits::eVertex,
             .module = modules[stage],
@@ -212,7 +242,7 @@ GraphicsPipeline::GraphicsPipeline(
         });
     }
     stage = u32(Shader::SwStage::Geometry);
-    if (infos[stage]) {
+    if (stages[stage]) {
         shader_stages.emplace_back(vk::PipelineShaderStageCreateInfo{
             .stage = vk::ShaderStageFlagBits::eGeometry,
             .module = modules[stage],
@@ -221,7 +251,7 @@ GraphicsPipeline::GraphicsPipeline(
     }
     u32 aux_vs_output_locations = 0;
     stage = u32(Shader::SwStage::TessellationControl);
-    if (infos[stage]) {
+    if (stages[stage]) {
         shader_stages.emplace_back(vk::PipelineShaderStageCreateInfo{
             .stage = vk::ShaderStageFlagBits::eTessellationControl,
             .module = modules[stage],
@@ -234,7 +264,7 @@ GraphicsPipeline::GraphicsPipeline(
         // leaves the provoking vertex of the generated triangles to the implementation: a flat
         // input would take any corner's value, not the guest's provoking vertex (unproven for
         // RectList).
-        if (const auto* fs = infos[u32(Shader::SwStage::Fragment)]) {
+        if (const auto* fs = stages[u32(Shader::SwStage::Fragment)]) {
             const u32 flat = Shader::Backend::SPIRV::AuxiliaryFlatInputs(
                 *fs, runtime_infos[u32(Shader::SwStage::Fragment)].hw.fs);
             ASSERT_MSG(flat == 0,
@@ -247,8 +277,8 @@ GraphicsPipeline::GraphicsPipeline(
 #endif
         if (!preloading) {
             const auto& fs_info = runtime_infos[u32(Shader::SwStage::Fragment)].hw.fs;
-            const auto* vs = infos[u32(Shader::SwStage::Vertex)];
-            const auto* fs = infos[u32(Shader::SwStage::Fragment)];
+            const auto* vs = stages[u32(Shader::SwStage::Vertex)];
+            const auto* fs = stages[u32(Shader::SwStage::Fragment)];
             ASSERT_MSG(vs, "RectList/QuadList emulation without a vertex stage");
             // Clip-distance emulation (native NVIDIA only) shifts every parameter location and adds
             // a clip vector at Location 0, which the location masks do not model: keep the
@@ -277,7 +307,7 @@ GraphicsPipeline::GraphicsPipeline(
         });
     }
     stage = u32(Shader::SwStage::TessellationEval);
-    if (infos[stage]) {
+    if (stages[stage]) {
         shader_stages.emplace_back(vk::PipelineShaderStageCreateInfo{
             .stage = vk::ShaderStageFlagBits::eTessellationEvaluation,
             .module = modules[stage],
@@ -296,7 +326,7 @@ GraphicsPipeline::GraphicsPipeline(
         });
     }
     stage = u32(Shader::SwStage::Fragment);
-    if (infos[stage]) {
+    if (stages[stage]) {
         shader_stages.emplace_back(vk::PipelineShaderStageCreateInfo{
             .stage = vk::ShaderStageFlagBits::eFragment,
             .module = modules[stage],
@@ -343,13 +373,13 @@ GraphicsPipeline::GraphicsPipeline(
     // stages forward zero for these. A direct VS/TES -> FS pipeline cannot yet: the producing
     // stage is compiled after the FS and would need the FS input locations in its key.
     const bool aux_tes = (is_rect_list || is_quad_list) &&
-                         !infos[u32(Shader::SwStage::TessellationEval)];
-    if (const auto* fs = infos[u32(Shader::SwStage::Fragment)];
-        fs && !aux_tes && !infos[u32(Shader::SwStage::Geometry)]) {
-        const auto producer = infos[u32(Shader::SwStage::TessellationEval)]
+                         !stages[u32(Shader::SwStage::TessellationEval)];
+    if (const auto* fs = stages[u32(Shader::SwStage::Fragment)];
+        fs && !aux_tes && !stages[u32(Shader::SwStage::Geometry)]) {
+        const auto producer = stages[u32(Shader::SwStage::TessellationEval)]
                                   ? Shader::SwStage::TessellationEval
                                   : Shader::SwStage::Vertex;
-        const auto* pre = infos[u32(producer)];
+        const auto* pre = stages[u32(producer)];
         ASSERT_MSG(pre, "graphics pipeline without a vertex stage");
         ASSERT(!profile.needs_clip_distance_emulation);
         const u32 fs_locations = Shader::Backend::SPIRV::AuxiliaryVaryingLocations(
@@ -398,7 +428,7 @@ GraphicsPipeline::GraphicsPipeline(
     }
 
     std::array<vk::SampleCountFlagBits, AmdGpu::NUM_COLOR_BUFFERS> color_samples;
-    std::ranges::transform(key.color_samples, color_samples.begin(), [&instance](u8 num_samples) {
+    std::ranges::transform(key.color_samples, color_samples.begin(), [this](u8 num_samples) {
         return num_samples ? LiverpoolToVK::NumSamples(num_samples, instance.GetColorSampleCounts())
                            : vk::SampleCountFlagBits::e1;
     });
@@ -582,6 +612,7 @@ void GraphicsPipeline::SetGsEmulation(std::unique_ptr<GsEmulationStages> stages)
 GraphicsPipeline::~GraphicsPipeline() = default;
 
 void GraphicsPipeline::BindDepthBoundsImage(vk::ImageView view, vk::ImageLayout layout) const {
+    WaitBuilt();
     const vk::DescriptorSet set = desc_heap.Commit(*depth_bounds_layout);
     const vk::DescriptorImageInfo image_info{.imageView = view, .imageLayout = layout};
     instance.GetDevice().updateDescriptorSets(
@@ -657,10 +688,10 @@ void GraphicsPipeline::BuildDescSetLayout(bool preloading) {
             continue;
         }
         const auto stage_bit = LogicalStageToStageBit[u32(stage->sw_stage)];
-        for (const auto& buffer : stage->buffers) {
-            const auto sharp =
-                preloading ? AmdGpu::Buffer{}
-                           : buffer.GetSharp(*stage); // See for the comment in compute PL creation
+        // bbport: a storage buffer per buffer resource, from the stage's recorded resources only:
+        // on Apple this runs on a build worker while the GPU thread refreshes the stage's live
+        // user data, so reading a sharp here would race with it.
+        for (size_t i = 0; i < stage->buffers.size(); ++i) {
             bindings.push_back({
                 .binding = binding++,
                 .descriptorType = vk::DescriptorType::eStorageBuffer,

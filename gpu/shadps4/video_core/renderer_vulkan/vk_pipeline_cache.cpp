@@ -391,6 +391,11 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     ASSERT_MSG(cache_result == vk::Result::eSuccess, "Failed to create pipeline cache: {}",
                vk::to_string(cache_result));
     pipeline_cache = std::move(cache);
+#ifdef __APPLE__
+    // New graphics pipelines are built on workers (docs/macos/pipeline-compile.md).
+    build_queue = std::make_unique<PipelineBuildQueue>(
+        std::clamp<u32>(std::thread::hardware_concurrency(), 1, 8));
+#endif
 }
 
 PipelineCache::~PipelineCache() = default;
@@ -498,12 +503,19 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
     if (is_new) {
         const auto pipeline_hash = std::hash<GraphicsPipelineKey>{}(sel.graphics_key);
         LOG_INFO(Render_Vulkan, "Compiling graphics pipeline {:#x}", pipeline_hash);
-        CompileTimer timer{"graphics pipeline", pipeline_hash};
 
         GraphicsPipeline::SerializationSupport sdata{};
-        it.value() = std::make_unique<GraphicsPipeline>(
-            instance, scheduler, desc_heap, profile, sel.graphics_key, *pipeline_cache, sel.infos,
-            sel.runtime_infos, sel.fetch_shader, sel.modules, sdata, false);
+        if (build_queue) {
+            // Built on a worker (posted below); the draw recording thread waits for the handle.
+            it.value() = std::make_unique<GraphicsPipeline>(
+                instance, scheduler, desc_heap, profile, sel.graphics_key, *pipeline_cache,
+                sel.infos, sel.runtime_infos, sel.fetch_shader, sel.modules, sdata, false, true);
+        } else {
+            CompileTimer timer{"graphics pipeline", pipeline_hash};
+            it.value() = std::make_unique<GraphicsPipeline>(
+                instance, scheduler, desc_heap, profile, sel.graphics_key, *pipeline_cache,
+                sel.infos, sel.runtime_infos, sel.fetch_shader, sel.modules, sdata, false);
+        }
 
         if (sel.graphics_key.gs_es_hash) {
             // Emulated geometry stage: the ES and GS compute pipelines. Not stored in the pipeline
@@ -532,8 +544,19 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
             stages->run_length = Shader::GsEmulation::IndexRunLength(
                 stages->max_vert_out, regs.vgt_gs_out_prim_type.GetPrimitiveType(0));
             it.value()->SetGsEmulation(std::move(stages));
-        } else {
+        } else if (!build_queue) {
             RegisterPipelineData(sel.graphics_key, pipeline_hash, sdata);
+        }
+        if (build_queue) {
+            // GS pipelines are not recorded either way (see above).
+            build_queue->Post([pipeline = it.value().get(), key = sel.graphics_key, pipeline_hash,
+                               record = sel.graphics_key.gs_es_hash == 0] {
+                CompileTimer timer{"graphics pipeline", pipeline_hash};
+                auto& built_sdata = pipeline->BuildDeferred();
+                if (record) {
+                    RegisterPipelineData(key, pipeline_hash, built_sdata);
+                }
+            });
         }
         ++num_new_pipelines;
 
@@ -1171,6 +1194,11 @@ PipelineCache::Result PipelineCache::GetProgram(PipelineSelection& sel, HwStage 
 
 std::optional<vk::ShaderModule> PipelineCache::ReplaceShader(vk::ShaderModule module,
                                                              std::span<const u32> spv_code) {
+    // bbport: queued builds hold raw pipeline pointers and module handles, and a worker records
+    // the pipeline after SetBuilt: let every build finish before destroying or erasing any.
+    if (build_queue) {
+        build_queue->WaitIdle();
+    }
     std::optional<vk::ShaderModule> new_module{};
     for (const auto& [_, program] : program_cache) {
         for (auto& m : program->modules) {

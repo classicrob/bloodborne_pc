@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <chrono>
 #include <span>
 
 #include <boost/container/small_vector.hpp>
@@ -22,12 +23,32 @@ Pipeline::Pipeline(const Instance& instance_, Scheduler& scheduler_, DescriptorH
 
 Pipeline::~Pipeline() = default;
 
+std::atomic<u64> g_bb_pipeline_wait_ns;
+
+void Pipeline::SetBuilt() {
+    {
+        std::scoped_lock lk{build_mutex};
+        built.store(true, std::memory_order_release);
+    }
+    build_cv.notify_all();
+}
+
+void Pipeline::WaitBuiltSlow() const noexcept {
+    const auto start = std::chrono::steady_clock::now();
+    std::unique_lock lk{build_mutex};
+    build_cv.wait(lk, [this] { return built.load(std::memory_order_acquire); });
+    g_bb_pipeline_wait_ns += u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                     std::chrono::steady_clock::now() - start)
+                                     .count());
+}
+
 
 void Pipeline::BindResources(DescriptorWrites& set_writes,
                              const Shader::PushData& push_data) const {
     const auto bind_point =
         IsCompute() ? vk::PipelineBindPoint::eCompute : vk::PipelineBindPoint::eGraphics;
     const auto stage_flags = IsCompute() ? vk::ShaderStageFlagBits::eCompute : AllGraphicsStageBits;
+    WaitBuilt();
     const vk::PipelineLayout layout = *pipeline_layout;
     scheduler.Record([layout, stage_flags, push_data](vk::CommandBuffer cmdbuf) {
         cmdbuf.pushConstants(layout, stage_flags, 0u, sizeof(push_data), &push_data);

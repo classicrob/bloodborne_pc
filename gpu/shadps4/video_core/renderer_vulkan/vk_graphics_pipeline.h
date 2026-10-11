@@ -98,8 +98,13 @@ public:
                      std::span<const Shader::RuntimeInfo, MaxShaderStages> runtime_infos,
                      std::optional<const Shader::Gcn::FetchShaderData> fetch_shader,
                      std::span<const vk::ShaderModule> modules, SerializationSupport& sdata,
-                     bool preloading);
+                     bool preloading, bool deferred = false);
     ~GraphicsPipeline();
+
+    /// bbport: `deferred` construction sets the stages, key and fetch shader and keeps the
+    /// rest of its inputs; this builds the layouts and the VkPipeline from them (on a worker,
+    /// PipelineCache) and returns the serialization data the build filled in.
+    SerializationSupport& BuildDeferred();
 
     const std::optional<const Shader::Gcn::FetchShaderData>& GetFetchShader() const noexcept {
         return fetch_shader;
@@ -123,6 +128,7 @@ public:
     /// macOS depth-bounds emulation: the layout of descriptor set 1 (the stored depth the
     /// fragment shader tests), or null when the pipeline does not emulate the test.
     vk::DescriptorSetLayout DepthBoundsLayout() const noexcept {
+        WaitBuilt();
         return *depth_bounds_layout;
     }
     /// Commits and binds set 1 with the stored-depth view (DepthBoundsLayout non-null).
@@ -138,6 +144,17 @@ public:
 private:
     std::unique_ptr<GsEmulationStages> gs_emulation;
     void BuildDescSetLayout(bool preloading);
+    void Build(vk::PipelineCache pipeline_cache,
+               std::span<const Shader::RuntimeInfo, MaxShaderStages> runtime_infos,
+               std::span<const vk::ShaderModule> modules, SerializationSupport& sdata,
+               bool preloading);
+    struct DeferredInputs {
+        vk::PipelineCache pipeline_cache;
+        std::vector<Shader::RuntimeInfo> runtime_infos; ///< MaxShaderStages entries
+        std::vector<vk::ShaderModule> modules;
+        SerializationSupport sdata;
+    };
+    std::unique_ptr<DeferredInputs> deferred_inputs;
 
 private:
     GraphicsPipelineKey key;
