@@ -168,6 +168,20 @@ int main() {
                q == 0x1122334455667788ull && d == 0x99AABBCCu && h == 0xDDEE &&
                    bytes[7] == 0xEE && bytes[16] == 0xEE && bytes[24] == 0xEE &&
                    bytes[28] == 0xEE);
+        // WRITE_DATA payloads: 1 or 2 aligned dwords as one store, others copied.
+        std::memset(bytes, 0xEE, sizeof(bytes));
+        const std::uint32_t one = 0x01020304;
+        const std::uint32_t two[2] = {0x05060708, 0x090A0B0C};
+        const std::uint32_t three[3] = {1, 2, 3};
+        BbLabelStore::WriteData(&bytes[0], &one, 4);
+        BbLabelStore::WriteData(&bytes[8], two, 8);
+        BbLabelStore::WriteData(&bytes[17], &one, 4); // unaligned: copied
+        std::uint8_t three_at[12];
+        BbLabelStore::WriteData(three_at, three, 12);
+        Expect("WRITE_DATA payloads of 1, 2 (aligned, unaligned) and 3 dwords land exactly",
+               !std::memcmp(&bytes[0], &one, 4) && !std::memcmp(&bytes[8], two, 8) &&
+                   !std::memcmp(&bytes[17], &one, 4) && !std::memcmp(three_at, three, 12) &&
+                   bytes[4] == 0xEE && bytes[16] == 0xEE && bytes[21] == 0xEE);
     }
 
     std::fprintf(stderr, "%s: %u failures\n", failures ? "FAIL" : "PASS", failures);

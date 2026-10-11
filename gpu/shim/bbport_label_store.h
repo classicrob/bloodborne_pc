@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 namespace BbLabelStore {
 
@@ -29,6 +30,19 @@ inline void StoreOnce(void* address, std::uint64_t value, std::uint32_t num_byte
                      num_bytes, address);
         std::abort();
     }
+}
+
+/// A WRITE_DATA payload: 4 or 8 naturally aligned bytes (a label or fence the guest may poll and
+/// free) as one store; longer or unaligned payloads are copied (no single store on the PS4 either).
+inline void WriteData(void* address, const void* data, std::size_t size) {
+    const auto at = reinterpret_cast<std::uintptr_t>(address);
+    if ((size == 4 || size == 8) && (at & (size - 1)) == 0) {
+        std::uint64_t value = 0;
+        std::memcpy(&value, data, size);
+        StoreOnce(address, value, static_cast<std::uint32_t>(size));
+        return;
+    }
+    std::memcpy(address, data, size);
 }
 
 } // namespace BbLabelStore

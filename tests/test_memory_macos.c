@@ -5,6 +5,7 @@
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
 #include <pthread.h>
+#include <sched.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/mman.h>
@@ -28,10 +29,11 @@ uintptr_t runtime_lookup(const RuntimeExport *table,size_t count,const char *nam
     return 0;
 }
 static volatile uint64_t *watched;
-static int stop_reader, torn;
+static int stop_reader, reader_ready, torn;
 /* Reads a label the writer alternates between all-zero and all-one bits. */
 static void *read_labels(void *unused) {
     (void)unused;
+    __atomic_store_n(&reader_ready,1,__ATOMIC_RELEASE);
     while (!__atomic_load_n(&stop_reader,__ATOMIC_ACQUIRE)) {
         const uint64_t v=__atomic_load_n(watched,__ATOMIC_ACQUIRE);
         if (v!=0 && v!=UINT64_MAX) torn=1;
@@ -189,8 +191,11 @@ int main(void) {
     assert(((unsigned char *)labels)[7]==0xee && ((unsigned char *)labels)[16]==0xee &&
            ((unsigned char *)labels)[24]==0xee && ((unsigned char *)labels)[28]==0xee);
     watched=(volatile uint64_t *)labels;
+    const uint64_t zero=0;
+    assert(runtime_memory_write_backing((uintptr_t)labels,&zero,8)); // a value the reader accepts
     pthread_t reader;
     assert(!pthread_create(&reader,NULL,read_labels,NULL));
+    while (!__atomic_load_n(&reader_ready,__ATOMIC_ACQUIRE)) sched_yield(); // the race runs
     const uint64_t values[2]={0,UINT64_MAX};
     for (int i=0;i<2000000;++i) assert(runtime_memory_write_backing((uintptr_t)labels,&values[i&1],8));
     __atomic_store_n(&stop_reader,1,__ATOMIC_RELEASE);
