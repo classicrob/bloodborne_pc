@@ -4,6 +4,7 @@
 #pragma once
 
 #include <cstring>
+#include <span>
 #include <type_traits>
 #include "common/assert.h"
 #include "common/bit_field.h"
@@ -24,6 +25,19 @@ enum class PM4Predicate : u32 {
     PredDisable = 0,
     PredEnable = 1,
 };
+
+/// bbport (macOS): a fence/label write (EOP, EOS, RELEASE_MEM) must name a guest address aligned
+/// to its size, below 2^48. The command processor drops the low address bits, so a misaligned
+/// label would land at a different address there than here; a stray high bit lands nowhere the
+/// guest owns. Gnm never emits either, so one means a malformed packet: stop and name it.
+inline void CheckFenceAddress([[maybe_unused]] u64 address, [[maybe_unused]] u32 bytes,
+                              [[maybe_unused]] const char* packet) {
+#ifdef __APPLE__
+    ASSERT_MSG((address & (bytes - 1)) == 0 && (address >> 48) == 0,
+               "macOS: {} writes {} bytes to {:#x}, not a {}-byte aligned guest address", packet,
+               bytes, address, bytes);
+#endif
+}
 
 union PM4Type0Header {
     u32 raw;
@@ -468,6 +482,10 @@ struct PM4CmdEventWriteEop {
 
     void SignalFence(auto&& write_mem, auto&& signal_irq) const {
         u32* address = Address<u32>();
+        if (data_sel.Value() != DataSelect::None) {
+            CheckFenceAddress(reinterpret_cast<u64>(address),
+                              data_sel.Value() == DataSelect::Data32Low ? 4 : 8, "EVENT_WRITE_EOP");
+        }
         switch (data_sel.Value()) {
         case DataSelect::None: {
             break;
@@ -808,6 +826,7 @@ struct PM4CmdEventWriteEos {
         const auto cmd = command.Value();
         switch (cmd) {
         case Command::SignalFence: {
+            CheckFenceAddress(reinterpret_cast<u64>(Address()), 4, "EVENT_WRITE_EOS");
             write_mem(Address(), DataDWord(), sizeof(u32));
             break;
         }
@@ -958,6 +977,10 @@ struct PM4CmdReleaseMem {
     }
 
     void SignalFence(auto&& signal_irq, auto&& gds_to_mem) const {
+        if (data_sel.Value() != DataSelect::GdsMemStore && data_sel.Value() != DataSelect::None) {
+            CheckFenceAddress(Address<u64>(), data_sel.Value() == DataSelect::Data32Low ? 4 : 8,
+                              "RELEASE_MEM");
+        }
         switch (data_sel.Value()) {
         case DataSelect::Data32Low: {
             *Address<u32*>() = DataDWord();
