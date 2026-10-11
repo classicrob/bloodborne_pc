@@ -56,11 +56,27 @@ static uint64_t *check_current(int value) {
     assert(*guest_error()==value);
     return tcb;
 }
+static void check_host_name(const char *expected) {
+    char name[64];
+    assert(!pthread_getname_np(pthread_self(),name,sizeof(name)));
+    assert(!strcmp(name,expected));
+    assert(!strcmp(runtime_thread_current()->name,expected));
+}
 static void *host_worker(void *arg) {
+    runtime_thread_current();
+    check_host_name("host");
+    runtime_thread_attach_host("TLS worker long diagnostic name");
+    check_host_name("TLS worker long diagnostic name");
+    runtime_thread_attach_host(NULL);
+    check_host_name("host");
     runtime_thread_attach_host("TLS worker");
+    check_host_name("TLS worker");
     return check_current((int)(uintptr_t)arg);
 }
 static ABI void *guest_worker(void *arg) {
+    check_host_name("low TLS test");
+    assert(!thread_rename(current,"renamed guest diagnostic worker"));
+    check_host_name("renamed guest diagnostic worker");
     char on_stack;
     assert((uintptr_t)&on_stack<(UINT64_C(1)<<40));
     assert((void *)thread_self()==current);
@@ -88,6 +104,7 @@ int main(void) {
     assert(!mprotect(image,4096,PROT_READ|PROT_EXEC));
     tcb_load=(uintptr_t (*)(void))image;
     runtime_thread_attach_main();
+    check_host_name("main");
     uint64_t *main_tcb=check_current(123);
     pthread_t workers[3]; uint64_t *tcbs[3];
     for (size_t i=0;i<3;i++) assert(!pthread_create(&workers[i],NULL,host_worker,(void *)(i+1)));
@@ -107,6 +124,6 @@ int main(void) {
     fail_after=-1;
 #endif
     assert(!attr_destroy(&attr) && !attr);
-    puts("macOS runtime TLS: concurrent key init, loader rewrite, main/host/guest isolation, low TCB/DTV/errno/handles/stack, 8192-byte alignment passed");
+    puts("macOS runtime TLS: concurrent key init, loader rewrite, main/host/guest isolation and pthread names, low TCB/DTV/errno/handles/stack, 8192-byte alignment passed");
     return 0;
 }

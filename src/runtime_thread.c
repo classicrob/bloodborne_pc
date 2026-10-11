@@ -151,6 +151,7 @@ static void attach(GuestThread *t) {
     set_gs(tcb);
     current=t;
 }
+static void set_host_name(const char *name);
 static GuestThread *new_thread(void) {
     GuestThread *t=runtime_guest_calloc(1,sizeof(*t));
     if (!t) return NULL;
@@ -168,6 +169,9 @@ GuestThread *runtime_thread_current(void) {
     if (!t) { fputs("Cannot allocate guest thread\n",stderr); exit(1); }
     t->host=pthread_self(); t->host_owned=1;
     snprintf(t->name,sizeof(t->name),"host");
+#ifdef __APPLE__
+    set_host_name(t->name);
+#endif
     attach(t); publish(t);
     return t;
 }
@@ -176,10 +180,16 @@ GuestThread *runtime_thread_current(void) {
 void runtime_thread_attach_host(const char *name) {
     GuestThread *t=runtime_thread_current();
     snprintf(t->name,sizeof(t->name),"%s",name ? name : "host");
+#ifdef __APPLE__
+    set_host_name(t->name);
+#endif
 }
 void runtime_thread_attach_main(void) {
     GuestThread *t=runtime_thread_current();
     snprintf(t->name,sizeof(t->name),"main");
+#ifdef __APPLE__
+    set_host_name(t->name);
+#endif
 }
 #ifdef __APPLE__
 /* HLE workers retain their native pthread identity, but all code that may call
@@ -332,11 +342,15 @@ static ABI int32_t attr_set_guard(ThreadAttr **slot,uint64_t size) {
 
 /* Linux thread names hold 15 characters; longer ones would be rejected. */
 static void set_host_name(const char *name) {
+#ifdef __APPLE__
+    int error=pthread_setname_np(name);
+    if (error) {
+        fprintf(stderr,"macOS guest thread name '%s': pthread_setname_np failed: %d\n",name,error);
+        abort();
+    }
+#else
     char host[16]={0};
     memcpy(host,name,strnlen(name,sizeof(host)-1));
-#ifdef __APPLE__
-    pthread_setname_np(host);
-#else
     pthread_setname_np(pthread_self(),host);
 #endif
 }
