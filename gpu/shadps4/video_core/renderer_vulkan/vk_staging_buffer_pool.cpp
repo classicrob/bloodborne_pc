@@ -187,8 +187,9 @@ void StagingBufferPool::RetireLarge(const VideoCore::Buffer* buffer) {
                 }
                 if (tick > entry.tick + 1 && ++late_retires <= 16) {
                     LOG_ERROR(Render_Vulkan,
-                              "Staging buffer ({} MB) used in submission {} but requested at {}: "
-                              "released by its request tick it would have been freed early",
+                              "Staging buffer ({} MB): retirement tick {} is two or more "
+                              "submissions after its request tick {}; released by its request "
+                              "tick it could have been freed before its last use",
                               entry.buffer->SizeBytes() >> 20, tick, entry.tick);
                 }
                 entry.tick = std::max(entry.tick, tick);
