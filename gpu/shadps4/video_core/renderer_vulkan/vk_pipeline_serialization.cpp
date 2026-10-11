@@ -6,6 +6,7 @@
 #include <chrono>
 #include <thread>
 #include "common/serdes.h"
+#include "common/thread.h"
 #include "core/emulator_settings.h"
 #include "shader_recompiler/frontend/fetch_shader.h"
 #include "shader_recompiler/info.h"
@@ -438,7 +439,10 @@ void PipelineCache::WarmUp() {
     {
         std::vector<std::jthread> workers;
         for (u32 t = 1; t < num_threads; ++t) {
-            workers.emplace_back(create);
+            workers.emplace_back([&create, t] {
+                Common::SetCurrentThreadName(fmt::format("PipelinePreload {}", t).c_str());
+                create();
+            });
         }
         create();
     }
