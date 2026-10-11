@@ -113,6 +113,9 @@ struct HwVertexRuntimeInfo {
     u32 user_clip_plane_mask{};
     /// bbport: object motion vectors (G-buffer draws), see MotionVectors below.
     bool motion_vectors{};
+    /// bbport (Apple): the gl_PointSize a GS copy shader drawing points writes (PA_SU_POINT_SIZE,
+    /// in pixels); 0: none.
+    float point_size{};
 
     bool operator==(const HwVertexRuntimeInfo& other) const noexcept = default;
 };

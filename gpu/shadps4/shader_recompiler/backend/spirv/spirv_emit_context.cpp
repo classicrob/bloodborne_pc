@@ -691,7 +691,9 @@ void EmitContext::DefineVertexBlock() {
         cull_distances = DefineVariable(type, spv::BuiltIn::CullDistance, spv::StorageClass::Output,
                                         initializer);
     }
-    if (info.stores.GetAny(IR::Attribute::PointSize)) {
+    if (info.stores.GetAny(IR::Attribute::PointSize) ||
+        (runtime_info.gs_role == GsEmulationRole::CopyVertex &&
+         runtime_info.hw.vs.point_size > 0.0f)) {
         output_point_size =
             DefineVariable(F32[1], spv::BuiltIn::PointSize, spv::StorageClass::Output);
     }

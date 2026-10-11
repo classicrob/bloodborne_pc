@@ -1214,7 +1214,13 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     if (pipeline->GsEmulation()) {
         scheduler.Record([=](vk::CommandBuffer cmdbuf) {
             cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, handle);
-            if (gs_draw.index_count) {
+            if (gs_draw.indirect) {
+                // Point output: the compaction kernel wrote the command.
+                cmdbuf.bindIndexBuffer(gs_draw.index_buffer, gs_draw.index_offset,
+                                       vk::IndexType::eUint32);
+                cmdbuf.drawIndexedIndirect(gs_draw.index_buffer, gs_draw.indirect_offset, 1,
+                                           sizeof(VkDrawIndexedIndirectCommand));
+            } else if (gs_draw.index_count) {
                 cmdbuf.bindIndexBuffer(gs_draw.index_buffer, gs_draw.index_offset,
                                        vk::IndexType::eUint32);
                 cmdbuf.drawIndexed(gs_draw.index_count, 1, 0, 0, 0);
@@ -4021,11 +4027,12 @@ void Rasterizer::UpdatePrimitiveState(const bool is_indexed) const {
 #ifdef __APPLE__
     if (regs.stage_enable.raw == AmdGpu::ShaderStageEnable::VgtStages::EsGs) {
         // Emulated geometry stage (vk_gs_emulation.h): the draw is the GS's output strips,
-        // separated by restart indices; culling applies to the triangles the GS makes.
-        const auto raster = FeatureChecks::RasterizedPrimitive(
-            regs.primitive_type, true, regs.vgt_gs_out_prim_type.GetPrimitiveType(0), false,
-            regs.tess_config.topology);
-        dynamic_state.SetPrimitiveRestartEnabled(true);
+        // separated by restart indices, or its compacted points; culling applies to the
+        // triangles the GS makes.
+        const auto out_prim = regs.vgt_gs_out_prim_type.GetPrimitiveType(0);
+        const auto raster = FeatureChecks::RasterizedPrimitive(regs.primitive_type, true, out_prim,
+                                                               false, regs.tess_config.topology);
+        dynamic_state.SetPrimitiveRestartEnabled(!Shader::GsEmulation::PointOutput(out_prim));
         dynamic_state.SetRasterizerDiscardEnabled(regs.clipper_control.dx_rasterization_kill);
         dynamic_state.SetCullMode(FeatureChecks::FacesCullable(raster, true, false)
                                       ? LiverpoolToVK::CullMode(regs.polygon_control.CullingMode())

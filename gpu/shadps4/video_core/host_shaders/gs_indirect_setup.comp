@@ -29,12 +29,13 @@ layout(push_constant) uniform Params {
     uint capacity_dwords; // dwords of the scratch range
     uint args_address_lo; // guest address of the arguments, named in the report
     uint args_address_hi;
+    uint point_output;    // 1: the runs are compacted after the GS (gs_point_compact.comp)
 };
 
 // Header (gs_emulation.h)
 const uint RecordsPerInstance = 0, PrimsPerInstance = 1, Instances = 2, IndexKindField = 3,
            BaseVertex = 4, BaseInstance = 5, FirstIndex = 6, EsgsBase = 7, GsvsBase = 8,
-           IndexBase = 9, EsDispatch = 16, GsDispatch = 19, StripDraw = 22, IndirectDwords = 32;
+           IndexBase = 9, CompactBase = 10, EsDispatch = 16, GsDispatch = 19, StripDraw = 22, IndirectDwords = 32;
 // errors[]: [0] reports, [1] largest scratch dwords asked for, [2] index overruns,
 // [3..4] guest address of the last reported draw's arguments
 const uint WorkgroupSize = 64;
@@ -67,7 +68,8 @@ void main() {
     uint64_t slots = uint64_t(prims) * instances * invocations;
     uint64_t esgs = uint64_t(count) * instances * esgs_dwords;
     uint64_t gsvs = slots * max_vert_out * vertex_dwords;
-    uint64_t needed = IndirectDwords + esgs + gsvs + slots * run_length;
+    // Point output: the compacted list follows the runs, as long as they are.
+    uint64_t needed = IndirectDwords + esgs + gsvs + slots * run_length * (point_output + 1);
     if (needed > capacity_dwords) {
         Report();
         atomicMax(errors[1], needed > 0xFFFFFFFFul ? 0xFFFFFFFFu : uint(needed));
@@ -90,6 +92,7 @@ void main() {
     scratch[EsgsBase] = esgs_base;
     scratch[GsvsBase] = gsvs_base;
     scratch[IndexBase] = index_base;
+    scratch[CompactBase] = index_base + uint(slots) * run_length;
     scratch[EsDispatch + 0] = (count + WorkgroupSize - 1) / WorkgroupSize;
     scratch[EsDispatch + 1] = count != 0 ? instances : 0;
     scratch[EsDispatch + 2] = 1;

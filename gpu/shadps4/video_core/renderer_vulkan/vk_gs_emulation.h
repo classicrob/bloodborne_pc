@@ -27,6 +27,7 @@ struct GsEmulationStages {
     u32 esgs_dwords;    ///< VGT_ESGS_RING_ITEMSIZE
     u32 vertex_dwords;  ///< VGT_GS_VERT_ITEMSIZE (stream 0)
     u32 run_length;     ///< index entries per output slot
+    bool point_output;  ///< points: the runs are compacted and drawn as a point list
 };
 
 /// BB_GS_SKIP_DRAWS=1, a diagnostic for bisecting rendering faults: ES/GS draws record nothing.

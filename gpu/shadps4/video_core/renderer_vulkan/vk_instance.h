@@ -443,6 +443,11 @@ public:
     }
 
     /// Returns the maximim viewport width.
+    /// Largest point size the device rasterizes (Metal clamps larger ones silently).
+    float GetMaxPointSize() const {
+        return properties.limits.pointSizeRange[1];
+    }
+
     u32 GetMaxViewportWidth() const {
         return properties.limits.maxViewportDimensions[0];
     }

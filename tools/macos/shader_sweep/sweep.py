@@ -233,6 +233,12 @@ def main():
     args.driver = os.path.abspath(os.path.join(args.gpu_build, 'shader-sweep'))
     if not os.access(args.driver, os.X_OK):
         raise SystemExit(f'shader-sweep: no driver at {args.driver} (ninja -C out/gpu shader-sweep)')
+    # The driver shares C++ types with the library it loads: a driver built before the library
+    # was rebuilt can read the wrong fields (a plain `ninja -C out/gpu` does not rebuild it).
+    library = os.path.join(os.path.dirname(args.driver), 'libbbgpu.dylib')
+    if os.path.exists(library) and os.path.getmtime(args.driver) < os.path.getmtime(library):
+        raise SystemExit(f'shader-sweep: {args.driver} is older than {library}; rebuild it with '
+                         f'ninja -C {os.path.dirname(args.driver)} shader-sweep')
     msl_tool = os.path.abspath(args.msl_tool)
     if not os.access(msl_tool, os.X_OK):
         raise SystemExit(f'shader-sweep: no MSL stage at {msl_tool} '

@@ -230,6 +230,10 @@ void EmitGsEmulationPrologue(EmitContext& ctx) {
         break;
     case GsEmulationRole::CopyVertex:
         ctx.gs.gsvs_base = LoadHeader(ctx, GsEmu::GsvsBase);
+        // Points whose size the copy shader does not export: PA_SU_POINT_SIZE.
+        if (ctx.runtime_info.hw.vs.point_size > 0.0f) {
+            ctx.OpStore(ctx.output_point_size, ctx.ConstF32(ctx.runtime_info.hw.vs.point_size));
+        }
         break;
     default:
         UNREACHABLE();
@@ -369,6 +373,10 @@ void EndStrip(EmitContext& ctx, bool closing) {
 } // Anonymous namespace
 
 void GsEmulationEmitPrimitive(EmitContext& ctx) {
+    // Points: every vertex is its own primitive, a cut ends nothing.
+    if (GsEmu::PointOutput(ctx.runtime_info.hw.gs.out_primitive[0])) {
+        return;
+    }
     EndStrip(ctx, true);
 }
 
