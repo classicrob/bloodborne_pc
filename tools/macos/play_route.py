@@ -372,7 +372,14 @@ def launch(args):
                   f'this build is {artifacts["libbbgpu.dylib"]["sha256"][:12]}', file=sys.stderr)
     (run / 'shots').mkdir()
     (run / 'pad.txt').write_text('\n')
-    (run / 'bbport.ini').write_text(SETTINGS[args.output])
+    settings = SETTINGS[args.output]
+    for item in args.ini:  # --ini KEY=VALUE overrides (or adds) one bbport.ini line
+        key, sep, value = item.partition('=')
+        if not sep or not re.fullmatch(r'[a-z_]+', key):
+            die(f'--ini needs KEY=VALUE with a lowercase bbport.ini key: {item}')
+        lines = [l for l in settings.splitlines() if not l.startswith(key + '=')]
+        settings = '\n'.join(lines + [f'{key}={value}']) + '\n'
+    (run / 'bbport.ini').write_text(settings)
     # run.sh regenerates boot images and patches at every launch: one directory per output size, and
     # launches serialized (see below) so a starting game never reads a half-written file.
     data = BASE / f'data-{args.output}'
@@ -418,7 +425,7 @@ def launch(args):
     if args.frame_capture:
         (run / 'captures').mkdir()
         env.update(BB_CAPTURE_TRIGGER=str(run / 'capture.trigger'), BB_CAPTURE_DIR=str(run / 'captures'))
-    record = {'run': run.name, 'started': now(), 'output': args.output, 'settings': SETTINGS[args.output],
+    record = {'run': run.name, 'started': now(), 'output': args.output, 'settings': settings,
               'artifacts': artifacts, 'pinned_probe': str(probe), 'repo_head': subprocess.run(
                   ['git', '-C', str(ROOT), 'rev-parse', 'HEAD'], capture_output=True, text=True).stdout.strip(),
               'env': {k: v for k, v in env.items() if k.startswith(('BB_', 'DYLD_'))}, 'env_removed': removed,
@@ -798,6 +805,8 @@ def main():
         p.add_argument('--probe', required=True, help='signed production bb-probe (gpu/libbbgpu.dylib beside it)')
         p.add_argument('--output', choices=sorted(SETTINGS), default='1080p')
         p.add_argument('--label', default='')
+        p.add_argument('--ini', action='append', default=[], metavar='KEY=VALUE',
+                       help='override a bbport.ini setting (e.g. upscaler=off, object_motion=0)')
         p.add_argument('--parallel', action='store_true',
                        help='allow another game of this worktree to run at the same time (orchestrator approval)')
         p.add_argument('--name', default='Hunter', help='BB_IME_TEXT: the text every IME dialog accepts')
