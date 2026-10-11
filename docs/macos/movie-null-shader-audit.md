@@ -107,3 +107,32 @@ from corruption after publication. Correlating those observations with command
 consumption/completion can test the common-race hypothesis; it is not established
 by this audit. No repair or rendering-performance claim follows from static
 analysis alone.
+
+## Production register capture on fb46250
+
+The later production movie run
+`20261010-215705-1080p-PAR-wl1-movie-c` captures the same PC with R9=0,
+confirming the null shader-wrapper dereference rather than relying on the fault
+address inference. R11 is context `0x70282a2840`; RDI is its CommandBuffer at
+`+0x10`, and RBX/RCX/R15 are the graphics state cache at `+0x50`. The saved guest
+frame chain contains return addresses `0x2169730` and `0x28ff215` exactly.
+There is no evidence of a corrupt return frame in this capture.
+
+The existing BB_FAULT_DUMP expressions were aimed at the other resource-list
+fault. They do not include the movie's shader field or the input draw-state
+shader slot, so this capture still cannot tell where the pointer first became
+zero. The prologue at `0x26bc320` saves the input draw-state pointer at RBP-0xe0.
+The caller at `0x21696c0` saves its caller's R15 (the movie pointer) at its own
+RBP-8; its RBP is the first qword at the fault frame's RBP. Thus the following
+additional expressions reach both fields at this PC:
+
+```text
+r11+0xc1b0,[rbp-0xe0]+0xa80,[[rbp]-8]+0xd0
+```
+
+The first two include context+0xc1b8 / draw-state+0xa88. The last includes
+movie+0xe0. These expressions are safe-read diagnostics specific to this call
+chain, not general object-layout assumptions for other faults. They have been
+sent to Playtest for the next movie run. The new function-entry trace can
+separately correlate context copy, initialization and destruction by address;
+no null-shader bypass is proposed.
