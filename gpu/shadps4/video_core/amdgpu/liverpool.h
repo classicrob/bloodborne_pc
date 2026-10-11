@@ -18,6 +18,9 @@
 #include <queue>
 
 #include "common/assert.h"
+#ifdef __APPLE__
+#include "bbport_cmd_data.h"
+#endif
 #include "common/slot_vector.h"
 #include "common/types.h"
 #include "common/unique_function.h"
@@ -127,6 +130,12 @@ struct Liverpool {
     /// does not present or publish the held frame before its draws parse.
     std::array<u32, NumTotalQueues> replay_held_tasks{};
     u32 replay_held_left{};
+#ifdef __APPLE__
+    /// BB_CMD_DATA_CHECK (bbport_cmd_data.h): where `size` bytes at `address`, read as
+    /// `bytes_read`, lie relative to the submitted command memory snapshots still held.
+    static BbCmdData::Result LookupCommandData(void* owner, u64 address, u64 size,
+                                               const void* bytes_read);
+#endif
     /// A stream write the PS4 command processor would see in command memory a copy hides.
     void CheckCommandMemoryWrite(VAddr address, u64 size, const char* writer);
     static u64 HashRegisterPacket(u64 checksum, const u32* words, u32 count);

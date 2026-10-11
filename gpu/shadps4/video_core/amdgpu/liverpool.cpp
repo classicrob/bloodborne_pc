@@ -35,6 +35,7 @@
 #include "core/platform.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "bbport_write_log.h"
+#include "bbport_cmd_data.h"
 #include "bbport_label_check.h"
 #include "bbport_label_store.h"
 #include "video_core/amdgpu/pm4_cmds.h"
@@ -175,15 +176,45 @@ static std::span<const u32> NextPacket(std::span<const u32> span, size_t offset)
     return span.subspan(offset);
 }
 
+#ifdef __APPLE__
+BbCmdData::Result Liverpool::LookupCommandData(void* owner, u64 address, u64 size,
+                                               const void* bytes_read) {
+    // Runs under BbCmdData's registry lock, so ~Liverpool's Unregister waits for it.
+    Liverpool* self = static_cast<Liverpool*>(owner);
+    // Classified under the lock against the snapshots' own copies; no guest memory is read here
+    // (the caller reads a chunk tail's status word after this returns).
+    static thread_local std::vector<BbCmdData::HeldRegion> held;
+    held.clear();
+    std::scoped_lock lk{self->snapshots_mutex};
+    for (const auto& snapshot : self->gfx_snapshots) {
+        for (const auto& region : snapshot->Regions()) {
+            held.push_back({reinterpret_cast<u64>(region.guest),
+                            u64(region.size_dw) * sizeof(u32), snapshot->submit_number,
+                            reinterpret_cast<const u8*>(snapshot->Words(region).data())});
+        }
+    }
+    return BbCmdData::Classify(address, size, bytes_read, held, BbCmdData::Pools(),
+                               BbCmdData::current_submission);
+}
+#endif
+
 Liverpool::Liverpool() : guest_markers_enabled{EmulatorSettings.IsVkGuestMarkersEnabled()} {
 #ifdef __APPLE__
     SetAssertStopHook(&ReportParserStop);
+    if (BbCmdData::Enabled()) {
+        BbCmdData::Register(&Liverpool::LookupCommandData, this);
+    }
 #endif
     num_counter_pairs = Libraries::Kernel::sceKernelIsNeoMode() ? 16 : 8;
     process_thread = std::jthread{std::bind_front(&Liverpool::Process, this)};
 }
 
 Liverpool::~Liverpool() {
+#ifdef __APPLE__
+    // First, holding none of this object's locks: waits out any lookup in flight on any thread
+    // (GPU, draw, preparation workers); later reads are not located.
+    BbCmdData::Unregister(this);
+#endif
     process_thread.request_stop();
     process_thread.join();
 }
@@ -1306,6 +1337,11 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
         if (region) {
             region->parsed_dw = region->size_dw - static_cast<u32>(dcb.size());
         }
+#ifdef __APPLE__
+        // BB_CMD_DATA_CHECK: the submission this thread parses (a coroutine; set per packet, as
+        // other submissions' tasks run on this thread in between).
+        BbCmdData::current_submission = snapshot ? snapshot->submit_number : 0;
+#endif
 
         const auto* header = reinterpret_cast<const PM4Header*>(dcb.data());
         const u32 type = header->type;
@@ -2059,6 +2095,9 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
     auto base_addr = reinterpret_cast<VAddr>(acb.data());
     size_t acb_size = acb.size_bytes();
     while (!acb.empty()) {
+#ifdef __APPLE__
+        BbCmdData::current_submission = 0; // compute has no snapshot
+#endif
         ProcessCommands();
         if (rasterizer) {
             rasterizer->DrainDrawPipe(Vulkan::DrawPipe::ReasonCompute); // bbport: compute work uses the caches
