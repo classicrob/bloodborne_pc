@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Machine-wide limit on heavy jobs (GPU builds, test suites, game runs, benchmarks).
 
-  tools/macos/heavy.sh [--pool build|playtest|quick] [--priority] [--gpu shared|exclusive]
+  tools/macos/heavy.sh [--pool build|playtest|quick|sweep] [--priority] [--gpu shared|exclusive]
                        LABEL -- COMMAND [ARG...]
   tools/macos/heavy.sh status
 
@@ -14,6 +14,12 @@ Pools of slots, each slot an flock on a file in BB_HEAVY_DIR (default ~/bbport-d
             4 jobs (BB_BUILD_JOBS, MAKEFLAGS, CMAKE_BUILD_PARALLEL_LEVEL), warned on stderr after
             BB_HEAVY_QUICK_WARN (300) s, and killed with its whole process group, reported, and
             exit 124 after BB_HEAVY_QUICK_LIMIT (600) s: a long job belongs in the build pool.
+            A small test-target build (one target and its run) belongs here, not behind a long
+            build-pool job;
+  sweep     BB_HEAVY_SWEEP_SLOTS (1) for the long shader-sweep phase, run as its own heavy.sh
+            call after the build (a slot is held by the whole job, so a sweep inside a build job
+            keeps the build slot; that is reported). Background QoS like builds, so it does not
+            add load on the performance cores.
 Each slot acquisition (pool, slot, wait, load average, slots held) is appended to
 BB_HEAVY_DIR/history.jsonl; quick jobs also record their duration and exit status.
 The GPU is a separate lock (BB_HEAVY_DIR/gpu). Games (the playtest pool) hold it shared; a
@@ -53,7 +59,7 @@ def lock_dir():
 
 
 POOLS = {'build': ('BB_HEAVY_BUILD_SLOTS', 1), 'playtest': ('BB_HEAVY_PLAYTEST_SLOTS', 2),
-         'quick': ('BB_HEAVY_QUICK_SLOTS', 2)}
+         'quick': ('BB_HEAVY_QUICK_SLOTS', 2), 'sweep': ('BB_HEAVY_SWEEP_SLOTS', 1)}
 QUICK_JOBS = '4'
 
 
@@ -162,7 +168,7 @@ def record(event):
 def busy_slots():
     """Slot names currently held (a non-blocking probe of each lock)."""
     held = []
-    for name in ['build-priority'] + slot_names('build') + slot_names('quick') + slot_names('playtest'):
+    for name in ['build-priority'] + slot_names('build') + slot_names('quick') + slot_names('sweep') + slot_names('playtest'):
         fd = try_lock(name)
         if fd is None:
             held.append(name)
@@ -177,7 +183,7 @@ def describe(info):
 
 def status():
     print(f'gpu: {gpu_state()}')
-    for name in ['build-priority'] + slot_names('build') + slot_names('quick') + slot_names('playtest'):
+    for name in ['build-priority'] + slot_names('build') + slot_names('quick') + slot_names('sweep') + slot_names('playtest'):
         fd = try_lock(name)
         if fd is not None:
             os.close(fd)
@@ -222,8 +228,14 @@ def announce(label):
         print(f'heavy: {label}: running', file=sys.stderr, flush=True)
 
 
-def run(pool, priority, gpu, label, command):
-    if os.environ.get('BB_HEAVY_HELD'):
+def run(pool, priority, gpu, label, command, pool_given=False):
+    held = os.environ.get('BB_HEAVY_HELD')
+    if held:
+        held_pool = held.split(':', 1)[0].rstrip('0123456789').replace('build-priority', 'build')
+        if pool_given and pool != held_pool and pool != 'playtest':
+            print(f'heavy: {label}: started inside {held}; it runs in that {held_pool} slot, not a '
+                  f'{pool} slot (start it as its own heavy.sh call to free the slot)',
+                  file=sys.stderr, flush=True)
         if gpu:
             take_gpu(gpu, label)
         announce(label)
@@ -317,24 +329,24 @@ def supervise_quick(label, command):
 def main(argv):
     if argv == ['status']:
         return status()
-    pool, priority, gpu = 'build', False, None
+    pool, priority, gpu, pool_given = 'build', False, None, False
     while argv and argv[0].startswith('--') and argv[0] != '--':
         if argv[0] == '--priority':
             priority, argv = True, argv[1:]
         elif argv[0] == '--pool' and len(argv) > 1 and argv[1] in POOLS:
-            pool, argv = argv[1], argv[2:]
+            pool, argv, pool_given = argv[1], argv[2:], True
         elif argv[0] == '--gpu' and len(argv) > 1 and argv[1] in ('shared', 'exclusive'):
             gpu, argv = argv[1], argv[2:]
         else:
-            fail(f'unknown option {argv[0]} (--pool build|playtest|quick, --priority, --gpu shared|exclusive)')
+            fail(f'unknown option {argv[0]} (--pool build|playtest|quick|sweep, --priority, --gpu shared|exclusive)')
     if pool == 'playtest' and gpu is None:
         gpu = 'shared'  # a game uses the GPU
     if priority and pool != 'build':
         fail('--priority is for the build pool (shared builds); the playtest pool is dedicated already')
     if len(argv) < 3 or argv[1] != '--' or not argv[0]:
-        fail('usage: heavy.sh [--pool build|playtest|quick] [--priority] [--gpu shared|exclusive] LABEL -- '
+        fail('usage: heavy.sh [--pool build|playtest|quick|sweep] [--priority] [--gpu shared|exclusive] LABEL -- '
              'COMMAND [ARG...] | heavy.sh status')
-    run(pool, priority, gpu, argv[0], argv[2:])
+    run(pool, priority, gpu, argv[0], argv[2:], pool_given)
 
 
 if __name__ == '__main__':
