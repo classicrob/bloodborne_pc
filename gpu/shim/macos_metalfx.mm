@@ -58,6 +58,7 @@ struct TemporalScaler::Impl {
     /// over time (the scheduler's owner moves between the draw-pipe thread and its caller), but
     /// never from two at once.
     mutable std::atomic<bool> busy{false};
+    MTLPixelFormat color_format = MTLPixelFormatRGBA16Float, output_format = MTLPixelFormatRGBA16Float;
     std::shared_ptr<const unsigned char> binding_owner = std::make_shared<const unsigned char>(0);
     std::deque<id<MTLCommandBuffer>> pending;
     uint64_t last_producer = 0, last_consumer = 0, last_frame = 0, last_epoch = 0;
@@ -95,7 +96,7 @@ struct TemporalScaler::Impl {
                 "exported texture belongs to another Metal device");
         Require(texture.textureType == MTLTextureType2D && texture.sampleCount == 1 &&
                 texture.width == width && texture.height == height && texture.pixelFormat == format,
-                "texture dimension, sample count or format violates the linear HDR input contract");
+                "texture dimension, sample count or format violates the MetalFX input contract");
         Require((texture.usage & usage) == usage, "exported texture lacks required MetalFX usage flags");
     }
     void Reap() {
@@ -143,25 +144,43 @@ TemporalScaler::TemporalScaler(VkDevice device, PFN_vkGetDeviceProcAddr get_proc
                 "Metal device/shared-event export failed; declare export intent during Vulkan creation");
         Require([MTLFXTemporalScalerDescriptor supportsDevice:impl->metal],
                 "temporal scaling is unsupported by this device");
-        const double sx = double(config.output_width) / config.input_width;
-        const double sy = double(config.output_height) / config.input_height;
+        const uint32_t content_width = config.content_width ? config.content_width : config.input_width;
+        const uint32_t content_height = config.content_height ? config.content_height : config.input_height;
+        Require(content_width <= config.input_width && content_height <= config.input_height,
+                "content extent exceeds the input textures");
+        const double sx = double(config.output_width) / content_width;
+        const double sy = double(config.output_height) / content_height;
         const double low = [MTLFXTemporalScalerDescriptor supportedInputContentMinScaleForDevice:impl->metal];
         const double high = [MTLFXTemporalScalerDescriptor supportedInputContentMaxScaleForDevice:impl->metal];
         Require(std::abs(sx - sy) < 0.001 && sx >= low && sx <= high,
                 "unsupported scale factor or changed aspect ratio");
+        switch (config.color_format) {
+        case VK_FORMAT_R16G16B16A16_SFLOAT: impl->color_format = MTLPixelFormatRGBA16Float; break;
+        case VK_FORMAT_R8G8B8A8_UNORM: impl->color_format = MTLPixelFormatRGBA8Unorm; break;
+        case VK_FORMAT_R8G8B8A8_SRGB: impl->color_format = MTLPixelFormatRGBA8Unorm_sRGB; break;
+        default: Require(false, "color format is not RGBA16F, RGBA8 UNORM or RGBA8 sRGB");
+        }
+        switch (config.output_format) {
+        case VK_FORMAT_R16G16B16A16_SFLOAT: impl->output_format = MTLPixelFormatRGBA16Float; break;
+        case VK_FORMAT_R8G8B8A8_UNORM: impl->output_format = MTLPixelFormatRGBA8Unorm; break;
+        default: Require(false, "output format is not RGBA16F or RGBA8 UNORM");
+        }
+        // A tonemapped frame already carries its exposure; MetalFX's own would expose it twice.
+        Require(!config.auto_exposure || config.color_format == VK_FORMAT_R16G16B16A16_SFLOAT,
+                "auto exposure on a tonemapped RGBA8 input");
         auto descriptor = [MTLFXTemporalScalerDescriptor new];
         descriptor.inputWidth = config.input_width;
         descriptor.inputHeight = config.input_height;
         descriptor.outputWidth = config.output_width;
         descriptor.outputHeight = config.output_height;
-        descriptor.colorTextureFormat = MTLPixelFormatRGBA16Float;
+        descriptor.colorTextureFormat = impl->color_format;
         descriptor.depthTextureFormat = config.depth_stencil ? MTLPixelFormatDepth32Float_Stencil8
                                                            : MTLPixelFormatDepth32Float;
         descriptor.motionTextureFormat = MTLPixelFormatRG16Float;
-        descriptor.outputTextureFormat = MTLPixelFormatRGBA16Float;
+        descriptor.outputTextureFormat = impl->output_format;
         descriptor.reactiveMaskTextureEnabled = YES;
         descriptor.reactiveMaskTextureFormat = MTLPixelFormatR8Unorm;
-        descriptor.autoExposureEnabled = YES;
+        descriptor.autoExposureEnabled = config.auto_exposure ? YES : NO;
         descriptor.requiresSynchronousInitialization = YES;
         impl->scaler = [descriptor newTemporalScalerWithDevice:impl->metal];
         Require(impl->scaler, "synchronous temporal-scaler creation failed");
@@ -170,8 +189,8 @@ TemporalScaler::TemporalScaler(VkDevice device, PFN_vkGetDeviceProcAddr get_proc
         impl->queue.label = @"bbport MetalFX temporal";
         impl->scaler.motionVectorScaleX = impl->scaler.motionVectorScaleY = 1.0f;
         impl->scaler.depthReversed = NO;
-        impl->scaler.inputContentWidth = config.input_width;
-        impl->scaler.inputContentHeight = config.input_height;
+        impl->scaler.inputContentWidth = content_width;
+        impl->scaler.inputContentHeight = content_height;
     }
 }
 
@@ -194,16 +213,14 @@ std::shared_ptr<Textures> TemporalScaler::Register(Images images) {
         textures->output = impl->ExportImage(images.output, VK_IMAGE_ASPECT_COLOR_BIT);
         textures->reactive = impl->ExportImage(images.reactive, VK_IMAGE_ASPECT_COLOR_BIT);
         const auto& config = impl->config;
-        impl->Validate(textures->color, config.input_width, config.input_height,
-                       MTLPixelFormatRGBA16Float, impl->scaler.colorTextureUsage);
-        impl->Validate(textures->depth, config.input_width, config.input_height,
-                       impl->scaler.depthTextureFormat, impl->scaler.depthTextureUsage);
-        impl->Validate(textures->motion, config.input_width, config.input_height,
-                       MTLPixelFormatRG16Float, impl->scaler.motionTextureUsage);
-        impl->Validate(textures->reactive, config.input_width, config.input_height,
-                       MTLPixelFormatR8Unorm, impl->scaler.reactiveTextureUsage);
+        const auto tw = config.input_width, th = config.input_height;
+        impl->Validate(textures->color, tw, th, impl->color_format, impl->scaler.colorTextureUsage);
+        impl->Validate(textures->depth, tw, th, impl->scaler.depthTextureFormat,
+                       impl->scaler.depthTextureUsage);
+        impl->Validate(textures->motion, tw, th, MTLPixelFormatRG16Float, impl->scaler.motionTextureUsage);
+        impl->Validate(textures->reactive, tw, th, MTLPixelFormatR8Unorm, impl->scaler.reactiveTextureUsage);
         impl->Validate(textures->output, config.output_width, config.output_height,
-                       MTLPixelFormatRGBA16Float, impl->scaler.outputTextureUsage);
+                       impl->output_format, impl->scaler.outputTextureUsage);
         Require(textures->output.storageMode == MTLStorageModePrivate,
                 "MetalFX output must use private storage");
         Require(textures->output != textures->color && textures->output != textures->depth &&

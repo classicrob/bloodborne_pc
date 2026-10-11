@@ -304,23 +304,134 @@ static void present(Env& e,const Image& output,VkSemaphore scaled,uint64_t value
 static FfxVkPortableImage describe(const Image& x,FfxVkPortableResourceState state) {
     return {sizeof(FfxVkPortableImage),x.image,x.format,{x.w,x.h},1,1,x.usage,x.aspect,state};
 }
+// The scaled presets' placement (docs/macos/metalfx.md): the module upscales the finished,
+// tonemapped RGBA8 frame, whose W x H content is the top-left of larger aligned targets, without
+// auto exposure. The padding is filled with green; the output's center and bottom-right pixels must
+// show only the content (MetalFX honors inputContentWidth/Height), in both output formats.
+static void ldrPadded(Env& e) {
+    constexpr uint32_t TW=W+64, TH=H+32;
+    struct Case { VkFormat color, output; const char* label; };
+    for(const Case c:{Case{VK_FORMAT_R8G8B8A8_UNORM,VK_FORMAT_R16G16B16A16_SFLOAT,"RGBA8 UNORM -> RGBA16F"},
+                      Case{VK_FORMAT_R8G8B8A8_SRGB,VK_FORMAT_R8G8B8A8_UNORM,"RGBA8 sRGB -> RGBA8 UNORM"}}) {
+        Image color=e.image(c.color,TW,TH,VK_IMAGE_ASPECT_COLOR_BIT);
+        Image depth=e.image(VK_FORMAT_D32_SFLOAT,TW,TH,VK_IMAGE_ASPECT_DEPTH_BIT);
+        Image motion=e.image(VK_FORMAT_R16G16_SFLOAT,TW,TH,VK_IMAGE_ASPECT_COLOR_BIT);
+        Image reactive=e.image(VK_FORMAT_R8_UNORM,TW,TH,VK_IMAGE_ASPECT_COLOR_BIT);
+        Image output=e.image(c.output,OW,OH,VK_IMAGE_ASPECT_COLOR_BIT);
+        auto [ready,readyMetal]=event(e); auto [done,doneMetal]=event(e);
+        BbMetalFX::Config config{TW,TH,OW,OH};
+        config.color_format=c.color; config.output_format=c.output; config.auto_exposure=false;
+        config.content_width=W; config.content_height=H;
+        auto provider=std::make_unique<BbMetalFX::TemporalScaler>(e.device,vkGetDeviceProcAddr,ready,done,config);
+        auto binding=provider->Register({color.image,depth.image,motion.image,output.image,reactive.image});
+        VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO}; VkFence fence{};
+        VK(vkCreateFence(e.device,&fi,nullptr,&fence));
+        VkCommandBuffer producer=e.command(), consumer=e.command();
+        VkBufferCreateInfo bc{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO}; bc.size=16;
+        bc.usage=VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        VkBuffer readback{}; VK(vkCreateBuffer(e.device,&bc,nullptr,&readback));
+        VkMemoryRequirements br{}; vkGetBufferMemoryRequirements(e.device,readback,&br);
+        VkMemoryAllocateInfo ba{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO}; ba.allocationSize=br.size;
+        ba.memoryTypeIndex=e.memoryType(br.memoryTypeBits,VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        VkDeviceMemory bm{}; VK(vkAllocateMemory(e.device,&ba,nullptr,&bm));
+        VK(vkBindBufferMemory(e.device,readback,bm,0));
+        void* pixels{}; VK(vkMapMemory(e.device,bm,0,VK_WHOLE_SIZE,0,&pixels));
+        VkAttachmentDescription attachment{};
+        attachment.format=c.color; attachment.samples=VK_SAMPLE_COUNT_1_BIT;
+        attachment.loadOp=VK_ATTACHMENT_LOAD_OP_CLEAR; attachment.storeOp=VK_ATTACHMENT_STORE_OP_STORE;
+        attachment.initialLayout=VK_IMAGE_LAYOUT_GENERAL; attachment.finalLayout=VK_IMAGE_LAYOUT_GENERAL;
+        VkAttachmentReference ref{0,VK_IMAGE_LAYOUT_GENERAL};
+        VkSubpassDescription sub{}; sub.pipelineBindPoint=VK_PIPELINE_BIND_POINT_GRAPHICS;
+        sub.colorAttachmentCount=1; sub.pColorAttachments=&ref;
+        VkRenderPassCreateInfo rc{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+        rc.attachmentCount=1; rc.pAttachments=&attachment; rc.subpassCount=1; rc.pSubpasses=&sub;
+        VkRenderPass renderPass{}; VK(vkCreateRenderPass(e.device,&rc,nullptr,&renderPass));
+        VkFramebufferCreateInfo fc{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+        fc.renderPass=renderPass; fc.attachmentCount=1; fc.pAttachments=&color.view;
+        fc.width=TW; fc.height=TH; fc.layers=1;
+        VkFramebuffer frame{}; VK(vkCreateFramebuffer(e.device,&fc,nullptr,&frame));
+        for(uint64_t value=1; value<=6; ++value) {
+            const float red=value%2 ? 0.25f : 0.75f;
+            begin(producer);
+            for(auto* x:{&color,&depth,&motion,&output,&reactive})
+                barrier(producer,*x,value==1?VK_IMAGE_LAYOUT_UNDEFINED:VK_IMAGE_LAYOUT_GENERAL,
+                        VK_IMAGE_LAYOUT_GENERAL,value==1?VK_QUEUE_FAMILY_IGNORED:VK_QUEUE_FAMILY_EXTERNAL,
+                        value==1?VK_QUEUE_FAMILY_IGNORED:e.family);
+            // Padding: green over the whole texture; then the content rect (render-pass area).
+            VkImageSubresourceRange cr{color.aspect,0,1,0,1}, dr{depth.aspect,0,1,0,1}, mr{motion.aspect,0,1,0,1};
+            VkClearColorValue green{}; green.float32[1]=1; green.float32[3]=1;
+            vkCmdClearColorImage(producer,color.image,VK_IMAGE_LAYOUT_GENERAL,&green,1,&cr);
+            VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+            mb.srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;
+            mb.dstAccessMask=VK_ACCESS_COLOR_ATTACHMENT_READ_BIT|VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+            vkCmdPipelineBarrier(producer,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                                 0,1,&mb,0,nullptr,0,nullptr);
+            VkClearValue clear{}; clear.color.float32[0]=red;
+            clear.color.float32[1]=0.5f; clear.color.float32[2]=0.25f; clear.color.float32[3]=1;
+            VkRenderPassBeginInfo ri{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO}; ri.renderPass=renderPass;
+            ri.framebuffer=frame; ri.renderArea={{0,0},{W,H}}; ri.clearValueCount=1; ri.pClearValues=&clear;
+            vkCmdBeginRenderPass(producer,&ri,VK_SUBPASS_CONTENTS_INLINE); vkCmdEndRenderPass(producer);
+            VkClearDepthStencilValue dv{0.5f,0}; VkClearColorValue zero{};
+            vkCmdClearDepthStencilImage(producer,depth.image,VK_IMAGE_LAYOUT_GENERAL,&dv,1,&dr);
+            vkCmdClearColorImage(producer,motion.image,VK_IMAGE_LAYOUT_GENERAL,&zero,1,&mr);
+            vkCmdClearColorImage(producer,reactive.image,VK_IMAGE_LAYOUT_GENERAL,&zero,1,&mr);
+            for(auto* x:{&color,&depth,&motion,&output,&reactive})
+                barrier(producer,*x,VK_IMAGE_LAYOUT_GENERAL,VK_IMAGE_LAYOUT_GENERAL,e.family,VK_QUEUE_FAMILY_EXTERNAL);
+            submit(e,producer,nullptr,0,ready,value,nullptr);
+            provider->Submit(binding,{value,value,value-1,value,0,0});
+            begin(consumer);
+            barrier(consumer,output,VK_IMAGE_LAYOUT_GENERAL,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                    VK_QUEUE_FAMILY_EXTERNAL,e.family);
+            const uint32_t texel=c.output==VK_FORMAT_R8G8B8A8_UNORM ? 4 : 8;
+            VkBufferImageCopy copies[2]{};
+            copies[0].imageSubresource=copies[1].imageSubresource={output.aspect,0,0,1};
+            copies[0].imageOffset={(int)OW/2,(int)OH/2,0}; copies[1].imageOffset={(int)OW-1,(int)OH-1,0};
+            copies[0].imageExtent=copies[1].imageExtent={1,1,1}; copies[1].bufferOffset=8;
+            vkCmdCopyImageToBuffer(consumer,output.image,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,readback,2,copies);
+            barrier(consumer,output,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,VK_IMAGE_LAYOUT_GENERAL,
+                    e.family,VK_QUEUE_FAMILY_EXTERNAL);
+            submit(e,consumer,done,value,nullptr,0,fence); complete(e,fence);
+            provider->Drain();
+            for(int at=0; at<2; ++at) {
+                const auto* bytes=static_cast<const unsigned char*>(pixels)+at*8;
+                float rgb[3];
+                for(int i=0;i<3;++i) {
+                    if(texel==4) rgb[i]=bytes[i]/255.0f;
+                    else { _Float16 h; std::memcpy(&h,bytes+2*i,2); rgb[i]=(float)h; }
+                }
+                std::printf("ldr-padded %s frame=%llu %s rgb=%.4f,%.4f,%.4f expected=%.2f,.5,.25\n",c.label,
+                            (unsigned long long)value,at?"bottom-right":"center",rgb[0],rgb[1],rgb[2],red);
+                require(std::isfinite(rgb[0]) && std::abs(rgb[0]-red)<0.08f && std::abs(rgb[1]-0.5f)<0.08f &&
+                        std::abs(rgb[2]-0.25f)<0.08f,
+                        "LDR padded input: output pixel mismatch (padding or exposure leaked in)");
+            }
+        }
+        provider.reset();
+        VK(vkDeviceWaitIdle(e.device));
+        std::printf("PASS: module, %s, %ux%u content in %ux%u textures -> %ux%u, no auto exposure\n",
+                    c.label,W,H,TW,TH,OW,OH);
+    }
+}
 int main(int argc,char** argv) {
     setbuf(stdout,nullptr);
     try {
-        bool wantPresent=false, depthStencil=false, useModule=false, reactiveHistory=false;
+        bool wantPresent=false, depthStencil=false, useModule=false, reactiveHistory=false, ldr=false;
         for(int i=1;i<argc;++i) {
             if(!std::strcmp(argv[i],"--present")) wantPresent=true;
             else if(!std::strcmp(argv[i],"--depth-stencil")) depthStencil=true;
             else if(!std::strcmp(argv[i],"--module")) useModule=true;
             else if(!std::strcmp(argv[i],"--reactive-history")) reactiveHistory=true;
-            else throw std::runtime_error("expected --present, --depth-stencil, --module or --reactive-history");
+            else if(!std::strcmp(argv[i],"--ldr-padded")) ldr=true;
+            else throw std::runtime_error("expected --present, --depth-stencil, --module, --reactive-history or --ldr-padded");
         } @autoreleasepool {
         require(!reactiveHistory || useModule,"reactive-history qualification requires --module");
+        require(!ldr || argc==2,"--ldr-padded runs alone");
         int translated=0; size_t n=sizeof(translated);
         require(sysctlbyname("sysctl.proc_translated",&translated,&n,nullptr,0)==0 && translated==1,
                 "prototype requires actual Rosetta x86_64");
         Env e;
         require([MTLFXTemporalScalerDescriptor supportsDevice:e.metal],"MetalFX temporal unsupported");
+        if(ldr) { ldrPadded(e); return 0; }
         require([MTLFXSpatialScalerDescriptor supportsDevice:e.metal],"MetalFX spatial unsupported");
         auto* td=[MTLFXTemporalScalerDescriptor new];
         td.inputWidth=W; td.inputHeight=H; td.outputWidth=OW; td.outputHeight=OH;

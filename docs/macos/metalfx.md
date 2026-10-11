@@ -68,6 +68,7 @@ BB_DEPS_PREFIX="$HOME/bbport-deps/x86_64"   bash tests/macos_metalfx/run.sh --mo
 bash tests/macos_metalfx/signature.sh
 PATH=/opt/homebrew/bin:$PATH bash tests/macos_metalfx/jitter.sh
 BB_DEPS_PREFIX="$HOME/bbport-deps/x86_64" bash tests/macos_metalfx/run.sh --module --reactive-history
+BB_DEPS_PREFIX="$HOME/bbport-deps/x86_64" bash tests/macos_metalfx/run.sh --ldr-padded
 ~~~
 
 The optional --present briefly creates a 640 × 360 SDL/Metal window. Scaling
@@ -158,9 +159,15 @@ reactive-mask qualification.
 into libbbgpu or exposed as a setting yet. Its C++ header hides Objective-C
 objects. One owner thread creates/encodes/drains the provider:
 
-- Config fixes input/output extents, D32F versus D32F/S8, and an in-flight limit.
+- Config fixes input texture/output extents, D32F versus D32F/S8, an in-flight
+  limit, the color format (RGBA16F linear HDR, or tonemapped RGBA8 UNORM/sRGB),
+  the output format (RGBA16F or RGBA8 UNORM), auto exposure (HDR only; an RGBA8
+  input with auto exposure aborts) and the content extent: the frame may be the
+  top-left of larger aligned input textures (inputContentWidth/Height). The
+  scale factor is output / content. Values are used as stored; no inverse gamma.
 - Register exports and validates the five Vulkan images once per resource
-  generation: RGBA16F color/output, RG16F motion, depth, and R8 reactive mask.
+  generation: color and output in their configured formats, RG16F motion,
+  depth, and R8 reactive mask; all inputs at the input texture size.
   Cached bindings retain their Metal textures. A unique retained owner token
   rejects bindings from another provider, including after address reuse.
 - Submit waits for a producer timeline value, encodes temporal scaling, signals
@@ -182,6 +189,10 @@ moving-grid history/jitter checks and module-output Vulkan presentation. These
 are synthetic tests, not HDR integration, scene-quality or game acceptance.
 The reactive-history test leaves the epoch unchanged while alternating the
 input color and setting mask=1; checked output follows the current frame.
+The LDR-padded test (`--ldr-padded`) puts a 2560x1440 RGBA8 frame in 2624x1472
+textures with green padding and upscales it without auto exposure to RGBA16F
+and to RGBA8 UNORM output; the center and bottom-right output pixels must show
+the frame only (they show the padding when the content extent is ignored).
 
 ## Renderer integration proposal
 
