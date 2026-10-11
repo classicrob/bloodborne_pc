@@ -507,7 +507,7 @@ def supervise(run):
         env = dict(os.environ, **{k: v for k, v in heavy.items() if k.startswith('BB_HEAVY_')},
                    BB_HEAVY_ANNOUNCE='1')
         command = [str(ROOT / 'tools/macos/heavy.sh'), '--pool', 'playtest', f'game {run.name}', '--',
-                   '/usr/bin/nice', '-n', '5', '/bin/bash', str(ROOT / 'run.sh')]  # below the user's apps
+                   '/bin/bash', str(ROOT / 'run.sh')]  # heavy.sh runs games at nice 5, utility QoS
         p = subprocess.Popen(command, cwd=ROOT, stdout=log, stderr=subprocess.STDOUT,
                              stdin=subprocess.DEVNULL, env=env)
         info['pid'] = p.pid  # heavy.sh and run.sh exec into bb-probe, so this is the game's pid
