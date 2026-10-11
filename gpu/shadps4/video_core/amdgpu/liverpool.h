@@ -113,6 +113,14 @@ struct Liverpool {
     std::mutex snapshots_mutex;
     std::deque<std::shared_ptr<CmdSnapshot>> gfx_snapshots;
     u64 snapshot_submits{};
+    /// GPU command thread: a replay capture holds the next frame's submissions (replay_capture.h).
+    bool replay_hold{};
+    u32 replay_hold_commands{};
+    /// After a hold ended on a CPU flip: per queue, the held tasks still to complete. Until they
+    /// have, ProcessCommands leaves a CPU flip (and what is queued behind it) waiting, so the flip
+    /// does not present or publish the held frame before its draws parse.
+    std::array<u32, NumTotalQueues> replay_held_tasks{};
+    u32 replay_held_left{};
     /// A stream write the PS4 command processor would see in command memory a copy hides.
     void CheckCommandMemoryWrite(VAddr address, u64 size, const char* writer);
     static u64 HashRegisterPacket(u64 checksum, const u32* words, u32 count);
@@ -161,23 +169,26 @@ public:
         rasterizer = rasterizer_;
     }
 
+    /// Runs `func` on the GPU command thread. `cpu_flip` marks a CPU (non-EOP) flip, which a
+    /// replay capture hold must not run ahead of the held frame.
     template <bool wait_done = false>
-    void SendCommand(auto&& func) {
+    void SendCommand(auto&& func, bool cpu_flip = false) {
         if constexpr (wait_done) {
             std::binary_semaphore sem{0};
             {
                 std::scoped_lock lk{submit_mutex};
-                command_queue.emplace([&sem, &func] {
-                    func();
-                    sem.release();
-                });
+                command_queue.push({[&sem, &func] {
+                                        func();
+                                        sem.release();
+                                    },
+                                    cpu_flip});
                 ++num_commands;
                 submit_cv.notify_one();
             }
             sem.acquire();
         } else {
             std::scoped_lock lk{submit_mutex};
-            command_queue.emplace(std::move(func));
+            command_queue.push({std::move(func), cpu_flip});
             ++num_commands;
             submit_cv.notify_one();
         }
@@ -260,7 +271,10 @@ private:
     template <bool is_indirect = false>
     Task ProcessCompute(std::span<const u32> acb, u32 vqid);
 
-    void ProcessCommands();
+    /// Runs queued host commands; returns how many ran. With `stopped_at_cpu_flip` (replay
+    /// capture hold) a CPU flip at the front stays queued and sets it; so it does while held
+    /// work from a hold that ended on a CPU flip is still parsing (replay_held_left).
+    u32 ProcessCommands(bool* stopped_at_cpu_flip = nullptr);
     void Process(std::stop_token stoken);
 
     struct GpuQueue {
@@ -310,7 +324,11 @@ private:
     std::atomic<bool> submit_done{};
     std::mutex submit_mutex;
     std::condition_variable_any submit_cv;
-    std::queue<Common::UniqueFunction<void>> command_queue{};
+    struct HostCommand {
+        Common::UniqueFunction<void> func;
+        bool cpu_flip;
+    };
+    std::queue<HostCommand> command_queue{};
     std::thread::id gpu_id;
 #if defined(__linux__) || defined(_WIN32) || defined(__APPLE__)
     u32 gpu_tid{};

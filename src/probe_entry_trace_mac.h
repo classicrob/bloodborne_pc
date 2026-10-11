@@ -22,6 +22,15 @@ static int entry_trace_delayed;
 static int32_t (__attribute__((sysv_abi)) *entry_trace_start_target)(void *);
 static const char *entry_trace_import_error;
 
+/* Setup can fail after renderer threads have started. Do not run process/UI
+ * teardown against that partially initialized state on a diagnostic refusal. */
+static void entry_trace_require(const char *error) {
+    if (!error) return;
+    fprintf(stderr,"ERROR: %s\n",error);
+    fflush(stderr);
+    _Exit(23);
+}
+
 static const char *entry_trace_configure(const char *sites,const char *arm) {
     if (!arm || !*arm) return NULL;
     if (!sites || !*sites || !strcmp(sites,"0")) return "BB_GUEST_ENTRY_ARM requires BB_GUEST_ENTRY_TRACE";

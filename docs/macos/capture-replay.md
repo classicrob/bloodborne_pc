@@ -145,6 +145,35 @@ protocol. If not, reduce to an isolated draw/dispatch interval with a valid chec
 or explicitly expand the producer instrumentation. Do not promise arbitrary live
 one-frame capture on the strength of the existing command snapshots.
 
+### Inventory run (implemented, diagnostic)
+
+`BB_REPLAY_CAPTURE=inventory:<frames>` (Apple, off by default; `BB_REPLAY_HOLD_MS`
+bound, 1–60000, default 3000; malformed values disable it loudly) tests step 1 only.
+At the `<frames>`th *retired* frame end (sceGnmSubmitDone after which GpuIdle was
+raised with nothing queued; a frame end that finds submissions already queued is not
+counted, so the held frame can be later than `<frames>` + 1) the GPU command thread
+stops parsing until the guest ends the next frame, then prints:
+
+- G1: whether the cut was reached, renderer quiescence, and blocking host commands that
+  ran during the hold (buffer synchronize, import pause; they must run or the guest
+  never ends the frame, and each one rejects the cut). A CPU (non-EOP) flip ends the
+  hold and rejects the cut: it would present a framebuffer whose draws are held. The
+  flip, and commands queued behind it, then wait until the held work has parsed, so
+  the game does not present or publish the frame early. A held submission waiting on
+  memory that only a command behind the flip would write cannot finish (as with any
+  command queued behind a flip).
+- G2: a raw scan of the held frame's copied command regions (potential packets,
+  including untaken COND_EXEC/predicated ranges; uncopied, invalid or truncated regions
+  make it incomplete and reject), graphics and asynchronous-compute tasks queued at the
+  cut (sampled from the queues, plus asynchronous compute counted from sampling to
+  the report), the runtime memory inventory and every GPU-modified
+  image with its writeback reject reason.
+
+The best verdict is "no inventoried blocker found; capture NOT yet qualified": the run
+does not rendezvous guest CPU or HLE writers (step 2), omits low/untracked memory, does
+not exercise image writeback, and cannot attribute asynchronous compute submitted
+between the report and the released frame's retirement (reported when the window closes).
+
 ### Authoritative images are a separate checkpoint problem
 
 Buffer imports share guest backing, but texture-cache images can hold newer contents.
