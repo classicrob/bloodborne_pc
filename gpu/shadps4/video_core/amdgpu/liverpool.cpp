@@ -65,6 +65,14 @@ static const char* acb_task_name[] = NAME_ARRAY(ACB_TASK, MAX_NAMES);
 
 std::array<u8, 48_KB> Liverpool::ConstantEngine::constants_heap;
 
+#ifdef __APPLE__
+/// BB_CMD_SNAPSHOT_CHECK=1: command snapshot diagnostics (guest rewrites, CMD-OVERLAP).
+static bool SnapshotCheck() {
+    static const bool check = EmulatorSettingsImpl::Flag("BB_CMD_SNAPSHOT_CHECK", false);
+    return check;
+}
+#endif
+
 static std::span<const u32> NextPacket(std::span<const u32> span, size_t offset) {
     if (offset > span.size()) {
         LOG_ERROR(
@@ -795,8 +803,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                                            CmdSnapshot::Region* region) {
     FIBER_ENTER(dcb_task_name);
 #ifdef __APPLE__
-    static const bool snapshot_check = EmulatorSettingsImpl::Flag("BB_CMD_SNAPSHOT_CHECK", false);
-    if (region && snapshot_check) {
+    if (region && SnapshotCheck()) {
         snapshot->ReportGuestRewrites(*region);
         if (auto* ccb_region = seq != NoSeq ? snapshot->Ccb() : nullptr) {
             snapshot->ReportGuestRewrites(*ccb_region);
@@ -1894,13 +1901,18 @@ void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
             snapshot->submit_number = ++snapshot_submits;
             gfx_snapshots.push_back(snapshot);
         }
-        snapshot->ReportRecentOverlaps();
         auto task = ProcessGraphics(dcb, ccb, seq, snapshot, &snapshot->Dcb());
 #else
         auto task = ProcessGraphics(dcb, ccb, seq);
 #endif
         queue.submits.emplace(task.handle);
     }
+#ifdef __APPLE__
+    // Diagnostic (quadratic in regions): outside the queue lock the GPU thread needs.
+    if (SnapshotCheck()) {
+        snapshot->ReportRecentOverlaps();
+    }
+#endif
 
     std::scoped_lock lk{submit_mutex};
     ++num_submits;
