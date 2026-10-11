@@ -176,7 +176,7 @@ The guest frees per-frame objects holding end-of-pipe labels (48-byte heap block
 offset 0) once the submitDone throttle releases it. A label written after that corrupts its heap
 (guest fault 0x263b8e7, `docs/history/SESSION_2026-09-30.md`). With `BB_LABEL_CHECK=1`, each EOP
 label is sampled when the EOP is parsed and again just before it is written. A change in between
-that does not match one of our recorded EOP writes (WRITE_DATA, EOS and DMA writes are not
+that does not match one of our tracked label writes (EOP, and RELEASE_MEM with 32/64-bit data) (WRITE_DATA, EOS and DMA writes are not
 tracked) is logged as `LABEL-CHECK`, with the values, the 16-byte
 aligned 48 bytes around the label, and the time since the parse sample. Every 4096 checks a summary
 gives the checked, changed, unreadable, unmatched and mixed-width counts.
