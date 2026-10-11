@@ -74,6 +74,20 @@ constexpr u32 PixelFormatBpp(PixelFormat pixel_format) {
 }
 
 VideoOutDriver::VideoOutDriver(u32 width, u32 height) {
+#ifdef __APPLE__
+    // Read first, before any thread starts: a malformed BB_FLIP_AT_GPU_RETIRE stops here, not at
+    // the first flip.
+    flip_run_mode = BbFlip::ParseRunMode(std::getenv("BB_FLIP_AT_GPU_RETIRE"));
+    std::fprintf(stderr, "Flips: %s\n",
+                 flip_run_mode == BbFlip::RunMode::AtRetire
+                     ? "published at GPU retirement of their frame copy for the whole run "
+                       "(BB_FLIP_AT_GPU_RETIRE=1)"
+                 : flip_run_mode == BbFlip::RunMode::AtEnqueue
+                     ? "published when enqueued for the whole run (BB_FLIP_AT_GPU_RETIRE=0, "
+                       "diagnosis)"
+                     : "published at GPU retirement of their frame copy (default; toggle bit 60 "
+                       "publishes them when enqueued)");
+#endif
     main_port.resolution.full_width = width;
     main_port.resolution.full_height = height;
     main_port.resolution.pane_width = width;
@@ -595,20 +609,8 @@ void VideoOutDriver::Flip(const Request& req) {
     // guest framebuffer is the frame copy PrepareFrame submitted (req.ready_tick; a blank frame's
     // own submission). By default the flip is published once the GPU retired it; flips are
     // published in order either way (BbFlip::Publisher). See bbport_flip_mode.h.
-    static const BbFlip::RunMode run = [] {
-        const auto mode = BbFlip::ParseRunMode(std::getenv("BB_FLIP_AT_GPU_RETIRE"));
-        std::fprintf(stderr, "Flips: %s\n",
-                     mode == BbFlip::RunMode::AtRetire
-                         ? "published at GPU retirement of their frame copy for the whole run "
-                           "(BB_FLIP_AT_GPU_RETIRE=1)"
-                     : mode == BbFlip::RunMode::AtEnqueue
-                         ? "published when enqueued for the whole run (BB_FLIP_AT_GPU_RETIRE=0, "
-                           "diagnosis)"
-                         : "published at GPU retirement of their frame copy (default; toggle "
-                           "bit 60 publishes them when enqueued)");
-        return mode;
-    }();
-    const bool at_retire = BbFlip::AtRetire(run, BbToggle::Disabled(BbToggle::FlipAtEnqueue));
+    const bool at_retire =
+        BbFlip::AtRetire(flip_run_mode, BbToggle::Disabled(BbToggle::FlipAtEnqueue));
     publisher->Submit(req, req.ready_tick, at_retire);
 }
 

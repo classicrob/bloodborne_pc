@@ -10,6 +10,7 @@
 #include <deque>
 #include <memory>
 #ifdef __APPLE__
+#include "bbport_flip_mode.h"
 #include "bbport_flip_publish.h"
 #endif
 #include <functional>
@@ -160,6 +161,7 @@ private:
     /// Flips published at GPU retirement of their frame copy (the default; bbport_flip_mode.h), in
     /// flip order.
     std::unique_ptr<BbFlip::Publisher<Request>> publisher;
+    BbFlip::RunMode flip_run_mode{}; ///< BB_FLIP_AT_GPU_RETIRE, read in the constructor
 #endif
     std::jthread present_thread;
     std::queue<Request> requests;
