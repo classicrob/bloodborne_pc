@@ -138,7 +138,8 @@ struct Liverpool {
     /// BB_CMD_DATA_CHECK provenance: the SET_SH_REG that last wrote a user-data word of this
     /// register file, and our latest DUMP_CONST_RAM over [address, address + size).
     static void LookupOrigin(void* owner, const void* pointer_word, u64 address, u64 size,
-                             BbCmdData::PointerOrigin& pointer, BbCmdData::DumpOrigin& dump);
+                             BbCmdData::PointerOrigin& low, BbCmdData::PointerOrigin& high,
+                             BbCmdData::DumpOrigin& dump, u64& flips_now);
     /// `compute_queue` -1: the graphics stream.
     void NoteShWrite(const PM4Header* header, u64 guest_packet, u64 submission,
                      s32 compute_queue = -1);
