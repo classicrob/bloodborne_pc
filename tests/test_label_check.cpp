@@ -228,6 +228,8 @@ int main() {
         callback.join();
         Expect("  ... the recorder wait stays blocked until its callback completes, then ends",
                blocked && completed);
+    }
+
     // When labels are written (bbport_label_mode.h): at GPU completion by default, toggle bit 59
     // switches to at submit live, BB_LABELS_AT_GPU_COMPLETE=0/1 fixes the mode for the run.
     {
