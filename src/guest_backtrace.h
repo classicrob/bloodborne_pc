@@ -20,12 +20,13 @@
  * the main thread, HLE callback workers) through the kernel, so an unmapped frame fails instead
  * of faulting. */
 static inline int guest_backtrace_frame(uintptr_t frame, uintptr_t bottom, uintptr_t top,
-                                        uintptr_t record[2]) {
+                                        int kernel_reads, uintptr_t record[2]) {
     if (frame >= bottom && frame <= top - 16) {
         record[0] = ((const uintptr_t *)frame)[0];
         record[1] = ((const uintptr_t *)frame)[1];
         return 1;
     }
+    if (!kernel_reads) return 0;
     mach_vm_size_t got = 0;
     return mach_vm_read_overwrite(mach_task_self(), frame, 16, (mach_vm_address_t)record, &got) ==
                KERN_SUCCESS && got == 16;
@@ -36,13 +37,16 @@ static inline int guest_backtrace_frame(uintptr_t frame, uintptr_t bottom, uintp
  * called, or the guest rbp of a trapped thread). The walk follows strictly ascending frames, at
  * most 8 MiB apart or into the thread's own pthread stack, so it also crosses from a low guest
  * stack into the host frames that switched to it. Returns how many were stored. */
-static inline size_t guest_backtrace(uintptr_t frame, uintptr_t *out, size_t max) {
+/* kernel_reads == 0: only frames on the thread's pthread stack (no system calls; a low stack ends
+ * the walk). */
+static inline size_t guest_backtrace_ex(uintptr_t frame, uintptr_t *out, size_t max,
+                                        int kernel_reads) {
     const uintptr_t top = (uintptr_t)pthread_get_stackaddr_np(pthread_self());
     const uintptr_t bottom = top - pthread_get_stacksize_np(pthread_self());
     size_t n = 0;
     uintptr_t record[2];
     while (n < max && frame && (frame & 7) == 0 &&
-           guest_backtrace_frame(frame, bottom, top, record)) {
+           guest_backtrace_frame(frame, bottom, top, kernel_reads, record)) {
         if (!record[1]) break;
         out[n++] = record[1];
         if (record[0] <= frame) break;
@@ -53,6 +57,9 @@ static inline size_t guest_backtrace(uintptr_t frame, uintptr_t *out, size_t max
         frame = record[0];
     }
     return n;
+}
+static inline size_t guest_backtrace(uintptr_t frame, uintptr_t *out, size_t max) {
+    return guest_backtrace_ex(frame, out, max, 1);
 }
 #endif
 #endif

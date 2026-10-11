@@ -3,6 +3,8 @@
 
 #include <algorithm>
 #include <chrono>
+#include <memory>
+#include <thread>
 #include <pthread.h>
 #ifdef __APPLE__
 #include "bb_mac_compat.h"
@@ -117,10 +119,28 @@ static void ReportParserStop() {
     for (size_t i = 0; i < std::min<size_t>(parsing_left, 8); ++i) {
         words += fmt::format(" {:08x}", parsing_words[i]);
     }
-    LOG_CRITICAL(Render, "GPU stop while decoding the packet at {} (parsed words{})",
+    LOG_CRITICAL(Render, "GPU stop on the command thread while decoding the packet at {} (parsed "
+                         "words{})",
                  fmt::ptr(parsing_guest), words);
     BuilderTrace::Report(parsing_guest);
-    ReportCommandMemoryAliases(parsing_guest);
+    // The alias query takes the runtime's VMA lock, which the asserting code may hold: run it on a
+    // helper thread and wait at most a second (the process exits right after either way).
+    struct AliasQuery {
+        const u32* guest;
+        std::atomic<bool> done{false};
+    };
+    auto query = std::make_shared<AliasQuery>();
+    query->guest = parsing_guest;
+    std::thread([query] {
+        ReportCommandMemoryAliases(query->guest);
+        query->done.store(true);
+    }).detach();
+    for (int waited_ms = 0; !query->done.load() && waited_ms < 1000; waited_ms += 10) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    if (!query->done.load()) {
+        LOG_CRITICAL(Render, "Alias query blocked at the stop (runtime VMA lock held), skipped");
+    }
     // BB_WRITE_LOG: GPU-side writes into the command chunk around it (256 KiB each way).
     BbWriteLog::DumpNear(reinterpret_cast<u64>(parsing_guest) - 256_KB,
                          reinterpret_cast<u64>(parsing_guest) + 256_KB, "the stop");

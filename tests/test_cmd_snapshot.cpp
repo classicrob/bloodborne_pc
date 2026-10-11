@@ -72,6 +72,8 @@ void AppendNop(std::vector<u32>& stream, u32 marker) {
 } // namespace
 
 int main() {
+    // Off-stack call chains are read only in diagnostic runs; the low-stack case needs them.
+    setenv("BB_CMD_SNAPSHOT_CHECK", "1", 1);
     struct sigaction action{};
     action.sa_sigaction = OnFault;
     action.sa_flags = SA_SIGINFO;
