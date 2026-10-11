@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Extracts every PS4 shader the game ships (dvdroot_ps4/shader/*.shaderbnd*.dcx) into a corpus.
+"""Extracts every PS4 shader the game ships (dvdroot_ps4/shader/*.shaderbnd*.dcx, and the ones
+embedded in eboot.bin) into a corpus.
 
 Each archive is a DCX-compressed BND4 binder of *.vpo/*.ppo/*.gpo/*.cpo/*.hpo/*.dpo files. A file is
 a FromSoftware header (magic 0x0003e220, then the low half of the shader hash), then a PSSL .sb
@@ -62,9 +63,11 @@ def vertex_struct(words, at, stage, name):
     return regs, slots, semantics, 10 + n_slots + n_in + (n_exp + 1) // 2
 
 
-def parse(blob, name):
-    if struct.unpack_from('<I', blob, 0)[0] != 0x20E20300 or blob[0x24:0x28] != b'Shdr':
-        raise ValueError(f'{name}: not a FromSoftware-wrapped PSSL shader')
+def parse(blob, name, wrapped=True):
+    """`blob` holds a PSSL .sb shader at 0x24, after the FromSoftware header (`wrapped`) or
+    after 0x24 bytes that are not part of it (shaders embedded in the executable)."""
+    if (wrapped and struct.unpack_from('<I', blob, 0)[0] != 0x20E20300) or blob[0x24:0x28] != b'Shdr':
+        raise ValueError(f'{name}: not a PSSL shader')
     stage = STAGES[blob[0x2C]]
     header_dw = blob[0x2D]
     w = struct.unpack_from('<%dI' % header_dw, blob, 0x34)
@@ -186,27 +189,44 @@ def main():
     os.makedirs(os.path.join(out, 'code'), exist_ok=True)
     seen = {}
     files = 0
+
+    def add(entry, label):
+        key = (entry['hash'], entry['stage'])
+        if key in seen:
+            if seen[key]['code'] != entry['code']:
+                raise ValueError(f'{label}: same hash and stage as {seen[key]["names"][0]}, different code')
+            seen[key]['names'].append(label)
+            return
+        entry['names'] = [label]
+        seen[key] = entry
+        base = os.path.join(out, 'code', '%016x-%s' % key)
+        with open(base + '.bin', 'wb') as f:
+            f.write(entry['code'])
+        if 'copy' in entry:
+            with open(base + '-copy.bin', 'wb') as f:
+                f.write(entry['copy']['code'])
+
     for archive in sorted(os.listdir(shader_dir)):
         with open(os.path.join(shader_dir, archive), 'rb') as f:
             binder = fromsoft.dcx_decompress(f.read())
         for name, _, blob in fromsoft.bnd4_files(binder):
             files += 1
-            label = f'{archive}:{name}'
-            entry = parse(blob, label)
-            key = (entry['hash'], entry['stage'])
-            if key in seen:
-                if seen[key]['code'] != entry['code']:
-                    raise ValueError(f'{label}: same hash and stage as {seen[key]["names"][0]}, different code')
-                seen[key]['names'].append(label)
-                continue
-            entry['names'] = [label]
-            seen[key] = entry
-            base = os.path.join(out, 'code', '%016x-%s' % key)
-            with open(base + '.bin', 'wb') as f:
-                f.write(entry['code'])
-            if 'copy' in entry:
-                with open(base + '-copy.bin', 'wb') as f:
-                    f.write(entry['copy']['code'])
+            add(parse(blob, f'{archive}:{name}'), f'{archive}:{name}')
+    # The executable embeds more PSSL shaders (SDK/Gnmx kernels and others): a .sb header each,
+    # without the FromSoftware wrapper. Each runs from its header to the end of its binary info
+    # (a GS also carries its copy shader's).
+    with open(os.path.join(game, 'eboot.bin'), 'rb') as f:
+        eboot = f.read()
+    pos = eboot.find(b'Shdr')
+    while pos != -1:
+        if struct.unpack_from('<I', eboot, pos + 4)[0] == 0x00010007 and pos >= 0x24:
+            footer = eboot.find(b'OrbShdr', pos)
+            if eboot[pos + 8] == 3:
+                footer = eboot.find(b'OrbShdr', footer + 1)
+            label = f'eboot.bin:{pos:#x}'
+            files += 1
+            add(parse(eboot[pos - 0x24:footer + BINARY_INFO_BYTES], label, wrapped=False), label)
+        pos = eboot.find(b'Shdr', pos + 1)
     pairs = es_pairs(seen)
     jobs = [line for key, e in sorted(seen.items()) for line in job_lines(key, e, out, pairs)]
     jobs.sort(key=lambda job: KIND_ORDER.index(job[0]))

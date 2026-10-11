@@ -16,7 +16,9 @@ The game data is only read. A recompiler change states its delta against the mer
 
 ## What it runs
 1. `extract.py` decompresses `dvdroot_ps4/shader/*.shaderbnd*.dcx` (DCX zlib, BND4 binders;
-   `fromsoft.py`) and parses each `.?po` file: the Gnmx stage struct (stage registers, input
+   `fromsoft.py`) and parses each `.?po` file, plus the 5,493 PSSL shaders embedded in
+   `eboot.bin` (SDK/Gnmx kernels and others, the same `.sb` layout without FromSoftware's
+   wrapper; labelled `eboot.bin:<offset>`): the Gnmx stage struct (stage registers, input
    usage slots, vertex semantics), the GCN code with its `OrbShdr` binary info, and for a GS its
    copy shader. The hash is the binary info's `shader_hash`, the one the game log and
    `BB_DUMP_SHADERS` print. One job per distinct (hash, stage); a GS gets one job per ESGS item
