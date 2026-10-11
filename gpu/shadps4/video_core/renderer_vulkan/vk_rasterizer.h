@@ -142,6 +142,13 @@ public:
     void SyncParserRead(VAddr address, u64 size);
     /// Before a guest-visible write: fences deferred earlier are written first.
     void WaitDeferredSignals() {
+#ifdef __APPLE__
+        // Labels this stage B batched are not submitted yet: submit them before waiting for
+        // them (stage A waits only after a drain, which ends with stage B's idle flush).
+        if (DrawPipe::OnStageB()) {
+            scheduler.FlushLabels(true);
+        }
+#endif
         scheduler.WaitDeferredSignals();
     }
     /// Runs `signal` after the guest memory copies issued so far, without waiting here.
@@ -149,8 +156,9 @@ public:
         scheduler.SignalAfterHostCopies(std::move(signal));
     }
 #ifdef __APPLE__
+    /// Batched when issued on stage B (submitted at the next idle or aged packet boundary).
     void SignalAtGpuCompletion(std::function<void()> signal) {
-        scheduler.SignalAtGpuCompletion(std::move(signal));
+        scheduler.SignalAtGpuCompletion(std::move(signal), DrawPipe::OnStageB());
     }
 #endif
     /// The GPU command thread or the draw recording thread (fault handling runs inline there).

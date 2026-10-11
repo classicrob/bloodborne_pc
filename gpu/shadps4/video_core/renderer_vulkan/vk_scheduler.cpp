@@ -213,7 +213,17 @@ bool Scheduler::LabelsAtGpuComplete() {
     return whole_run || BbToggle::Disabled(BbToggle::LabelsAtGpuComplete);
 }
 
-void Scheduler::SignalAtGpuCompletion(std::function<void()> signal) {
+void Scheduler::FlushLabels(bool idle) {
+    if (!labels_unflushed.load(std::memory_order_relaxed)) {
+        return;
+    }
+    if (!idle && std::chrono::steady_clock::now() - unflushed_since < LabelBatchAge) {
+        return;
+    }
+    Flush(); // asserts it signals unflushed_tick
+}
+
+void Scheduler::SignalAtGpuCompletion(std::function<void()> signal, bool batch) {
     const u64 tick = CurrentTick(); // the next submission signals this value
     // Issued now, in stream order; the writer takes labels only in this order, whichever
     // becomes ready first (deferred ones after the copy threads, direct ones at once).
@@ -238,6 +248,19 @@ void Scheduler::SignalAtGpuCompletion(std::function<void()> signal) {
             labels.Ready(sequence, tick, std::move(signal));
         });
     });
+    if (batch) {
+        // Submitted by the next submission, whoever makes it: that one signals `tick`
+        // (SubmitExecution asserts it). FlushLabels makes sure it comes soon.
+        if (!labels_unflushed.load(std::memory_order_relaxed)) {
+            unflushed_tick = tick;
+            unflushed_since = std::chrono::steady_clock::now();
+            labels_unflushed.store(true, std::memory_order_release);
+        }
+        ASSERT_MSG(unflushed_tick == tick,
+                   "macOS: batched labels span timeline values {} and {} without a submission",
+                   unflushed_tick, tick);
+        return;
+    }
     const u64 submitted = Flush();
     // The writer waits for `tick`: it must be the submission holding the label and the work
     // recorded before it (no other submission came between).
@@ -505,6 +528,14 @@ void Scheduler::AllocateWorkerCommandBuffers() {
 u64 Scheduler::SubmitExecution(SubmitInfo& info) {
     std::scoped_lock lk{submit_mutex};
     const u64 signal_value = work_semaphore.NextTick();
+#ifdef __APPLE__
+    // Batched labels (SignalAtGpuCompletion) were recorded for exactly this submission.
+    if (labels_unflushed.exchange(false, std::memory_order_acq_rel)) {
+        ASSERT_MSG(signal_value == unflushed_tick,
+                   "macOS: batched labels wait for timeline value {}, their submission signals {}",
+                   unflushed_tick, signal_value);
+    }
+#endif
 
 #if TRACY_GPU_ENABLED
     auto* profiler_ctx = instance.GetProfilerContext();

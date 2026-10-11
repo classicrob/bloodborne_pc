@@ -196,9 +196,17 @@ overwrite memory that recorded but not yet executed draws still read.
 With `BB_LABELS_AT_GPU_COMPLETE=1`:
 - EOP, EOS and RELEASE_MEM labels, and their interrupts, are written only once the GPU has
   completed the command buffer holding everything recorded before them.
-- That command buffer is submitted at once, one submission per label, so a guest or a
-  WAIT_REG_MEM waiting on the label is never left waiting for a submission that only comes at the
-  frame's end.
+- Labels issued on the draw recording thread (stage B) are batched rather than submitted one by
+  one. A submission per label made loading take more than 15 minutes (run B, PREVIEW-11).
+  - The label's command buffer is submitted by the next submission. That submission signals
+    exactly the label's tick, which SubmitExecution asserts.
+  - Stage B makes that submission between packets, before the packet counts as consumed (so a
+    stage A drain includes it): as soon as no further packet is published (idle), or once the
+    oldest batched label has waited 0.5 ms.
+  - Stage B also submits before it waits for labels itself (WaitDeferredSignals).
+  - Labels issued on stage A (no draw pipe, or a compute RELEASE_MEM after a drain) are still
+    submitted at once.
+  - Nobody waiting on a label is left waiting for a submission that only comes at the frame's end.
 - A dedicated label writer thread writes labels strictly in the order they were issued in the
   stream (`gpu/shim/bbport_label_sequencer.h`), across the graphics and compute queues and across
   deferred and direct recording. A label that becomes ready early waits for the earlier ones. Each

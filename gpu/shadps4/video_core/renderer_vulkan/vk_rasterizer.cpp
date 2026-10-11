@@ -73,6 +73,11 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
     if (DrawPipeWanted()) {
         constant_ring = std::make_unique<ConstantRing>(instance, scheduler);
         draw_pipe = std::make_unique<DrawPipe>(&RunDrawPacket, this);
+#ifdef __APPLE__
+        draw_pipe->after_packet = [](void* context, bool idle) {
+            static_cast<Rasterizer*>(context)->scheduler.FlushLabels(idle);
+        };
+#endif
     }
     // bbport: this thread joins the texture binding helper before it changes image state.
     runtime.SetImageAccessHook(&JoinBindHelper, this);
