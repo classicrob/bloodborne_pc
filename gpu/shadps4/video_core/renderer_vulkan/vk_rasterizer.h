@@ -623,6 +623,10 @@ private:
     /// Submissions (prepared draws) kept alive until stage B reaches the position.
     std::deque<std::pair<u64, std::shared_ptr<const void>>> pipe_keepalive;
     std::unique_ptr<DrawPipe> draw_pipe;
+#ifdef __APPLE__
+    /// BB_GPU_READ_CHECK: last, so its thread is stopped first.
+    std::unique_ptr<class GpuReadChecker> read_checker;
+#endif
 };
 
 } // namespace Vulkan

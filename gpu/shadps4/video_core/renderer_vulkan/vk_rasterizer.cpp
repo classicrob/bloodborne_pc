@@ -4,6 +4,7 @@
 #include <xxhash.h>
 #ifdef __APPLE__
 #include <sys/stat.h>
+#include <map>
 #include <thread>
 #include <deque>
 #include <condition_variable>
@@ -30,6 +31,9 @@
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/renderer_vulkan/vk_feature_checks.h"
 #include "video_core/renderer_vulkan/vk_gpu_profiler.h"
+#ifdef __APPLE__
+#include "video_core/renderer_vulkan/vk_gpu_read_check.h"
+#endif
 #include "bbport_threads.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -96,7 +100,6 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
     });
 }
 
-Rasterizer::~Rasterizer() = default;
 
 inline const AmdGpu::Regs& Rasterizer::Regs() const {
     return stage_regs ? *stage_regs : liverpool->regs;
@@ -4633,156 +4636,28 @@ bool Rasterizer::DrawBisectSkip(const GraphicsPipeline* pipeline, bool is_indexe
 #endif
 
 #ifdef __APPLE__
+// bbport: BB_GPU_READ_CHECK=1|2 (diagnostic, off by default). Finds guest data that is different
+// once our GPU has retired the draws that read it in place (buffers are the guest's own memory on
+// Apple). For each draw, on the thread recording it, the guest bytes it reads are hashed: its
+// read-only buffers of up to 64 KB (constants) and its index range; with 2 also its vertex buffers
+// and read-only buffers of up to 1 MB; not ranges GPU-written at that point. A checker thread
+// waits until the GPU retired the submission the draw lands in and hashes them again. What a
+// difference proves: the bytes changed between the record and that check. Not when: before the
+// GPU read them (the corruption), or after (a guest that waited correctly, but then only within
+// the moments between retirement and the check, before our labels and flips can let it). The
+// recording thread then sorts out ranges GPU-written since (later GPU work, ordered) and prints
+// the rest, with a per-binding summary every 5 s so that the buffers that change stand out.
 namespace {
-// bbport: BB_GPU_READ_CHECK=1|2 (diagnostic, off by default). Finds guest data rewritten while our
-// GPU still reads it in place (buffers are the guest's own memory on Apple). For each draw, on the
-// thread recording it, the guest bytes of what it reads are hashed: its read-only buffers of up to
-// 64 KB (constants) and its index range; with 2 also its vertex buffers and read-only buffers of
-// up to 1 MB. A checker thread waits until the GPU retired the submission the draw lands in
-// (CurrentTick right after recording it) and hashes them again: a difference is printed (frame,
-// draw, stage, shader, binding, range), unless the range is GPU-written by then (later GPU work
-// in stream order, not the guest). Changes just after retirement (microseconds, before labels or
-// flips can reach the guest) are counted too; anything else is the guest writing early.
-struct ReadRange {
-    VAddr address;
-    u32 size;
-    u64 hash;
-    u64 vs, ps;
-    u64 frame, sequence;
-    char kind; ///< 'b' read-only buffer, 'v' vertex buffer, 'i' index range
-    u8 stage;
-    u16 binding;
-};
-struct ReadBatch {
-    u64 tick;
-    std::vector<ReadRange> ranges;
-};
-
 const int gpu_read_check = [] {
     const char* env = std::getenv("BB_GPU_READ_CHECK");
     const int level = env ? std::atoi(env) : 0;
     if (level) {
         std::printf("\n*** BB_GPU_READ_CHECK=%d: DIAGNOSTIC MODE. Every draw's read data is hashed "
-                    "at record and at GPU retirement (slow). ***\n\n",
+                    "at record and after GPU retirement (slow). ***\n\n",
                     level);
     }
     return level;
 }();
-
-class ReadChecker {
-public:
-    ReadChecker(const Instance& instance_, Scheduler& scheduler_,
-                VideoCore::BufferCache& buffer_cache_)
-        : instance{instance_}, scheduler{scheduler_}, buffer_cache{buffer_cache_},
-          thread{[this](std::stop_token stop) { Run(stop); }} {}
-
-    void Submit(ReadBatch&& batch) {
-        {
-            std::scoped_lock lock{mutex};
-            queue.push_back(std::move(batch));
-        }
-        cv.notify_one();
-    }
-
-private:
-    bool WaitTick(u64 tick, const std::stop_token& stop) {
-        while (!scheduler.IsFree(tick)) {
-            if (stop.stop_requested()) {
-                return false;
-            }
-            const vk::Semaphore semaphore = scheduler.GetWorkSemaphore()->Handle();
-            const vk::SemaphoreWaitInfo wait_info = {
-                .semaphoreCount = 1, .pSemaphores = &semaphore, .pValues = &tick};
-            const vk::Result result = instance.GetDevice().waitSemaphores(&wait_info, 10'000'000);
-            ASSERT_MSG(result == vk::Result::eSuccess || result == vk::Result::eTimeout,
-                       "BB_GPU_READ_CHECK: the wait for timeline value {} failed: {}", tick,
-                       vk::to_string(result));
-        }
-        return true;
-    }
-
-    void Run(std::stop_token stop) {
-        Common::SetCurrentThreadName("bb:GpuReadCheck");
-        auto last_summary = std::chrono::steady_clock::now();
-        while (!stop.stop_requested()) {
-            ReadBatch batch;
-            {
-                std::unique_lock lock{mutex};
-                cv.wait(lock, stop, [this] { return !queue.empty(); });
-                if (stop.stop_requested()) {
-                    return;
-                }
-                batch = std::move(queue.front());
-                queue.pop_front();
-            }
-            if (!WaitTick(batch.tick, stop)) {
-                return;
-            }
-            for (const auto& range : batch.ranges) {
-                ++checked;
-                checked_bytes += range.size;
-                // The guest may have unmapped the range since: a fault skips it.
-                sigjmp_buf recover;
-                if (sigsetjmp(recover, 0)) {
-                    runtime_fault_recover = nullptr;
-                    ++unreadable;
-                    continue;
-                }
-                runtime_fault_recover = &recover;
-                const u64 hash =
-                    XXH3_64bits(reinterpret_cast<const void*>(range.address), range.size);
-                runtime_fault_recover = nullptr;
-                if (hash == range.hash) {
-                    continue;
-                }
-                if (buffer_cache.IsRegionGpuModified(range.address, range.size)) {
-                    ++gpu_written; // later GPU work wrote it, in stream order
-                    continue;
-                }
-                if (++changed <= 64 || (changed & 1023) == 0) {
-                    std::printf("GPU read check: CHANGED before GPU retirement (#%llu): frame %llu "
-                                "draw #%llu %s stage %u binding %u vs %#llx ps %#llx range "
-                                "%#llx+%u (tick %llu)\n",
-                                (unsigned long long)changed, (unsigned long long)range.frame,
-                                (unsigned long long)range.sequence,
-                                range.kind == 'i'   ? "index range"
-                                : range.kind == 'v' ? "vertex buffer"
-                                                    : "read-only buffer",
-                                u32(range.stage), u32(range.binding),
-                                (unsigned long long)range.vs, (unsigned long long)range.ps,
-                                (unsigned long long)range.address, range.size,
-                                (unsigned long long)batch.tick);
-                }
-            }
-            const auto now = std::chrono::steady_clock::now();
-            if (now - last_summary >= std::chrono::seconds(5)) {
-                last_summary = now;
-                std::size_t pending;
-                {
-                    std::scoped_lock lock{mutex};
-                    pending = queue.size();
-                }
-                std::printf("GPU read check: %llu ranges (%llu MB) checked, %llu changed before "
-                            "GPU retirement, %llu GPU-written since, %llu unmapped since; %zu "
-                            "draws waiting\n",
-                            (unsigned long long)checked,
-                            (unsigned long long)(checked_bytes >> 20),
-                            (unsigned long long)changed, (unsigned long long)gpu_written,
-                            (unsigned long long)unreadable, pending);
-                std::fflush(stdout);
-            }
-        }
-    }
-
-    const Instance& instance;
-    Scheduler& scheduler;
-    VideoCore::BufferCache& buffer_cache;
-    std::mutex mutex;
-    std::condition_variable_any cv;
-    std::deque<ReadBatch> queue;
-    u64 checked = 0, checked_bytes = 0, changed = 0, gpu_written = 0, unreadable = 0;
-    std::jthread thread; ///< last: stops before the queue goes
-};
 } // namespace
 
 void Rasterizer::GpuReadCheck(const GraphicsPipeline* pipeline, bool is_indexed,
@@ -4790,22 +4665,36 @@ void Rasterizer::GpuReadCheck(const GraphicsPipeline* pipeline, bool is_indexed,
     if (!gpu_read_check) {
         return;
     }
-    static ReadChecker checker{instance, scheduler, buffer_cache};
+    if (!read_checker) {
+        read_checker = std::make_unique<GpuReadChecker>(instance, scheduler);
+    }
+    read_checker->Report(buffer_cache);
     const u64 small = gpu_read_check >= 2 ? 1_MB : 64_KB;
     const auto& vs = pipeline->GetStage(Shader::SwStage::Vertex);
     const auto* ps = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
     const u64 frame = BbStats::gpu_frames.load(std::memory_order_relaxed);
     const u64 sequence = VideoCore::record_context.sequence;
-    ReadBatch batch;
+    GpuReadChecker::Batch batch;
     const auto add = [&](VAddr address, u64 size, char kind, u32 stage, u32 binding) {
         if (!address || size == 0 || size > small ||
             buffer_cache.IsRegionGpuModified(address, size)) {
             return; // GPU-written data: ordered by the GPU, not a guest race
         }
-        batch.ranges.push_back({address, u32(size),
-                                XXH3_64bits(reinterpret_cast<const void*>(address), size),
-                                vs.pgm_hash, ps ? ps->pgm_hash : 0, frame, sequence, kind,
-                                u8(stage), u16(binding)});
+        // Under this thread's fault recovery: a range the draw describes may not be readable.
+        auto* const previous = runtime_fault_recover;
+        sigjmp_buf recover;
+        if (sigsetjmp(recover, 0)) {
+            runtime_fault_recover = previous;
+            return;
+        }
+        runtime_fault_recover = &recover;
+        const u64 hash = XXH3_64bits(reinterpret_cast<const void*>(address), size);
+        runtime_fault_recover = previous;
+        batch.ranges.push_back({address, u32(size), hash, vs.pgm_hash, ps ? ps->pgm_hash : 0,
+                                frame, sequence, kind, u8(stage), u16(binding)});
+    };
+    const auto span = [](const AmdGpu::Buffer& sharp) {
+        return sharp.stride ? u64(sharp.num_records) * sharp.stride : u64(sharp.num_records);
     };
     const auto stages = pipeline->GetStages();
     for (u32 stage = 0; stage < stages.size(); ++stage) {
@@ -4819,14 +4708,15 @@ void Rasterizer::GpuReadCheck(const GraphicsPipeline* pipeline, bool is_indexed,
                 continue;
             }
             const auto sharp = desc.GetSharp(info);
-            add(sharp.base_address, sharp.GetSize(), 'b', stage, i);
+            add(sharp.base_address, span(sharp), 'b', stage, i);
         }
     }
     if (gpu_read_check >= 2 && !pipeline->GsEmulation()) {
         if (const auto& fetch = pipeline->GetFetchShader()) {
             for (const auto& attribute : fetch->attributes) {
+                // The draw just bound these: its vertex table was readable a moment ago.
                 const auto sharp = attribute.GetSharp(vs);
-                add(sharp.base_address, sharp.GetSize(), 'v', 0, attribute.semantic);
+                add(sharp.base_address, span(sharp), 'v', 0, attribute.semantic);
             }
         }
     }
@@ -4842,9 +4732,11 @@ void Rasterizer::GpuReadCheck(const GraphicsPipeline* pipeline, bool is_indexed,
     }
     // Recorded on this thread just before: the draw lands in CurrentTick()'s submission.
     batch.tick = scheduler.CurrentTick();
-    checker.Submit(std::move(batch));
+    read_checker->Submit(std::move(batch));
 }
 #endif
+
+Rasterizer::~Rasterizer() = default;
 
 void Rasterizer::NoteFrameStart() {
     if (auto* profiler = GpuProfiler::Get()) {
