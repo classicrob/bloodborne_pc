@@ -28,6 +28,9 @@ parser reads copies taken at submit (`AmdGpu::CmdSnapshot`, `Liverpool::SubmitGf
   a hard error naming the packet and submission.
 - **`BB_CMD_SNAPSHOT_CHECK=1` (diagnostic):** when a submission's parsing starts, its copies are
   compared with live memory, and guest writes made after submit are logged as `CMD-SNAPSHOT ...`. It cannot see a stream write still on its way: live memory is as stale as the copy.
+  At submit it also logs `CMD-OVERLAP` when a captured buffer partly overlaps one submitted in the
+  last 64 submissions (two command buffers written into the same memory), with the guest thread
+  numbers the builder trace uses.
 - **Cost:** the "Parse lag" summary every 600 frames reports snapshot KiB per frame and the mean
   and maximum microseconds per submit. `BB_COPY_GPU_BUFFERS` is refused on Apple.
 
