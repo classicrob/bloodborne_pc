@@ -35,7 +35,10 @@ Removing the conversion would therefore change observable bits.
 Run `BB_GPU_BUILD=/path/to/stable/gpu tests/macos_pkrtz/run.sh` with matching
 checkout headers. The script signs its executables and runs translated processes
 sequentially. The emitter test calls the production packing function. A separate
-optimizer test proves both RTZ pack/unpack round trips survive constant propagation.
+optimizer test decodes VOP2 opcode 47 and proves its translation carries the flag,
+and that both RTZ pack/unpack round trips survive constant propagation. Four
+full-dispatcher modules also verify `EmitSPIRV` uses integer RTZ packing with no
+native `PackHalf2x16` or `OpFConvert`.
 
 On M4 Max, macOS 27.2, MoltenVK 1.4.2:
 
@@ -47,7 +50,8 @@ On M4 Max, macOS 27.2, MoltenVK 1.4.2:
 - The independent C reference searches the ordered half-value table for the
   greatest representable magnitude not exceeding the input, rather than using
   the emitter's exponent/shift algorithm.
-- Input and tail canaries are intact; all four modules pass `spirv-val`.
+- Input and tail canaries are intact; all four runtime modules, all four
+  full-dispatcher modules and the RTE control pass `spirv-val`.
 - An ordinary RTE packing negative control fails **63,501 / 63,510 pairs** in
   preserve mode, proving the probe detects the original rounding gap.
 

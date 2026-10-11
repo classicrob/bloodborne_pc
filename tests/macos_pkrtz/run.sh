@@ -24,14 +24,20 @@ cxx tests/macos_pkrtz/optimizer.cpp \
     gpu/shadps4/shader_recompiler/ir/ir_emitter.cpp \
     gpu/shadps4/shader_recompiler/ir/passes/constant_propagation_pass.cpp \
     -o "$output/optimizer"
+cxx tests/macos_pkrtz/entry.cpp \
+    gpu/shadps4/shader_recompiler/backend/spirv/emit_spirv.cpp \
+    gpu/shadps4/shader_recompiler/backend/spirv/emit_spirv_bitwise_conversion.cpp \
+    -Igpu/third_party/magic_enum/include -o "$output/entry"
 clang -arch x86_64 -std=c11 -O2 -Wall -Wextra -Werror -DBB_PKRTZ_CASES \
     -I"$prefix/include" tests/macos_float_modes/probe.c \
     -L"$prefix/lib" -Wl,-rpath,"$prefix/lib" -lvulkan -o "$output/probe"
-python3 packaging/macos/sign.py "$output/emit" "$output/optimizer" "$output/probe"
+python3 packaging/macos/sign.py "$output/emit" "$output/optimizer" "$output/probe" "$output/entry"
 arch -x86_64 "$output/optimizer"
 arch -x86_64 "$output/emit" "$output"
 export VK_DRIVER_FILES="$prefix/share/vulkan/icd.d/MoltenVK_icd.json"
 for mode in 0 1 2 3; do
+    arch -x86_64 "$output/entry" "$output/entry-$mode.spv" "$mode"
+    spirv-val --target-env vulkan1.2 "$output/entry-$mode.spv"
     spirv-val --target-env vulkan1.2 "$output/mode-$mode.spv"
     arch -x86_64 "$output/probe" "$output/mode-$mode.spv" "$mode" \
         > "$output/mode-$mode.log" 2>&1
