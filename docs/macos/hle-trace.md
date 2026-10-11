@@ -115,3 +115,14 @@ reset and frame cadence. The fixture's optional `bench off` / `bench on` modes
 measure one million trivial imports; compare CPU ns/call as well as wall time.
 This establishes instrumentation cost, not a gameplay FPS claim. Narrow the
 filter for steady performance runs if high-frequency mutex/clock calls dominate.
+
+Qualification for 905d516 on this Rosetta host: three paired one-million-call
+runs measured off 2.84/2.61/3.40 ns CPU per trivial call and summary-on
+341.17/342.90/343.53 ns (`getrusage(RUSAGE_SELF)`, user + system). Summary-on wall
+cost was 3.85–4.96 microseconds per call under contention, so it is not a quiet
+throughput result. At 100,000 selected calls/second, the measured CPU increment
+would be about 34 ms/second; count-dependent overhead still needs a gameplay A/B.
+`CLOCK_THREAD_CPUTIME_ID` produced implausibly small values in an earlier probe
+and was not used for these numbers. Evidence: `out/hle-trace-summary-integration.log`.
+The affected VideoOut driver compiled with production flags; the signed fixture
+passed both detailed and summary modes. No shared artifact was rebuilt.
