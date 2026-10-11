@@ -10,12 +10,18 @@
 #include <cstring>
 #include <deque>
 #include <mutex>
+#ifndef _WIN32
+#include <pthread.h>
+#endif
 #include <vector>
 #include "bbport_toggles.h"
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "video_core/amdgpu/cmd_snapshot.h"
 #include "video_core/amdgpu/pm4_cmds.h"
+#ifdef __APPLE__
+#include "../../../../src/guest_backtrace.h"
+#endif
 
 namespace AmdGpu {
 
@@ -107,18 +113,40 @@ std::mutex builder_trace_mutex;
 std::array<BuilderTrace::Call, 8192> builder_trace;
 u64 builder_trace_calls = 0;
 std::atomic<u32> builder_trace_threads = 0;
+std::array<std::array<char, 32>, 256> builder_thread_names{}; ///< by thread number (mod 256)
 } // namespace
 
 u32 BuilderTrace::ThreadNumber() {
-    static thread_local const u32 thread = ++builder_trace_threads;
+    static thread_local const u32 thread = [] {
+        const u32 number = ++builder_trace_threads;
+        std::array<char, 32> name{};
+#ifndef _WIN32
+        pthread_getname_np(pthread_self(), name.data(), name.size());
+#endif
+        std::scoped_lock lk{builder_trace_mutex};
+        builder_thread_names[number % builder_thread_names.size()] = name;
+        return number;
+    }();
     return thread;
 }
 
-void BuilderTrace::Note(const char* builder, const u32* cmdbuf, u32 size) {
-    const u32 thread = ThreadNumber();
+std::string BuilderTrace::ThreadName(u32 thread) {
     std::scoped_lock lk{builder_trace_mutex};
-    const u64 seq = builder_trace_calls++;
-    builder_trace[seq % builder_trace.size()] = {builder, cmdbuf, size, thread, seq};
+    return builder_thread_names[thread % builder_thread_names.size()].data();
+}
+
+void BuilderTrace::Note(const char* builder, const u32* cmdbuf, u32 size,
+                        [[maybe_unused]] uintptr_t frame) {
+    const u32 thread = ThreadNumber();
+    Call call{builder, cmdbuf, size, thread, 0, 0, {}};
+#ifdef __APPLE__
+    if (frame) {
+        call.depth = static_cast<u32>(guest_backtrace(frame, call.chain, std::size(call.chain)));
+    }
+#endif
+    std::scoped_lock lk{builder_trace_mutex};
+    call.seq = builder_trace_calls++;
+    builder_trace[call.seq % builder_trace.size()] = call;
 }
 
 namespace {
@@ -195,11 +223,18 @@ void BuilderTrace::Report(const u32* at) {
                          "(and the 8 latest), oldest first:",
                  Window, fmt::ptr(at));
     for (const auto& call : Around(at - Window, at + Window, 8)) {
-        LOG_CRITICAL(Render, "  #{} thread {} {} cmdbuf {} ({:+} dwords from the packet) size {}",
-                     call.seq, call.thread, call.builder, fmt::ptr(call.cmdbuf),
+        std::string chain;
+        for (u32 i = 0; i < call.depth; ++i) {
+            chain += fmt::format(" {:#x}", call.chain[i]);
+        }
+        LOG_CRITICAL(Render,
+                     "  #{} thread {} \"{}\" {} cmdbuf {} ({:+} dwords from the packet) size {}, "
+                     "called from{}",
+                     call.seq, call.thread, ThreadName(call.thread), call.builder,
+                     fmt::ptr(call.cmdbuf),
                      (std::bit_cast<intptr_t>(call.cmdbuf) - std::bit_cast<intptr_t>(at)) /
                          intptr_t{sizeof(u32)},
-                     call.size);
+                     call.size, chain.empty() ? " (no chain)" : chain);
     }
 }
 

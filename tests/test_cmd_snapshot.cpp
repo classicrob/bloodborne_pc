@@ -8,6 +8,7 @@
 #include <csignal>
 #include <cstdio>
 #include <thread>
+#include <pthread.h>
 #include <vector>
 #include <sys/mman.h>
 #include <sys/wait.h>
@@ -48,6 +49,18 @@ void AppendIb(std::vector<u32>& stream, PM4ItOpcode op, const u32* target, u32 s
     const auto address = reinterpret_cast<u64>(target);
     stream.insert(stream.end(),
                   {Header(op, 3), u32(address), u32(address >> 32), size_dw});
+}
+
+// A builder as the guest calls it: notes itself with its own frame pointer.
+__attribute__((noinline)) void FakeBuilder(const u32* cmdbuf) {
+    BuilderTrace::Note("FakeBuilder", cmdbuf, 4,
+                       reinterpret_cast<uintptr_t>(__builtin_frame_address(0)));
+    asm volatile("" ::: "memory");
+}
+// Its caller, whose address the chain must start in.
+__attribute__((noinline)) void CallsFakeBuilder(const u32* cmdbuf) {
+    FakeBuilder(cmdbuf);
+    asm volatile("" ::: "memory");
 }
 
 void AppendNop(std::vector<u32>& stream, u32 marker) {
@@ -244,6 +257,26 @@ int main() {
                latest.size() == 2 && latest[0].cmdbuf == stream + 10 &&
                    latest[1].cmdbuf == stream + 140 && latest[0].thread != latest[1].thread);
         BuilderTrace::Report(stream + 106);
+
+        // Each call carries the guest call chain and its thread's name.
+        static u32 chained[8];
+        std::thread([] {
+            pthread_setname_np("TraceNamed");
+            CallsFakeBuilder(chained);
+        }).join();
+        const auto with_chain = BuilderTrace::Around(chained, chained + 1, 0);
+        const auto here = reinterpret_cast<uintptr_t>(&CallsFakeBuilder);
+        Expect("trace: call chain starts in the builder's caller",
+               with_chain.size() == 1 && with_chain[0].depth >= 1 &&
+                   with_chain[0].chain[0] > here && with_chain[0].chain[0] < here + 64);
+        Expect("trace: thread name recorded",
+               with_chain.size() == 1 &&
+                   BuilderTrace::ThreadName(with_chain[0].thread) == "TraceNamed");
+        static u32 unchained[8];
+        BuilderTrace::Note("NoFrame", unchained, 4, 0x10); // not on this stack: no chain
+        const auto without = BuilderTrace::Around(unchained, unchained + 1, 0);
+        Expect("trace: a frame off the stack gives no chain",
+               without.size() == 1 && without[0].depth == 0);
     }
 
     // Command memory submitted twice within a few submissions, partly overlapping: reported.

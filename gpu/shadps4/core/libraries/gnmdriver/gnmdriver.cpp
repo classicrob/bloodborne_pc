@@ -190,7 +190,8 @@ int PS4_SYSV_ABI sceGnmBeginWorkload(u32 workload_stream, u64* workload) {
 s32 PS4_SYSV_ABI sceGnmComputeWaitOnAddress(u32* cmdbuf, u32 size, uintptr_t addr, u32 mask,
                                             u32 cmp_func, u32 ref) {
 #ifdef __APPLE__
-    AmdGpu::BuilderTrace::Note(__func__, cmdbuf, size);
+    AmdGpu::BuilderTrace::Note(__func__, cmdbuf, size,
+                               reinterpret_cast<uintptr_t>(__builtin_frame_address(0)));
 #endif
     LOG_TRACE(Lib_GnmDriver, "called");
 
@@ -393,7 +394,8 @@ int PS4_SYSV_ABI sceGnmDisableMipStatsReport() {
 s32 PS4_SYSV_ABI sceGnmDispatchDirect(u32* cmdbuf, u32 size, u32 threads_x, u32 threads_y,
                                       u32 threads_z, u32 flags) {
 #ifdef __APPLE__
-    AmdGpu::BuilderTrace::Note(__func__, cmdbuf, size);
+    AmdGpu::BuilderTrace::Note(__func__, cmdbuf, size,
+                               reinterpret_cast<uintptr_t>(__builtin_frame_address(0)));
 #endif
     LOG_TRACE(Lib_GnmDriver, "called");
 
@@ -412,7 +414,8 @@ s32 PS4_SYSV_ABI sceGnmDispatchDirect(u32* cmdbuf, u32 size, u32 threads_x, u32 
 
 s32 PS4_SYSV_ABI sceGnmDispatchIndirect(u32* cmdbuf, u32 size, u32 data_offset, u32 flags) {
 #ifdef __APPLE__
-    AmdGpu::BuilderTrace::Note(__func__, cmdbuf, size);
+    AmdGpu::BuilderTrace::Note(__func__, cmdbuf, size,
+                               reinterpret_cast<uintptr_t>(__builtin_frame_address(0)));
 #endif
     LOG_TRACE(Lib_GnmDriver, "called");
 
@@ -431,7 +434,8 @@ s32 PS4_SYSV_ABI sceGnmDispatchIndirect(u32* cmdbuf, u32 size, u32 data_offset, 
 
 s32 PS4_SYSV_ABI sceGnmDispatchIndirectOnMec(u32* cmdbuf, u32 size, VAddr args, u32 modifier) {
 #ifdef __APPLE__
-    AmdGpu::BuilderTrace::Note(__func__, cmdbuf, size);
+    AmdGpu::BuilderTrace::Note(__func__, cmdbuf, size,
+                               reinterpret_cast<uintptr_t>(__builtin_frame_address(0)));
 #endif
     if (cmdbuf != nullptr && size == 8 && args != 0 && ((args & 3u) == 0)) {
         cmdbuf[0] = 0xc0021602 | (modifier & 1u);
@@ -446,7 +450,8 @@ s32 PS4_SYSV_ABI sceGnmDispatchIndirectOnMec(u32* cmdbuf, u32 size, VAddr args, 
 
 u32 PS4_SYSV_ABI sceGnmDispatchInitDefaultHardwareState(u32* cmdbuf, u32 size) {
 #ifdef __APPLE__
-    AmdGpu::BuilderTrace::Note(__func__, cmdbuf, size);
+    AmdGpu::BuilderTrace::Note(__func__, cmdbuf, size,
+                               reinterpret_cast<uintptr_t>(__builtin_frame_address(0)));
 #endif
     LOG_TRACE(Lib_GnmDriver, "called");
 
@@ -484,7 +489,8 @@ u32 PS4_SYSV_ABI sceGnmDispatchInitDefaultHardwareState(u32* cmdbuf, u32 size) {
 s32 PS4_SYSV_ABI sceGnmDrawIndex(u32* cmdbuf, u32 size, u32 index_count, uintptr_t index_addr,
                                  u32 flags, u32 type) {
 #ifdef __APPLE__
-    AmdGpu::BuilderTrace::Note(__func__, cmdbuf, size);
+    AmdGpu::BuilderTrace::Note(__func__, cmdbuf, size,
+                               reinterpret_cast<uintptr_t>(__builtin_frame_address(0)));
 #endif
     LOG_TRACE(Lib_GnmDriver, "called");
 
@@ -507,7 +513,8 @@ s32 PS4_SYSV_ABI sceGnmDrawIndex(u32* cmdbuf, u32 size, u32 index_count, uintptr
 
 s32 PS4_SYSV_ABI sceGnmDrawIndexAuto(u32* cmdbuf, u32 size, u32 index_count, u32 flags) {
 #ifdef __APPLE__
-    AmdGpu::BuilderTrace::Note(__func__, cmdbuf, size);
+    AmdGpu::BuilderTrace::Note(__func__, cmdbuf, size,
+                               reinterpret_cast<uintptr_t>(__builtin_frame_address(0)));
 #endif
     LOG_TRACE(Lib_GnmDriver, "called");
 
@@ -526,7 +533,8 @@ s32 PS4_SYSV_ABI sceGnmDrawIndexIndirect(u32* cmdbuf, u32 size, u32 data_offset,
                                          u32 vertex_sgpr_offset, u32 instance_sgpr_offset,
                                          u32 flags) {
 #ifdef __APPLE__
-    AmdGpu::BuilderTrace::Note(__func__, cmdbuf, size);
+    AmdGpu::BuilderTrace::Note(__func__, cmdbuf, size,
+                               reinterpret_cast<uintptr_t>(__builtin_frame_address(0)));
 #endif
     LOG_TRACE(Lib_GnmDriver, "called");
 
@@ -556,7 +564,8 @@ s32 PS4_SYSV_ABI sceGnmDrawIndexIndirectCountMulti(u32* cmdbuf, u32 size, u32 da
                                                    u32 vertex_sgpr_offset, u32 instance_sgpr_offset,
                                                    u32 flags) {
 #ifdef __APPLE__
-    AmdGpu::BuilderTrace::Note(__func__, cmdbuf, size);
+    AmdGpu::BuilderTrace::Note(__func__, cmdbuf, size,
+                               reinterpret_cast<uintptr_t>(__builtin_frame_address(0)));
 #endif
     LOG_TRACE(Lib_GnmDriver, "called");
 
@@ -595,7 +604,8 @@ int PS4_SYSV_ABI sceGnmDrawIndexIndirectMulti(u32* cmdbuf, u32 size, u32 data_of
                                               u32 shader_stage, u32 vertex_sgpr_offset,
                                               u32 instance_sgpr_offset, u32 flags) {
 #ifdef __APPLE__
-    AmdGpu::BuilderTrace::Note(__func__, cmdbuf, size);
+    AmdGpu::BuilderTrace::Note(__func__, cmdbuf, size,
+                               reinterpret_cast<uintptr_t>(__builtin_frame_address(0)));
 #endif
     LOG_TRACE(Lib_GnmDriver, "called");
 
@@ -632,7 +642,8 @@ int PS4_SYSV_ABI sceGnmDrawIndexMultiInstanced() {
 s32 PS4_SYSV_ABI sceGnmDrawIndexOffset(u32* cmdbuf, u32 size, u32 index_offset, u32 index_count,
                                        u32 flags) {
 #ifdef __APPLE__
-    AmdGpu::BuilderTrace::Note(__func__, cmdbuf, size);
+    AmdGpu::BuilderTrace::Note(__func__, cmdbuf, size,
+                               reinterpret_cast<uintptr_t>(__builtin_frame_address(0)));
 #endif
     LOG_TRACE(Lib_GnmDriver, "called");
 
@@ -652,7 +663,8 @@ s32 PS4_SYSV_ABI sceGnmDrawIndexOffset(u32* cmdbuf, u32 size, u32 index_offset, 
 s32 PS4_SYSV_ABI sceGnmDrawIndirect(u32* cmdbuf, u32 size, u32 data_offset, u32 shader_stage,
                                     u32 vertex_sgpr_offset, u32 instance_sgpr_offset, u32 flags) {
 #ifdef __APPLE__
-    AmdGpu::BuilderTrace::Note(__func__, cmdbuf, size);
+    AmdGpu::BuilderTrace::Note(__func__, cmdbuf, size,
+                               reinterpret_cast<uintptr_t>(__builtin_frame_address(0)));
 #endif
     LOG_TRACE(Lib_GnmDriver, "called");
 
@@ -687,7 +699,8 @@ s32 PS4_SYSV_ABI sceGnmDrawIndirectMulti(u32* cmdbuf, u32 size, u32 data_offset,
                                          u32 shader_stage, u32 vertex_sgpr_offset,
                                          u32 instance_sgpr_offset, u32 flags) {
 #ifdef __APPLE__
-    AmdGpu::BuilderTrace::Note(__func__, cmdbuf, size);
+    AmdGpu::BuilderTrace::Note(__func__, cmdbuf, size,
+                               reinterpret_cast<uintptr_t>(__builtin_frame_address(0)));
 #endif
     LOG_TRACE(Lib_GnmDriver, "called");
 
@@ -714,7 +727,8 @@ s32 PS4_SYSV_ABI sceGnmDrawIndirectMulti(u32* cmdbuf, u32 size, u32 data_offset,
 
 u32 PS4_SYSV_ABI sceGnmDrawInitDefaultHardwareState(u32* cmdbuf, u32 size) {
 #ifdef __APPLE__
-    AmdGpu::BuilderTrace::Note(__func__, cmdbuf, size);
+    AmdGpu::BuilderTrace::Note(__func__, cmdbuf, size,
+                               reinterpret_cast<uintptr_t>(__builtin_frame_address(0)));
 #endif
     LOG_TRACE(Lib_GnmDriver, "called");
 
@@ -742,7 +756,8 @@ u32 PS4_SYSV_ABI sceGnmDrawInitDefaultHardwareState(u32* cmdbuf, u32 size) {
 
 u32 PS4_SYSV_ABI sceGnmDrawInitDefaultHardwareState175(u32* cmdbuf, u32 size) {
 #ifdef __APPLE__
-    AmdGpu::BuilderTrace::Note(__func__, cmdbuf, size);
+    AmdGpu::BuilderTrace::Note(__func__, cmdbuf, size,
+                               reinterpret_cast<uintptr_t>(__builtin_frame_address(0)));
 #endif
     LOG_TRACE(Lib_GnmDriver, "called");
 
@@ -763,7 +778,8 @@ u32 PS4_SYSV_ABI sceGnmDrawInitDefaultHardwareState175(u32* cmdbuf, u32 size) {
 
 u32 PS4_SYSV_ABI sceGnmDrawInitDefaultHardwareState200(u32* cmdbuf, u32 size) {
 #ifdef __APPLE__
-    AmdGpu::BuilderTrace::Note(__func__, cmdbuf, size);
+    AmdGpu::BuilderTrace::Note(__func__, cmdbuf, size,
+                               reinterpret_cast<uintptr_t>(__builtin_frame_address(0)));
 #endif
     LOG_TRACE(Lib_GnmDriver, "called");
 
@@ -802,7 +818,8 @@ u32 PS4_SYSV_ABI sceGnmDrawInitDefaultHardwareState200(u32* cmdbuf, u32 size) {
 
 u32 PS4_SYSV_ABI sceGnmDrawInitDefaultHardwareState350(u32* cmdbuf, u32 size) {
 #ifdef __APPLE__
-    AmdGpu::BuilderTrace::Note(__func__, cmdbuf, size);
+    AmdGpu::BuilderTrace::Note(__func__, cmdbuf, size,
+                               reinterpret_cast<uintptr_t>(__builtin_frame_address(0)));
 #endif
     LOG_TRACE(Lib_GnmDriver, "called");
 
@@ -841,7 +858,8 @@ u32 PS4_SYSV_ABI sceGnmDrawInitDefaultHardwareState350(u32* cmdbuf, u32 size) {
 
 u32 PS4_SYSV_ABI sceGnmDrawInitToDefaultContextState(u32* cmdbuf, u32 size) {
 #ifdef __APPLE__
-    AmdGpu::BuilderTrace::Note(__func__, cmdbuf, size);
+    AmdGpu::BuilderTrace::Note(__func__, cmdbuf, size,
+                               reinterpret_cast<uintptr_t>(__builtin_frame_address(0)));
 #endif
     LOG_TRACE(Lib_GnmDriver, "called");
 
@@ -860,7 +878,8 @@ u32 PS4_SYSV_ABI sceGnmDrawInitToDefaultContextState(u32* cmdbuf, u32 size) {
 
 u32 PS4_SYSV_ABI sceGnmDrawInitToDefaultContextState400(u32* cmdbuf, u32 size) {
 #ifdef __APPLE__
-    AmdGpu::BuilderTrace::Note(__func__, cmdbuf, size);
+    AmdGpu::BuilderTrace::Note(__func__, cmdbuf, size,
+                               reinterpret_cast<uintptr_t>(__builtin_frame_address(0)));
 #endif
     LOG_TRACE(Lib_GnmDriver, "called");
 
@@ -1124,7 +1143,8 @@ void PS4_SYSV_ABI sceGnmGpuPaDebugLeave() {
 
 s32 PS4_SYSV_ABI sceGnmInsertDingDongMarker(u32* cmdbuf, u32 size) {
 #ifdef __APPLE__
-    AmdGpu::BuilderTrace::Note(__func__, cmdbuf, size);
+    AmdGpu::BuilderTrace::Note(__func__, cmdbuf, size,
+                               reinterpret_cast<uintptr_t>(__builtin_frame_address(0)));
 #endif
     LOG_TRACE(Lib_GnmDriver, "called");
 
@@ -1137,7 +1157,8 @@ s32 PS4_SYSV_ABI sceGnmInsertDingDongMarker(u32* cmdbuf, u32 size) {
 
 s32 PS4_SYSV_ABI sceGnmInsertPopMarker(u32* cmdbuf, u32 size) {
 #ifdef __APPLE__
-    AmdGpu::BuilderTrace::Note(__func__, cmdbuf, size);
+    AmdGpu::BuilderTrace::Note(__func__, cmdbuf, size,
+                               reinterpret_cast<uintptr_t>(__builtin_frame_address(0)));
 #endif
     LOG_TRACE(Lib_GnmDriver, "called");
 
@@ -1152,7 +1173,8 @@ s32 PS4_SYSV_ABI sceGnmInsertPopMarker(u32* cmdbuf, u32 size) {
 
 s32 PS4_SYSV_ABI sceGnmInsertPushColorMarker(u32* cmdbuf, u32 size, const char* marker, u32 color) {
 #ifdef __APPLE__
-    AmdGpu::BuilderTrace::Note(__func__, cmdbuf, size);
+    AmdGpu::BuilderTrace::Note(__func__, cmdbuf, size,
+                               reinterpret_cast<uintptr_t>(__builtin_frame_address(0)));
 #endif
     LOG_TRACE(Lib_GnmDriver, "called");
 
@@ -1178,7 +1200,8 @@ s32 PS4_SYSV_ABI sceGnmInsertPushColorMarker(u32* cmdbuf, u32 size, const char* 
 
 s32 PS4_SYSV_ABI sceGnmInsertPushMarker(u32* cmdbuf, u32 size, const char* marker) {
 #ifdef __APPLE__
-    AmdGpu::BuilderTrace::Note(__func__, cmdbuf, size);
+    AmdGpu::BuilderTrace::Note(__func__, cmdbuf, size,
+                               reinterpret_cast<uintptr_t>(__builtin_frame_address(0)));
 #endif
     LOG_TRACE(Lib_GnmDriver, "called");
 
@@ -1207,7 +1230,8 @@ int PS4_SYSV_ABI sceGnmInsertSetColorMarker() {
 
 s32 PS4_SYSV_ABI sceGnmInsertSetMarker(u32* cmdbuf, u32 size, const char* marker) {
 #ifdef __APPLE__
-    AmdGpu::BuilderTrace::Note(__func__, cmdbuf, size);
+    AmdGpu::BuilderTrace::Note(__func__, cmdbuf, size,
+                               reinterpret_cast<uintptr_t>(__builtin_frame_address(0)));
 #endif
     LOG_TRACE(Lib_GnmDriver, "called");
 
@@ -1237,7 +1261,8 @@ int PS4_SYSV_ABI sceGnmInsertThreadTraceMarker() {
 
 s32 PS4_SYSV_ABI sceGnmInsertWaitFlipDone(u32* cmdbuf, u32 size, s32 vo_handle, u32 buf_idx) {
 #ifdef __APPLE__
-    AmdGpu::BuilderTrace::Note(__func__, cmdbuf, size);
+    AmdGpu::BuilderTrace::Note(__func__, cmdbuf, size,
+                               reinterpret_cast<uintptr_t>(__builtin_frame_address(0)));
 #endif
     LOG_TRACE(Lib_GnmDriver, "called");
 
@@ -1405,7 +1430,8 @@ int PS4_SYSV_ABI sceGnmRequestMipStatsReportAndReset() {
 
 s32 PS4_SYSV_ABI sceGnmResetVgtControl(u32* cmdbuf, u32 size) {
 #ifdef __APPLE__
-    AmdGpu::BuilderTrace::Note(__func__, cmdbuf, size);
+    AmdGpu::BuilderTrace::Note(__func__, cmdbuf, size,
+                               reinterpret_cast<uintptr_t>(__builtin_frame_address(0)));
 #endif
     LOG_TRACE(Lib_GnmDriver, "called");
     if (cmdbuf == nullptr || size != 3) {
@@ -1473,7 +1499,8 @@ int PS4_SYSV_ABI sceGnmSdmaOpen() {
 
 s32 PS4_SYSV_ABI sceGnmSetCsShader(u32* cmdbuf, u32 size, const u32* cs_regs) {
 #ifdef __APPLE__
-    AmdGpu::BuilderTrace::Note(__func__, cmdbuf, size);
+    AmdGpu::BuilderTrace::Note(__func__, cmdbuf, size,
+                               reinterpret_cast<uintptr_t>(__builtin_frame_address(0)));
 #endif
     LOG_TRACE(Lib_GnmDriver, "called");
 
@@ -1504,7 +1531,8 @@ s32 PS4_SYSV_ABI sceGnmSetCsShader(u32* cmdbuf, u32 size, const u32* cs_regs) {
 s32 PS4_SYSV_ABI sceGnmSetCsShaderWithModifier(u32* cmdbuf, u32 size, const u32* cs_regs,
                                                u32 modifier) {
 #ifdef __APPLE__
-    AmdGpu::BuilderTrace::Note(__func__, cmdbuf, size);
+    AmdGpu::BuilderTrace::Note(__func__, cmdbuf, size,
+                               reinterpret_cast<uintptr_t>(__builtin_frame_address(0)));
 #endif
     LOG_TRACE(Lib_GnmDriver, "called");
 
@@ -1540,7 +1568,8 @@ s32 PS4_SYSV_ABI sceGnmSetCsShaderWithModifier(u32* cmdbuf, u32 size, const u32*
 s32 PS4_SYSV_ABI sceGnmSetEmbeddedPsShader(u32* cmdbuf, u32 size, u32 shader_id,
                                            u32 shader_modifier) {
 #ifdef __APPLE__
-    AmdGpu::BuilderTrace::Note(__func__, cmdbuf, size);
+    AmdGpu::BuilderTrace::Note(__func__, cmdbuf, size,
+                               reinterpret_cast<uintptr_t>(__builtin_frame_address(0)));
 #endif
     LOG_TRACE(Lib_GnmDriver, "called");
 
@@ -1612,7 +1641,8 @@ s32 PS4_SYSV_ABI sceGnmSetEmbeddedPsShader(u32* cmdbuf, u32 size, u32 shader_id,
 s32 PS4_SYSV_ABI sceGnmSetEmbeddedVsShader(u32* cmdbuf, u32 size, u32 shader_id,
                                            u32 shader_modifier) {
 #ifdef __APPLE__
-    AmdGpu::BuilderTrace::Note(__func__, cmdbuf, size);
+    AmdGpu::BuilderTrace::Note(__func__, cmdbuf, size,
+                               reinterpret_cast<uintptr_t>(__builtin_frame_address(0)));
 #endif
     LOG_TRACE(Lib_GnmDriver, "called");
 
@@ -1666,7 +1696,8 @@ s32 PS4_SYSV_ABI sceGnmSetEmbeddedVsShader(u32* cmdbuf, u32 size, u32 shader_id,
 
 s32 PS4_SYSV_ABI sceGnmSetEsShader(u32* cmdbuf, u32 size, const u32* es_regs, u32 shader_modifier) {
 #ifdef __APPLE__
-    AmdGpu::BuilderTrace::Note(__func__, cmdbuf, size);
+    AmdGpu::BuilderTrace::Note(__func__, cmdbuf, size,
+                               reinterpret_cast<uintptr_t>(__builtin_frame_address(0)));
 #endif
     LOG_TRACE(Lib_GnmDriver, "called");
 
@@ -1705,7 +1736,8 @@ int PS4_SYSV_ABI sceGnmSetGsRingSizes() {
 
 s32 PS4_SYSV_ABI sceGnmSetGsShader(u32* cmdbuf, u32 size, const u32* gs_regs) {
 #ifdef __APPLE__
-    AmdGpu::BuilderTrace::Note(__func__, cmdbuf, size);
+    AmdGpu::BuilderTrace::Note(__func__, cmdbuf, size,
+                               reinterpret_cast<uintptr_t>(__builtin_frame_address(0)));
 #endif
     LOG_TRACE(Lib_GnmDriver, "called");
 
@@ -1736,7 +1768,8 @@ s32 PS4_SYSV_ABI sceGnmSetGsShader(u32* cmdbuf, u32 size, const u32* gs_regs) {
 
 s32 PS4_SYSV_ABI sceGnmSetHsShader(u32* cmdbuf, u32 size, const u32* hs_regs, u32 param4) {
 #ifdef __APPLE__
-    AmdGpu::BuilderTrace::Note(__func__, cmdbuf, size);
+    AmdGpu::BuilderTrace::Note(__func__, cmdbuf, size,
+                               reinterpret_cast<uintptr_t>(__builtin_frame_address(0)));
 #endif
     LOG_TRACE(Lib_GnmDriver, "called");
     if (!cmdbuf || size < 0x1E) {
@@ -1769,7 +1802,8 @@ s32 PS4_SYSV_ABI sceGnmSetHsShader(u32* cmdbuf, u32 size, const u32* hs_regs, u3
 
 s32 PS4_SYSV_ABI sceGnmSetLsShader(u32* cmdbuf, u32 size, const u32* ls_regs, u32 shader_modifier) {
 #ifdef __APPLE__
-    AmdGpu::BuilderTrace::Note(__func__, cmdbuf, size);
+    AmdGpu::BuilderTrace::Note(__func__, cmdbuf, size,
+                               reinterpret_cast<uintptr_t>(__builtin_frame_address(0)));
 #endif
     LOG_TRACE(Lib_GnmDriver, "called");
 
@@ -1805,7 +1839,8 @@ s32 PS4_SYSV_ABI sceGnmSetLsShader(u32* cmdbuf, u32 size, const u32* ls_regs, u3
 
 s32 PS4_SYSV_ABI sceGnmSetPsShader(u32* cmdbuf, u32 size, const u32* ps_regs) {
 #ifdef __APPLE__
-    AmdGpu::BuilderTrace::Note(__func__, cmdbuf, size);
+    AmdGpu::BuilderTrace::Note(__func__, cmdbuf, size,
+                               reinterpret_cast<uintptr_t>(__builtin_frame_address(0)));
 #endif
     LOG_TRACE(Lib_GnmDriver, "called");
 
@@ -1845,7 +1880,8 @@ s32 PS4_SYSV_ABI sceGnmSetPsShader(u32* cmdbuf, u32 size, const u32* ps_regs) {
 
 s32 PS4_SYSV_ABI sceGnmSetPsShader350(u32* cmdbuf, u32 size, const u32* ps_regs) {
 #ifdef __APPLE__
-    AmdGpu::BuilderTrace::Note(__func__, cmdbuf, size);
+    AmdGpu::BuilderTrace::Note(__func__, cmdbuf, size,
+                               reinterpret_cast<uintptr_t>(__builtin_frame_address(0)));
 #endif
     LOG_TRACE(Lib_GnmDriver, "called");
 
@@ -1916,7 +1952,8 @@ int PS4_SYSV_ABI sceGnmSetupMipStatsReport() {
 s32 PS4_SYSV_ABI sceGnmSetVgtControl(u32* cmdbuf, u32 size, u32 prim_group_sz_minus_one,
                                      u32 partial_vs_wave_mode, u32 wd_switch_only_on_eop_mode) {
 #ifdef __APPLE__
-    AmdGpu::BuilderTrace::Note(__func__, cmdbuf, size);
+    AmdGpu::BuilderTrace::Note(__func__, cmdbuf, size,
+                               reinterpret_cast<uintptr_t>(__builtin_frame_address(0)));
 #endif
     LOG_TRACE(Lib_GnmDriver, "called");
 
@@ -1949,7 +1986,8 @@ s32 PS4_SYSV_ABI sceGnmSetVgtControl(u32* cmdbuf, u32 size, u32 prim_group_sz_mi
 
 s32 PS4_SYSV_ABI sceGnmSetVsShader(u32* cmdbuf, u32 size, const u32* vs_regs, u32 shader_modifier) {
 #ifdef __APPLE__
-    AmdGpu::BuilderTrace::Note(__func__, cmdbuf, size);
+    AmdGpu::BuilderTrace::Note(__func__, cmdbuf, size,
+                               reinterpret_cast<uintptr_t>(__builtin_frame_address(0)));
 #endif
     LOG_TRACE(Lib_GnmDriver, "called");
 
@@ -2520,7 +2558,8 @@ int PS4_SYSV_ABI sceGnmUnregisterResource() {
 
 s32 PS4_SYSV_ABI sceGnmUpdateGsShader(u32* cmdbuf, u32 size, const u32* gs_regs) {
 #ifdef __APPLE__
-    AmdGpu::BuilderTrace::Note(__func__, cmdbuf, size);
+    AmdGpu::BuilderTrace::Note(__func__, cmdbuf, size,
+                               reinterpret_cast<uintptr_t>(__builtin_frame_address(0)));
 #endif
     LOG_TRACE(Lib_GnmDriver, "called");
 
@@ -2554,7 +2593,8 @@ s32 PS4_SYSV_ABI sceGnmUpdateGsShader(u32* cmdbuf, u32 size, const u32* gs_regs)
 
 int PS4_SYSV_ABI sceGnmUpdateHsShader(u32* cmdbuf, u32 size, const u32* hs_regs, u32 ls_hs_config) {
 #ifdef __APPLE__
-    AmdGpu::BuilderTrace::Note(__func__, cmdbuf, size);
+    AmdGpu::BuilderTrace::Note(__func__, cmdbuf, size,
+                               reinterpret_cast<uintptr_t>(__builtin_frame_address(0)));
 #endif
     LOG_TRACE(Lib_GnmDriver, "called");
 
@@ -2590,7 +2630,8 @@ int PS4_SYSV_ABI sceGnmUpdateHsShader(u32* cmdbuf, u32 size, const u32* hs_regs,
 
 s32 PS4_SYSV_ABI sceGnmUpdatePsShader(u32* cmdbuf, u32 size, const u32* ps_regs) {
 #ifdef __APPLE__
-    AmdGpu::BuilderTrace::Note(__func__, cmdbuf, size);
+    AmdGpu::BuilderTrace::Note(__func__, cmdbuf, size,
+                               reinterpret_cast<uintptr_t>(__builtin_frame_address(0)));
 #endif
     LOG_TRACE(Lib_GnmDriver, "called");
 
@@ -2636,7 +2677,8 @@ s32 PS4_SYSV_ABI sceGnmUpdatePsShader(u32* cmdbuf, u32 size, const u32* ps_regs)
 
 s32 PS4_SYSV_ABI sceGnmUpdatePsShader350(u32* cmdbuf, u32 size, const u32* ps_regs) {
 #ifdef __APPLE__
-    AmdGpu::BuilderTrace::Note(__func__, cmdbuf, size);
+    AmdGpu::BuilderTrace::Note(__func__, cmdbuf, size,
+                               reinterpret_cast<uintptr_t>(__builtin_frame_address(0)));
 #endif
     LOG_TRACE(Lib_GnmDriver, "called");
 
@@ -2685,7 +2727,8 @@ s32 PS4_SYSV_ABI sceGnmUpdatePsShader350(u32* cmdbuf, u32 size, const u32* ps_re
 s32 PS4_SYSV_ABI sceGnmUpdateVsShader(u32* cmdbuf, u32 size, const u32* vs_regs,
                                       u32 shader_modifier) {
 #ifdef __APPLE__
-    AmdGpu::BuilderTrace::Note(__func__, cmdbuf, size);
+    AmdGpu::BuilderTrace::Note(__func__, cmdbuf, size,
+                               reinterpret_cast<uintptr_t>(__builtin_frame_address(0)));
 #endif
     LOG_TRACE(Lib_GnmDriver, "called");
 
@@ -3003,7 +3046,8 @@ int PS4_SYSV_ABI Func_C4C328B7CF3B4171() {
 
 int PS4_SYSV_ABI sceGnmDrawInitToDefaultContextStateInternalCommand(u32* cmdbuf, u32 size) {
 #ifdef __APPLE__
-    AmdGpu::BuilderTrace::Note(__func__, cmdbuf, size);
+    AmdGpu::BuilderTrace::Note(__func__, cmdbuf, size,
+                               reinterpret_cast<uintptr_t>(__builtin_frame_address(0)));
 #endif
     LOG_TRACE(Lib_GnmDriver, "called");
     if (sdk_version >= Common::ElfInfo::FW_400) {
