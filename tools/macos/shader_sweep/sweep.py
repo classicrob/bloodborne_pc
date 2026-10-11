@@ -4,7 +4,8 @@
 Extracts the corpus (extract.py), runs out/gpu/shader-sweep over it (at most two translated
 processes; a job that stops the process is recorded and the driver restarts after it), checks
 every SPIR-V module with spirv-val and converts it to MSL the way MoltenVK does (msl.cpp, built by
-build_msl.sh), and writes under OUT:
+build_msl.sh; with --metal also compiles that MSL with Apple's Metal compiler), and writes under
+OUT:
   results.tsv     one line per job: hash, kind, status (PASS / LOUD / CRASH / HANG / SETUP),
                   message, spirv-val, MSL conversion, logged errors, name
   report.md       counts, LOUD grouped by message, crashes, spirv-val failures, logged errors
@@ -186,13 +187,14 @@ def spirv_val(path):
     return first[0] if first else f'exit {result.returncode}'
 
 
-def msl_convert(tool, paths, processes):
-    """SPIR-V -> MSL with MoltenVK's SPIRV-Cross and options (msl.cpp): path -> error or None."""
+def msl_convert(tool, paths, processes, emit=None):
+    """SPIR-V -> MSL with MoltenVK's SPIRV-Cross and options (msl.cpp): path -> error or None.
+    With `emit`, each converted module's MSL is written there as <name>.metal."""
     chunks = [paths[i::processes] for i in range(processes)]
 
     def run(chunk):
-        result = subprocess.run([tool], input='\n'.join(chunk) + '\n', capture_output=True,
-                                text=True)
+        result = subprocess.run([tool] + (['--emit', emit] if emit else []),
+                                input='\n'.join(chunk) + '\n', capture_output=True, text=True)
         out = {}
         for line in result.stdout.splitlines():
             status, rest = line.split(' ', 1)
@@ -210,6 +212,26 @@ def msl_convert(tool, paths, processes):
     return verdicts
 
 
+METAL_COMPILE = ['xcrun', '-sdk', 'macosx', 'metal', '-std=metal4.0', '-c', '-o', '/dev/null']
+
+
+def metal_compile(msl_dir, processes):
+    """Apple's Metal compiler on every emitted MSL file (what MoltenVK compiles at pipeline
+    creation): module name -> first error line, or None."""
+    files = sorted(f for f in os.listdir(msl_dir) if f.endswith('.metal'))
+
+    def run(name):
+        result = subprocess.run(METAL_COMPILE + [os.path.join(msl_dir, name)],
+                                capture_output=True, text=True)
+        if result.returncode == 0:
+            return name[:-len('.metal')], None
+        errors = [l for l in result.stderr.splitlines() if 'error:' in l]
+        return name[:-len('.metal')], (errors[0].split('error:', 1)[1].strip() if errors
+                                        else f'exit {result.returncode}')
+    with concurrent.futures.ThreadPoolExecutor(processes) as pool:
+        return dict(pool.map(run, files))
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--game', default=os.environ.get('BB_GAME_DIR'))
@@ -220,6 +242,9 @@ def main():
     parser.add_argument('--compare', metavar='BASE_TSV',
                         help='print the delta against an earlier results.tsv (status, message, '
                              'spirv-val, MSL) and exit 1 if a job that passed there does not now')
+    parser.add_argument('--metal', action='store_true',
+                        help='also compile every MSL module with Apple\'s Metal compiler '
+                             '(xcrun metal; needs the Metal Toolchain component)')
     parser.add_argument('--msl-tool', default='out/tools/shader-msl',
                         help='the MSL stage (tools/macos/shader_sweep/build_msl.sh builds it)')
     args = parser.parse_args()
@@ -243,6 +268,12 @@ def main():
     if not os.access(msl_tool, os.X_OK):
         raise SystemExit(f'shader-sweep: no MSL stage at {msl_tool} '
                          '(tools/macos/shader_sweep/build_msl.sh)')
+    if args.metal:
+        probe = subprocess.run(['xcrun', '-sdk', 'macosx', 'metal', '--version'],
+                               capture_output=True, text=True)
+        if probe.returncode != 0:
+            raise SystemExit('shader-sweep: --metal needs Apple\'s Metal compiler: '
+                             + (probe.stderr.strip().splitlines() or ['xcrun metal failed'])[-1])
     jobs = read_jobs(args.jobs_file)
     if args.only:
         wanted = {int(h, 16) for h in args.only.split(',')}
@@ -322,7 +353,19 @@ def main():
         verdicts = dict(zip([p for paths in spv.values() for p in paths],
                             pool.map(spirv_val, [p for paths in spv.values() for p in paths])))
     all_spv = [p for paths in spv.values() for p in paths]
-    msl = msl_convert(msl_tool, all_spv, os.cpu_count() or 4)
+    msl_dir = None
+    if args.metal:
+        msl_dir = os.path.join(out, 'msl')
+        shutil.rmtree(msl_dir, ignore_errors=True)
+        os.makedirs(msl_dir)
+    msl = msl_convert(msl_tool, all_spv, os.cpu_count() or 4, emit=msl_dir)
+    if args.metal:
+        # Apple's compiler rejecting converted MSL is a MoltenVK pipeline failure too.
+        rejected = metal_compile(msl_dir, os.cpu_count() or 4)
+        for path in all_spv:
+            error = rejected.get(os.path.basename(path))
+            if msl[path] is None and error:
+                msl[path] = 'metal: ' + error
     for shader_hash, indices in by_hash.items():
         failures = [f'{os.path.basename(p)}: {verdicts[p]}' for p in spv.get(shader_hash, [])
                     if verdicts[p]]
