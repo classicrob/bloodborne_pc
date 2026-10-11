@@ -269,6 +269,7 @@ if [[ ${1:-} == --test ]]; then
         sh tests/test_audio_macos.sh
         sh tests/test_guest_heap_lock_macos.sh
         sh tests/test_low_map_trace_macos.sh
+        sh tests/test_perf_summary.sh
         sh tests/test_guest_entry_macos.sh
         sh tests/test_hle_trace_macos.sh
         BB_DEPS_PREFIX="$deps" bash tests/macos_external_host/run.sh
