@@ -183,3 +183,23 @@ Test: `label-check-test`.
 and announced at the first submission. With `BB_LABEL_CHECK=1` it shows whether label contents
 start to change before their writes once the guest is not held, and how soon after the parse they
 are checked. It may corrupt the guest heap, so it is not for play.
+
+## Labels at GPU completion (`BB_LABELS_AT_GPU_COMPLETE=1`, diagnostic)
+
+End-of-pipe labels (EOP, EOS, compute RELEASE_MEM) are normally written when the recording side
+has passed the work before them and its guest-memory copies are done. That is before Metal
+executes the work. Guest buffers bound zero-copy are read by the GPU at execution. So a guest that
+reuses memory when a label says done (its label-governed reclaimer frees nodes whose label is 4,
+and those nodes own GPU data such as index buffers) can overwrite memory that recorded but not yet
+executed work will still read.
+
+With `BB_LABELS_AT_GPU_COMPLETE=1`:
+- EOP and EOS labels, with their interrupts, are written only once the GPU has completed the
+  command buffer holding everything recorded before them. That buffer is submitted at once
+  (one submission per label), in order.
+- WaitDeferredSignals, and with it GpuIdle, waits for them.
+- A compute RELEASE_MEM first waits for the GPU (Rasterizer::Finish).
+
+It costs a submission and a GPU round trip per label. If intermittent corruption disappears with
+it, the exact fix is to write GPU-visible labels at GPU completion, in order. That is also the
+precondition for dropping the submit throttle.

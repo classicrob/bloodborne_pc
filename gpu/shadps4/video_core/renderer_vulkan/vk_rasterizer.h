@@ -148,6 +148,11 @@ public:
     void SignalAfterHostCopies(std::function<void()> signal) {
         scheduler.SignalAfterHostCopies(std::move(signal));
     }
+#ifdef __APPLE__
+    void SignalAtGpuCompletion(std::function<void()> signal) {
+        scheduler.SignalAtGpuCompletion(std::move(signal));
+    }
+#endif
     /// The GPU command thread or the draw recording thread (fault handling runs inline there).
     bool IsGpuSideThread() const;
     bool IsGpuSideThreadId(u32 tid) const;

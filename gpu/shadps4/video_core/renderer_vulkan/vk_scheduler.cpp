@@ -197,6 +197,54 @@ void Scheduler::SignalAfterHostCopies(std::function<void()> signal) {
     KickRecording(true);
 }
 
+#ifdef __APPLE__
+bool Scheduler::LabelsAtGpuComplete() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("BB_LABELS_AT_GPU_COMPLETE");
+        const bool on = env && env[0] == '1';
+        if (on) {
+            std::fprintf(stderr, "BB_LABELS_AT_GPU_COMPLETE=1: EOP/EOS/RELEASE_MEM labels are "
+                                 "written once the GPU completed the work before them (diagnostic; "
+                                 "one submission per label)\n");
+        }
+        return on;
+    }();
+    return enabled;
+}
+
+void Scheduler::SignalAtGpuCompletion(std::function<void()> signal) {
+    const u64 tick = CurrentTick(); // the next submission signals this value
+    if (!IsRecordingDeferred()) {
+        Flush();
+        WaitHostCopies();
+        Wait(tick);
+        signal();
+        return;
+    }
+    BbCopy::FlushBatch();
+    deferred_signals_issued.fetch_add(1, std::memory_order_relaxed);
+    Record([this, tick, signal = std::move(signal),
+            done = deferred_signals_done](vk::CommandBuffer) mutable {
+        // After the copies queued before it, then after the GPU passed `tick`: the priority
+        // runner waits for each op's tick in order.
+        BbCopy::AfterCopies([this, tick, signal = std::move(signal),
+                             done = std::move(done)]() mutable {
+            {
+                std::unique_lock lk(priority_pending_ops_mutex);
+                priority_pending_ops.emplace(
+                    [signal = std::move(signal), done = std::move(done)]() mutable {
+                        signal();
+                        done->fetch_add(1, std::memory_order_release);
+                    },
+                    tick);
+            }
+            priority_pending_ops_cv.notify_one();
+        });
+    });
+    Flush();
+}
+#endif
+
 void Scheduler::WaitDeferredSignals() {
     const u64 issued = deferred_signals_issued.load(std::memory_order_relaxed);
     if (deferred_signals_done->load(std::memory_order_acquire) >= issued ||

@@ -419,6 +419,12 @@ void RunEventWriteEop(Vulkan::Rasterizer& rasterizer, const u8* data) {
         const char* env = std::getenv("BB_ASYNC_FENCES");
         return env && env[0] == '1';
     }();
+#ifdef __APPLE__
+    if (Vulkan::Scheduler::LabelsAtGpuComplete()) {
+        rasterizer.SignalAtGpuCompletion([eop] { SignalEop(eop); });
+        return;
+    }
+#endif
     if (async_fences && !BbToggle::Disabled(BbToggle::AsyncFences)) {
         BbCopy::AfterCopies([eop] { SignalEop(eop); });
     } else if (Vulkan::DrawPipe::OnStageB() && !BbToggle::Disabled(BbToggle::RecorderFences)) {
@@ -496,12 +502,7 @@ void RunWriteData(Vulkan::Rasterizer& rasterizer, const u8* data) {
 #endif
 }
 
-void RunEventWriteEos(Vulkan::Rasterizer& rasterizer, const u8* data) {
-    const auto& event_eos = *reinterpret_cast<const PM4CmdEventWriteEos*>(data);
-    // Copies deferred to the recording thread precede writes the guest sees.
-    rasterizer.WaitHostCopies();
-    rasterizer.WaitDeferredSignals();
-    rasterizer.ProcessDownloadImages();
+void SignalEos(const PM4CmdEventWriteEos& event_eos) {
     event_eos.SignalFence([](void* address, u64 value, u32 num_bytes) {
         auto* memory = Core::Memory::Instance();
         BbWriteLog::Note(reinterpret_cast<u64>(address), &value, num_bytes, BbWriteLog::Fence);
@@ -509,6 +510,23 @@ void RunEventWriteEos(Vulkan::Rasterizer& rasterizer, const u8* data) {
             memcpy(address, &value, num_bytes);
         }
     });
+}
+
+void RunEventWriteEos(Vulkan::Rasterizer& rasterizer, const u8* data) {
+    const auto& event_eos = *reinterpret_cast<const PM4CmdEventWriteEos*>(data);
+#ifdef __APPLE__
+    if (Vulkan::Scheduler::LabelsAtGpuComplete() &&
+        event_eos.command != PM4CmdEventWriteEos::Command::GdsStore) {
+        rasterizer.ProcessDownloadImages();
+        rasterizer.SignalAtGpuCompletion([event_eos] { SignalEos(event_eos); });
+        return;
+    }
+#endif
+    // Copies deferred to the recording thread precede writes the guest sees.
+    rasterizer.WaitHostCopies();
+    rasterizer.WaitDeferredSignals();
+    rasterizer.ProcessDownloadImages();
+    SignalEos(event_eos);
     if (event_eos.command == PM4CmdEventWriteEos::Command::GdsStore) {
         ASSERT(event_eos.size == 1);
         rasterizer.Finish();
@@ -1948,6 +1966,12 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             const auto* release_mem = reinterpret_cast<const PM4CmdReleaseMem*>(header);
             if (rasterizer) {
                 rasterizer->ProcessDownloadImages();
+#ifdef __APPLE__
+                // Compute end-of-pipe label: after the GPU completed the dispatches before it.
+                if (Vulkan::Scheduler::LabelsAtGpuComplete()) {
+                    rasterizer->Finish();
+                }
+#endif
             }
             release_mem->SignalFence(
                 [pipe_id = queue.pipe_id] {

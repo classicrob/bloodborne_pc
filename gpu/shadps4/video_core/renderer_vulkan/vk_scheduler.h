@@ -847,6 +847,18 @@ public:
     /// it to the copy threads' completion (BbCopy::AfterCopies).
     void SignalAfterHostCopies(std::function<void()> signal);
 
+#ifdef __APPLE__
+    /// bbport (Apple diagnostic, BB_LABELS_AT_GPU_COMPLETE=1): like SignalAfterHostCopies, but
+    /// `signal` runs only once the GPU has completed the command buffer holding everything
+    /// recorded before it. That buffer is submitted at once, so the GPU reaches it without
+    /// waiting for the frame's end (a guest or WAIT_REG_MEM waiting on the label would never
+    /// see it otherwise). Signals keep their order, and WaitDeferredSignals waits for them.
+    void SignalAtGpuCompletion(std::function<void()> signal);
+
+    /// Whether BB_LABELS_AT_GPU_COMPLETE=1.
+    static bool LabelsAtGpuComplete();
+#endif
+
     /// bbport: before a guest-visible write that is not deferred (WriteData, end-of-shader
     /// fences, flip): waits until every signal handed to SignalAfterHostCopies ran, so that
     /// the write cannot overtake an earlier fence. Otherwise the guest, seeing the later value,
