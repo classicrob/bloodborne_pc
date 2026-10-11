@@ -8,6 +8,7 @@ neutral observation.
 
 Filters may be comma-separated categories or exact symbol/scoped-NID names:
 
+- `waits`: wait, sleep and join names, excluding mutex lock/unlock, clock and yield hot paths.
 - `sync`: mutex, condvar, semaphore, event flag, equeue, usleep/nanosleep, yield,
   and clock-gettime calls.
 - `gnm`: Gnm names containing Submit, Wait, Flip or Label. Builders are excluded
@@ -56,3 +57,90 @@ arguments), variadic FP, x87 long-double and aggregate returns, YMM arguments an
 return, nested callbacks, repeated inner longjmp with outer return, both errno
 domains, concurrent ring wrap, and a signal/fault interrupting publication on the
 publishing thread. Logs from a busy fatal dump explicitly state their limitation.
+
+## Aggregate wait attribution
+
+`BB_HLE_TRACE_SUMMARY=600` reports every 600 actual VideoOut flips and once at
+ordinary `runtime_report`. With `BB_HLE_TRACE` unset, summary mode does not publish
+or print ring records. `BB_HLE_TRACE_SUMMARY_FILTER` accepts the same filter syntax;
+its default is `waits,gnm,videoout,avplayer`. Select `sync` explicitly to include
+uncontended mutex/clock/yield calls as well. Setting `BB_HLE_TRACE` as well enables
+both modes with that variable's filter, at the detailed trace's additional cost.
+Use a smaller positive frame interval when frames are slow. `0` disables summary.
+
+Each pthread has its own cached identity and counter table. Calls take a short
+per-thread gate for bookkeeping, with no global per-call publication, formatting
+or name lookup. Reporting copies/resets each table under its gate, then releases
+it before writing stderr. A frame/report mutex serializes only reports and frame
+counting. Counter nodes persist until process exit so terminated threads remain
+reportable. A pthread TLS destructor marks unfinished calls abandoned, clears
+inflight/active state and marks the node retired. Later reports cannot count a
+terminated thread as a growing pending wait; names are cached at their first selected call, not updated on rename.
+The existing ABI bridges, nonlocal-exit handling and exception limitations apply.
+
+Output names the interval wall duration, flips, pthread/name, import, completed
+calls, `call_wall_ms`, `max_ms`, `wall_pct`, abandoned calls, and in-flight calls.
+A separate active-import line gives the innermost pending call's age, including a
+wait that has not returned. Abandoned calls are counted when slot reuse or an
+outer return proves their abandonment; their durations are not guessed.
+
+These are **inclusive call wall durations, not measured blocked CPU time**. An
+HLE can compute, block, or call guest code during that interval. Nested import
+values are non-additive. The whole duration is charged to the reporting interval
+in which the call completes, so a call spanning windows can yield over 100%.
+Pending time is shown separately and must not be added to completed time. Table
+snapshots occur sequentially, rather than freezing every thread at one instant.
+Use the CPU profile alongside these numbers to distinguish execution from waits.
+There is no signal-handler summary: the fatal ring dump remains nonblocking and
+summary-only mode leaves that ring disabled. A hard stop before the next flip
+report can therefore omit the final partial interval.
+
+Existing host wait counters (separate from guest import timing):
+
+| Site | Existing measurement / missing attribution |
+| --- | --- |
+| Scheduler::WaitDeferredSignals | `deferred_signals_wait_ns` |
+| Scheduler::WaitHostCopies | `host_copy_record_wait_ns`, then `copy_threads_wait_ns` |
+| Scheduler::SyncRecording | `sync_recording_ns` |
+| Scheduler::Wait(tick) | `tick_wait_ns` |
+| DrawPipe::Drain | TSC duration/count by drain reason |
+| Liverpool submit_cv / RecorderThread recorder_cv | Add idle-wait count/total/max around predicate waits; distinguish idle from dependency waits |
+| DrawPipe::Run wake.wait / WaitForSpace | Add empty-queue idle and full-queue backpressure separately |
+| Scheduler deferred-op worker | Separate its queue idle wait from GPU timeline wait |
+
+The first five counters already feed frame/BB_PERF reports. They aggregate call
+sites rather than distinguishing all calling threads, and nested wait timers
+must not be summed blindly. No host-wait behavior changes are part of this unit.
+
+The existing signed fixture also runs in summary-only mode: ABI/errno controls,
+nonlocal abandoned calls, four concurrent threads with exact independent counts,
+thread exit inside an HLE and after a nonlocal jump, a held wait reported before
+completion, duration/max after release, interval
+reset and frame cadence. The fixture's optional `bench off` / `bench on` modes
+measure one million trivial imports; compare CPU ns/call as well as wall time.
+This establishes instrumentation cost, not a gameplay FPS claim. Narrow the
+filter for steady performance runs if high-frequency mutex/clock calls dominate.
+
+Qualification for 905d516 on this Rosetta host: three paired one-million-call
+runs measured off 2.84/2.61/3.40 ns CPU per trivial call and summary-on
+341.17/342.90/343.53 ns (`getrusage(RUSAGE_SELF)`, user + system). Summary-on wall
+cost was 3.85–4.96 microseconds per call under contention, so it is not a quiet
+throughput result. At 100,000 selected calls/second, the measured CPU increment
+would be about 34 ms/second; count-dependent overhead still needs a gameplay A/B.
+`CLOCK_THREAD_CPUTIME_ID` produced implausibly small values in an earlier probe
+and was not used for these numbers. Evidence: `out/hle-trace-summary-integration.log`.
+The affected VideoOut driver compiled with production flags; the signed fixture
+passed both detailed and summary modes. No shared artifact was rebuilt.
+
+
+The broad `sync,gnm,videoout,avplayer` filter was also measured with four threads,
+each doing 100,000 uncontended lock/clock/unlock iterations (1.2 million selected
+imports). Three off/on pairs used 24.35/451.71, 24.36/455.51, and 24.46/454.06 ms
+of process CPU: about 0.356–0.359 microseconds added per call, but approximately
+18.6x this deliberately tiny hot-loop workload. It is **not** an acceptable
+blanket timing-neutral default. Summary therefore defaults to `waits` rather
+than `sync`; add mutex/clock categories only for an attribution run that needs
+them, then turn them off for the uninstrumented baseline. Evidence:
+`out/hle-trace-summary-retirement.log`. This is a synthetic cost bound, not proof
+of gameplay overhead. Actual wait/submit/video/AvPlayer call rates still determine
+the default filter's cost.
