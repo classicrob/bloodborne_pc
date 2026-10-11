@@ -58,10 +58,11 @@ StagingBufferPool::StagingBufferPool(const Instance& instance_, Scheduler& sched
 StagingBufferPool::~StagingBufferPool() = default;
 
 StagingBufferRef StagingBufferPool::Request(u64 size, MemoryType type, u64 alignment,
-                                            bool deferred) {
+                                            bool deferred, bool retire) {
+    std::scoped_lock lk{mutex};
     Ring& ring = rings[u32(type)];
     if (deferred || size > BLOCK_SIZE) {
-        return RequestLarge(size, type, deferred);
+        return RequestLarge(size, type, deferred, retire);
     }
     return RequestFromRing(ring, size, alignment, type);
 }
@@ -106,7 +107,8 @@ StagingBufferRef StagingBufferPool::RequestFromRing(Ring& ring, u64 size, u64 al
     return ref;
 }
 
-StagingBufferRef StagingBufferPool::RequestLarge(u64 size, MemoryType type, bool deferred) {
+StagingBufferRef StagingBufferPool::RequestLarge(u64 size, MemoryType type, bool deferred,
+                                                 bool retire) {
     auto& cache = large_caches[u32(type)];
     const u64 max_size = std::max(size + size / 4, RoundAllocationSize(size));
 
@@ -134,7 +136,8 @@ StagingBufferRef StagingBufferPool::RequestLarge(u64 size, MemoryType type, bool
 
     best->tick = scheduler.CurrentTick();
     best->last_used_frame = frame;
-    best->held = deferred;
+    best->held = deferred || retire;
+    best->retiring = retire && !deferred;
 
     VideoCore::Buffer& buffer = *best->buffer;
     StagingBufferRef ref{
@@ -150,6 +153,7 @@ StagingBufferRef StagingBufferPool::RequestLarge(u64 size, MemoryType type, bool
 }
 
 void StagingBufferPool::FreeDeferred(const StagingBufferRef& ref) {
+    std::scoped_lock lk{mutex};
     auto& cache = large_caches[u32(ref.type)];
     const auto it = std::ranges::find_if(
         cache, [&](const LargeBuffer& entry) { return entry.buffer.get() == ref.buffer; });
@@ -159,7 +163,46 @@ void StagingBufferPool::FreeDeferred(const StagingBufferRef& ref) {
     it->last_used_frame = frame;
 }
 
+void StagingBufferPool::RetireLarge(const VideoCore::Buffer* buffer) {
+    {
+        std::scoped_lock lk{mutex};
+        const bool large = std::ranges::any_of(large_caches, [&](const auto& cache) {
+            return std::ranges::any_of(cache, [&](const LargeBuffer& entry) {
+                return entry.buffer.get() == buffer && entry.retiring;
+            });
+        });
+        if (!large) {
+            return;
+        }
+    }
+    // Runs where the commands before it are recorded. CurrentTick() there is the submission
+    // they land in, or the next one while a submission is syncing: never an earlier one.
+    scheduler.Record([this, buffer](vk::CommandBuffer) {
+        const u64 tick = scheduler.CurrentTick();
+        std::scoped_lock lk{mutex};
+        for (auto& cache : large_caches) {
+            for (auto& entry : cache) {
+                if (entry.buffer.get() != buffer || !entry.retiring) {
+                    continue;
+                }
+                if (tick > entry.tick + 1 && ++late_retires <= 16) {
+                    LOG_ERROR(Render_Vulkan,
+                              "Staging buffer ({} MB) used in submission {} but requested at {}: "
+                              "released by its request tick it would have been freed early",
+                              entry.buffer->SizeBytes() >> 20, tick, entry.tick);
+                }
+                entry.tick = std::max(entry.tick, tick);
+                entry.held = false;
+                entry.retiring = false;
+                return;
+            }
+        }
+        UNREACHABLE_MSG("Staging buffer retired twice or not held");
+    });
+}
+
 void StagingBufferPool::TickFrame() {
+    std::scoped_lock lk{mutex};
     ++frame;
     for (Ring& ring : rings) {
         TrimRing(ring);
