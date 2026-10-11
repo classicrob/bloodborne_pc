@@ -14,6 +14,7 @@
 #include "bbport_toggles.h"
 #ifdef __APPLE__
 #include "bb_mac_compat.h"
+#include "../../../../../src/runtime_hle_trace.h"
 #endif
 #include "video_core/renderer_vulkan/vk_frame_capture.h"
 #include "common/debug.h"
@@ -295,6 +296,9 @@ int VideoOutDriver::ChangeBufferAttribute(VideoOutPort* port, s32 attributeIndex
 }
 
 void VideoOutDriver::Flip(const Request& req) {
+#ifdef __APPLE__
+    runtime_hle_trace_frame();
+#endif
 #ifdef __APPLE__
     BbPerf::Flip();
 #endif

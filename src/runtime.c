@@ -76,6 +76,7 @@ void runtime_report(void) {
     runtime_cpu_profile_stop();
 #endif
     runtime_hle_trace_dump();
+    runtime_hle_trace_summary();
     printf("Runtime: _init_env=%zu, atexit=%zu, __cxa_atexit=%zu, registered handlers=%zu\n",
            calls_init, calls_atexit, calls_cxa, handler_count);
     printf("Runtime: static guards acquired=%zu, released=%zu\n", (size_t)guards_acquired, (size_t)guards_released);
