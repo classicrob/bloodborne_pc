@@ -699,7 +699,8 @@ public:
 
     /// Sends the current execution context to the GPU
     /// and increments the scheduler timeline semaphore.
-    void Flush(SubmitInfo& info);
+    /// Returns the timeline value the submission signals.
+    u64 Flush(SubmitInfo& info);
 
     /// The next submission waits for `semaphore` to reach `value` before any of its commands
     /// (MetalFX: its output is consumed after the Metal queue signals; docs/macos/
@@ -708,7 +709,7 @@ public:
 
     /// Sends the current execution context to the GPU
     /// and increments the scheduler timeline semaphore.
-    void Flush();
+    u64 Flush();
 
     /// Sends the current execution context to the GPU and waits for it to complete.
     void Finish();
@@ -928,7 +929,7 @@ private:
 
     void RecorderThread(std::stop_token stoken);
 
-    void SubmitExecution(SubmitInfo& info);
+    u64 SubmitExecution(SubmitInfo& info);
 
     void PriorityPendingOpsThread(std::stop_token stoken);
 

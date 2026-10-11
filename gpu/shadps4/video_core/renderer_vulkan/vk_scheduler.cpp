@@ -215,7 +215,10 @@ bool Scheduler::LabelsAtGpuComplete() {
 void Scheduler::SignalAtGpuCompletion(std::function<void()> signal) {
     const u64 tick = CurrentTick(); // the next submission signals this value
     if (!IsRecordingDeferred()) {
-        Flush();
+        const u64 submitted = Flush();
+        ASSERT_MSG(submitted == tick,
+                   "macOS: a label's submission signals timeline value {}, it waits for {}",
+                   submitted, tick);
         WaitHostCopies();
         Wait(tick);
         signal();
@@ -243,7 +246,12 @@ void Scheduler::SignalAtGpuCompletion(std::function<void()> signal) {
     std::call_once(label_thread_once, [this] {
         label_thread = std::jthread([this](std::stop_token stoken) { LabelThread(stoken); });
     });
-    Flush();
+    const u64 submitted = Flush();
+    // The writer waits for `tick`: it must be the submission holding the label and the work
+    // recorded before it (no other submission came between).
+    ASSERT_MSG(submitted == tick,
+               "macOS: a label's submission signals timeline value {}, its writer waits for {}",
+               submitted, tick);
 }
 
 void Scheduler::LabelThread(std::stop_token stoken) {
@@ -390,14 +398,14 @@ void Scheduler::RecorderThread(std::stop_token stoken) {
     }
 }
 
-void Scheduler::Flush(SubmitInfo& info) {
+u64 Scheduler::Flush(SubmitInfo& info) {
     // When flushing, we only send data to the driver; no waiting is necessary.
-    SubmitExecution(info);
+    return SubmitExecution(info);
 }
 
-void Scheduler::Flush() {
+u64 Scheduler::Flush() {
     SubmitInfo info{};
-    Flush(info);
+    return Flush(info);
 }
 
 void Scheduler::WaitBeforeNextSubmit(vk::Semaphore semaphore, u64 value) {
@@ -478,7 +486,7 @@ void Scheduler::AllocateWorkerCommandBuffers() {
 #endif
 }
 
-void Scheduler::SubmitExecution(SubmitInfo& info) {
+u64 Scheduler::SubmitExecution(SubmitInfo& info) {
     std::scoped_lock lk{submit_mutex};
     const u64 signal_value = work_semaphore.NextTick();
 
@@ -547,6 +555,7 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
 
     // Apply pending operations
     PopPendingOperations();
+    return signal_value;
 }
 
 #ifdef __APPLE__
