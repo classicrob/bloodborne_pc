@@ -3,9 +3,10 @@
 
 Extracts the corpus (extract.py), runs out/gpu/shader-sweep over it (at most two translated
 processes; a job that stops the process is recorded and the driver restarts after it), checks
-every SPIR-V module with spirv-val, and writes under OUT:
+every SPIR-V module with spirv-val and converts it to MSL the way MoltenVK does (msl.cpp, built by
+build_msl.sh), and writes under OUT:
   results.tsv     one line per job: hash, kind, status (PASS / LOUD / CRASH / HANG / SETUP),
-                  message, spirv-val, logged errors, name
+                  message, spirv-val, MSL conversion, logged errors, name
   report.md       counts, LOUD grouped by message, crashes, spirv-val failures, logged errors
   gs_census.md    every ES/GS/copy configuration the game ships, with the production
                   GsEmulationUnsupported verdict (static census)
@@ -150,9 +151,11 @@ def loud_message(lines):
         if '<Critical>' in line:
             text = strip_log(line)
             text = re.sub(r'^Critical: ', '', text)
-            # Assertion messages continue on the next line.
-            if text.endswith('Assertion Failed!') and i + 1 < len(lines):
-                text += ' ' + lines[i + 1].strip()
+            # ASSERT_MSG and UNREACHABLE_MSG put their message on the following line(s).
+            j = i + 1
+            while j < len(lines) and not lines[j].startswith(('GPU [', '@@', 'STOP:')):
+                text += ' ' + lines[j].strip()
+                j += 1
             out.append(text)
     return ' | '.join(out) if out else 'stopped (exit 23) without a Critical log line'
 
@@ -181,6 +184,30 @@ def spirv_val(path):
     return first[0] if first else f'exit {result.returncode}'
 
 
+def msl_convert(tool, paths, processes):
+    """SPIR-V -> MSL with MoltenVK's SPIRV-Cross and options (msl.cpp): path -> error or None."""
+    chunks = [paths[i::processes] for i in range(processes)]
+
+    def run(chunk):
+        result = subprocess.run([tool], input='\n'.join(chunk) + '\n', capture_output=True,
+                                text=True)
+        out = {}
+        for line in result.stdout.splitlines():
+            status, rest = line.split(' ', 1)
+            path, _, message = rest.partition('\t')
+            out[path] = message if status == 'ERR' else None
+        missing = [p for p in chunk if p not in out]
+        if missing:
+            raise SystemExit(f'shader-sweep: shader-msl stopped (exit {result.returncode}) before '
+                             f'{missing[0]}:\n{result.stderr[-2000:]}')
+        return out
+    verdicts = {}
+    with concurrent.futures.ThreadPoolExecutor(processes) as pool:
+        for part in pool.map(run, chunks):
+            verdicts.update(part)
+    return verdicts
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--game', default=os.environ.get('BB_GAME_DIR'))
@@ -188,6 +215,8 @@ def main():
     parser.add_argument('--out', default='out/shader_sweep')
     parser.add_argument('--processes', type=int, default=2)
     parser.add_argument('--only', help='comma-separated hashes (debugging)')
+    parser.add_argument('--msl-tool', default='out/tools/shader-msl',
+                        help='the MSL stage (tools/macos/shader_sweep/build_msl.sh builds it)')
     args = parser.parse_args()
     if not args.game:
         raise SystemExit('shader-sweep: --game or BB_GAME_DIR')
@@ -199,6 +228,10 @@ def main():
     args.driver = os.path.abspath(os.path.join(args.gpu_build, 'shader-sweep'))
     if not os.access(args.driver, os.X_OK):
         raise SystemExit(f'shader-sweep: no driver at {args.driver} (ninja -C out/gpu shader-sweep)')
+    msl_tool = os.path.abspath(args.msl_tool)
+    if not os.access(msl_tool, os.X_OK):
+        raise SystemExit(f'shader-sweep: no MSL stage at {msl_tool} '
+                         '(tools/macos/shader_sweep/build_msl.sh)')
     jobs = read_jobs(args.jobs_file)
     if args.only:
         wanted = {int(h, 16) for h in args.only.split(',')}
@@ -277,9 +310,16 @@ def main():
     with concurrent.futures.ThreadPoolExecutor(os.cpu_count() or 4) as pool:
         verdicts = dict(zip([p for paths in spv.values() for p in paths],
                             pool.map(spirv_val, [p for paths in spv.values() for p in paths])))
+    all_spv = [p for paths in spv.values() for p in paths]
+    msl = msl_convert(msl_tool, all_spv, os.cpu_count() or 4)
     for shader_hash, indices in by_hash.items():
         failures = [f'{os.path.basename(p)}: {verdicts[p]}' for p in spv.get(shader_hash, [])
                     if verdicts[p]]
+        msl_failures = [f'{os.path.basename(p)}: {msl[p]}' for p in spv.get(shader_hash, [])
+                        if msl[p]]
+        for i in indices:
+            results.setdefault(i, {'status': 'NOT RUN', 'message': '', 'errors': [], 'gs': {}, 'log': []})
+            results[i]['msl_failures'] = msl_failures
         for i in indices:
             r = results.setdefault(i, {'status': 'NOT RUN', 'message': '', 'errors': [], 'gs': {}, 'log': []})
             r['spirv'] = len(spv.get(shader_hash, []))
@@ -289,11 +329,12 @@ def main():
 
 def write_reports(out, jobs, keep, results, compile_seconds, total_seconds):
     with open(os.path.join(out, 'results.tsv'), 'w') as f:
-        f.write('hash\tkind\tstatus\tmessage\tspirv_modules\tspirv_val\tlogged\tname\n')
+        f.write('hash\tkind\tstatus\tmessage\tspirv_modules\tspirv_val\tmsl\tlogged\tname\n')
         for i in keep:
             j, r = jobs[i], results[i]
             f.write('\t'.join([j['hash'], j['kind'], r['status'], r['message'], str(r.get('spirv', 0)),
                                ' | '.join(r.get('spirv_failures', [])) or 'ok',
+                               ' | '.join(r.get('msl_failures', [])) or 'ok',
                                ' | '.join(sorted(set(r['errors']))), j['name']]) + '\n')
     counts = collections.Counter((jobs[i]['kind'], results[i]['status']) for i in keep)
     statuses = sorted({s for _, s in counts})
@@ -306,6 +347,10 @@ def write_reports(out, jobs, keep, results, compile_seconds, total_seconds):
     for i in keep:
         for failure in results[i].get('spirv_failures', []):
             val[normalize(failure.split(': ', 1)[1])].append(i)
+    msl_groups = collections.defaultdict(list)
+    for i in keep:
+        for failure in results[i].get('msl_failures', []):
+            msl_groups[normalize(failure.split(': ', 1)[1])].append(i)
     logged = collections.defaultdict(list)
     for i in keep:
         if results[i]['status'] == 'PASS':
@@ -338,6 +383,11 @@ def write_reports(out, jobs, keep, results, compile_seconds, total_seconds):
     for key, indices in sorted(val.items(), key=lambda kv: -len(kv[1])):
         lines.append(f'- x{len(indices)}: `{key}` e.g. ' + ', '.join(
             f'{jobs[i]["hash"]} {jobs[i]["kind"]}' for i in indices[:6]))
+    lines += ['', '## SPIR-V -> MSL failures (MoltenVK 1.4.2\'s SPIRV-Cross and options; '
+              'MoltenVK stops at pipeline creation on these)', '']
+    for key, indices in sorted(msl_groups.items(), key=lambda kv: -len(kv[1])):
+        lines.append(f'- x{len(indices)}: `{key}` e.g. ' + ', '.join(
+            f'{jobs[i]["hash"]} {jobs[i]["kind"]}' for i in indices[:8]))
     lines += ['', '## Errors and warnings logged by jobs that compiled', '']
     for key, indices in sorted(logged.items(), key=lambda kv: -len(kv[1])):
         lines.append(f'- x{len(indices)}: `{key}` e.g. ' + ', '.join(

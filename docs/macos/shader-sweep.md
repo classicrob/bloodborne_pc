@@ -6,6 +6,7 @@ geometry emulation, float controls, push user data) without reaching the draw in
 
 ```
 ninja -C out/gpu shader-sweep
+tools/macos/shader_sweep/build_msl.sh      # once: the MSL stage (fetches SPIRV-Cross)
 tools/macos/heavy.sh --pool build "shader sweep" -- \
     python3 -I tools/macos/shader_sweep/sweep.py --game "$BB_GAME_DIR" --out out/shader_sweep
 ```
@@ -29,12 +30,19 @@ Options: `--gpu-build DIR` (default `out/gpu`), `--only HASH,...`. The game data
 3. `sweep.py` runs the driver in at most two processes; a job that stops the process
    (assertion, exit 23) or crashes is recorded and the driver restarts after it. Every SPIR-V
    module (`BB_DUMP_SHADERS` output) goes through `spirv-val --target-env vulkan1.3`.
+4. The MSL stage (`msl.cpp`, `out/tools/shader-msl`) converts every module to MSL with the
+   SPIRV-Cross revision MoltenVK 1.4.2 vendors (6c09849f) and the options MoltenVK sets on an
+   Apple GPU under macOS 26+ (MSL 4.0, padded tier-2 argument buffers with descriptor base types,
+   the AGX cube-gradient fixup, 32-wide subgroups, the LS/HS/DS tessellation setups). A failure
+   there is what MoltenVK reports at pipeline creation. Compiling the MSL with the Metal compiler
+   is not done (the Metal Toolchain component is not installed).
 
 ## Output (`out/shader_sweep`)
 - `results.tsv`: hash, stage, PASS / LOUD (the stop message) / CRASH / HANG / SETUP (the sweep
-  could not build the job), spirv-val result, errors and warnings logged by the job, file name.
-- `report.md`: counts per stage, everything not PASS grouped by message, spirv-val failures,
-  logged errors.
+  could not build the job), spirv-val result, MSL conversion result, errors and warnings logged
+  by the job, file name.
+- `report.md`: counts per stage, everything not PASS grouped by message, spirv-val and MSL
+  failures, logged errors.
 - `gs_census.md`: the static GS census: each ES/GS/copy configuration (input topology from the
   GS's ESGS ring loads, output primitive, max vertices, per-stream vertex sizes, instancing,
   stream-out, ESGS size and ES hashes) with the production verdict.
