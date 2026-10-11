@@ -499,3 +499,26 @@ uint16_t gcn_f32_to_f16_rtz(uint32_t bits, int flush_out) {
     if (flush_out && m != 0) return sign;
     return (uint16_t)(sign | m);
 }
+
+uint32_t gcn_f32_to_ufloat(uint32_t bits, uint32_t mant_bits, unsigned readings) {
+    const uint32_t sign = bits >> 31, e8 = (bits >> 23) & 0xFFu, frac = bits & 0x7FFFFFu;
+    const uint32_t inf = 0x1Fu << mant_bits, max_finite = inf - 1;
+    if (e8 == 0xFF && frac) return (sign && (readings & GCN_UF_NEGNAN0)) ? 0 : GCN_UF_ANY_NAN;
+    if (sign) return 0;          /* -0, negative finite, -Inf: the unsigned clamp */
+    if (e8 == 0xFF) return inf;  /* +Inf */
+    if (e8 == 0) return 0;       /* +0 and f32 denormals (far below 2^-24) */
+    const int32_t e = (int32_t)e8 - 127;
+    if (e < -14 && (readings & GCN_UF_FLUSH)) return 0;
+    const uint64_t sig = (1ull << 23) | frac; /* 1.frac in 24 bits */
+    /* Normal: keep mant_bits below the hidden bit. Denormal: scale to units of 2^(-14-mant_bits). */
+    uint32_t shift = (23 - mant_bits) + (e < -14 ? (uint32_t)(-14 - e) : 0u);
+    if (shift > 40) shift = 40;
+    uint64_t q = sig >> shift;
+    const uint64_t rem = sig & ((1ull << shift) - 1), half = 1ull << (shift - 1);
+    if (!(readings & GCN_UF_RTZ) && (rem > half || (rem == half && (q & 1)))) ++q;
+    /* Normal: biased exponent plus the rounded mantissa (a carry moves into the exponent). Denormal:
+     * q itself (rounding up to 2^mant_bits is the smallest normal, the same encoding). */
+    const uint64_t enc = e < -14 ? q : ((uint64_t)(e + 15) << mant_bits) + (q - (1ull << mant_bits));
+    if (e > 15 || enc > max_finite) return (readings & GCN_UF_INF) ? inf : max_finite;
+    return (uint32_t)enc;
+}

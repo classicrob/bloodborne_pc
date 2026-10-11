@@ -153,6 +153,7 @@ struct Template {
     u32 smemfb = 0;                  // SmemFallback: 0 in range, 1 mask also stored, 2 mask also a branch, 3 OOB too, 5 OOB through bitwise ops,
                                      // 4 in range with the mask carried around a uniform loop (phi cycle)
     bool fill = false;               // the SDK fill kernel (FillKernel): 12 user SGPRs + TGID_X, EvaluateFill
+    u32 ufloat = 0;                  // unsigned small floats (EvaluateUfloat): 1 store, 2 load, 3 store then reload
     u32 Threads() const { return wg[0] * wg[1] * wg[2]; }
     std::vector<u32> code;
     u64 hash = 0;
@@ -1007,6 +1008,12 @@ void Assemble(Template& t) {
             c.Mtbuf(t.opcode, t.op.inst_dfmt, t.op.inst_nfmt, f);
         } else {
             c.Mubuf(t.opcode, f);
+        }
+        if (t.ufloat == 3) { // reload the stored element: the quantization must survive
+            c.SWaitcntAll();
+            Code::BufFields r = f;
+            r.vdata = 10;
+            c.Mubuf(BUFFER_LOAD_FORMAT_XYZ, r);
         }
         c.SWaitcntAll();
         if (t.op.kind == GCN_ATOMIC && t.glc) c.VMov(10, Vgpr(5));
@@ -2864,6 +2871,73 @@ void AddFillCases() {
                           " records, 2 groups";
             }
         }
+    }
+}
+
+// 10_11_11 / 11_11_10 FLOAT (orchestrator P0, Sol-2's fix): typed stores of f32 values across the
+// unsigned 11/10-bit float range (exact, ties-even at mantissa carry, the normal/denormal boundary
+// and the top of the range, overflow, denormal results, negatives, -0, +-Inf, +-NaN, f32
+// denormals), typed loads of every special code, and a store reloaded in the same shader. One lane
+// per value, element = lane; one lane past num_records (dropped, reads 0).
+void AddUfloatCases() {
+    using namespace GcnAsm;
+    const TArgs ix{.idxen = true, .offen = false};
+    auto make = [&](const char* name, gcn_kind kind, u32 opcode, u32 mode) {
+        Template t = Base(name, kind, opcode, ix);
+        t.name += " [ufloat]";
+        t.op.typed = 1;
+        t.op.ncomp = 3;
+        t.ufloat = mode;
+        return AddTemplate(t);
+    };
+    const u32 store = make("buffer_store_format_xyz", GCN_STORE, BUFFER_STORE_FORMAT_XYZ, 1);
+    const u32 load = make("buffer_load_format_xyz", GCN_LOAD, BUFFER_LOAD_FORMAT_XYZ, 2);
+    const u32 reload = make("buffer_store_format_xyz, buffer_load_format_xyz", GCN_STORE, BUFFER_STORE_FORMAT_XYZ, 3);
+    auto f = [](float x) { return FloatBits(x); };
+    const std::vector<u32> values = {
+        0x00000000u, f(1.0f), f(0.5f), f(2.0f), f(0.25f), f(3.0f), f(1.5f), f(1234.0f),
+        f(65024.0f), f(64512.0f),                                // 11-bit / 10-bit largest finite
+        f(65025.0f), f(65280.0f), f(65535.0f), f(65536.0f), f(1e10f), 0x7F7FFFFFu, // overflow; 65280 ties at the top
+        f(1.0f + 1.0f / 128), f(1.0f + 3.0f / 128), f(1.0f + 1.0f / 64), f(1.0f + 3.0f / 64), // ties (11 / 10 bit)
+        f(2.0f - 1.0f / 128), f(2.0f - 1.0f / 256), f(1.0f + 5.0f / 256),                     // carry into the exponent
+        f(0x1p-14f), f(0x1p-15f), f(0x1p-20f), f(0x1p-21f), f(0x3p-21f), f(0x1p-19f * 1.5f),  // boundary and denormals
+        f(0x1p-14f * (1.0f - 0x1p-7f)), f(0x1p-25f), f(0x1.234p-17f),                         // denormal rounding
+        f(-1.0f), 0x80000000u, f(-65536.0f), f(-1e-30f),           // negatives, -0
+        0x7F800000u, 0xFF800000u,                                  // +-Inf
+        0x7FC00000u, 0x7F800001u, 0xFFC00000u, 0xFF800001u,        // +-NaN (quiet, signalling)
+        0x00000001u, 0x007FFFFFu,                                  // f32 denormals
+    };
+    const u32 n = u32(values.size());
+    for (u32 dfmt : {u32(GCN_DFMT_10_11_11), u32(GCN_DFMT_11_11_10)}) {
+        const std::string fmt = dfmt == GCN_DFMT_10_11_11 ? "10_11_11" : "11_11_10";
+        for (u32 tmpl : {store, reload}) {
+            for (u32 rot = 0; rot < 2; ++rot) { // all channels equal, then each channel a different value
+                Job& j = NewJob("ufloat", tmpl, StructV(4, n, dfmt, GCN_NFMT_FLOAT), 0);
+                for (u32 k = 0; k < n; ++k) {
+                    SetLane(j, k, k, 0, {values[k], values[(k + rot * 7) % n], values[(k + rot * 13) % n], 0x3F800000u});
+                }
+                SetLane(j, n, n, 0, {values[1], values[1], values[1], 0}); // past num_records: dropped
+                j.label = g_templates[tmpl].name + " | " + fmt + " float | " + std::to_string(n) +
+                          " values" + (rot ? ", channels differ" : ", channels equal");
+            }
+        }
+        // Loads: every special code in each field (x/y 11 or 10 bits by format).
+        const u32 c11[] = {0x000u, 0x001u, 0x03Fu, 0x040u, 0x3C0u, 0x3C1u, 0x7BFu, 0x7C0u, 0x7C1u, 0x7FFu, 0x400u, 0x2AAu};
+        const u32 c10[] = {0x000u, 0x001u, 0x01Fu, 0x020u, 0x1E0u, 0x1E1u, 0x3DFu, 0x3E0u, 0x3E1u, 0x3FFu, 0x200u, 0x155u};
+        u32 shift[4], width[4], elem = 0, k = 0;
+        gcn_format_bits(dfmt, &elem, &k, shift, width);
+        Job& j = NewJob("ufloat", load, StructV(4, 12, dfmt, GCN_NFMT_FLOAT), 0);
+        for (u32 e = 0; e < 12; ++e) {
+            u32 word = 0;
+            for (u32 c = 0; c < 3; ++c) {
+                const u32 code = width[c] == 11 ? c11[(e + c * 5) % 12] : c10[(e + c * 5) % 12];
+                word |= code << shift[c];
+            }
+            j.init_words.push_back(word);
+            SetLane(j, e, e, 0);
+        }
+        SetLane(j, 12, 12, 0);
+        j.label = g_templates[load].name + " | " + fmt + " float | 12 elements of special codes";
     }
 }
 
@@ -4990,6 +5064,102 @@ JobResult EvaluateFill(Gpu& g, const Job& j) {
     return {Verdict::Ambiguous, "  matched reading: " + DescribeReadings(matched) + "\n"};
 }
 
+// Unsigned small-float jobs: every component of every lane's element against gcn_f32_to_ufloat
+// (stores) and the exact widening (loads, reloads), under one combination of the GCN_UF_*
+// readings and the packed layout for the whole job; the rest of the arena unchanged.
+JobResult EvaluateUfloat(Gpu& g, const Job& j, const u32* res) {
+    const Template& t = g_templates[j.tmpl];
+    const gcn_vsharp v = ActualV(j);
+    const u64 lo = SlotBase(j.slot);
+    const u8* got = g.guest.data + (lo - GuestVa);
+    const u8* before = g.pristine.data() + (lo - GuestVa);
+    u32 elem = 0, k = 0, shift[4], width[4];
+    gcn_format_bits(v.dfmt, &elem, &k, shift, width);
+    const bool stores = t.ufloat != 2, loads = t.ufloat != 1;
+    auto nan_code = [](u32 code, u32 w) { const u32 m = w - 5; return (code >> m) == 0x1Fu && (code & ((1u << m) - 1)); };
+    auto nan32 = [](u32 x) { return (x & 0x7F800000u) == 0x7F800000u && (x & 0x7FFFFFu); };
+    std::string detail;
+    // Memory outside the stored elements (all of it for loads) is unchanged.
+    std::vector<bool> written(Arena, false);
+    if (stores) {
+        for (u32 l = 0; l < 64; ++l) {
+            if (j.lanes[l].active && j.lanes[l].vindex < v.num_records) {
+                for (u32 b = 0; b < 4; ++b) written[v.base - lo + j.lanes[l].vindex * 4 + b] = true;
+            }
+        }
+    }
+    u32 stray = 0;
+    for (u32 b = 0; b < Arena; ++b) {
+        if (!written[b] && got[b] != before[b] && stray++ < 8) {
+            char line[120];
+            std::snprintf(line, sizeof(line), "    arena +%#06x changed: %#04x -> %#04x (not a stored element)\n", b, before[b], got[b]);
+            detail += line;
+        }
+    }
+    std::vector<u32> matched;
+    std::string first_why;
+    for (u32 combo = 0; combo < GCN_UF_READINGS * 2; ++combo) {
+        const unsigned uf = combo & (GCN_UF_READINGS - 1);
+        const bool mirror = combo & GCN_UF_READINGS;
+        u32 bad = 0;
+        std::string why;
+        auto note = [&](const char* fmt, u32 l, u32 c, u32 a, u32 b2, u32 in) {
+            if (bad++ < 10) {
+                char line[200];
+                std::snprintf(line, sizeof(line), fmt, l, "xyz"[c], a, b2, in);
+                why += line;
+            }
+        };
+        for (u32 l = 0; l < 64; ++l) {
+            const Lane& L = j.lanes[l];
+            if (!L.active) continue;
+            const bool in = L.vindex < v.num_records;
+            u32 word = 0;
+            if (in) std::memcpy(&word, got + (v.base - lo) + L.vindex * 4, 4);
+            for (u32 c = 0; c < 3; ++c) {
+                const u32 sh = mirror ? 32 - shift[c] - width[c] : shift[c];
+                const u32 code = (word >> sh) & ((1u << width[c]) - 1);
+                if (stores && in) {
+                    const u32 want = gcn_f32_to_ufloat(L.data[c], width[c] - 5, uf);
+                    if (want == GCN_UF_ANY_NAN ? !nan_code(code, width[c]) : code != want) {
+                        note("    lane %u %c: stored %#05x, want %#05x (f32 %#010x)\n", l, c, code, want == GCN_UF_ANY_NAN ? 0x7FFu : want, L.data[c]);
+                    }
+                }
+                if (loads) {
+                    int unk = 0;
+                    const u32 want = in ? gcn_convert_component(code, width[c], GCN_NFMT_FLOAT, &unk) : 0u;
+                    const u32 reg = res[l * 4 + c];
+                    if (in && nan_code(code, width[c]) ? !nan32(reg) : reg != want) {
+                        note("    lane %u %c: loaded %#010x, want %#010x (code %#05x)\n", l, c, reg, want, code);
+                    }
+                }
+            }
+            for (u32 r = loads ? 3 : 0; r < 4; ++r) {
+                if (res[l * 4 + r] != VgprMarker + r) note("    lane %u %c: marker VGPR clobbered (%#010x, want %#010x, %u)\n", l, r < 3 ? r : 2, res[l * 4 + r], VgprMarker + r, 0);
+            }
+        }
+        if (!bad) {
+            matched.push_back(combo);
+        } else if (combo == 0) {
+            first_why = "  literal reading (RTNE, overflow to max finite, denormals kept, NaN to NaN, X in the low bits): " +
+                        std::to_string(bad) + " mismatches\n" + why;
+        }
+    }
+    if (!detail.empty()) return {Verdict::Fail, detail};
+    if (matched.empty()) return {Verdict::Fail, "  no combination of readings matches\n" + first_why};
+    if (matched.size() == GCN_UF_READINGS * 2) return {Verdict::Strict, ""};
+    const u32 m = matched.front();
+    std::string name;
+    if (m & GCN_UF_RTZ) name += "+rtz";
+    if (m & GCN_UF_INF) name += "+overflow-inf";
+    if (m & GCN_UF_FLUSH) name += "+flush";
+    if (m & GCN_UF_NEGNAN0) name += "+negnan-zero";
+    if (m & GCN_UF_READINGS) name += "+pack-mirror";
+    return {Verdict::Ambiguous, "  matched reading: " + (name.empty() ? std::string("literal") : name.substr(1)) + " (" +
+                                    std::to_string(matched.size()) + " of " + std::to_string(GCN_UF_READINGS * 2) +
+                                    " combinations match)\n"};
+}
+
 std::map<u32, JobResult> RunBatch(Gpu& g, const std::vector<u32>& jobs) {
     std::map<u32, JobResult> out;
     FillPristine(g, jobs);
@@ -5125,6 +5295,10 @@ std::map<u32, JobResult> RunBatch(Gpu& g, const std::vector<u32>& jobs) {
             continue;
         }
         const u32* res = reinterpret_cast<const u32*>(g.results.data + u64(j.slot) * ResultSlot);
+        if (g_templates[j.tmpl].ufloat) {
+            out[ji] = EvaluateUfloat(g, j, res);
+            continue;
+        }
         if (g_templates[j.tmpl].lds_contend) {
             out[ji] = EvaluateLdsContend(j, res);
             continue;
@@ -5776,6 +5950,7 @@ int main(int argc, char** argv) {
     AddPushUdCases();
     AddTinyCases();
     AddFillCases();
+    AddUfloatCases();
     AddPushDescriptorCases();
     if (!opt.only.empty()) {
         std::vector<Job> kept;

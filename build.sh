@@ -248,6 +248,7 @@ if [[ ${1:-} == --test || ${1:-} == --test-dry ]]; then
         BB_DEPS_PREFIX="$deps" t sh tests/test_geometry_runtime_info.sh
         BB_DEPS_PREFIX="$deps" BB_GPU_BUILD="$PWD/out/gpu" t bash tests/macos_fp16/run.sh
         BB_DEPS_PREFIX="$deps" BB_GPU_BUILD="$PWD/out/gpu" t sh tests/macos_pkrtz/run.sh
+        BB_DEPS_PREFIX="$deps" BB_GPU_BUILD="$PWD/out/gpu" t sh tests/macos_ufloat_fold/run.sh
         BB_DEPS_PREFIX="$deps" BB_GPU_BUILD="$PWD/out/gpu" BB_GPU_THIRD_PARTY="$PWD/gpu/third_party" \
             t bash tests/macos_gs/run.sh
         # GPU library unit tests: Apple paths (PM4 parsing, feature checks, views, scheduler,
