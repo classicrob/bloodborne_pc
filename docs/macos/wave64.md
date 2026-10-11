@@ -29,7 +29,8 @@ reading) or written as 0 (reading SMEM_ZERO, which `tests/gcn_buffer_conformance
 too). When **every** workgroup-divergent cross-lane value of a shader is used only as that old
 destination value (through phis and 32/64-bit packing), the pass takes the SMEM_ZERO reading for
 **all** scalar buffer loads of that shader, then removes the dead masks. A warning names each
-such shader: `reads out-of-range scalar buffer dwords as 0 (SMEM_ZERO reading)`. This is a choice
+such shader (once per compiled module or permutation): `reads out-of-range scalar buffer dwords
+as 0 (SMEM_ZERO reading)`. This is a choice
 between two accepted readings of the ISA text, not a statement about physical GCN2 behaviour.
 
 Any other use of a divergent mask (a store, an address, a branch condition, an export) keeps the
