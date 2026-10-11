@@ -4,9 +4,9 @@ Static audit of the 01.09 image, 2026-10-11. PCs are image offsets, added to
 `0x800000000` at runtime. No game was launched for this audit.
 
 The concrete allocator found here is **a free-list arena with 64 KiB bump
-suballocations**, not a byte-wrapping 128 MiB ring. Its normal retirement is
-an EOP value-4 label. Identifying its live bounds with the bad table remains
-necessary; the initializer probe below supplies that evidence.
+suballocations**, not a byte-wrapping frame ring. Its normal retirement is
+an EOP value-4 label. The initializer probe found a live **160 MiB** arena
+containing the address from the earlier bad-table capture.
 
 ## Evidence and ownership boundary
 
@@ -34,7 +34,7 @@ There is a matching 128 MiB guest allocation path:
 | `0x216b258..0x216b274` | Saves a resource allocator A at O+`0x18`; calls `0x26a9b50(A, metadata_allocator, payload_base, size)`. |
 | `0x26a9b7d/0x26a9b88` | Initializer stores the aligned payload bounds at A+`0xb8`/A+`0xc0`. |
 
-The primary renderer's candidate owner can be found through
+The primary renderer's owner can be found through
 `R = *[image+0x55406c8]`, `O = *[R]`, `A = *[O+0x18]`.
 These pointers and bounds must be safely read and validated in the actual
 run; their presence is not proof that every graphics context shares A.
@@ -47,9 +47,23 @@ BB_GUEST_ENTRY_TRACE=0x26a9b50
 
 Leave `BB_GUEST_ENTRY_ARM` unset: delayed movie arming misses initialization.
 The entry is `55 48 89 e5`. Each record supplies RDI=A, RDX=payload base,
-RCX=size. Playtest has this exact configuration for the next stop hunt.
-Do not substitute the earlier run's bad address for the next run's address
-without checking layout stability.
+RCX=size. Playtest ran this on PREVIEW-20 (`505afab`),
+`20261011-193953-1080p-ALLOC-PROBE`. Exactly one initialization hit:
+
+```
+thread = GXRenderThread, caller = image+0x216b279
+A = 0x70282a2060
+payload base = 0x7043400040
+payload size = 0xa000000
+payload end = 0x704d400040
+```
+
+Thus the live setting overrides the 128 MiB image default with 160 MiB.
+HUNT-1's address `0x70437a72a0` lies at +`0x3a7260` within these bounds.
+This is a separate run: the initializer establishes the owner of this
+address range in ALLOC-PROBE, while per-node ownership at the HUNT-1 stop
+still needs its own observation. The earlier 128 MiB boundary and derived
+2.7-frame capacity must not be used as allocator geometry.
 
 ## Allocation does not wrap blindly
 
@@ -148,9 +162,9 @@ this audit has not proved them unreachable for the bad block.
 
 ## Consequence and next discrimination
 
-If the initializer proves that A contains the stopping table, a large
-frame simply wrapping into an unparsed frame is not the mechanism in this
-allocator. The useful timeline is instead **allocate block, publish table
+For the now-identified arena, a large frame simply wrapping into an
+unparsed frame is not the mechanism in this allocator. The useful timeline
+is instead **allocate block, publish table
 pointer, retire block, reclaim/rewrite block, consume pointer**.
 
 The guest's `flip_arg >= F+1-B` test is a separate frame-end gate. Its
