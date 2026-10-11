@@ -179,12 +179,13 @@ void Liverpool::Process(std::stop_token stoken) {
                              "Parse lag, last 600 frames: {} graphics submissions, queued ahead of "
                              "the parser at submit: mean {:.1f}, max {}; GpuIdle held back {} "
                              "times; command snapshots {:.1f} KiB/frame, {:.1f} us/submit mean, "
-                             "{:.1f} us max",
+                             "{:.1f} us max, waited for {} stream writes",
                              parse_lag.samples, parse_lag.queued_sum / samples,
                              parse_lag.queued_max, parse_lag.idle_held_back,
                              parse_lag.snapshot_bytes / 600.0 / 1024.0,
                              parse_lag.snapshot_ns / samples / 1000.0,
-                             parse_lag.snapshot_ns_max / 1000.0);
+                             parse_lag.snapshot_ns_max / 1000.0,
+                             parse_lag.snapshot_writes_waited);
                     parse_lag = {};
                 }
             }
@@ -354,6 +355,14 @@ void RunDmaData(Vulkan::Rasterizer& rasterizer, const u8* data) {
         UNREACHABLE_MSG("WriteData src_sel = {}, dst_sel = {}", u32(dma_data->src_sel),
                         u32(dma_data->dst_sel));
     }
+#ifdef __APPLE__
+    // Registered by the parser (StreamWrites::Add). A copy or fill recorded for the GPU leaves the
+    // range GPU-modified; one done in host memory does not.
+    if (dma_data->dst_sel == DmaDataDst::Memory || dma_data->dst_sel == DmaDataDst::MemoryUsingL2) {
+        StreamWrites::Landed(rasterizer.GetBufferCache().IsRegionGpuModified(
+            dma_data->DstAddress<VAddr>(), dma_data->NumBytes()));
+    }
+#endif
 }
 
 void SignalFlip(Vulkan::Rasterizer& rasterizer, const u8*) {
@@ -372,6 +381,9 @@ void RunWriteData(Vulkan::Rasterizer& rasterizer, const u8* data) {
                      (header->type3.count.Value() - 2) * sizeof(u32), BbWriteLog::WriteData);
     std::memcpy(write_data->Address<u64*>(), write_data->data,
                 (header->type3.count.Value() - 2) * sizeof(u32));
+#ifdef __APPLE__
+    StreamWrites::Landed(false);
+#endif
 }
 
 void RunEventWriteEos(Vulkan::Rasterizer& rasterizer, const u8* data) {
@@ -1245,6 +1257,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     dma_data->dst_sel == DmaDataDst::MemoryUsingL2) {
                     CheckCommandMemoryWrite(dma_data->DstAddress<VAddr>(), dma_data->NumBytes(),
                                             "DMA_DATA");
+#ifdef __APPLE__
+                    StreamWrites::Add(dma_data->DstAddress<VAddr>(), dma_data->NumBytes());
+#endif
                 }
                 if (rasterizer->RunInOrder(&RunDmaData, dma_data, sizeof(PM4DmaData),
                                            BbToggle::PipelinedMemoryWrites) &&
@@ -1266,6 +1281,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                                            BbWriteLog::WriteDataIntent);
                     CheckCommandMemoryWrite(write_data->Address<VAddr>(), (count - 2) * sizeof(u32),
                                             "WRITE_DATA");
+#ifdef __APPLE__
+                    StreamWrites::Add(write_data->Address<VAddr>(), (count - 2) * sizeof(u32));
+#endif
                     if (rasterizer->RunInOrder(&RunWriteData, header, (count + 1) * sizeof(u32),
                                                BbToggle::PipelinedMemoryWrites)) {
                         NotePendingWrite(*write_data, (count - 2) * sizeof(u32));
@@ -1883,6 +1901,7 @@ void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
     parse_lag.snapshot_bytes += snapshot->copied_bytes;
     parse_lag.snapshot_ns += snapshot->copy_ns;
     parse_lag.snapshot_ns_max = std::max(parse_lag.snapshot_ns_max, snapshot->copy_ns);
+    parse_lag.snapshot_writes_waited += snapshot->writes_waited;
     ++parse_lag.samples;
     parse_lag.queued_sum += num_submits;
     parse_lag.queued_max = std::max<u64>(parse_lag.queued_max, num_submits);

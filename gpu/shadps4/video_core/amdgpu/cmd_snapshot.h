@@ -5,9 +5,10 @@
 // Here the GPU command thread parses later, and production runs tore on command memory the guest
 // changed after submitting it ("Unimplemented PM4 type 0", "Wrong PM4 type 1"). The parser
 // therefore reads the copies taken at submit: the top-level DCB and CCB and every indirect buffer
-// they reach. REWIND ("refetch from memory") switches parsing to live guest memory. A
-// WRITE_DATA/DMA_DATA into command memory not yet parsed would be seen by the PS4 command processor
-// but not in a copy, so it is a hard error. See docs/macos/command-snapshots.md.
+// they reach. REWIND ("refetch from memory") switches parsing to live guest memory. Copies wait for
+// WRITE_DATA/DMA_DATA writes parsed before the submit that have not landed yet (StreamWrites); one
+// parsed after the submit into command memory not yet parsed would be seen by the PS4 command
+// processor but not in a copy, so it is a hard error. See docs/macos/command-snapshots.md.
 #pragma once
 
 #include <memory>
@@ -55,12 +56,30 @@ public:
     u64 submit_number{};
     u64 copied_bytes{};
     u64 copy_ns{};
+    u32 writes_waited{}; ///< StreamWrites this copy waited for (included in copy_ns)
     bool done{}; ///< GPU command thread: the submission is parsed
 
 private:
     std::vector<u32> words;
     std::vector<Region> regions;
     bool has_ccb{};
+};
+
+/// WRITE_DATA / DMA_DATA memory writes the GPU command thread has parsed but that have not
+/// reached guest memory yet: they run later, in order, on the draw recording thread. The PS4
+/// command processor executes them before it fetches anything submitted after them, and games
+/// patch command chunks that way. A copy taken at submit (CmdSnapshot::Take) therefore waits for
+/// the ones overlapping what it copies. See docs/macos/command-snapshots.md.
+class StreamWrites {
+public:
+    /// GPU command thread, before handing the write on. Writes land in the order added.
+    static void Add(VAddr address, u64 size);
+    /// Whoever executed the oldest added write, once it ran. `through_gpu`: it was recorded as a
+    /// GPU copy or fill, which reaches guest memory only when the GPU runs it.
+    static void Landed(bool through_gpu);
+    /// Waits until no added write overlaps [address, address + size); returns how many it waited
+    /// for. A write it waited for that went through the GPU is a hard error (not implemented).
+    static u32 WaitLanded(VAddr address, u64 size);
 };
 
 } // namespace AmdGpu
