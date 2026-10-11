@@ -364,6 +364,25 @@ constexpr NumberConversion MapNumberConversion(const NumberFormat num_fmt,
     }
 }
 
+// Whether MapNumberConversion has a conversion for this pair (SNORM_NZ is implemented for 8- and
+// 16-bit components only).
+constexpr bool HasNumberConversion(const NumberFormat num_fmt, const DataFormat data_fmt) {
+    if (num_fmt != NumberFormat::SnormNz) {
+        return true;
+    }
+    switch (data_fmt) {
+    case DataFormat::Format8:
+    case DataFormat::Format8_8:
+    case DataFormat::Format8_8_8_8:
+    case DataFormat::Format16:
+    case DataFormat::Format16_16:
+    case DataFormat::Format16_16_16_16:
+        return true;
+    default:
+        return false;
+    }
+}
+
 constexpr NumberClass GetNumberClass(const NumberFormat nfmt) {
     switch (nfmt) {
     case NumberFormat::Sint:

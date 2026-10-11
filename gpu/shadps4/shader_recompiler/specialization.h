@@ -4,6 +4,8 @@
 #pragma once
 
 #include <bitset>
+#include <cstring>
+#include <string>
 
 #include "common/types.h"
 #include "shader_recompiler/backend/bindings.h"
@@ -98,6 +100,26 @@ struct StageSpecialization {
     bool emulate_robust_buffer_access{};
     bool emulate_vertex_fetch{};
 
+    // A descriptor whose number format has no conversion on this backend stops here, naming the
+    // shader, the resource (its index in Info::buffers or Info::images, not a Vulkan binding) and
+    // the descriptor's dwords (a real asset format and a stale or
+    // corrupt descriptor look different there), instead of in MapNumberConversion.
+    void CheckNumberConversion(const char* kind, u32 index, const void* sharp, size_t size,
+                               AmdGpu::NumberFormat num_fmt, AmdGpu::DataFormat data_fmt) const {
+        if (AmdGpu::HasNumberConversion(num_fmt, data_fmt)) {
+            return;
+        }
+        std::string dwords;
+        for (size_t i = 0; i < size / sizeof(u32); ++i) {
+            u32 dword;
+            std::memcpy(&dword, static_cast<const u8*>(sharp) + i * sizeof(u32), sizeof(dword));
+            dwords += fmt::format("{}{:08x}", i ? " " : "", dword);
+        }
+        UNREACHABLE_MSG("{} shader {:#x}: {} {} (Info index) has data format {} with number format {}, "
+                        "which this backend cannot convert; descriptor {}",
+                        info->hw_stage, info->pgm_hash, kind, index, u32(data_fmt), u32(num_fmt), dwords);
+    }
+
     StageSpecialization() = default;
     StageSpecialization(const Info& info_, RuntimeInfo runtime_info_, const Profile& profile_,
                         Backend::Bindings start_)
@@ -136,6 +158,9 @@ struct StageSpecialization {
                          spec.is_unbound = profile_.emulate_robust_buffer_access && !desc.IsSpecial() &&
                              sharp.GetDataFmt() == AmdGpu::DataFormat::FormatInvalid;
                          if (spec.is_formatted) {
+                             CheckNumberConversion("buffer", u32(buffers.size() - 1), &sharp, sizeof(sharp),
+                                                   AmdGpu::NumberFormat(sharp.num_format),
+                                                   AmdGpu::DataFormat(sharp.data_format));
                              spec.data_format = static_cast<u32>(sharp.GetDataFmt());
                              spec.num_format = static_cast<u32>(sharp.GetNumberFmt());
                              spec.dst_select = sharp.DstSelect();
@@ -157,6 +182,9 @@ struct StageSpecialization {
                          } else {
                              spec.is_srgb = sharp.GetNumberFmt() == AmdGpu::NumberFormat::Srgb;
                          }
+                         CheckNumberConversion("image", u32(images.size() - 1), &sharp, sizeof(sharp),
+                                               AmdGpu::NumberFormat(sharp.num_format),
+                                               AmdGpu::DataFormat(sharp.data_format));
                          spec.num_conversion = sharp.GetNumberConversion();
                      });
         // bbport: every image's descriptor count as the emitter declares it (NumBindings),
