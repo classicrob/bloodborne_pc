@@ -199,9 +199,27 @@ def game_pid(run):
     return pid
 
 
-def log_lines(run):
+# Bulk diagnostic output (entry/low-map traces, fault-dump memory windows) can reach gigabytes; the
+# route only needs the other lines, read incrementally. report() reads the whole file.
+TRACE_NOISE = ('GUEST-ENTRY', 'LOW-MEM', 'BB_FAULT_DUMP memory', '  0x')
+_LOG_CACHE = {}
+
+
+def log_lines(run, full=False):
     path = run / 'game.log'
-    return path.read_text(errors='replace').splitlines() if path.exists() else []
+    if full:
+        return path.read_text(errors='replace').splitlines() if path.exists() else []
+    state = _LOG_CACHE.setdefault(str(run), {'offset': 0, 'lines': [], 'partial': b''})
+    if path.exists():
+        with path.open('rb') as f:
+            f.seek(state['offset'])
+            data = f.read()
+        state['offset'] += len(data)
+        parts = (state['partial'] + data).split(b'\n')
+        state['partial'] = parts.pop()
+        state['lines'].extend(line for line in (part.decode(errors='replace') for part in parts)
+                              if not line.startswith(TRACE_NOISE))
+    return state['lines']
 
 
 def frame_stats(lines):
@@ -508,12 +526,13 @@ REPORT = {
     'builder_rejected': r'rejected a \d+-dword command buffer request',
     'gpu_copy_gap': r'runs on the GPU',
     'cmd_overlap': r'CMD-OVERLAP',
+    'audio_health_failure': r'AUDIO HEALTH FAILURE',  # software input health, not audibility
 }
 
 
 def report(run):
     """Counts of the known diagnostic lines, the periodic parse-lag summaries and the stop reason."""
-    lines = log_lines(run)
+    lines = log_lines(run, full=True)
     counts = {name: [i + 1 for i, l in enumerate(lines) if re.search(rx, l)] for name, rx in REPORT.items()}
     stop_at = next((i for i, l in enumerate(lines) if l.startswith('STOP:')), None)
     print(json.dumps({
