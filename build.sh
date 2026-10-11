@@ -174,6 +174,8 @@ if [[ ${1:-} == --test ]]; then
         BB_DEPS_PREFIX="$deps" sh tests/test_geometry_runtime_info.sh
         BB_DEPS_PREFIX="$deps" BB_GPU_BUILD="$PWD/out/gpu" bash tests/macos_fp16/run.sh
         BB_DEPS_PREFIX="$deps" BB_GPU_BUILD="$PWD/out/gpu" sh tests/macos_pkrtz/run.sh
+        BB_DEPS_PREFIX="$deps" BB_GPU_BUILD="$PWD/out/gpu" BB_GPU_THIRD_PARTY="$PWD/gpu/third_party" \
+            bash tests/macos_gs/run.sh
         # BB_PERF's GPU numbers rely on per-submission timestamps; qualify them on this device.
         BB_DEPS_PREFIX="$deps" bash tests/macos_perf/timestamps.sh
         out/gpu/macos-perf-test
