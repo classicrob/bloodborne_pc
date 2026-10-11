@@ -13,6 +13,36 @@ initialization from a parent, context initialization, out-of-space callback,
 and context destruction. No offset is hard-coded into the implementation.
 Installation prints each offset and absolute site/trampoline address.
 
+## Arm at movie start
+
+Add `BB_GUEST_ENTRY_ARM=avplayer-start` to the site list to suppress entry
+records until the first resolved `sceAvPlayerStart` call. The loader wraps
+only that function import (one handle argument and a signed 32-bit return),
+arms immediately before calling the original resolved target, and forwards its
+argument, result and errno. Subsequent Start calls do not re-arm or reset the
+sequence. A missing Start import, an unsupported mode, or an arm setting without
+a site list fails startup. Data imports are never wrapped.
+
+```sh
+BB_GUEST_ENTRY_ARM=avplayer-start \
+BB_GUEST_ENTRY_TRACE=0x26d3b80,0x1075480,0x10753c0,0x1075840,0x108a870 \
+BB_WRITE_LOG=2 bash run.sh
+```
+
+This is delayed **logging**, not trap-free delayed patching. All INT3 sites and
+trampolines are installed while execution is quiescent, as before. Until armed,
+the handler only validates the breakpoint, reads a lock-free flag and redirects
+to the existing trampoline. It performs no object reads, name queries, sequence
+updates or per-hit output. Signal delivery still costs time, so these runs remain
+unsuitable for performance measurement. There is no live code mutation at Start.
+A `GUEST-ENTRY armed before sceAvPlayerStart` marker identifies the transition;
+concurrent entries can reach stderr before that marker's write completes.
+The trigger is the attempted call, even if Start later reports failure. It does
+not capture allocations before Start, such as AddSource or Init callbacks.
+When HLE import tracing is also enabled, the original resolved target remains
+its HLE wrapper. Its saved caller can therefore identify this diagnostic wrapper
+rather than the guest; the entry records retain their actual guest entry callers.
+
 Each `GUEST-ENTRY` hit prints a process-local atomic sequence, Mach absolute-time
 ticks, the guest thread handle (from the established GS TCB slot), saved caller
 at RSP, all GPRs/flags and eight qwords at each of RDI, RSI and RDX. For the copy,
@@ -92,3 +122,9 @@ bytes are included in the fixture.
 The identity checks compare pthread pointers and names against the pthread
 API outside the handler, including renames and an empty name, and check errno
 preservation and balanced Mach send-right references.
+
+The same fixture runs in immediate and delayed modes. Delayed mode checks 32
+silent pre-arm calls with full register/flags/vector/stack preservation, no
+sequence advancement, arming before the fake Start target, handle/return/errno
+forwarding, and repeated Start without duplicate arming. Both modes retain the
+34 logged hits and concurrent/identity/provenance controls above.

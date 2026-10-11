@@ -5,13 +5,23 @@ mkdir -p out/mac-entry-trace
 clang -arch x86_64 -O2 -g -std=c11 -Wall -Wextra -Werror \
     tests/test_guest_entry_mac.c tests/test_guest_entry_mac.S -o out/mac-entry-trace/test
 python3 packaging/macos/sign.py out/mac-entry-trace/test
-arch -x86_64 out/mac-entry-trace/test >out/mac-entry-trace/stdout.log 2>out/mac-entry-trace/stderr.log
-python3 - <<'PY'
+for mode in immediate delayed; do
+    if [ "$mode" = delayed ]; then
+        arch -x86_64 out/mac-entry-trace/test delayed >out/mac-entry-trace/stdout.log 2>out/mac-entry-trace/stderr.log
+    else
+        arch -x86_64 out/mac-entry-trace/test >out/mac-entry-trace/stdout.log 2>out/mac-entry-trace/stderr.log
+    fi
+python3 - "$mode" <<'PY'
 from pathlib import Path
-import re
+import re, sys
 p=Path('out/mac-entry-trace')
 result=(p/'stdout.log').read_text()
-lines=[s for s in (p/'stderr.log').read_text().splitlines() if s.startswith('GUEST-ENTRY seq=')]
+all_lines=(p/'stderr.log').read_text().splitlines()
+arms=[i for i,s in enumerate(all_lines) if s=='GUEST-ENTRY armed before sceAvPlayerStart']
+assert len(arms)==(1 if sys.argv[1]=='delayed' else 0)
+if arms:
+    assert not any(s.startswith('GUEST-ENTRY seq=') for s in all_lines[:arms[0]])
+lines=[s for s in all_lines if s.startswith('GUEST-ENTRY seq=')]
 assert len(lines)==34, len(lines)
 assert {int(re.search(r'seq=0x([0-9a-f]+)',s)[1],16) for s in lines}==set(range(1,35))
 assert {int(re.search(r'thread=0x([0-9a-f]+)',s)[1],16) for s in lines}=={0,42,100,101,102,103}
@@ -26,3 +36,6 @@ for thread, host, name in identities:
     assert len(matching)==(1 if int(thread)<100 else 4), (thread,host,name,matching)
 print(result,end='')
 PY
+    cp out/mac-entry-trace/stdout.log "out/mac-entry-trace/$mode-stdout.log"
+    cp out/mac-entry-trace/stderr.log "out/mac-entry-trace/$mode-stderr.log"
+done
