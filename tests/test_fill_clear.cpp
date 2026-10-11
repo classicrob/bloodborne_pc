@@ -13,7 +13,8 @@ using namespace Vulkan::FillClear;
 namespace {
 // The census shape: 2560x1440 RGBA16F, 3768320 records, 29440 groups of 64 threads.
 Dispatch GoodDispatch() {
-    return {.threads_x = 64, .threads_x_partial = 0, .threads_y = 1, .threads_z = 1,
+    return {.threads_x = 64, .threads_x_partial = 0, .threads_y = 1, .threads_y_partial = 0,
+            .threads_z = 1, .threads_z_partial = 0,
             .dim_x = 29440, .dim_y = 1, .dim_z = 1, .start_x = 0, .start_y = 0, .start_z = 0,
             .user_sgprs = 12, .tgid_enable = 1};
 }
@@ -66,7 +67,8 @@ int main() {
         d.*field += 1;
         assert(!CoversAllElements(d, GoodTarget(), 8));
     }
-    for (const auto field : {&Dispatch::threads_x_partial, &Dispatch::start_x, &Dispatch::start_y,
+    for (const auto field : {&Dispatch::threads_x_partial, &Dispatch::threads_y_partial,
+                             &Dispatch::threads_z_partial, &Dispatch::start_x, &Dispatch::start_y,
                              &Dispatch::start_z}) {
         auto d = GoodDispatch();
         d.*field = 1;
@@ -77,8 +79,14 @@ int main() {
         auto d = GoodDispatch();
         d.dim_x = (1u << 25) + 1;
         assert(!CoversAllElements(d, GoodTarget(8, 1000), 8));
+        // Byte size: a buffer binding takes 32 bits. 2^29 - 1 records of 8 bytes fit, 2^29 do not
+        // (4 GiB), nor does UINT32_MAX records of 8 bytes (32 GiB).
         d.dim_x = 1u << 25;
-        assert(CoversAllElements(d, GoodTarget(8, std::numeric_limits<uint32_t>::max()), 8));
+        assert(CoversAllElements(d, GoodTarget(8, (1u << 29) - 1), 8));
+        assert(!CoversAllElements(d, GoodTarget(8, 1u << 29), 8));
+        assert(!CoversAllElements(d, GoodTarget(8, std::numeric_limits<uint32_t>::max()), 8));
+        assert(CoversAllElements(d, GoodTarget(4, (1u << 30) - 1), 4));
+        assert(!CoversAllElements(d, GoodTarget(4, 1u << 30), 4));
     }
     // The V#: stride is the texel, no swizzle or add_tid, identity dst_sel, records.
     assert(!CoversAllElements(GoodDispatch(), GoodTarget(4), 8));

@@ -42,7 +42,8 @@ inline uint32_t TexelBytes(Format format) {
 
 /// The dispatch and the kernel's SGPR layout.
 struct Dispatch {
-    uint32_t threads_x, threads_x_partial, threads_y, threads_z;
+    uint32_t threads_x, threads_x_partial, threads_y, threads_y_partial, threads_z,
+        threads_z_partial;
     uint32_t dim_x, dim_y, dim_z;
     uint32_t start_x, start_y, start_z;
     uint32_t user_sgprs;  ///< COMPUTE_PGM_RSRC2 user SGPR count
@@ -57,11 +58,13 @@ struct Target {
 };
 
 /// Whether the kernel stores every element of the target, each exactly once, at element i of the
-/// linear buffer: 64 threads per group, one group row, no start offset; s12 holds the workgroup
-/// id x (12 user SGPRs, then TGID_X); an unswizzled V# with identity dst_sel and the texel as its
-/// stride; enough groups for every record, and no 32-bit wrap of the element index.
+/// linear buffer: 64 threads per group, one group row, no start offset or partial group; s12 holds
+/// the workgroup id x (12 user SGPRs, then TGID_X); an unswizzled V# with identity dst_sel and the
+/// texel as its stride; enough groups for every record, no 32-bit wrap of the element index, and a
+/// byte size a buffer binding takes (32 bits).
 inline bool CoversAllElements(const Dispatch& d, const Target& t, uint32_t texel_bytes) {
-    if (d.threads_x != 64 || d.threads_x_partial != 0 || d.threads_y != 1 || d.threads_z != 1 ||
+    if (d.threads_x != 64 || d.threads_x_partial != 0 || d.threads_y != 1 ||
+        d.threads_y_partial != 0 || d.threads_z != 1 || d.threads_z_partial != 0 ||
         d.dim_y != 1 || d.dim_z != 1 || d.start_x != 0 || d.start_y != 0 || d.start_z != 0) {
         return false;
     }
@@ -73,7 +76,8 @@ inline bool CoversAllElements(const Dispatch& d, const Target& t, uint32_t texel
         return false;
     }
     const uint64_t elements = uint64_t(d.dim_x) * 128;
-    return elements >= t.num_records && elements <= (uint64_t(1) << 32);
+    const uint64_t bytes = uint64_t(t.num_records) * t.stride;
+    return elements >= t.num_records && elements <= (uint64_t(1) << 32) && bytes <= UINT32_MAX;
 }
 
 /// A float exactly representable as a small float with a 5-bit exponent (bias 15): its bits, or

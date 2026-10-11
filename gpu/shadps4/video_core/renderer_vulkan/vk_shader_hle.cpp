@@ -327,13 +327,45 @@ enum class FillPath : u32 {
     GpuValue,
     Value,
     HalvesDiffer,
+    Reference,
     Count
 };
 constexpr std::array<const char*, u32(FillPath::Count)> fill_path_names = {
     "replaced",          "dispatch, SGPR or V# shape", "format",
     "no image",          "not exactly one image",      "value GPU-written or in an image",
-    "value not exact",   "8-byte texel halves differ"};
+    "value not exact",   "8-byte texel halves differ",     "kernel run as the verify reference"};
 std::array<std::atomic<u64>, u32(FillPath::Count)> fill_counts{};
+
+/// BB_RT_FILL_VERIFY: 1 checks every replaced fill; 2 also runs every other qualifying fill as the
+/// kernel and checks the kernel's bytes against the same derived pattern.
+const int fill_verify = [] {
+    const char* env = std::getenv("BB_RT_FILL_VERIFY");
+    return env ? std::atoi(env) : 0;
+}();
+/// A qualifying fill left to the kernel (verify 2), checked once its dispatch is recorded. Only the
+/// thread recording dispatches touches it.
+struct KernelCheck {
+    bool armed;
+    VAddr address;
+    u64 size;
+    u32 pattern;
+};
+KernelCheck kernel_check{};
+
+/// Waits until the GPU ran everything recorded and stops unless the guest range holds `pattern`.
+void CheckRangeHolds(Rasterizer& rasterizer, VAddr address, u64 size, u32 pattern,
+                     const char* what) {
+    rasterizer.GetRuntime().GetScheduler().Finish();
+    const auto* bytes = reinterpret_cast<const u8*>(address);
+    for (u64 offset = 0; offset < size; offset += 4) {
+        u32 word;
+        std::memcpy(&word, bytes + offset, 4);
+        ASSERT_MSG(word == pattern,
+                   "BB_RT_FILL_VERIFY: byte {:#x} of {:#x}+{:#x} holds {:#010x} after {}, the "
+                   "derived fill is {:#010x}",
+                   offset, address, size, word, what, pattern);
+    }
+}
 
 void CountFill(FillPath path) {
     fill_counts[u32(path)].fetch_add(1, std::memory_order_relaxed);
@@ -434,7 +466,9 @@ bool FillAsImageClear(const Shader::Info& info, const AmdGpu::ComputeProgram& cs
         .threads_x = cs_program.num_thread_x.full,
         .threads_x_partial = cs_program.num_thread_x.partial,
         .threads_y = cs_program.num_thread_y.full,
+        .threads_y_partial = cs_program.num_thread_y.partial,
         .threads_z = cs_program.num_thread_z.full,
+        .threads_z_partial = cs_program.num_thread_z.partial,
         .dim_x = cs_program.dim_x,
         .dim_y = cs_program.dim_y,
         .dim_z = cs_program.dim_z,
@@ -508,6 +542,13 @@ bool FillAsImageClear(const Shader::Info& info, const AmdGpu::ComputeProgram& cs
     if (!pattern) {
         return fails(FillPath::HalvesDiffer);
     }
+    // BB_RT_FILL_VERIFY=2: every other qualifying fill runs the kernel itself, and AfterDispatchHLE
+    // checks that it wrote exactly the derived bytes: the reference for the replaced ones.
+    static u64 qualifying = 0;
+    if (fill_verify == 2 && (qualifying++ & 1) == 0) {
+        kernel_check = {true, address, size, *pattern};
+        return fails(FillPath::Reference);
+    }
     // The bytes, as the kernel writes them (the buffer write it would have bound).
     const auto [buffer, offset] = buffer_cache.ObtainBuffer(address, u32(size), true, false);
     ASSERT_MSG(offset % 4 == 0, "RT fill: target {:#x} is not 4-byte aligned in its buffer",
@@ -518,21 +559,36 @@ bool FillAsImageClear(const Shader::Info& info, const AmdGpu::ComputeProgram& cs
     clear.color.float32 = value;
     runtime.ClearImage(image, VideoCore::SubresourceRange{}, clear);
     CountFill(FillPath::Cleared);
-    static const bool verify = [] {
-        const char* env = std::getenv("BB_RT_FILL_VERIFY");
-        return env && env[0] == '1';
-    }();
-    if (verify) {
+    if (fill_verify) {
         VerifyFillClear(rasterizer, *image, address, size, *pattern, *texel, texel_bytes);
     }
     return true;
 }
 } // namespace
+
+void AfterDispatchHLE(Rasterizer& rasterizer) {
+    if (!kernel_check.armed) {
+        return;
+    }
+    kernel_check.armed = false;
+    CheckRangeHolds(rasterizer, kernel_check.address, kernel_check.size, kernel_check.pattern,
+                    "the fill kernel");
+    static u64 matched = 0;
+    if (matched++ % 256 == 0) {
+        std::printf("BB_RT_FILL_VERIFY=2: %llu kernel fills wrote exactly the derived bytes\n",
+                    (unsigned long long)matched);
+    }
+}
 #endif
 
 bool ExecuteShaderHLE(const Shader::Info& info, const AmdGpu::Regs& regs,
                       const AmdGpu::ComputeProgram& cs_program, Rasterizer& rasterizer) {
 #ifdef __APPLE__
+    if (kernel_check.armed) {
+        // The previous dispatch was not recorded (its bindings failed): nothing to check.
+        std::printf("BB_RT_FILL_VERIFY=2: a reference fill was not dispatched, not checked\n");
+        kernel_check.armed = false;
+    }
     if (info.pgm_hash == SDK_FILL_HASH || info.pgm_hash == SDK_COPY_HASH) {
         CensusRenderTargetKernel(info, cs_program, rasterizer);
     }
