@@ -220,11 +220,17 @@ Id EmitImageQueryDimensions(EmitContext& ctx, IR::Inst* inst, u32 handle, Id lod
     }
 }
 
-Id EmitImageQueryLod(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords) {
+Id EmitImageQueryLod(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords,
+                     const IR::Value& sampler_handle) {
+    ASSERT_MSG(sampler_handle.IsEmpty(), "Unpatched IMAGE_GET_LOD sampler: shader={:#x}",
+               ctx.info.pgm_hash);
     const auto& texture = ctx.images[handle & 0xFFFF];
     if (texture.is_null) {
         return ctx.ConstantNull(ctx.F32[2]);
     }
+    ASSERT_MSG(Sirit::ValidId(ctx.sampler_type) && (handle >> 16) < ctx.samplers.size(),
+               "IMAGE_GET_LOD sampler {} missing: shader={:#x}, samplers={}",
+               handle >> 16, ctx.info.pgm_hash, ctx.samplers.size());
     const Id image = ctx.OpLoad(texture.image_type, texture.id);
     const Id sampler = ctx.OpLoad(ctx.sampler_type, ctx.samplers[handle >> 16]);
     const Id sampled_image = ctx.OpSampledImage(texture.sampled_type, image, sampler);

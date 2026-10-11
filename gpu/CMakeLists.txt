@@ -311,7 +311,9 @@ if (APPLE)
         ../tests/test_gpu_runtime_stubs.cpp)
     add_executable(depth-bounds-shader-test EXCLUDE_FROM_ALL ../tests/test_depth_bounds_shader.cpp
         ../tests/test_gpu_runtime_stubs.cpp)
-    foreach(bounds_target buffer-bounds-test buffer-bounds-benchmark buffer-dead-resources-test host-import-arena-test vertex-pulling-pipeline-test shader-permutation-info-test gpu-user-dir-test push-userdata-test macos-perf-test depth-bounds-shader-test)
+    add_executable(shader-inputs-test EXCLUDE_FROM_ALL ../tests/test_shader_inputs.cpp
+        ../tests/test_gpu_runtime_stubs.cpp)
+    foreach(bounds_target buffer-bounds-test buffer-bounds-benchmark buffer-dead-resources-test host-import-arena-test vertex-pulling-pipeline-test shader-permutation-info-test gpu-user-dir-test push-userdata-test macos-perf-test depth-bounds-shader-test shader-inputs-test)
         target_include_directories(${bounds_target} PRIVATE shim shadps4 third_party/gcn/include)
         target_compile_options(${bounds_target} PRIVATE -UNDEBUG -fPIC)
         target_link_libraries(${bounds_target} PRIVATE bbgpu)
@@ -363,7 +365,7 @@ if (APPLE)
     target_compile_definitions(overlay-concurrency-test PRIVATE
         BB_FONT_PATH="${CMAKE_CURRENT_SOURCE_DIR}/third_party/fonts/DejaVuSans.ttf")
     find_package(Python3 REQUIRED COMPONENTS Interpreter)
-    foreach(test_target motion-shader-test scene-resolution-test taa-shader-test camera-motion-test null-descriptor-test buffer-bounds-test buffer-bounds-benchmark buffer-dead-resources-test host-import-arena-test vertex-pulling-pipeline-test shader-permutation-info-test gpu-user-dir-test push-userdata-test macos-perf-test depth-bounds-shader-test shader-sweep ${apple_unit_test_targets})
+    foreach(test_target motion-shader-test scene-resolution-test taa-shader-test camera-motion-test null-descriptor-test buffer-bounds-test buffer-bounds-benchmark buffer-dead-resources-test host-import-arena-test vertex-pulling-pipeline-test shader-permutation-info-test gpu-user-dir-test push-userdata-test macos-perf-test depth-bounds-shader-test shader-inputs-test shader-sweep ${apple_unit_test_targets})
         add_custom_command(TARGET ${test_target} POST_BUILD
             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../packaging/macos/check-exports.py
                 $<TARGET_FILE:bbgpu> $<TARGET_FILE:${test_target}> VERBATIM)

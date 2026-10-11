@@ -769,6 +769,7 @@ void Translator::IMAGE_GET_LOD(const GcnInst& inst) {
     IR::VectorReg dst_reg{inst.dst[0].code};
     IR::VectorReg addr_reg{inst.src[0].code};
     const IR::ScalarReg tsharp_reg{inst.src[2].code * 4};
+    const IR::ScalarReg sampler_reg{inst.src[3].code * 4};
 
     IR::TextureInstInfo info{};
     info.is_array.Assign(mimg.da);
@@ -786,7 +787,10 @@ void Translator::IMAGE_GET_LOD(const GcnInst& inst) {
     const IR::Value body = ir.CompositeConstruct(
         ir.GetVectorReg<IR::F32>(addr_reg), ir.GetVectorReg<IR::F32>(addr_reg + 1),
         ir.GetVectorReg<IR::F32>(addr_reg + 2), ir.GetVectorReg<IR::F32>(addr_reg + 3));
-    const IR::Value lod = ir.ImageQueryLod(ir.ImageHandle(tsharp_low, tsharp_high), body, info);
+    const IR::Value sampler =
+        ir.CompositeConstruct(ir.GetScalarReg(sampler_reg), ir.GetScalarReg(sampler_reg + 1),
+                              ir.GetScalarReg(sampler_reg + 2), ir.GetScalarReg(sampler_reg + 3));
+    const IR::Value lod = ir.ImageQueryLod(ir.ImageHandle(tsharp_low, tsharp_high), body, info, sampler);
     if (mimg.dmask & 1) {
         ir.SetVectorReg(dst_reg++, IR::F32{ir.CompositeExtract(lod, 0)});
     }

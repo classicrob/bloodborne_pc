@@ -319,12 +319,14 @@ void DiscoverImageSharp(IR::Block& block, IR::Inst& inst, ResourceDiscoveryList&
 
     MarkReadConstBufferSharpSources(tsharp);
 
-    if (inst.GetOpcode() != IR::Opcode::ImageSampleRaw) {
+    if (inst.GetOpcode() != IR::Opcode::ImageSampleRaw &&
+        inst.GetOpcode() != IR::Opcode::ImageQueryLod) {
         return;
     }
 
-    // Gather S# dwords
-    const IR::Inst* sampler = inst.Arg(1).Inst();
+    // Queries consume the sampler too (LOD bias, limits and filtering).
+    const u32 sampler_arg = inst.GetOpcode() == IR::Opcode::ImageQueryLod ? 2 : 1;
+    const IR::Inst* sampler = inst.Arg(sampler_arg).Inst();
     auto& ssharp = resource.sharps[1];
     for (size_t i = 0; i < sampler->NumArgs(); ++i) {
         ssharp.dwords[ssharp.num_dwords++] = sampler->Arg(i);
