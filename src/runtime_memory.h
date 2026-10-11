@@ -58,6 +58,19 @@ typedef struct {
  */
 int runtime_memory_alias_snapshot(uintptr_t address,RuntimeMemoryAlias *aliases,
     size_t capacity,RuntimeMemoryAliasSnapshot *snapshot);
+typedef struct {
+    uint64_t generation;
+    size_t direct_vmas, flexible_vmas, reserved_vmas;
+    uint64_t direct_view_bytes, flexible_view_bytes; /* sum of committed guest views */
+    uint64_t unique_backing_bytes; /* union of the views' backing-pool intervals */
+    size_t aliased_vmas;           /* committed views sharing backing with another view */
+    uint64_t live_direct_bytes, flexible_in_use_bytes; /* allocator counters */
+} RuntimeMemoryInventory;
+/* Capture-replay inventory (diagnostic): one consistent read of the VMA table, then
+ * allocation outside the lock. Not for fault handlers. Low/untracked host allocations
+ * outside the VMA table are not counted. Returns 0, or -1 for a NULL output or failed
+ * allocation. */
+int runtime_memory_inventory(RuntimeMemoryInventory *out);
 #endif
 #ifdef __cplusplus
 }
