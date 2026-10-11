@@ -128,7 +128,8 @@ class Bisect:
     def __init__(self, game, roi, out):
         self.game, self.roi, self.out = game, roi, Path(out)
         self.out.mkdir(parents=True, exist_ok=True)
-        self.steps, self.review, self.list_value = [], [], 0
+        # 'list N' lists only when N is new in this game session: start from a value no earlier pass used
+        self.steps, self.review, self.list_value = [], [], int(time.time()) % 1000000
 
     def note(self, text):
         line = f'{time.strftime("%H:%M:%S")} {text}'
