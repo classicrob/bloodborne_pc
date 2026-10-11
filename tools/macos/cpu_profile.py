@@ -132,7 +132,7 @@ def report(rows, config, symbols, top, folded):
     print('Loss/finish:', json.dumps(summaries[-1], sort_keys=True) if summaries else 'no final summary; abrupt/ongoing capture')
     for thread, counts in sorted(flat.items(), key=lambda item: -item[1].total()):
         total = counts.total()
-        print(f'\n{thread}: {total} samples; {incomplete[thread]} uncached/failed-read samples')
+        print(f'\n{thread}: {total} samples; {incomplete[thread]} uncached/failed/blocked-unwind samples')
         print('  Split:', ', '.join(f'{name} {n/total:.1%}' for name, n in categories[thread].most_common()))
         for name, n in counts.most_common(top):
             print(f'  {n:7d} {n/total:6.1%} {name}')

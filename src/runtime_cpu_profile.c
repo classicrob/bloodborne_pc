@@ -38,7 +38,7 @@ typedef struct { uintptr_t low,high; uint64_t ticks; char name[1024],uuid[33]; i
 static ProfileThread *threads;
 static ProfileImage images[PROFILE_IMAGES];
 static _Atomic unsigned image_count;
-static _Atomic int configured,active,stop_requested,joined;
+static _Atomic int configured,active,stop_requested,stop_state;
 static _Atomic unsigned sampling_handlers;
 static _Atomic unsigned long long table_full,image_full,read_faults;
 static pthread_t collector;
@@ -103,12 +103,17 @@ static void profile_sample(int sig,siginfo_t *info,void *context) {
     s->ticks=ticks;s->depth=1;s->flags=0;s->pc[0]=ss->__rip;
     for(unsigned i=0;i<sizeof(s->name);i++)s->name[i]=t->name[i];
     if(!t->high[0])s->flags|=1; /* Unknown thread: RIP only. */
-    atomic_store_explicit(&t->unwind,1,memory_order_relaxed);
-    int failed=0;
-    s->depth+=(unsigned)guest_backtrace_bounded(ss->__rbp,s->pc+1,PROFILE_DEPTH-1,
-                                               t->low,t->high,cpu_profile_read,&failed);
-    if(failed)s->flags|=2;
-    atomic_store_explicit(&t->unwind,0,memory_order_relaxed);
+    const ucontext_t *uc=context;
+    if(sigismember(&uc->uc_sigmask,SIGBUS)==1 || sigismember(&uc->uc_sigmask,SIGSEGV)==1) {
+        s->flags|=4; /* Recovery cannot run with an inherited blocked fault signal. */
+    } else {
+        atomic_store_explicit(&t->unwind,1,memory_order_relaxed);
+        int failed=0;
+        s->depth+=(unsigned)guest_backtrace_bounded(ss->__rbp,s->pc+1,PROFILE_DEPTH-1,
+                                                   t->low,t->high,cpu_profile_read,&failed);
+        if(failed)s->flags|=2;
+        atomic_store_explicit(&t->unwind,0,memory_order_relaxed);
+    }
     atomic_store_explicit(&t->write,w+1,memory_order_release);
     atomic_fetch_sub_explicit(&sampling_handlers,1,memory_order_release);
     errno=saved;
@@ -236,8 +241,16 @@ static void *profile_collect(void *arg) {
 }
 void runtime_cpu_profile_stop(void) {
     if(!atomic_load_explicit(&configured,memory_order_relaxed))return;
-    if(atomic_exchange(&joined,1))return;
-    atomic_store(&stop_requested,1);int e=pthread_join(collector,NULL);if(e){errno=e;profile_fail("join collector");}
+    int expected=0;
+    if(atomic_compare_exchange_strong_explicit(&stop_state,&expected,1,memory_order_acq_rel,memory_order_acquire)) {
+        atomic_store(&stop_requested,1);int e=pthread_join(collector,NULL);if(e){errno=e;profile_fail("join collector");}
+        atomic_store_explicit(&stop_state,2,memory_order_release);
+    } else {
+        /* Every ordinary exit/report caller must wait for the completed drain. */
+        while(atomic_load_explicit(&stop_state,memory_order_acquire)!=2) {
+            struct timespec pause={0,100000};nanosleep(&pause,NULL);
+        }
+    }
     /* Keep the inactive SIGPROF handler for a pending timer signal. */
 }
 void runtime_cpu_profile_init(void) {
@@ -257,6 +270,7 @@ void runtime_cpu_profile_init(void) {
     fprintf(output,"{\"type\":\"config\",\"version\":1,\"hz\":%u,\"numer\":%u,\"denom\":%u,\"start_ticks\":%llu,\"window_start\":%.6f,\"window_end\":%.6f,\"pid\":%d}\n",frequency,timebase.numer,timebase.denom,(unsigned long long)started,start,end,getpid());fflush(output);
     _dyld_register_func_for_add_image(image_added);
     _dyld_register_func_for_remove_image(image_removed);
+    sigset_t empty_mask;sigemptyset(&empty_mask);(void)sigismember(&empty_mask,SIGBUS);
     struct sigaction sa={0};sa.sa_sigaction=profile_sample;sa.sa_flags=SA_SIGINFO|SA_RESTART;sigemptyset(&sa.sa_mask);
     if(sigaction(SIGPROF,&sa,NULL))profile_fail("SIGPROF handler");
     sa=(struct sigaction){0};sa.sa_handler=profile_request_stop;sa.sa_flags=SA_RESTART;sigemptyset(&sa.sa_mask);

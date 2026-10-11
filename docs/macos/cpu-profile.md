@@ -84,8 +84,9 @@ or low-stack range, and advance the frame pointer. Missing/omitted frame pointer
 truncate or make the chain unreliable; the leaf RIP remains the interrupted PC.
 Cached bounds alone are not assumed safe: the two assembly load instructions
 have an exact-PC SIGBUS/SIGSEGV recovery, permitted only while this thread's
-profiler unwind is active. Both words must load before publishing a frame. An
-unreadable frame ends the walk and flags the sample. All other faults follow the
+profiler unwind is active. Both words must load before publishing a frame. When the interrupted signal mask blocks SIGBUS or SIGSEGV (including sampling
+inside a fault handler), the sample is explicitly flagged RIP-only: recovery
+could not safely run there. An unreadable frame ends the walk and flags the sample. All other faults follow the
 existing entry-probe, GPU tracker and fatal paths unchanged.
 
 Each ring has one producer (that thread's SIGPROF handler, non-reentrant for
@@ -97,6 +98,8 @@ The collector drains about every 20 ms and flushes JSONL. A fatal `_exit` retain
 previous flushes, but can lose the last interval and has no final summary. An
 incomplete last line is explicitly ignored by the reader. Normal stop disables
 the timer, quiesces active samplers, drains and reports drops/read failures.
+Concurrent ordinary stop/report callers all wait for join completion, so none
+can terminate the process while another caller is still draining.
 Image add/remove metadata is published outside signal handlers; its independent
 512-event cap is reported on overflow. The collector blocks SIGPROF; process
 CPU accounting and redirection mean its cost is not perfectly separable in the
@@ -114,7 +117,9 @@ The script is also wired into Darwin `build.sh --test`. Signed SDK-only fixtures
 cover default-off behavior; two known hot functions on different threads; name
 retirement and uncached RIP-only threads; deliberate ring overflow with counted
 drops; window and SIGUSR1 finish; offline symbols and folded stacks;
-protected first/second frame words and unmapped stale bounds; overflow-safe frame
+protected first/second frame words and unmapped stale bounds; nested SIGPROF
+inside SIGBUS/SIGSEGV and explicitly blocked recovery signals (RIP-only);
+two simultaneous stop callers with the collector held before its final drain; overflow-safe frame
 bounds; unrelated faults while unwind-active; 1000 write-protection faults;
 a blocked pipe read under SIGPROF; and the entry probe's 34 concurrent hits with
 GPR, flags, YMM and stack preservation while SIGPROF interrupts SIGTRAP handling.

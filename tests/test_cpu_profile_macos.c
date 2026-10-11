@@ -15,8 +15,27 @@ static volatile sig_atomic_t tracking_faults;
 static _Atomic int waiting;
 static int pipe_fd[2];
 static volatile uint64_t result;
+static volatile sig_atomic_t nested_signal,nested_seen;
+static uintptr_t nested_frame;
+static void sampled(int sig,siginfo_t *info,void *context) {
+    const ucontext_t *interrupted=context;
+    if(nested_signal && (sigismember(&interrupted->uc_sigmask,SIGBUS)==1 ||
+                         sigismember(&interrupted->uc_sigmask,SIGSEGV)==1)) {
+        ucontext_t copy=*(ucontext_t *)context;
+        struct __darwin_mcontext64 mc=*copy.uc_mcontext;copy.uc_mcontext=&mc;
+        mc.__ss.__rbp=nested_frame;
+        ProfileThread *t=thread_slot(0);assert(t);
+        uint64_t w=atomic_load(&t->write);profile_sample(sig,info,&copy);
+        assert(atomic_load(&t->write)==w+1);
+        Sample *sample=&t->samples[w%PROFILE_RING];
+        assert(sample->depth==1 && (sample->flags&4) && !(sample->flags&2));
+        nested_seen++;return;
+    }
+    profile_sample(sig,info,context);
+}
 static void fault(int sig,siginfo_t *info,void *context) {
     if(runtime_cpu_profile_fault(sig,context))return;
+    if(nested_signal==sig){assert(!raise(SIGPROF));return;}
     if(tracking_page && (uintptr_t)info->si_addr>=(uintptr_t)tracking_page &&
        (uintptr_t)info->si_addr<(uintptr_t)tracking_page+page_size) {
         if(mprotect(tracking_page,page_size,PROT_READ|PROT_WRITE))_exit(87);
@@ -92,6 +111,21 @@ static void synthetic(uintptr_t frame,uintptr_t low,uintptr_t high,int expect_fa
     if(expect_fail)assert(s->depth==1);
     t->low[1]=saved_low;t->high[1]=saved_high;restore_mask(&mask);
 }
+static _Atomic unsigned stop_entered,stop_completed;
+static void *stopping(void *arg) {
+    (void)arg;atomic_fetch_add(&stop_entered,1);
+    runtime_cpu_profile_stop();atomic_fetch_add(&stop_completed,1);return NULL;
+}
+static void stop_control(void) {
+    assert(!raise(SIGPROF));
+    pthread_mutex_lock(&output_lock);
+    pthread_t a,b;assert(!pthread_create(&a,NULL,stopping,NULL));assert(!pthread_create(&b,NULL,stopping,NULL));
+    while(atomic_load(&stop_entered)!=2)sched_yield();
+    usleep(30000);assert(!atomic_load(&stop_completed));
+    pthread_mutex_unlock(&output_lock);
+    assert(!pthread_join(a,NULL));assert(!pthread_join(b,NULL));
+    assert(atomic_load(&stop_completed)==2 && atomic_load(&stop_state)==2);
+}
 static void safety_controls(void) {
     unsigned char *p=mmap(NULL,page_size*2,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANON,-1,0);
     assert(p!=MAP_FAILED);
@@ -99,6 +133,16 @@ static void safety_controls(void) {
     frame[2]=0;frame[3]=(uintptr_t)hot_alpha;
     synthetic((uintptr_t)p,(uintptr_t)p,(uintptr_t)p+page_size*2,0);
     assert(!mprotect(p,page_size,PROT_NONE));
+    ProfileThread *current=thread_slot(0);assert(current);
+    current->low[1]=(uintptr_t)p;current->high[1]=(uintptr_t)p+page_size*2;
+    nested_frame=(uintptr_t)p;
+    nested_signal=SIGSEGV;assert(!raise(SIGSEGV));
+    nested_signal=SIGBUS;assert(!raise(SIGBUS));
+    sigset_t blocked,previous;sigemptyset(&blocked);sigaddset(&blocked,SIGBUS);
+    assert(!pthread_sigmask(SIG_BLOCK,&blocked,&previous));assert(!raise(SIGPROF));
+    assert(!pthread_sigmask(SIG_SETMASK,&previous,NULL));
+    nested_signal=0;assert(nested_seen>=3);
+    current->low[1]=current->high[1]=0;
     synthetic((uintptr_t)p,(uintptr_t)p,(uintptr_t)p+page_size*2,1);
     assert(!mprotect(p,page_size,PROT_READ|PROT_WRITE));
     assert(!mprotect(p+page_size,page_size,PROT_NONE));
@@ -141,12 +185,15 @@ int main(int argc,char **argv) {
     struct sigaction sa={0};sa.sa_sigaction=fault;sa.sa_flags=SA_SIGINFO|SA_RESTART;sigemptyset(&sa.sa_mask);
     assert(!sigaction(SIGBUS,&sa,NULL));assert(!sigaction(SIGSEGV,&sa,NULL));
     runtime_cpu_profile_init();runtime_cpu_profile_thread("fixture-main");
+    sa.sa_sigaction=sampled;assert(!sigaction(SIGPROF,&sa,NULL));
     assert(atomic_load(&configured));
     while(!atomic_load(&active)){struct timespec t={0,1000000};nanosleep(&t,NULL);}
     if(argc>1 && !strcmp(argv[1],"bench")) {
         double start=seconds(),cpu=cpu_seconds();result=hot_beta(250000000);printf("BENCH %.9f %.9f\n",seconds()-start,cpu_seconds()-cpu);
     } else if(argc>1 && !strcmp(argv[1],"window")) {
         while(atomic_load(&active))result=hot_alpha(1000000);
+    } else if(argc>1 && !strcmp(argv[1],"stop-race")) {
+        stop_control();
     } else if(argc>1 && !strcmp(argv[1],"overflow")) {
         pthread_mutex_lock(&output_lock);
         for(unsigned i=0;i<PROFILE_RING+100;i++)assert(!raise(SIGPROF));

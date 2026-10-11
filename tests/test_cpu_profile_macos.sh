@@ -9,6 +9,7 @@ python3 packaging/macos/sign.py "$capture_dir/test"
 arch -x86_64 "$capture_dir/test" off
 BB_CPU_PROFILE="$capture_dir/safety.jsonl" arch -x86_64 "$capture_dir/test"
 BB_CPU_PROFILE="$capture_dir/window.jsonl" BB_CPU_PROFILE_WINDOW=0.05:1.5 arch -x86_64 "$capture_dir/test" window
+BB_CPU_PROFILE="$capture_dir/stop-race.jsonl" arch -x86_64 "$capture_dir/test" stop-race
 BB_CPU_PROFILE="$capture_dir/overflow.jsonl" arch -x86_64 "$capture_dir/test" overflow
 clang -arch x86_64 -std=c11 -O2 -g -fno-omit-frame-pointer -Wall -Wextra -Werror -pthread \
     -DBB_TEST_CPU_PROFILE tests/test_guest_entry_mac.c tests/test_guest_entry_mac.S -o "$capture_dir/entry-test"
@@ -20,7 +21,7 @@ from pathlib import Path
 from collections import Counter
 import json, sys
 p=Path(sys.argv[1])
-for name in ('safety','window','entry','overflow'):
+for name in ('safety','window','entry','overflow','stop-race'):
     rows=[json.loads(s) for s in (p/f'{name}.jsonl').read_text().splitlines()]
     summary=next(r for r in rows if r['type']=='summary')
     assert (summary['ring_dropped']>=100 if name=='overflow' else not summary['ring_dropped']), summary
