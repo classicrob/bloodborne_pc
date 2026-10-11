@@ -277,10 +277,35 @@ int main() {
         };
         const Result same = Classify(region + 4, 4, copy_a + 4, held, pools, 9);
         const Result newest = Classify(region + 4, 4, copy_a + 4, held, pools, 0);
+        const Result reused = Classify(region + 4, 4, copy_b + 4, held, pools, 9);
         Expect("cmd data: inside two held copies, one differs, the current one named",
                parsed && same.where == Where::Inside && same.matches == 2 &&
                    same.differing == 1 && same.current && same.submission == 9 &&
                    !newest.current && newest.submission == 9);
+        Expect("  ... the selected copy differing is told apart from only an older one differing",
+               same.selected_differs && // current 9 (copy_b) vs the read of copy_a
+                   Describe(same).find("DIFFERS") != std::string::npos &&
+                   !reused.selected_differs && reused.differing == 1 && // only 7 (copy_a) differs
+                   Describe(reused).find("reused by a newer submission") != std::string::npos);
+        // A containing region is never renamed by a straddling one, in either order (Astra-2).
+        bool kept = true;
+        for (const std::uint64_t cur : {std::uint64_t{7}, std::uint64_t{0}}) {
+            const HeldRegion contain{0x1000, 0x100, 7, nullptr}, partial{0x1044, 8, 9, nullptr};
+            const std::vector<HeldRegion> orders[2] = {{contain, partial}, {partial, contain}};
+            for (const auto& order : orders) {
+                const Result x = Classify(0x1040, 8, copy_a, order, pools, cur);
+                kept = kept && x.where == Where::Inside && x.matches == 1 && x.submission == 7 &&
+                       x.region_start == 0x1000 && x.region_bytes == 0x100 &&
+                       x.current == (cur == 7);
+            }
+        }
+        const std::vector<HeldRegion> two_partial = {{0x1044, 8, 9, nullptr},
+                                                     {0x1030, 0x12, 4, nullptr}};
+        const Result only_straddle = Classify(0x1040, 8, copy_a, two_partial, pools, 0);
+        Expect("  ... a straddling region never renames the containing selection (both orders, "
+               "current and newest); straddling alone names the first",
+               kept && only_straddle.where == Where::Straddles &&
+                   only_straddle.submission == 9 && only_straddle.region_start == 0x1044);
         const Result straddle = Classify(region + 12, 8, copy_a, held, pools, 0);
         const Result tail = Classify(a1_chunk + 0x3ff00, 16, copy_a, held, pools, 0);
         const Result next_chunk = Classify(a1_chunk + 0x40000 + 8, 8, copy_a, held, pools, 0);
@@ -289,7 +314,9 @@ int main() {
                "chunk or across a chunk end",
                straddle.where == Where::Straddles && tail.where == Where::ChunkTail &&
                    tail.chunk_start == a1_chunk && tail.pool == 0 &&
-                   next_chunk.where == Where::Outside && crossing.where == Where::Outside);
+                   next_chunk.where == Where::Outside && crossing.where == Where::Outside &&
+                   Describe(next_chunk).find("not located") != std::string::npos &&
+                   Describe(next_chunk).find("known pools") == std::string::npos);
         const Result overflow = Classify(UINT64_MAX - 4, 16, copy_a, held, pools, 0);
         static std::uint8_t big[512];
         const std::vector<HeldRegion> big_held = {{0x1000, 512, 1, big}};
@@ -300,9 +327,15 @@ int main() {
                    Describe(uncompared).find("not compared") != std::string::npos);
         std::uint64_t v = 0;
         std::vector<Pool> bad;
-        Expect("  ... strict numbers: no sign, no trailing text, no overflow, no empty pool",
-               ParseU64("0x40000", v) && v == 0x40000 && !ParseU64("-1", v) &&
-                   !ParseU64("+5", v) && !ParseU64("12x", v) &&
+        std::uint64_t d = 0, z = 0;
+        Expect("  ... strict numbers: no whitespace or sign anywhere, no octal, no trailing text, "
+               "no overflow, no empty pool",
+               ParseU64("0x40000", v) && v == 0x40000 && ParseU64("10", d) && d == 10 &&
+                   ParseU64("0", z) && z == 0 && !ParseU64("010", v) && !ParseU64("0x", v) &&
+                   !ParseU64("", v) && !ParseU64("-1", v) && !ParseU64("+5", v) &&
+                   !ParseU64(" 5", v) && !ParseU64("\t-1", v) && !ParseU64("\n+5", v) &&
+                   !ParseU64("0x-1", v) && !ParseU64("0x 1", v) && !ParseU64("5 ", v) &&
+                   !ParseU64("12x", v) &&
                    !ParseU64("0x1ffffffffffffffff", v) && !ParsePools("0x1000:0", 0x40000, bad) &&
                    !ParsePools("0x1000", 0x40000, bad) &&
                    !ParsePools("0xffffffffffffff00:2", 0x40000, bad));
@@ -330,8 +363,43 @@ int main() {
         const std::string text = LastRead();
         Expect("  ... the stop's latest-read text comes from the observation, not a re-read",
                text.find("latest instrumented read: ud table") != std::string::npos &&
-                   text.find("some held copies differ") != std::string::npos);
+                   text.find("DIFFERS") != std::string::npos);
         munmap(two, page);
+        // Owner lifetime: Unregister waits for a lookup in flight; none runs after it.
+        static std::atomic<int> entered{0}, release{0}, calls{0};
+        static int owner_object = 0;
+        const LookupFn blocking = [](void* owner, std::uint64_t, std::uint64_t,
+                                     const void*) -> Result {
+            calls.fetch_add(1);
+            entered.store(owner == &owner_object ? 1 : -1);
+            while (!release.load()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            Result r;
+            r.where = Where::Inside;
+            return r;
+        };
+        Register(blocking, &owner_object);
+        Result in_flight;
+        std::thread reader([&] { in_flight = Lookup(1, 1, copy_a); });
+        while (!entered.load()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        std::atomic<bool> unregistered{false};
+        std::thread destroyer([&] {
+            Unregister(&owner_object);
+            unregistered.store(true);
+        });
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        const bool waited = !unregistered.load();
+        release.store(1);
+        reader.join();
+        destroyer.join();
+        const Result after = Lookup(1, 1, copy_a);
+        Expect("  ... unregistering waits for a lookup in flight; no lookup runs after it",
+               entered.load() == 1 && waited && unregistered.load() &&
+                   in_flight.where == Where::Inside && after.where == Where::Outside &&
+                   calls.load() == 1);
     }
 
     std::fprintf(stderr, "%s: %u failures\n", failures ? "FAIL" : "PASS", failures);

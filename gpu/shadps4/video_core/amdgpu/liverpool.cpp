@@ -177,15 +177,10 @@ static std::span<const u32> NextPacket(std::span<const u32> span, size_t offset)
 }
 
 #ifdef __APPLE__
-namespace {
-Liverpool* command_data_owner = nullptr; ///< BB_CMD_DATA_CHECK's snapshots (one GPU)
-} // namespace
-
-BbCmdData::Result Liverpool::LookupCommandData(u64 address, u64 size, const void* bytes_read) {
-    Liverpool* self = command_data_owner;
-    if (!self) {
-        return {};
-    }
+BbCmdData::Result Liverpool::LookupCommandData(void* owner, u64 address, u64 size,
+                                               const void* bytes_read) {
+    // Runs under BbCmdData's registry lock, so ~Liverpool's Unregister waits for it.
+    Liverpool* self = static_cast<Liverpool*>(owner);
     // Classified under the lock against the snapshots' own copies; no guest memory is read here
     // (the caller reads a chunk tail's status word after this returns).
     static thread_local std::vector<BbCmdData::HeldRegion> held;
@@ -207,8 +202,7 @@ Liverpool::Liverpool() : guest_markers_enabled{EmulatorSettings.IsVkGuestMarkers
 #ifdef __APPLE__
     SetAssertStopHook(&ReportParserStop);
     if (BbCmdData::Enabled()) {
-        command_data_owner = this;
-        BbCmdData::lookup.store(&Liverpool::LookupCommandData, std::memory_order_release);
+        BbCmdData::Register(&Liverpool::LookupCommandData, this);
     }
 #endif
     num_counter_pairs = Libraries::Kernel::sceKernelIsNeoMode() ? 16 : 8;
@@ -216,16 +210,13 @@ Liverpool::Liverpool() : guest_markers_enabled{EmulatorSettings.IsVkGuestMarkers
 }
 
 Liverpool::~Liverpool() {
+#ifdef __APPLE__
+    // First, holding none of this object's locks: waits out any lookup in flight on any thread
+    // (GPU, draw, preparation workers); later reads are not located.
+    BbCmdData::Unregister(this);
+#endif
     process_thread.request_stop();
     process_thread.join();
-#ifdef __APPLE__
-    if (command_data_owner == this) {
-        BbCmdData::lookup.store(nullptr, std::memory_order_release);
-        command_data_owner = nullptr; // a lookup already past the load still sees a live owner
-                                      // only until here: none run after the GPU thread joined,
-                                      // except on the draw thread, which is joined earlier
-    }
-#endif
 }
 
 u32 Liverpool::ProcessCommands(bool* stopped_at_cpu_flip) {

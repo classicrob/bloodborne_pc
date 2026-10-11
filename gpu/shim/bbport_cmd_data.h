@@ -16,20 +16,23 @@
 //   pool as a held region that ends below it (under the assumed pool geometry, BB_CMD_DATA_POOLS;
 //   ownership of the address is not established). The chunk's status word (its last 8 bytes:
 //   0 free, 1 claimed, 2 released) is then read without faulting, after the lookup;
-// - outside the held regions and known pools (parsed snapshots are released, so this does not
-//   mean outside command memory).
+// - not located: none of the above (it may still be in a known pool, e.g. a chunk with no held
+//   region below the address; parsed snapshots are released, so this never means outside command
+//   memory).
 // Reads made by generated code (the SRT walker) are not instrumented.
 #pragma once
-#include <atomic>
-#include <cerrno>
+#include <cctype>
+#include <charconv>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <map>
 #include <mutex>
+#include <shared_mutex>
 #include <span>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 #ifdef __APPLE__
@@ -39,15 +42,26 @@
 
 namespace BbCmdData {
 
-/// Strict unsigned number (decimal or 0x hex): no sign, no trailing text, no overflow.
+/// Strict unsigned number: decimal without a leading zero (so 010 is not octal), or 0x/0X hex.
+/// Digits only: no whitespace, sign or trailing text anywhere, no overflow.
 inline bool ParseU64(const char* text, std::uint64_t& out) {
-    if (!text || !*text || *text == '-' || *text == '+' || *text == ' ') {
+    std::string_view s = text ? text : "";
+    int base = 10;
+    if (s.size() > 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) {
+        base = 16;
+        s.remove_prefix(2);
+    } else if (s.empty() || (s.size() > 1 && s[0] == '0')) {
         return false;
     }
-    errno = 0;
-    char* end = nullptr;
-    const unsigned long long v = std::strtoull(text, &end, 0);
-    if (errno || end == text || *end) {
+    for (const char c : s) {
+        const auto u = static_cast<unsigned char>(c);
+        if (!(base == 16 ? std::isxdigit(u) : std::isdigit(u))) {
+            return false;
+        }
+    }
+    std::uint64_t v = 0;
+    const auto [end, ec] = std::from_chars(s.data(), s.data() + s.size(), v, base);
+    if (ec != std::errc{} || end != s.data() + s.size()) {
         return false;
     }
     out = v;
@@ -146,6 +160,9 @@ struct Result {
     bool compared = false;       ///< size <= MaxCompared
     std::uint32_t matches = 0;   ///< held regions containing the range
     std::uint32_t differing = 0; ///< of those, copies that differ from the bytes read
+    /// The selected copy (current, else newest) differs: the bytes read are not what that
+    /// submission submitted. Only older copies differing is a chunk reused by a newer submission.
+    bool selected_differs = false;
     bool current = false;        ///< one of them is the parser's current submission
     std::uint64_t submission = 0, region_start = 0, region_bytes = 0; ///< a selected region
     // ChunkTail:
@@ -170,7 +187,8 @@ inline Result Classify(std::uint64_t address, std::uint64_t size, const void* by
     }
     const std::uint64_t end = address + size;
     r.compared = size <= MaxCompared;
-    bool straddles = false;
+    const HeldRegion* selected = nullptr;
+    const HeldRegion* straddled = nullptr; // the first; reported only when nothing contains the range
     for (const auto& h : held) {
         if (h.bytes > UINT64_MAX - h.start) {
             continue;
@@ -182,6 +200,7 @@ inline Result Classify(std::uint64_t address, std::uint64_t size, const void* by
             // Selected: the parser's current submission if held, else the newest.
             if (r.matches == 1 || (is_current && !r.current) ||
                 (!r.current && !is_current && h.submission > r.submission)) {
+                selected = &h;
                 r.submission = h.submission;
                 r.region_start = h.start;
                 r.region_bytes = h.bytes;
@@ -191,21 +210,22 @@ inline Result Classify(std::uint64_t address, std::uint64_t size, const void* by
                 std::memcmp(h.copy + (address - h.start), bytes_read, size) != 0) {
                 ++r.differing;
             }
-        } else if (address < h_end && h.start < end) {
-            if (!straddles) {
-                r.submission = h.submission;
-                r.region_start = h.start;
-                r.region_bytes = h.bytes;
-            }
-            straddles = true;
+        } else if (address < h_end && h.start < end && !straddled) {
+            straddled = &h;
         }
     }
     if (r.matches) {
         r.where = Where::Inside;
+        r.selected_differs = r.compared && selected && selected->copy &&
+                             std::memcmp(selected->copy + (address - selected->start),
+                                         bytes_read, size) != 0;
         return r;
     }
-    if (straddles) {
+    if (straddled) {
         r.where = Where::Straddles;
+        r.submission = straddled->submission;
+        r.region_start = straddled->start;
+        r.region_bytes = straddled->bytes;
         return r;
     }
     for (std::uint32_t p = 0; p < pools.size(); ++p) {
@@ -269,9 +289,40 @@ inline void ReadStatus(Result& r) {
     r.status_read = SafeRead(r.chunk_start + r.chunk_bytes - 8, &r.chunk_status, 8);
 }
 
-/// Set by the owner (Liverpool) when the check is on: classifies under its snapshot lock.
-using LookupFn = Result (*)(std::uint64_t address, std::uint64_t size, const void* bytes_read);
-inline std::atomic<LookupFn> lookup{nullptr};
+/// The owner's lookup (Liverpool, when the check is on): classifies under its snapshot lock.
+using LookupFn = Result (*)(void* owner, std::uint64_t address, std::uint64_t size,
+                            const void* bytes_read);
+
+namespace detail {
+// Lifetime: a lookup holds `registry` shared for its whole use of the owner, so Unregister
+// (exclusive) returns only once no lookup uses it, and none starts after. Order: registry, then
+// the owner's locks; the owner must not hold its locks while unregistering.
+inline std::shared_mutex registry;
+inline LookupFn lookup_fn = nullptr;
+inline void* lookup_owner = nullptr;
+} // namespace detail
+
+inline void Register(LookupFn fn, void* owner) {
+    std::unique_lock lk{detail::registry};
+    detail::lookup_fn = fn;
+    detail::lookup_owner = owner;
+}
+
+/// Blocks until in-flight lookups of `owner` return; later reads are not located.
+inline void Unregister(void* owner) {
+    std::unique_lock lk{detail::registry};
+    if (detail::lookup_owner == owner) {
+        detail::lookup_fn = nullptr;
+        detail::lookup_owner = nullptr;
+    }
+}
+
+/// Classifies through the registered owner (Outside, not located, when none).
+inline Result Lookup(std::uint64_t address, std::uint64_t size, const void* bytes_read) {
+    std::shared_lock lk{detail::registry};
+    return detail::lookup_fn ? detail::lookup_fn(detail::lookup_owner, address, size, bytes_read)
+                             : Result{};
+}
 
 /// One-line description of a result (no guest memory access).
 inline std::string Describe(const Result& r) {
@@ -279,8 +330,10 @@ inline std::string Describe(const Result& r) {
     switch (r.where) {
     case Where::Outside:
         std::snprintf(text, sizeof(text), "%s",
-                      r.valid_range ? "outside the held command memory regions and known pools"
-                                    : "an invalid range (empty, or address + size overflows)");
+                      r.valid_range
+                          ? "not located in a held region or a candidate chunk tail (may still "
+                            "be command memory)"
+                          : "an invalid range (empty, or address + size overflows)");
         break;
     case Where::Straddles:
         std::snprintf(text, sizeof(text),
@@ -289,18 +342,30 @@ inline std::string Describe(const Result& r) {
                       static_cast<unsigned long long>(r.region_bytes),
                       static_cast<unsigned long long>(r.submission));
         break;
-    case Where::Inside:
-        std::snprintf(text, sizeof(text),
-                      "inside %u held region(s) (selected %#llx, submission %llu%s); %s",
-                      r.matches, static_cast<unsigned long long>(r.region_start),
-                      static_cast<unsigned long long>(r.submission),
-                      r.current ? ", the parser's current one" : "",
-                      !r.compared ? "not compared (longer than 256 bytes)"
-                      : r.differing
-                          ? (r.differing == r.matches ? "every held copy differs from the read"
-                                                      : "some held copies differ from the read")
-                          : "the read equals the held copies");
+    case Where::Inside: {
+        const std::uint32_t others_differing = r.differing - (r.selected_differs ? 1 : 0);
+        if (!r.compared) {
+            std::snprintf(text, sizeof(text),
+                          "inside %u held region(s) (selected %#llx, submission %llu%s); not "
+                          "compared (longer than 256 bytes)",
+                          r.matches, static_cast<unsigned long long>(r.region_start),
+                          static_cast<unsigned long long>(r.submission),
+                          r.current ? ", the parser's current one" : "");
+        } else {
+            std::snprintf(text, sizeof(text),
+                          "the %s copy (submission %llu, region %#llx) %s the read; %u other "
+                          "held cop%s, %u of them differ%s",
+                          r.current ? "current submission's" : "newest held",
+                          static_cast<unsigned long long>(r.submission),
+                          static_cast<unsigned long long>(r.region_start),
+                          r.selected_differs ? "DIFFERS from" : "matches", r.matches - 1,
+                          r.matches - 1 == 1 ? "y" : "ies", others_differing,
+                          r.selected_differs ? " (rewritten after that submission)"
+                          : others_differing ? " (the chunk reused by a newer submission)"
+                                             : "");
+        }
         break;
+    }
     case Where::ChunkTail: {
         char status[24];
         if (r.status_read) {
@@ -324,7 +389,8 @@ inline std::string Describe(const Result& r) {
 
 namespace detail {
 struct Tally {
-    std::uint64_t outside = 0, inside = 0, inside_differing = 0, inside_ambiguous = 0,
+    std::uint64_t outside = 0, inside = 0, inside_differing = 0, inside_reused = 0,
+                  inside_ambiguous = 0,
                   straddles = 0, chunk_tail = 0;
 };
 inline std::mutex mutex;
@@ -332,15 +398,18 @@ inline std::map<std::pair<std::string, std::uint64_t>, Tally> tallies; ///< (kin
 inline std::uint64_t reads = 0, logged = 0;
 
 inline void PrintSummaryLocked() {
-    std::printf("CMD-DATA summary (every 65536 reads, all kinds): %llu reads, %llu logged\n",
+    std::printf("CMD-DATA summary (every 65536 reads, all kinds; not located = no held region or "
+                "candidate tail): %llu reads, %llu logged\n",
                 static_cast<unsigned long long>(reads), static_cast<unsigned long long>(logged));
     for (const auto& [key, t] : tallies) {
-        std::printf("  %s shader %#llx: outside %llu, inside %llu (a held copy differs %llu, "
-                    "several held copies %llu), straddling %llu, candidate chunk tail %llu\n",
+        std::printf("  %s shader %#llx: not located %llu, inside %llu (selected copy differs %llu, "
+                    "only older copies differ %llu, several held copies %llu), straddling %llu, "
+                    "candidate chunk tail %llu\n",
                     key.first.c_str(), static_cast<unsigned long long>(key.second),
                     static_cast<unsigned long long>(t.outside),
                     static_cast<unsigned long long>(t.inside),
                     static_cast<unsigned long long>(t.inside_differing),
+                    static_cast<unsigned long long>(t.inside_reused),
                     static_cast<unsigned long long>(t.inside_ambiguous),
                     static_cast<unsigned long long>(t.straddles),
                     static_cast<unsigned long long>(t.chunk_tail));
@@ -361,11 +430,10 @@ inline thread_local Observation last;
 inline void NoteRead(const char* kind, std::uint64_t shader_hash, const void* address,
                      std::size_t size, const void* bytes_read) {
     const auto at = reinterpret_cast<std::uint64_t>(address);
-    const LookupFn fn = lookup.load(std::memory_order_acquire);
-    Result r = fn ? fn(at, size, bytes_read) : Result{};
+    Result r = Lookup(at, size, bytes_read);
     ReadStatus(r);
     last = {kind, shader_hash, at, size, r};
-    const bool notable = (r.where == Where::Inside && r.differing) ||
+    const bool notable = (r.where == Where::Inside && r.selected_differs) ||
                          r.where == Where::ChunkTail || r.where == Where::Straddles;
     std::scoped_lock lk{detail::mutex};
     auto& t = detail::tallies[{kind, shader_hash}];
@@ -375,7 +443,8 @@ inline void NoteRead(const char* kind, std::uint64_t shader_hash, const void* ad
         break;
     case Where::Inside:
         ++t.inside;
-        t.inside_differing += r.differing ? 1 : 0;
+        t.inside_differing += r.selected_differs ? 1 : 0;
+        t.inside_reused += !r.selected_differs && r.differing ? 1 : 0;
         t.inside_ambiguous += r.matches > 1 ? 1 : 0;
         break;
     case Where::Straddles:
