@@ -141,6 +141,15 @@ class Bisect:
         self.game.write(['# baseline: nothing skipped'])
         self.game.settle()
         self.base = self.game.capture('bisect-base')
+        if self.roi is None:
+            # --roi auto: the largest lit flat-shaded region of the baseline (out/macos_route/detector/autoroi.py)
+            out = subprocess.run([sys.executable, '-I', str(ROOT / 'out/macos_route/detector/autoroi.py'), self.base[0]],
+                                 capture_output=True, text=True)
+            found = json.loads(out.stdout) if out.returncode == 0 and out.stdout.strip() else {'roi': None}
+            if not found.get('roi'):
+                raise SystemExit(f'draw_bisect: --roi auto found no flat-shaded defect region ({found}); pick one by eye')
+            self.roi = tuple(found['roi'])
+            self.note(f'auto ROI {self.roi} (planar area {found["area"]})')
         noise = [roidiff(self.base[0], s, self.roi) for s in self.base[1:]]
         self.noise = max(noise) if noise else 0.5
         self.t_lo = max(1.5, 3 * self.noise)
@@ -310,7 +319,7 @@ def selftest():
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument('--run')
-    p.add_argument('--roi', help='X0,Y0,X1,Y1 as fractions of the window')
+    p.add_argument('--roi', help="X0,Y0,X1,Y1 as fractions of the window, or 'auto' (largest flat-shaded region)")
     p.add_argument('--label', default='defect')
     p.add_argument('--captures', type=int, default=3)
     p.add_argument('--selftest', action='store_true')
@@ -323,7 +332,7 @@ def main():
         sys.exit(0 if selftest() else 1)
     if not args.run or not args.roi:
         p.error('--run and --roi are required')
-    roi = tuple(float(v) for v in args.roi.split(','))
+    roi = None if args.roi == 'auto' else tuple(float(v) for v in args.roi.split(','))
     game = Game(args.run, args.captures)
     Bisect(game, roi, Path(args.run) / f'bisect-{args.label}').run()
 
