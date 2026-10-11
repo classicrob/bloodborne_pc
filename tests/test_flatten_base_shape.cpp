@@ -130,6 +130,53 @@ void CompileBindlessBuffer() {
     assert(info.srt_info.flattened_bufsize_dw > ud.size());
 }
 
+void CompileComputedBuffer(bool unsupported, bool audit) {
+    setenv("BB_SHADER_SHARP_AUDIT", audit ? "1" : "0", 1);
+    setenv("BB_GPU_LOG", "warning", 1);
+    auto input = AmdGpu::Buffer::Placeholder(64);
+    input.base_address = 0x2000000000ull;
+    auto output = AmdGpu::Buffer::Placeholder(64);
+    output.base_address = 0x3000000000ull;
+    std::array<u32, 16> ud{};
+    std::memcpy(ud.data() + 4, &input, sizeof(input));
+    std::memcpy(ud.data() + 8, &output, sizeof(output));
+    GcnAsm::Code code;
+    code.SMovLiteral(GcnAsm::VCC_HI, 0);
+    if (unsupported) {
+        code.Sop2(1, 6, 6, 4); // s_sub_u32: computed num_records, not a supported post-op.
+    } else {
+        code.Sop2(16, 5, 5, GcnAsm::LITERAL); // s_or_b32: supported stride patch.
+        code.words.push_back(16u << 16);
+    }
+    code.SBufferLoad(1, 12, 4, true, 0);
+    code.SWaitcntAll();
+    code.VMov(4, 12);
+    code.Mubuf(GcnAsm::BUFFER_STORE_DWORD, {.vdata = 4, .srsrc = 8});
+    code.SEndpgm();
+    ShaderParams params{.user_data = ud, .code = code.words, .hash = 0xc0de5a9e};
+    Info info(HwStage::Compute, SwStage::Compute, params);
+    RuntimeInfo runtime{};
+    runtime.Initialize(HwStage::Compute, SwStage::Compute);
+    runtime.props.num_user_data = 16;
+    runtime.props.num_allocated_vgprs = 16;
+    runtime.hw.cs.workgroup_size = {1, 1, 1};
+    Profile profile{};
+    profile.supported_spirv = 0x00010500;
+    profile.subgroup_size = 32;
+    profile.support_int64 = true;
+    Pools pools;
+    (void)TranslateProgram(code.words, pools, info, runtime, profile);
+    bool patched = false;
+    for (const auto& buffer : info.buffers) {
+        if (buffer.post_op != SharpFetchPostOp::BitwiseOrDw1WithImm) continue;
+        const auto sharp = buffer.GetSharp(info);
+        assert(sharp.base_address == input.base_address && sharp.stride == 16);
+        assert(sharp.num_records == input.num_records);
+        patched = true;
+    }
+    assert(patched);
+}
+
 enum class Shape { ReadConstPhi, BufferPair };
 
 // One block with a single ReadConst / sharp-source ReadConstBuffer of a malformed base.
@@ -163,6 +210,19 @@ void FlattenMalformed(Shape shape) {
 } // namespace
 
 int main() {
+    const auto computed = InChild([] { CompileComputedBuffer(false, true); });
+    Expect("computed sharp audit logs a supported stride patch before rewriting it",
+           computed.status == 0 && computed.output.find(
+               "SHARP-COMPUTED shader=0xc0de5a9e kind=buffer dword=1 producer=BitwiseOr32") !=
+               std::string::npos);
+    const auto unsupported = InChild([] { CompileComputedBuffer(true, true); });
+    Expect("computed num_records is reported and rejected, never replaced by an operand",
+           StoppedWith(unsupported, "Shader 0xc0de5a9e sharp dword 2 has unsupported producer") &&
+           unsupported.output.find("SHARP-COMPUTED shader=0xc0de5a9e kind=buffer dword=2") !=
+               std::string::npos);
+    const auto audit_off = InChild([] { CompileComputedBuffer(false, false); });
+    Expect("computed sharp audit is silent when disabled", audit_off.status == 0 &&
+           audit_off.output.find("SHARP-COMPUTED") == std::string::npos);
     Expect("bindless V# (s_buffer_load_dwordx4) compiles through the production recompiler",
            InChild(CompileBindlessBuffer).status == 0);
     Expect("ReadConst on a whole-pointer phi stops (exit 23)",
