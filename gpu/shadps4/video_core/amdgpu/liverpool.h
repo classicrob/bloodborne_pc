@@ -103,6 +103,9 @@ struct Liverpool {
     std::mutex snapshots_mutex;
     std::deque<std::shared_ptr<CmdSnapshot>> gfx_snapshots;
     u64 snapshot_submits{};
+    /// GPU command thread: a replay capture holds the next frame's submissions (replay_capture.h).
+    bool replay_hold{};
+    u32 replay_hold_commands{};
     /// A stream write the PS4 command processor would see in command memory a copy hides.
     void CheckCommandMemoryWrite(VAddr address, u64 size, const char* writer);
     static u64 HashRegisterPacket(u64 checksum, const u32* words, u32 count);
