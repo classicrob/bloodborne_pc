@@ -163,6 +163,15 @@ add_library(bbgpu ${BBGPU_KIND} ${VIDEO_CORE} ${RECOMPILER} ${COMMON} ${SHIM_SOU
     shadps4/core/libraries/kernel/equeue.cpp ${AVPLAYER}
     shadps4/core/libraries/videodec/video_utils.cpp)
 add_dependencies(bbgpu host_shaders)
+if (APPLE)
+    # MetalFX temporal upscaling module (docs/macos/metalfx.md, metalfx-integration.md unit 2):
+    # Objective-C++ with ARC; Vulkan is reached only through the vkGetDeviceProcAddr it is given.
+    enable_language(OBJCXX)
+    target_sources(bbgpu PRIVATE shim/macos_metalfx.mm)
+    set_source_files_properties(shim/macos_metalfx.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+    target_link_libraries(bbgpu PRIVATE "-framework Foundation" "-framework Metal"
+        "-framework MetalFX" "-framework Security")
+endif()
 # In-game settings menu: Dear ImGui (third_party/imgui, MIT) with its Vulkan backend, and an
 # embedded Cyrillic font (third_party/fonts).
 target_sources(bbgpu PRIVATE third_party/imgui/imgui.cpp third_party/imgui/imgui_draw.cpp
