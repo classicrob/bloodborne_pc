@@ -15,6 +15,10 @@
 #include <errno.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <limits.h>
+#ifdef __APPLE__
+#include <fcntl.h>
+#endif
 #ifndef _WIN32
 #include <ftw.h>
 #endif
@@ -120,14 +124,43 @@ static int valid_name(const char *name, size_t max) {
     for (size_t i=0;i<n;++i) if (name[i]=='/' || name[i]=='\\' || (name[i]=='.' && (i==0 || name[i-1]=='.'))) return 0;
     return 1;
 }
+#ifdef __APPLE__
+/* Publish complete shim metadata only after its contents have reached the filesystem. */
+static int replace_metadata(const char *path, const void *data, size_t size) {
+    char temporary[800];
+    if (snprintf(temporary,sizeof(temporary),"%s.tmp.XXXXXX",path)>=(int)sizeof(temporary)) {
+        errno=ENAMETOOLONG; return -1;
+    }
+    int fd=mkstemp(temporary);
+    if (fd<0) return -1;
+    const unsigned char *bytes=data;
+    size_t written=0;
+    int failed=0;
+    while (written<size) {
+        ssize_t n=write(fd,bytes+written,size-written);
+        if (n<0 && errno==EINTR) continue;
+        if (n<=0) { failed=1; break; }
+        written+=(size_t)n;
+    }
+    if (!failed && fsync(fd)) failed=1;
+    if (close(fd)) failed=1;
+    if (!failed && rename(temporary,path)) failed=1;
+    if (failed) unlink(temporary);
+    return failed ? -1 : 0;
+}
+#endif
 static int write_param(const char *meta, const Param *p) {
     char path[700]; snprintf(path,sizeof(path),"%s/param.bin",meta);
+    Param copy=*p; copy.mtime=time(NULL);
+#ifdef __APPLE__
+    return replace_metadata(path,&copy,sizeof(copy));
+#else
     FILE *f=fopen(path,"wb");
     if (!f) return -1;
-    Param copy=*p; copy.mtime=time(NULL);
     int failed=fwrite(&copy,sizeof(copy),1,f)!=1;
     if (fclose(f)) failed=1;
     return failed ? -1 : 0;
+#endif
 }
 static int read_param(const char *meta, Param *p) {
     char path[700]; snprintf(path,sizeof(path),"%s/param.bin",meta);
@@ -249,12 +282,15 @@ static ABI int32_t save_set_param(const MountPoint *point, uint32_t type, const 
 #ifdef __APPLE__
     if (slots[slot].readonly) { pthread_mutex_unlock(&lock); return ERR_BAD_MOUNTED; }
 #endif
-    Param p; read_param(slots[slot].meta,&p);
+    Param p;
+    if (read_param(slots[slot].meta,&p) && type!=0) {
+        pthread_mutex_unlock(&lock); return ERR_INTERNAL;
+    }
     switch (type) {
     case 0: if (size<sizeof(Param)) goto bad; memcpy(&p,buffer,sizeof(p)); break;     /* ALL */
-    case 1: snprintf(p.title,sizeof(p.title),"%.*s",(int)size,(const char *)buffer); break;
-    case 2: snprintf(p.subtitle,sizeof(p.subtitle),"%.*s",(int)size,(const char *)buffer); break;
-    case 3: snprintf(p.detail,sizeof(p.detail),"%.*s",(int)size,(const char *)buffer); break;
+    case 1: snprintf(p.title,sizeof(p.title),"%.*s",(int)(size<sizeof(p.title) ? size : sizeof(p.title)-1),(const char *)buffer); break;
+    case 2: snprintf(p.subtitle,sizeof(p.subtitle),"%.*s",(int)(size<sizeof(p.subtitle) ? size : sizeof(p.subtitle)-1),(const char *)buffer); break;
+    case 3: snprintf(p.detail,sizeof(p.detail),"%.*s",(int)(size<sizeof(p.detail) ? size : sizeof(p.detail)-1),(const char *)buffer); break;
     case 4: if (size<4) goto bad; memcpy(&p.user_param,buffer,4); break;
     default: goto bad;
     }
@@ -273,7 +309,8 @@ bad:
 }
 static ABI int32_t save_icon(const MountPoint *point, const Icon *icon) {
     if (!initialized) return ERR_NOT_INITIALIZED;
-    if (!icon || !icon->buffer) return ERR_PARAMETER;
+    if (!icon || !icon->buffer || icon->data_size>icon->buffer_size ||
+        icon->data_size>SIZE_MAX) return ERR_PARAMETER;
     pthread_mutex_lock(&lock);
     int slot=slot_of(point);
     int32_t r=ERR_NOT_MOUNTED;
@@ -282,11 +319,11 @@ static ABI int32_t save_icon(const MountPoint *point, const Icon *icon) {
         if (slots[slot].readonly) { pthread_mutex_unlock(&lock); return ERR_BAD_MOUNTED; }
 #endif
         char path[700]; snprintf(path,sizeof(path),"%s/icon0.png",slots[slot].meta);
+#ifdef __APPLE__
+        r=replace_metadata(path,icon->buffer,(size_t)icon->data_size) ? ERR_INTERNAL : 0;
+#else
         FILE *f=fopen(path,"wb");
         r=f && fwrite(icon->buffer,1,icon->data_size,f)==icon->data_size ? 0 : ERR_INTERNAL;
-#ifdef __APPLE__
-        if (f && fclose(f)) r=ERR_INTERNAL;
-#else
         if (f) fclose(f);
 #endif
     }
@@ -369,20 +406,26 @@ static ABI int32_t save_search(const SearchCond *cond, SearchResult *result) {
 /* SaveDataMemory: one fixed-size blob per user/title. */
 static ABI int32_t memory_setup(int32_t user, uint64_t size, const Param *param) {
     if (!initialized) return ERR_NOT_INITIALIZED;
-    if (!size) return ERR_PARAMETER;
+    if (!size || size>INT64_MAX) return ERR_PARAMETER;
+    if (user<0) return ERR_INVALID_USER;
     char base[600], dir[640];
     root(user,NULL,base,sizeof(base));
     snprintf(dir,sizeof(dir),"%s.memory",base);
     if (make_dirs(dir)) return ERR_INTERNAL;
     pthread_mutex_lock(&lock);
-    snprintf(memory_path,sizeof(memory_path),"%s/memory.dat",dir);
-    FILE *f=fopen(memory_path,"r+b");
-    if (!f) f=fopen(memory_path,"w+b");
+    char candidate[sizeof(memory_path)];
+    snprintf(candidate,sizeof(candidate),"%s/memory.dat",dir);
+    FILE *f=fopen(candidate,"r+b");
+    if (!f) f=fopen(candidate,"w+b");
     int32_t r=ERR_INTERNAL;
     if (f) {
-        fseek(f,0,SEEK_END);
-        if ((uint64_t)ftell(f)<size && ftruncate(fileno(f),(off_t)size)) goto done;
-        memory_size=size; r=0;
+        if (fseek(f,0,SEEK_END)) goto done;
+        long current=ftell(f);
+        if (current<0 || ((uint64_t)current<size && ftruncate(fileno(f),(off_t)size))) goto done;
+#ifdef __APPLE__
+        if (fsync(fileno(f))) goto done;
+#endif
+        r=0;
     done:
 #ifdef __APPLE__
         if (fclose(f)) r=ERR_INTERNAL;
@@ -395,6 +438,7 @@ static ABI int32_t memory_setup(int32_t user, uint64_t size, const Param *param)
 #else
     if (!r && param) write_param(dir,param);
 #endif
+    if (!r) { memcpy(memory_path,candidate,strlen(candidate)+1); memory_size=size; }
     pthread_mutex_unlock(&lock);
     if (!r) printf("Runtime: save data memory ready (%llu bytes)\n",(unsigned long long)size);
     return r;
@@ -404,12 +448,13 @@ static int32_t memory_io(void *buffer, uint64_t size, int64_t offset, int write)
     if (!buffer || offset<0) return ERR_PARAMETER;
     pthread_mutex_lock(&lock);
     if (!memory_size) { pthread_mutex_unlock(&lock); return ERR_MEMORY_NOT_READY; }
-    if ((uint64_t)offset+size>memory_size) { pthread_mutex_unlock(&lock); return ERR_PARAMETER; }
+    if ((uint64_t)offset>memory_size || size>memory_size-(uint64_t)offset || size>SIZE_MAX) { pthread_mutex_unlock(&lock); return ERR_PARAMETER; }
     FILE *f=fopen(memory_path,"r+b");
     int32_t r=ERR_INTERNAL;
     if (f && !fseek(f,offset,SEEK_SET) &&
         (write ? fwrite(buffer,1,size,f) : fread(buffer,1,size,f))==size) r=0;
 #ifdef __APPLE__
+    if (f && write && !r && (fflush(f) || fsync(fileno(f)))) r=ERR_INTERNAL;
     if (f && fclose(f)) r=ERR_INTERNAL;
 #else
     if (f) fclose(f);
