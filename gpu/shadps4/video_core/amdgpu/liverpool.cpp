@@ -773,7 +773,9 @@ void Liverpool::ApplyGraphicsRegisterPacket(Regs& regs, const PM4Header* header,
         if (event->event_type.Value() != EventType::SoVgtStreamoutFlush) {
             return;
         }
-        // TODO: handle proper synchronization, for now signal that update is done immediately
+        // The VGT has flushed its stream-out offsets: done when parsed. bbport (Apple): exact here,
+        // since stream-out draws and the filled-size store stop (GS-DESIGN section 11), so there
+        // are no offsets in flight; the Gnm flush wait (WAIT_REG_MEM on CP_STRMOUT_CNTL) is met.
         regs.cp_strmout_cntl.offset_update_done = 1;
         mark_field(regs.cp_strmout_cntl);
         break;
@@ -1442,6 +1444,13 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             case PM4ItOpcode::WaitRegMem: {
                 const auto* wait_reg_mem = reinterpret_cast<const PM4CmdWaitRegMem*>(header);
                 // ASSERT(wait_reg_mem->engine.Value() == PM4CmdWaitRegMem::Engine::Me);
+#ifdef __APPLE__
+                wait_reg_mem->AssertRegisterInRange(regs.reg_array.size());
+                if (wait_reg_mem->IsStreamOutFlushWait()) {
+                    wait_reg_mem->AssertStreamOutFlushWaitMet(regs.reg_array);
+                    break;
+                }
+#endif
                 // Optimization: VO label waits are special because the emulator
                 // will write to the label when presentation is finished. So if
                 // there are no other submits to yield to we can sleep the thread
@@ -1528,6 +1537,21 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
             case PM4ItOpcode::StrmoutBufferUpdate: {
                 const auto* strmout = reinterpret_cast<const PM4CmdStrmoutBufferUpdate*>(header);
+#ifdef __APPLE__
+                // bbport: Gnm's stream-out setup sets a buffer's offset from the packet and stores
+                // nothing (Bloodborne's eboot: VGT_STRMOUT_BUFFER_SIZE/VTX_STRIDE by
+                // SET_CONTEXT_REG, then this). The other forms (offset from memory or from the
+                // filled size, the filled-size store) are not emitted by this game: they stop
+                // instead of running with unverified units. The stream-out state the GS copy
+                // kernels read takes the offset in command stream order (GS-DESIGN section 11).
+                strmout->AssertImplementedForm();
+                if (rasterizer) {
+                    rasterizer->StreamOutUpdate(strmout->buffer_select.Value(),
+                                                SourceSelect::BufferOffset, strmout->buffer_offset,
+                                                0);
+                }
+                break;
+#endif
                 LOG_WARNING(Render_Vulkan,
                             "Unimplemented IT_STRMOUT_BUFFER_UPDATE, update_memory = {}, "
                             "source_select = {}, buffer_select = {}",
@@ -1881,6 +1905,9 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         case PM4ItOpcode::WaitRegMem: {
             const auto* wait_reg_mem = reinterpret_cast<const PM4CmdWaitRegMem*>(header);
             ASSERT(wait_reg_mem->engine.Value() == PM4CmdWaitRegMem::Engine::Me);
+#ifdef __APPLE__
+            wait_reg_mem->AssertRegisterInRange(regs.reg_array.size());
+#endif
             while (!wait_reg_mem->Test(regs.reg_array)) {
                 YIELD_ASC(vqid);
             }

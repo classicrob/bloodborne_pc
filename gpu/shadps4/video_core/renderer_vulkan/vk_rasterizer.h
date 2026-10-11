@@ -25,6 +25,7 @@
 #include "video_core/texture_cache/texture_cache.h"
 
 namespace AmdGpu {
+enum class SourceSelect : u32;
 struct Liverpool;
 }
 
@@ -90,6 +91,14 @@ public:
 
     void FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds);
     void CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds);
+#ifdef __APPLE__
+    /// IT_STRMOUT_BUFFER_UPDATE, called in command stream order: the stream-out state the GS
+    /// emulation's copy kernels read (GS-DESIGN section 11). `value_or_address`: the offset in
+    /// dwords (BufferOffset) or the address it is read from (SrcAddress); `dst_or_0`: where the
+    /// filled size is stored, or 0.
+    void StreamOutUpdate(u32 buffer, AmdGpu::SourceSelect source, u64 value_or_address,
+                         u64 dst_or_0);
+#endif
     u32 ReadDataFromGds(u32 gsd_offset);
     bool InvalidateMemory(VAddr addr, u64 size, bool assume_locks = false);
     /// GPU thread, before a write the guest can observe (see Scheduler::WaitHostCopies).

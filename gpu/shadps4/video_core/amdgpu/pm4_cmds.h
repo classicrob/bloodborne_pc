@@ -288,6 +288,24 @@ struct PM4CmdStrmoutBufferUpdate {
     };
     u32 src_address_hi;
 
+    /// bbport: the form Gnm's stream-out setup emits (Bloodborne, before each stream-out draw):
+    /// BUFFER_OFFSET of buffer_select from the packet (buffer_offset, dwords), no filled-size
+    /// store. The game emits no other form.
+    bool SetsOffsetFromPacket() const {
+        return update_memory.Value() == 0 && source_select.Value() == SourceSelect::BufferOffset;
+    }
+
+#ifdef __APPLE__
+    /// Stops on any other form: not emitted by this game, and its units are unverified.
+    void AssertImplementedForm() const {
+        ASSERT_MSG(SetsOffsetFromPacket(),
+                   "macOS: IT_STRMOUT_BUFFER_UPDATE form not implemented: update_memory {}, "
+                   "source_select {}, buffer {}",
+                   update_memory.Value(), static_cast<u32>(source_select.Value()),
+                   buffer_select.Value());
+    }
+#endif
+
     template <typename T = u64>
     T DstAddress() const {
         ASSERT(update_memory.Value() == 1);
@@ -718,6 +736,33 @@ struct PM4CmdWaitRegMem {
     bool Test(std::span<const u32> regs) const {
         return TestValue(mem_space.Value() == MemSpace::Memory ? *Address() : regs[Reg()]);
     }
+
+#ifdef __APPLE__
+    /// A register wait's index must be inside the register file (Reg() has 16 bits).
+    void AssertRegisterInRange(size_t num_regs) const {
+        ASSERT_MSG(mem_space.Value() != MemSpace::Register || Reg() < num_regs,
+                   "macOS: WAIT_REG_MEM on register {:#x}, outside the register file", Reg());
+    }
+
+    /// CP_STRMOUT_CNTL (uconfig 0x3F): its OFFSET_UPDATE_DONE is set only by the graphics
+    /// queue's own SO_VGTSTREAMOUT_FLUSH, when parsed, so a graphics wait on it that is unmet when
+    /// reached is never met. Other registers can change while it waits: a compute queue's
+    /// SET_SH_REG writes the shared register file. Those waits yield as before.
+    static constexpr u32 CpStrmoutCntl = 0xC03F;
+    bool IsStreamOutFlushWait() const {
+        return mem_space.Value() == MemSpace::Register && Reg() == CpStrmoutCntl;
+    }
+
+    /// bbport: stops on a stream-out flush wait the flush event did not meet, instead of spinning.
+    void AssertStreamOutFlushWaitMet(std::span<const u32> regs) const {
+        AssertRegisterInRange(regs.size());
+        ASSERT_MSG(!IsStreamOutFlushWait() || Test(regs),
+                   "macOS: WAIT_REG_MEM on CP_STRMOUT_CNTL ({:#x}) can never be met on the graphics "
+                   "queue (no SO_VGTSTREAMOUT_FLUSH before it): value {:#x}, mask {:#x}, function "
+                   "{}, reference {:#x}",
+                   Reg(), regs[Reg()], mask, static_cast<u32>(function.Value()), ref);
+    }
+#endif
 
     bool TestValue(u32 value) const {
         switch (function.Value()) {
