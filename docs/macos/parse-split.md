@@ -22,6 +22,8 @@ or end.
   suspended stays with whatever ran meanwhile. A scope open across a yield stops, as does a scope
   still open when a queue task returns to the scheduler loop. No scope spans a yield today.
 - A drain of an idle draw pipe is not timed: it returns at once.
+- No scope may span a `siglongjmp` (e.g. a speculative read's fault recovery). It would leave the
+  scope open.
 - Counts use `__rdtsc`, with no locked instructions. Each thread is the only writer of its
   account, and the reporter reads it with relaxed loads.
 - A thread without an account records nothing. For example, the texture helper and the
@@ -30,7 +32,11 @@ or end.
   Apple.
 
 **Overhead** (`tests/bench_parse_split.sh`, process CPU time, x86_64 under Rosetta on the M4 Max,
-accounting on vs off):
+accounting on vs off). The benchmark is synthetic and single-threaded, runs off then on in a fixed
+order, and its extra scopes repeat one kind. Read the numbers as an illustration of scale, not a
+measured bound for gameplay or for the composed hooks. The small stage A figure is especially
+noise-sensitive. Alternate the order and report the spread before using them for a performance
+claim.
 - one `__rdtsc` costs about 11 ns under Rosetta;
 - stage A: 0.6-1.4 ns per packet (same-bucket marks are free), about 6-11 µs per frame at 800
   draws;
@@ -80,7 +86,8 @@ Parse split, last 600 frame ends: <ms> ms per frame, <n> draws per frame; ms per
 ```
 
 How to read it:
-- Stage A charges its open interval before each report, so its window is complete. The other
+- Stage A charges its open interval before each report, so its window is effectively closed (the
+  counters, the TSC and the wall clock are sampled one after another). The other
   threads' counters are sampled as they stand, so their windows are approximate at both edges.
   An interval open at a report is charged to the next window, which therefore has carry-in as
   well as carry-out. Their accounted percentage is close to 100%, not exactly 100%.
