@@ -58,8 +58,11 @@ Run the title-idle repro (and gameplay) with `BB_COND_WAKE_CHECK=1`. Look for ca
 `main` with caller 0x2083ecd (the engine's condition helper, under the event wait 0x207e8f0).
 Those are the waits the kick's synchronous path relies on.
 
-If they exist, the fix belongs in the guest cond wait. Its exact policy is in Astra-2's audit,
-docs/macos/cond-wake-audit.md: explicit waiter grants, not a generation loop.
+Candidates are observations of host behaviour: returns with no notification. They do not by
+themselves establish that the guest may rely on no spurious returns, nor approve a new wait
+policy. Only if the guest/PS4 contract is established (docs/macos/cond-wake-audit.md: FreeBSD's
+user and kernel paths differ, and Sony's is unknown) would a change to the guest cond wait follow.
+Its candidate design, explicit waiter grants rather than a generation loop, is in that audit.
 
 ## Test
 
