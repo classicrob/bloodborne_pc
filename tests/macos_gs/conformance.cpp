@@ -14,8 +14,11 @@
 // the blended image depends on their order.
 //
 //   conformance SPV_DIR [--only SUBSTRING] [--control base-vertex|reverse-order|rotate-provoking]
+//   conformance SPV_DIR --provoking [--control provoking-last]
+//       the device's flat (provoking) vertex per topology (RunProvokingCase)
 // The controls perturb one side on purpose; every case that draws something must then FAIL,
 // showing that the data, order and provoking-vertex checks can fail.
+#define VK_ENABLE_BETA_EXTENSIONS // VK_KHR_portability_subset (triangle fans)
 #include <vulkan/vulkan.h>
 #include <array>
 #include <cmath>
@@ -23,6 +26,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <numeric>
 #include <string>
 #include <vector>
 
@@ -970,14 +974,154 @@ bool RunCase(const Case& k, const std::string& spv_dir) {
 
 } // namespace
 
+/// Which vertex a flat varying takes per triangle on this device, against Vulkan's FIRST
+/// provoking vertex, which is also per-vertex index 0 of VK_KHR_fragment_shader_barycentric:
+/// list triangle i -> vertex 3i, strip triangle i -> vertex i (odd triangles too), fan triangle
+/// i -> vertex i + 1. Every triangle covers its own pixels; vertex v's flat value is v + 1 (the
+/// vertex buffer index the index buffer names), read at the triangle's centroid. Indexed draws;
+/// strips restart between segments, like the emulated GS's strip draws.
+bool RunProvokingCase(const char* name, VkPrimitiveTopology topology,
+                      const std::vector<u32>& segment_lengths, const std::string& spv_dir) {
+    const bool strip = topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
+    const bool fan = topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN;
+    struct Tri {
+        std::array<u32, 3> slots; // positions in the index buffer, Vulkan's vertex order
+        u32 provoking;            // index buffer position of the expected vertex
+    };
+    std::vector<std::array<float, 2>> slot_pos; // per index-buffer position (restarts too)
+    std::vector<Tri> tris;
+    const u32 rows = u32(segment_lengths.size());
+    std::vector<u32> slot_of_index; // index-buffer position -> slot, or ~0 for a restart
+    for (u32 row = 0; row < rows; ++row) {
+        const u32 n = segment_lengths[row];
+        const float top = -1.0f + 2.0f * row / rows + 0.04f, bottom = top + 2.0f / rows - 0.08f;
+        const u32 first = u32(slot_pos.size());
+        for (u32 k = 0; k < n; ++k) {
+            float x, y;
+            if (fan) {
+                // Center first, then a rim of increasing angle: disjoint sectors.
+                const float cx = 0.0f, cy = (top + bottom) / 2, r = (bottom - top) / 2;
+                const float a = 3.1f * float(k - 1) / float(n - 2) + 0.02f;
+                x = k == 0 ? cx : cx + 5.0f * r * std::cos(a);
+                y = k == 0 ? cy : cy - r * std::sin(a) * 0.95f;
+            } else if (strip) {
+                x = -0.95f + 1.9f * k / (n - 1);
+                y = (k % 2) ? bottom : top;
+            } else {
+                const u32 t = k / 3, c = k % 3, tris_in_row = n / 3;
+                const float w = 1.9f / tris_in_row, x0 = -0.95f + w * t;
+                x = c == 0 ? x0 + 0.1f * w : c == 1 ? x0 + 0.9f * w : x0 + 0.5f * w;
+                y = c == 2 ? bottom : top;
+            }
+            slot_pos.push_back({x, y});
+        }
+        for (u32 j = 0; j + 2 < n; j += strip || fan ? 1 : 3) {
+            const u32 a = first + j;
+            if (strip) {
+                // Vulkan strip order: (i, i + 1 + i % 2, i + 2 - i % 2); provoking i.
+                tris.push_back({{a, a + 1 + j % 2, a + 2 - j % 2}, a});
+            } else if (fan) {
+                // Vulkan fan order: (i + 1, i + 2, 0); provoking i + 1.
+                tris.push_back({{a + 1, a + 2, first}, a + 1});
+            } else {
+                tris.push_back({{a, a + 1, a + 2}, a});
+            }
+        }
+    }
+    // Index buffer: slot k names vertex perm[k] (a fixed shuffle), restarts between segments.
+    const u32 slots = u32(slot_pos.size());
+    std::vector<u32> perm(slots);
+    for (u32 k = 0; k < slots; ++k) {
+        perm[k] = (k * 7 + 3) % slots;
+    }
+    if (std::gcd(7u, slots) != 1) {
+        for (u32 k = 0; k < slots; ++k) perm[k] = slots - 1 - k;
+    }
+    std::vector<u32> indices;
+    u32 slot = 0;
+    for (u32 row = 0; row < rows; ++row) {
+        if (row > 0 && (strip || fan)) {
+            indices.push_back(0xFFFFFFFFu);
+        }
+        for (u32 k = 0; k < segment_lengths[row]; ++k) {
+            indices.push_back(perm[slot++]);
+        }
+    }
+    Buffer vertices = MakeBuffer(slots * sizeof(Vertex));
+    for (u32 k = 0; k < slots; ++k) {
+        Vertex v{};
+        v.data = {slot_pos[k][0], slot_pos[k][1], 0.0f, 1.0f, float(perm[k] + 1), 0.0f, 0.0f, 1.0f};
+        std::memcpy(vertices.data + perm[k] * sizeof(Vertex), &v, sizeof(v));
+    }
+    Buffer index_buffer = MakeBuffer(indices.size() * 4);
+    std::memcpy(index_buffer.data, indices.data(), indices.size() * 4);
+    Buffer image = MakeBuffer(u64(Size) * Size * 16);
+    const Target target = MakeTarget();
+    const auto layout = MakeLayout(VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, {});
+    const VkPipeline pipe = GraphicsPipeline(Module(ReadFile(spv_dir + "/list.vert.spv")),
+                                             Module(ReadFile(spv_dir + "/flat.frag.spv")),
+                                             layout.layout, topology, strip || fan, true);
+    Begin();
+    Render(target, image, [&] {
+        vkCmdBindPipeline(g.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+        const VkDeviceSize zero = 0;
+        vkCmdBindVertexBuffers(g.cmd, 0, 1, &vertices.buffer, &zero);
+        vkCmdBindIndexBuffer(g.cmd, index_buffer.buffer, 0, VK_INDEX_TYPE_UINT32);
+        vkCmdDrawIndexed(g.cmd, u32(indices.size()), 1, 0, 0, 0);
+    });
+    Barrier(VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_HOST_BIT, VK_ACCESS_2_HOST_READ_BIT);
+    Submit();
+    // The pipeline blends dst = 0.5 * src + 0.5 * dst over a cleared target: a pixel holds half
+    // the flat value.
+    const float* px = reinterpret_cast<const float*>(image.data);
+    u32 wrong = 0, last_vertex = 0, other = 0;
+    std::string failures;
+    for (size_t t = 0; t < tris.size(); ++t) {
+        const auto& tri = tris[t];
+        float cx = 0, cy = 0;
+        for (const u32 k : tri.slots) {
+            cx += slot_pos[k][0] / 3;
+            cy += slot_pos[k][1] / 3;
+        }
+        const u32 x = u32((cx * 0.5f + 0.5f) * Size), y = u32((cy * 0.5f + 0.5f) * Size);
+        const float got = px[(y * Size + x) * 4] * 2.0f;
+        // Control "provoking-last": expect the triangle's last vertex instead (must fail).
+        const u32 want_slot = g_control == "provoking-last" ? tri.slots[2] : tri.provoking;
+        const float want = float(perm[want_slot] + 1);
+        if (got != want) {
+            ++wrong;
+            last_vertex += got == float(perm[tri.slots[2]] + 1) ? 1 : 0;
+            other += got != float(perm[tri.slots[2]] + 1) ? 1 : 0;
+            if (wrong <= 6) {
+                char line[200];
+                std::snprintf(line, sizeof line,
+                              "    triangle %zu (slots %u %u %u): flat value from vertex %g, want "
+                              "%g (Vulkan FIRST)\n",
+                              t, tri.slots[0], tri.slots[1], tri.slots[2], got - 1, want - 1);
+                failures += line;
+            }
+        }
+    }
+    std::printf("%-58s %s  (%zu triangles; %u wrong: %u take Vulkan's vertex 2, %u other)\n", name,
+                wrong ? "FAIL" : "PASS", tris.size(), wrong, last_vertex, other);
+    std::fputs(failures.c_str(), stdout);
+    return wrong == 0;
+}
+
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::fprintf(stderr, "usage: conformance SPV_DIR [--only SUBSTRING]\n");
+        std::fprintf(stderr, "usage: conformance SPV_DIR [--only SUBSTRING | --provoking]\n");
         return 2;
     }
     const std::string spv_dir = argv[1];
     std::string only;
-    for (int i = 2; i + 1 < argc; i += 2) {
+    bool provoking = false;
+    for (int i = 2; i < argc; ++i) {
+        provoking |= std::string(argv[i]) == "--provoking";
+    }
+    for (int i = 2 + (provoking && argc > 2 && std::string(argv[2]) == "--provoking");
+         i + 1 < argc; i += 2) {
         if (std::string(argv[i]) == "--only") {
             only = argv[i + 1];
         } else if (std::string(argv[i]) == "--control") {
@@ -1007,6 +1151,30 @@ int main(int argc, char** argv) {
         {"indirect: scratch one dword short -> empty + report", P::PointList, O::TriangleStrip, 8, 64, 1, Index::None, 0, true, true},
     };
     InitGpu();
+    if (provoking) {
+        const auto list = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+        const auto strip = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
+        const auto fan = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN;
+        VkPhysicalDevicePortabilitySubsetFeaturesKHR portability{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PORTABILITY_SUBSET_FEATURES_KHR};
+        VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &portability};
+        vkGetPhysicalDeviceFeatures2(g.physical, &features);
+        int failed = 0, ran = 0;
+        const auto run_case = [&](const char* name, VkPrimitiveTopology t, std::vector<u32> rows) {
+            ++ran;
+            failed += RunProvokingCase(name, t, rows, spv_dir) ? 0 : 1;
+        };
+        run_case("provoking: triangle list, 4 rows x 5 triangles", list, {15, 15, 15, 15});
+        run_case("provoking: strips 3/4/5/8/9 vertices, restarts", strip, {3, 4, 5, 8, 9});
+        run_case("provoking: strips 12 vertices x 4, restarts", strip, {12, 12, 12, 12});
+        if (portability.triangleFans) {
+            run_case("provoking: fans 5/6/8 vertices, restarts", fan, {5, 6, 8});
+        } else {
+            std::printf("provoking: fans: the device has no triangle fans (portability subset)\n");
+        }
+        std::printf("provoking vertex: %d of %d cases passed\n", ran - failed, ran);
+        return failed ? 1 : 0;
+    }
     int failed = 0, ran = 0;
     for (const auto& k : cases) {
         if (!only.empty() && std::string(k.name).find(only) == std::string::npos) {
