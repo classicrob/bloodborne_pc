@@ -72,6 +72,38 @@ may still be executing N. Examples are constants and the dynamic vertex ring aro
 | Command-chunk allocator 0x26d3b80 | Claim: `lock cmpxchg` qword 0 to 1 at the chunk's last qword. Release: CPU stores 2, then EOP (0x26d3c80) or RELEASE_MEM (0x26d3cb0) writes 0 at completion. Exception: cleanup's direct CPU zero 0x26d3d30 (from 0x26af3f0, 0x26b12f0), and pool teardown 0x26d3b50 (Astra-2). | **Ordinary reuse is completion-governed** (labels at GPU completion). The direct zero is not: if cleanup zeroes a status while an old release is pending, a new claimant can take the chunk and the old packet then zeroes its live status. The EOP release is visible to `BB_LABEL_CHECK` (status 1 found where 2 was parsed); the RELEASE_MEM release is not (the check covers EOP only). |
 | Anything done on wall time or call order alone (e.g. the movie step's 20 ms) | None. | The throttle never protected these (title-idle arms A/B/C). |
 
+### Run C: the one direct observation without the throttle
+
+PREVIEW-11 run C (`20261011-075756-1080p-PM4-C-P11`, `BB_SUBMIT_THROTTLE=none`, labels at GPU
+completion, flips **not** at retire) reached the world and then faulted in GetProgram's SRT
+candidate walk: a null user-data table pointer s[2:3] (docs/macos/srt-candidate-faults.md).
+The doc leaves two explanations open:
+- **an incompatible candidate layout.** c6a8b7d now rejects that candidate without faulting,
+  logs it (first 8 per thread, then every 1024), and falls back to a fresh translation;
+- **live user data the guest had already reused.**
+
+That walk reads **guest memory at parse/record time**: user-data tables, SRTs and shader code.
+Throttle off lets the guest run ahead of our parse. So whatever per-frame memory those reads
+come from can change before we read it. Run C had no flip gate at retire, so the guest's slot
+reuse waited only for an enqueue-time flip.
+
+What this means per step:
+- **R1 keeps parse-time reads protected.** Its GpuIdle still requires frame N parsed and
+  recorded before release, as R0 does. Only GPU-execution-time reads (zero-copy) are exposed
+  further. So R1 alone should not reproduce run C's exposure.
+- **R2, R3 and `none` expose parse-time reads.** The guest can be ahead of our parse, so run C
+  is direct evidence for them, not for R1.
+- **Bit 60 may change it.** With flips at retire, flip-gated per-frame data is reused only after
+  the frame's GPU retirement, which is after its parse.
+- **Before R2:** re-run run C's configuration with bits 59 and 60 (throttle `none`, as a
+  diagnostic only) and count, against the same route with the throttle on:
+  - SRT candidate rejections ("rejected on this thread");
+  - fresh translations;
+  - faults.
+
+  More rejections without the throttle, even with no fault, would mean stale parse-time reads,
+  which the c6a8b7d guard turns from a crash into a possibly wrong render.
+
 Host-side reasons, not guest semantics:
 - **Bounded run-ahead.** Snapshot bytes, the draw-prep queue, recorder chunks, staging and
   input latency all grow with frames in flight.
@@ -187,9 +219,12 @@ Only after R1/R2 evidence and the lifetime RE.
 
 **Zero-error list.** Each of these must stay at zero:
 - CMD-INTERLEAVE outside the known movie race (run with `BB_MOVIE_HANDOFF=1`);
-- parser stops;
+- parser stops and guest faults (run C's GetProgram/SRT-walker fault in particular);
 - `BB_LABEL_CHECK` reports;
 - Playtest's corruption detector.
+
+**Must not rise over R0 at the same pose:** SRT candidate rejections (c6a8b7d's log). Under R1
+these should be unchanged (section 2, run C).
 
 **Expected and counted, not errors:** CMD-SNAPSHOT guest rewrites. The snapshots make them
 harmless to the parse (section 2). Report their rate per half; a change between halves is
