@@ -269,6 +269,9 @@ private:
     /// returns whether the control file skips it.
     bool DrawBisectSkip(const GraphicsPipeline* pipeline, bool is_indexed, u32 index_offset,
                         const IndirectDraw* indirect);
+    /// BB_GPU_READ_CHECK (diagnostic): hashes what the draw just recorded reads, to compare at
+    /// GPU retirement.
+    void GpuReadCheck(const GraphicsPipeline* pipeline, bool is_indexed, u32 index_offset);
 #endif
     void DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_indexed,
                             const IndirectDraw& indirect);
