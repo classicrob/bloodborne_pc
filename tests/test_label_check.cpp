@@ -21,6 +21,7 @@
 #include "bbport_label_check.h"
 #include "bbport_label_mode.h"
 #include "bbport_label_store.h"
+#include "bbport_parse_split.h"
 #include "bbport_label_sequencer.h"
 
 namespace {
@@ -402,6 +403,44 @@ int main() {
                    in_flight.where == Where::Inside && after.where == Where::Outside &&
                    calls.load() == 1);
     }
+
+    // Parse split (bbport_parse_split.h): marks partition a thread's time exactly; nested scopes
+    // are charged their own time; a section for another thread's account does nothing.
+    std::thread([] {
+        using namespace BbSplit;
+        const auto spin = [] {
+            const std::uint64_t until = __rdtsc() + 20000;
+            while (__rdtsc() < until) {
+            }
+        };
+        Attach(stage_a, ALoop);
+        spin();
+        Mark(ADraw);
+        const std::uint64_t draw_from = stage_a.mark_at;
+        spin();
+        {
+            Scope deferred{KDeferred};
+            spin();
+            {
+                Scope tick{KGpuTick};
+                spin();
+            }
+            spin();
+        }
+        {
+            Section other{stage_b, BBind}; // stage B's: inactive here
+            spin();
+        }
+        const bool still_draw = Open() == ADraw;
+        Mark(ALoop);
+        const std::uint64_t span = stage_a.mark_at - draw_from;
+        const std::uint64_t draw = stage_a.bucket[ADraw].load(), def = stage_a.scope[KDeferred].load(),
+                            tick = stage_a.scope[KGpuTick].load();
+        Expect("parse split: bucket + nested scopes = the marked interval, each scope its own time",
+               still_draw && draw + def + tick == span && def > 0 && tick > 0 && draw > 0 &&
+                   stage_a.scope_in[KDeferred * MaxBuckets + ADraw].load() == def &&
+                   stage_a.bucket[ALoop].load() > 0 && stage_b.bucket[BBind].load() == 0);
+    }).join();
 
     std::fprintf(stderr, "%s: %u failures\n", failures ? "FAIL" : "PASS", failures);
     return failures ? 1 : 0;

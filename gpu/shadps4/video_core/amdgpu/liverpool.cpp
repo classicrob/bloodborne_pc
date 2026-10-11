@@ -38,6 +38,7 @@
 #include "bbport_cmd_data.h"
 #include "bbport_label_check.h"
 #include "bbport_label_store.h"
+#include "bbport_parse_split.h"
 #include "video_core/amdgpu/pm4_cmds.h"
 #include "video_core/renderdoc.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
@@ -223,6 +224,12 @@ u32 Liverpool::ProcessCommands(bool* stopped_at_cpu_flip) {
     // Process incoming commands with high priority
     u32 ran = 0;
     const bool stop_at_cpu_flip = stopped_at_cpu_flip || replay_held_left;
+#ifdef __APPLE__
+    const u32 split_open = BbSplit::Open();
+    if (num_commands) {
+        BbSplit::Mark(BbSplit::AHostCmds);
+    }
+#endif
     while (num_commands) {
         Common::UniqueFunction<void> callback{};
         {
@@ -245,6 +252,11 @@ u32 Liverpool::ProcessCommands(bool* stopped_at_cpu_flip) {
         callback();
         ++ran;
     }
+#ifdef __APPLE__
+    if (BbSplit::Open() == BbSplit::AHostCmds) {
+        BbSplit::Mark(split_open);
+    }
+#endif
     return ran;
 }
 
@@ -262,9 +274,15 @@ void Liverpool::Process(std::stop_token stoken) {
 #if defined(__linux__) || defined(_WIN32) || defined(__APPLE__)
     gpu_tid = static_cast<u32>(gettid());
 #endif
+#ifdef __APPLE__
+    BbSplit::Attach(BbSplit::stage_a, BbSplit::ALoop);
+#endif
 
     while (!stoken.stop_requested()) {
         {
+#ifdef __APPLE__
+            BbSplit::Mark(BbSplit::AIdle);
+#endif
             const auto idle_start = std::chrono::steady_clock::now();
             std::unique_lock lk{submit_mutex};
 #ifdef __APPLE__
@@ -284,6 +302,9 @@ void Liverpool::Process(std::stop_token stoken) {
                 std::chrono::duration_cast<std::chrono::nanoseconds>(
                     std::chrono::steady_clock::now() - idle_start).count(),
                 std::memory_order_relaxed);
+#ifdef __APPLE__
+            BbSplit::Mark(BbSplit::ALoop);
+#endif
         }
         if (stoken.stop_requested()) {
             break;
@@ -350,6 +371,9 @@ void Liverpool::Process(std::stop_token stoken) {
         curr_qid = -1;
 
         while (num_submits || num_commands) {
+#ifdef __APPLE__
+            BbSplit::Mark(BbSplit::ALoop);
+#endif
             ProcessCommands();
 
             curr_qid = (curr_qid + 1) % num_mapped_queues;
@@ -389,6 +413,7 @@ void Liverpool::Process(std::stop_token stoken) {
         // SubmitDone may overwrite submit_done_at before GpuIdle); this iteration's frame-end
         // body and the GpuIdle split use this same flag. (The body's submit_done reset is
         // unchanged: a SubmitDone during OnSubmit/Flush can still be cleared by it.)
+        BbSplit::Mark(BbSplit::AFrameEnd); // the frame end (if any) and the GpuIdle below
         bool frame_ended;
         {
             std::scoped_lock lk{submit_mutex};
@@ -496,6 +521,9 @@ void Liverpool::Process(std::stop_token stoken) {
         // Replay capture (off unless BB_REPLAY_CAPTURE): a frame end with all its work retired is
         // where the hold starts; the guest may already be submitting the next frame, which this
         // thread will not parse while holding.
+        if (retired_frame) {
+            BbSplit::NoteFrameEnd(BbStats::draws.load(std::memory_order_relaxed));
+        }
         if (retired_frame && ReplayCapture::Armed()) {
             ReplayCapture::OnReleasedFrameRetired();
             if (ReplayCapture::OnFrameRetired(rasterizer)) {
@@ -611,6 +639,66 @@ void Liverpool::NotePredication(const PM4Header* header) {
         std::fflush(stdout);
     }
 }
+#endif
+
+#ifdef __APPLE__
+namespace {
+/// Parse split (bbport_parse_split.h): the stage A bucket of a graphics packet.
+BbSplit::A SplitClass(PM4ItOpcode opcode) {
+    switch (opcode) {
+    case PM4ItOpcode::DrawIndex2:
+    case PM4ItOpcode::DrawIndexOffset2:
+    case PM4ItOpcode::DrawIndexAuto:
+        return BbSplit::ADraw;
+    case PM4ItOpcode::DrawIndirect:
+    case PM4ItOpcode::DrawIndirectMulti:
+    case PM4ItOpcode::DrawIndexIndirect:
+    case PM4ItOpcode::DrawIndexIndirectMulti:
+    case PM4ItOpcode::DrawIndexIndirectCountMulti:
+        return BbSplit::AIndirect;
+    case PM4ItOpcode::DispatchDirect:
+    case PM4ItOpcode::DispatchIndirect:
+        return BbSplit::ADispatch;
+    case PM4ItOpcode::Nop:
+    case PM4ItOpcode::ContextControl:
+    case PM4ItOpcode::ClearState:
+    case PM4ItOpcode::SetConfigReg:
+    case PM4ItOpcode::SetContextReg:
+    case PM4ItOpcode::SetShReg:
+    case PM4ItOpcode::SetUconfigReg:
+    case PM4ItOpcode::SetPredication:
+    case PM4ItOpcode::IndexType:
+    case PM4ItOpcode::NumInstances:
+    case PM4ItOpcode::IndexBase:
+    case PM4ItOpcode::IndexBufferSize:
+    case PM4ItOpcode::SetBase:
+    case PM4ItOpcode::IncrementDeCounter:
+    case PM4ItOpcode::WaitOnCeCounter:
+    case PM4ItOpcode::PfpSyncMe:
+        return BbSplit::ARegisters;
+    case PM4ItOpcode::EventWrite:
+    case PM4ItOpcode::EventWriteEop:
+    case PM4ItOpcode::EventWriteEos:
+    case PM4ItOpcode::ReleaseMem:
+    case PM4ItOpcode::WriteData:
+        return BbSplit::ALabels;
+    case PM4ItOpcode::WaitRegMem:
+        return BbSplit::AWaitRegMem;
+    case PM4ItOpcode::IndirectBuffer:
+        return BbSplit::AIndBuffer;
+    case PM4ItOpcode::DmaData:
+    case PM4ItOpcode::CopyData:
+    case PM4ItOpcode::MemSemaphore:
+    case PM4ItOpcode::AcquireMem:
+    case PM4ItOpcode::CondExec:
+    case PM4ItOpcode::Rewind:
+    case PM4ItOpcode::StrmoutBufferUpdate:
+        return BbSplit::AMemory;
+    default:
+        return BbSplit::AOther;
+    }
+}
+} // namespace
 #endif
 
 namespace {
@@ -986,6 +1074,9 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb,
 
         const PM4ItOpcode opcode = header->type3.opcode;
         const auto* it_body = reinterpret_cast<const u32*>(header) + 1;
+#ifdef __APPLE__
+        BbSplit::Mark(BbSplit::AConstEng);
+#endif
         switch (opcode) {
         case PM4ItOpcode::Nop: {
             // const auto* nop = reinterpret_cast<const PM4CmdNop*>(header);
@@ -1365,6 +1456,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             const u32 count = header->type3.NumWords();
             const PM4ItOpcode opcode = header->type3.opcode;
 #ifdef __APPLE__
+            BbSplit::Mark(SplitClass(opcode));
             if (predication.active && IsDrawOrDispatch(opcode)) {
                 ++predication.draws_while_set; // executed here; the PS4 may have skipped it
             }
@@ -1893,7 +1985,10 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     if (rasterizer) {
                         rasterizer->DrainDrawPipe(static_cast<u32>(opcode));
                     }
-                    vo_port->WaitVoLabel([&] { return wait_reg_mem->Test(regs.reg_array); });
+                    {
+                        BB_SPLIT_SCOPE(KVoLabel);
+                        vo_port->WaitVoLabel([&] { return wait_reg_mem->Test(regs.reg_array); });
+                    }
                     break;
                 }
                 // bbport: a fence handed to the draw recording thread counts as written: that
@@ -2097,6 +2192,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
     while (!acb.empty()) {
 #ifdef __APPLE__
         BbCmdData::current_submission = 0; // compute has no snapshot
+        BbSplit::Mark(BbSplit::ACompute);
 #endif
         ProcessCommands();
         if (rasterizer) {

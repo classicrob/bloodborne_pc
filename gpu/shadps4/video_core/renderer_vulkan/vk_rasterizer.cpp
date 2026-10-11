@@ -40,6 +40,7 @@
 #include "video_core/renderer_vulkan/vk_shader_hle.h"
 #include "video_core/texture_cache/image_view.h"
 #include "video_core/texture_cache/texture_cache.h"
+#include "bbport_parse_split.h"
 #include <vk_mem_alloc.h>
 
 namespace Vulkan {
@@ -438,6 +439,14 @@ void Rasterizer::DrainDrawPipe(u32 reason, u32 line, const char* function) {
     if (!draw_pipe || !OnStageA()) {
         return;
     }
+#ifdef __APPLE__
+    const BbSplit::K split_kind = reason == DrawPipe::ReasonConstRam ? BbSplit::KDrainConstRam
+                                  : reason == DrawPipe::ReasonSubmissionEnd
+                                      ? BbSplit::KDrainSubmitEnd
+                                  : reason == DrawPipe::ReasonRasterizer ? BbSplit::KDrainRasterizer
+                                                                         : BbSplit::KDrainPacket;
+    BbSplit::Scope split_scope{split_kind};
+#endif
     static const bool stats = std::getenv("BB_FRAME_STATS") != nullptr;
     if (!stats) {
         draw_pipe->Drain(reason);
@@ -764,6 +773,7 @@ void Rasterizer::RunDrawPacket(void* context, const u8* data, u32 size) {
     auto& self = *static_cast<Rasterizer*>(context);
     if (*reinterpret_cast<const PacketKind*>(data) == PacketKind::Task) {
         const auto& task = *reinterpret_cast<const TaskPacket*>(data);
+        BB_SPLIT_MARK_ON(stage_b, BTask);
         task.task(self, data + sizeof(TaskPacket));
         return;
     }
@@ -867,10 +877,12 @@ void Rasterizer::RunDrawPacket(void* context, const u8* data, u32 size) {
     self.pipe_db_extent = packet.db_extent;
     if (packet.kind == PacketKind::Special) {
         // A draw FilterDraw handles (fast clear elimination, resolve, depth copy, skip).
+        BB_SPLIT_MARK_ON(stage_b, BSpecial);
         FrameCapture::Poll();
         self.scheduler.PopPendingOperations();
         self.FilterDraw();
     } else if (cs) {
+        BB_SPLIT_MARK_ON(stage_b, BDispatch);
         stage_cs = cs;
         const auto* pipeline = static_cast<const ComputePipeline*>(packet.pipeline);
         if (indirect) {
@@ -880,6 +892,7 @@ void Rasterizer::RunDrawPacket(void* context, const u8* data, u32 size) {
         }
         stage_cs = nullptr;
     } else if (indirect) {
+        BB_SPLIT_MARK_ON(stage_b, BIndirect);
         self.DrawIndirectRecord(static_cast<const GraphicsPipeline*>(packet.pipeline),
                                 packet.is_indexed, *indirect);
     } else {
@@ -1035,6 +1048,7 @@ void Rasterizer::NoteRecordContext(const char* kind, const Pipeline* pipeline) {
 
 void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw* used_prepared,
                             bool is_indexed, u32 index_offset) {
+    BB_SPLIT_MARK_ON(stage_b, BDrawSetup);
     NoteRecordContext("draw", pipeline);
     if (DrawPipe::OnStageB()) {
         FrameCapture::Poll();
@@ -1078,6 +1092,7 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     motion_draw = pipeline->GetGraphicsKey().motion_vectors;
     motion_geometry = 0;
 
+    BB_SPLIT_MARK_ON(stage_b, BRenderState);
     PrepareRenderState(pipeline);
     if (upscaler->Enabled() && std::popcount(pipeline->GetGraphicsKey().mrt_mask) == 1) {
         const auto& viewport = Regs().viewports[0];
@@ -1089,6 +1104,7 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     // bbport: vertex and index buffers are resolved while the helper binds textures (their
     // commands are recorded after BeginRendering, as before).
     draw_inputs = {pipeline, draw_prepared, index_offset, is_indexed, true, false};
+    BB_SPLIT_MARK_ON(stage_b, BBind);
     const bool bound = BindResources(pipeline);
     bind_prepared = nullptr; // indirect draws and dispatches bind without prepared sharps
     const bool inputs_resolved = draw_inputs.resolved;
@@ -1096,7 +1112,9 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     if (!bound) {
         return;
     }
+    BB_SPLIT_MARK_ON(stage_b, BBegin);
     const auto state = BeginRendering(pipeline);
+    BB_SPLIT_MARK_ON(stage_b, BRecord);
 #ifdef __APPLE__
     if (gs_draw.ended_pass && *gs_draw.ended_pass == state) {
         // The compute passes ended the pass this draw continues (not counted when the draw
@@ -2400,6 +2418,7 @@ bool Rasterizer::IsComputeImageClear(const Pipeline* pipeline) {
 void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* prepared,
                              Shader::Backend::Bindings& binding,
                              Shader::PushData& push_data, u32& write_index) {
+    BB_SPLIT_SECTION(stage_b, BBuffers);
     const u64 alignment = instance.StorageMinAlignment();
     for (u32 buffer_index = 0; buffer_index < stage.buffers.size(); ++buffer_index) {
         const auto& desc = stage.buffers[buffer_index];
@@ -2606,6 +2625,7 @@ Rasterizer::ImageDescCacheEntry& Rasterizer::CachedImageDescEntry(const AmdGpu::
 void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* prepared,
                               Shader::Backend::Bindings& binding, u32& write_index,
                               bool& barrier, bool on_helper) {
+    BB_SPLIT_SECTION(stage_b, BTextures);
     const u32 first_image_idx = image_infos.size();
     TextureSet* set_slot = nullptr;
     if (!on_helper && BindTexturesFromSet(stage, prepared, first_image_idx, barrier, set_slot)) {
