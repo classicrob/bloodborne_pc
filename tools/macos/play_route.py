@@ -90,12 +90,12 @@ NEW_GAME = [
     ('brightness', [('press', 'down'), ('press_screen', 'cross', 0.04, 3, 3), ('capture', 'controls', 0.05)]),
     ('controls', [('press', 'down')] * 6 + [('capture', 'controls-next', 0.05),
                   ('press_log', 'cross', r'Init: Opening .*sprj_opening\.mp4', 2, 30), ('sleep', 15),
-                  ('capture', 'opening-movie', 0.05)]),
+                  ('capture', 'opening-movie', None)]),
     ('movie-end', [('wait_log', r'DemuxerThread: Demuxer Thread exited normally', 300), ('sleep', 5),
                    ('capture', 'after-movie', None)]),
     ('character-creation', [('wait_draws', 100, 2, 300), ('sleep', 5), ('capture', 'character-creation', 0.05)]),
     # The cursor starts on Enter Name; BB_IME_TEXT fills the dialog without a keyboard.
-    ('name', [('press', 'cross'), ('wait_log', r'^Runtime: ImeDialog text: ', 30), ('sleep', 2),
+    ('name', [('press_log', 'cross', r'^Runtime: ImeDialog text: ', 3, 30), ('sleep', 2),
               ('capture', 'name-entered', 0.05)]),
     # Up wraps to Finish; the confirmation highlights NO, so left selects YES.
     ('finish', [('press', 'up'), ('capture', 'finish-selected', 0.05), ('press', 'cross'), ('sleep', 2),
