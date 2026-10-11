@@ -157,3 +157,14 @@ For a targeted follow-up, framed entry probes can cover `0x26d6e50` (RDI identif
 (RDI allocator, RSI node). The existing 64-byte entry windows do not include F/B or a payload
 range's end through its neighbor; those need separately bounded safe reads. Avoid a global
 node-pool allocation probe unless the specific allocator is filtered: that pool helper is shared.
+
+## Checking when the guest acts on "done" (`BB_LABEL_CHECK=1`)
+
+The guest frees per-frame objects holding end-of-pipe labels (48-byte heap blocks, label at
+offset 0) once the submitDone throttle releases it. A label written after that corrupts its heap
+(guest fault 0x263b8e7, `docs/history/SESSION_2026-09-30.md`). With `BB_LABEL_CHECK=1`, each EOP
+label's value is read when the EOP is parsed and again just before it is written. If the guest
+changed it in between (the allocator's free-list link, a reset), `LABEL-CHECK` is logged with the
+values, the 48 bytes around it, and how long the write was pending. With several EOPs on one label
+in flight, a later one finding the earlier one's value is not a report. Any change to when the
+guest is released must keep the count at zero. Test: `label-check-test`.

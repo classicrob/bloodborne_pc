@@ -33,6 +33,7 @@
 #include "core/platform.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "bbport_write_log.h"
+#include "bbport_label_check.h"
 #include "video_core/amdgpu/pm4_cmds.h"
 #include "video_core/renderdoc.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
@@ -387,6 +388,11 @@ void SignalEop(const PM4CmdEventWriteEop& eop) {
     eop.SignalFence(
         [](void* address, u64 data, u32 num_bytes) {
             auto* memory = Core::Memory::Instance();
+#ifdef __APPLE__
+            if (BbLabelCheck::Enabled()) {
+                BbLabelCheck::BeforeWrite(reinterpret_cast<u64>(address), data, num_bytes);
+            }
+#endif
             BbWriteLog::Note(reinterpret_cast<u64>(address), &data, num_bytes, BbWriteLog::Fence);
             if (!memory->TryWriteBacking(address, &data, num_bytes)) {
                 memcpy(address, &data, num_bytes);
@@ -1345,6 +1351,16 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
             case PM4ItOpcode::EventWriteEop: {
                 const auto* event_eop = reinterpret_cast<const PM4CmdEventWriteEop*>(header);
+#ifdef __APPLE__
+                // Before the hand-over: the recording thread may write the label at once.
+                if (BbLabelCheck::Enabled()) {
+                    event_eop->SignalFence(
+                        [](void* address, u64, u32 num_bytes) {
+                            BbLabelCheck::NoteParsed(reinterpret_cast<u64>(address), num_bytes);
+                        },
+                        [] {});
+                }
+#endif
                 if (rasterizer) {
                     if (rasterizer->RunInOrder(&RunEventWriteEop, event_eop, sizeof(*event_eop))) {
                         NotePendingFences(*event_eop);
