@@ -101,6 +101,46 @@ u32 StreamWrites::WaitLanded(VAddr address, u64 size) {
     return static_cast<u32>(overlapping.size());
 }
 
+namespace {
+std::mutex builder_trace_mutex;
+std::array<BuilderTrace::Call, 8192> builder_trace;
+u64 builder_trace_calls = 0;
+std::atomic<u32> builder_trace_threads = 0;
+} // namespace
+
+void BuilderTrace::Note(const char* builder, const u32* cmdbuf, u32 size) {
+    static thread_local const u32 thread = ++builder_trace_threads;
+    std::scoped_lock lk{builder_trace_mutex};
+    const u64 seq = builder_trace_calls++;
+    builder_trace[seq % builder_trace.size()] = {builder, cmdbuf, size, thread, seq};
+}
+
+std::vector<BuilderTrace::Call> BuilderTrace::Around(const u32* begin, const u32* end, u32 last) {
+    std::scoped_lock lk{builder_trace_mutex};
+    std::vector<Call> calls;
+    const u64 count = std::min<u64>(builder_trace_calls, builder_trace.size());
+    for (u64 seq = builder_trace_calls - count; seq < builder_trace_calls; ++seq) {
+        const auto& call = builder_trace[seq % builder_trace.size()];
+        if ((call.cmdbuf < end && begin < call.cmdbuf + call.size) ||
+            seq + last >= builder_trace_calls) {
+            calls.push_back(call);
+        }
+    }
+    return calls;
+}
+
+void BuilderTrace::Report(const u32* at) {
+    constexpr u32 Window = 64; // dwords on each side
+    LOG_CRITICAL(Render, "Builder calls writing within {} dwords of the malformed packet at {} "
+                         "(and the 8 latest), oldest first:",
+                 Window, fmt::ptr(at));
+    for (const auto& call : Around(at - Window, at + Window, 8)) {
+        LOG_CRITICAL(Render, "  #{} thread {} {} cmdbuf {} ({:+} dwords from the packet) size {}",
+                     call.seq, call.thread, call.builder, fmt::ptr(call.cmdbuf),
+                     call.cmdbuf - at, call.size);
+    }
+}
+
 std::shared_ptr<CmdSnapshot> CmdSnapshot::Take(std::span<const u32> dcb,
                                                std::span<const u32> ccb) {
     const auto start = std::chrono::steady_clock::now();
