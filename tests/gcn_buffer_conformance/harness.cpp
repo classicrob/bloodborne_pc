@@ -4,7 +4,9 @@
 // binder mirroring Rasterizer::BindBuffers. Results are compared against ref.c (written from the
 // Sea Islands ISA; see SPEC.md and README.md).
 #include <algorithm>
+#include <array>
 #include <cassert>
+#include <cctype>
 #include <cerrno>
 #include <cinttypes>
 #include <csignal>
@@ -86,7 +88,8 @@ u8 CanaryByte(u64 va) { return u8(Hash32(va ^ 0xC0FFEE123ull) % 255 + 1); }
 enum class SoffSrc { Inline, Sgpr };
 enum class SmemSrc { None, Imm, Sgpr };
 // Wave64 lane-semantics programs (no buffer access under test).
-enum class Wave { None, Lane, MbcntMask, Readlane, Exec1, Exec2, LoopReadFirstLane, Lds, CtrlPhi, CtrlBreak, Pkrtz, Pkrtz3, SmemFallback };
+enum class Wave { None, Lane, MbcntMask, Readlane, Exec1, Exec2, LoopReadFirstLane, Lds, CtrlPhi, CtrlBreak, Pkrtz, Pkrtz3, SmemFallback, Exec3, Exec3Out, WriteLane,
+                  RlBeforeDiv, RlCselect, RlBareFf1, RlEmptyExec };
 
 struct Template {
     std::string name;
@@ -310,6 +313,87 @@ void AssembleWave(GcnAsm::Code& c, Wave w) {
         c.VMov(10, 21);
         c.VMov(11, 24);
         break;
+    case Wave::Exec3: { // a real branch around the scope (s_cbranch_execz): structured divergence
+        c.SMovLiteral(21, 0xDEAD0000u);
+        c.SMovLiteral(24, 0xDEAD0001u);
+        c.VCmpNeU32(Inline(0), 2);
+        c.SAndSaveexecB64(22, VCC_LO);
+        const size_t br = c.words.size();
+        c.Sopp(8, 0); // s_cbranch_execz END (patched)
+        c.VReadfirstlane(21, 3);
+        c.VCmpNeU32(Inline(0), 5); // VOPC ballot of data0 != 0 under the partial exec
+        c.SBcnt1B64(24, VCC_LO);
+        c.VMov(10, 21); // copied inside the scope: the active lanes' view
+        c.VMov(11, 24);
+        c.words[br] |= u32(int32_t(c.words.size()) - int32_t(br + 1)) & 0xFFFF;
+        c.SMovB64(EXEC_LO, 22); // END
+        break;
+    }
+    case Wave::Exec3Out: { // the same, read AFTER the scope by every lane: SGPRs are wave-wide
+        c.SMovLiteral(21, 0xDEAD0000u);
+        c.SMovLiteral(24, 0xDEAD0001u);
+        c.VCmpNeU32(Inline(0), 2);
+        c.SAndSaveexecB64(22, VCC_LO);
+        const size_t br = c.words.size();
+        c.Sopp(8, 0); // s_cbranch_execz END (patched)
+        c.VReadfirstlane(21, 3);
+        c.VCmpNeU32(Inline(0), 5);
+        c.SBcnt1B64(24, VCC_LO);
+        c.words[br] |= u32(int32_t(c.words.size()) - int32_t(br + 1)) & 0xFFFF;
+        c.SMovB64(EXEC_LO, 22); // END
+        c.VMov(10, 21);
+        c.VMov(11, 24);
+        break;
+    }
+    case Wave::WriteLane: // v_writelane_b32 to lane 5 (launched) and to lane 37 (absent in <=32)
+        c.SMovLiteral(20, 0xABCD1234u);
+        c.Sop1(3, 21, Inline(5));
+        c.Sop1(3, 22, Inline(37));
+        c.Vop2(2, 10, 21, 20); // v_writelane_b32 v10, s20, s21
+        c.Vop2(2, 11, 22, 20); // v_writelane_b32 v11, s20, s22
+        break;
+    // v_readlane lanes the one-subgroup lowering must reject (only v_readfirstlane's own selector,
+    // with an exec that cannot be empty or lane 0 executing, names a lane that executes the read).
+    case Wave::RlBeforeDiv: { // exec saved before an execz scope, its first lane read inside it
+        c.SMovB64(30, EXEC_LO);
+        c.VCmpNeU32(Inline(0), 2);
+        c.SAndSaveexecB64(22, VCC_LO);
+        const size_t br = c.words.size();
+        c.Sopp(8, 0);
+        c.Sop1(20, 20, 30); // s_ff1_i32_b64 s20, s[30:31]: may name a lane outside the scope
+        c.VReadlane(21, 3, 20);
+        c.VMov(10, 21);
+        c.words[br] |= u32(int32_t(c.words.size()) - int32_t(br + 1)) & 0xFFFF;
+        c.SMovB64(EXEC_LO, 22);
+        break;
+    }
+    case Wave::RlCselect: // s_ff1 of exec behind an unrelated s_cselect
+        c.Sop1(20, 20, EXEC_LO);
+        c.SCmpLtU32Literal(20, 2);
+        c.Sop2(10, 20, Inline(0), 20); // s_cselect_b32 s20, 0, s20
+        c.VReadlane(21, 3, 20);
+        c.VMov(10, 21);
+        break;
+    case Wave::RlBareFf1: // s_ff1 of exec as the lane: ~0 (lane 63) for an empty exec
+        c.Sop1(20, 20, EXEC_LO);
+        c.VReadlane(21, 3, 20);
+        c.VMov(10, 21);
+        break;
+    case Wave::RlEmptyExec: { // v_readfirstlane after an inner exec change, inside an execz scope
+        c.VCmpNeU32(Inline(0), 2);
+        c.SAndSaveexecB64(22, VCC_LO);
+        const size_t br = c.words.size();
+        c.Sopp(8, 0);
+        c.VCmpNeU32(Inline(0), 5);
+        c.SAndSaveexecB64(24, VCC_LO);
+        c.VMov(13, Vgpr(3));     // the last exec-masked instruction of the inner scope
+        c.VReadfirstlane(21, 3); // after it: exec may be empty, and lane 0 may be outside the scope
+        c.SMovB64(EXEC_LO, 24);
+        c.VMov(10, 21);
+        c.words[br] |= u32(int32_t(c.words.size()) - int32_t(br + 1)) & 0xFFFF;
+        c.SMovB64(EXEC_LO, 22);
+        break;
+    }
     case Wave::Exec2: // exec as a 64-bit value; mbcnt over exec inside the scope
         c.VCmpNeU32(Inline(0), 2);
         c.SAndSaveexecB64(22, VCC_LO);
@@ -666,11 +750,17 @@ void Assemble(Template& t) {
     }
     Code c;
     c.SMovLiteral(VCC_HI, 0x5eed); // the recompiler expects s_mov_b32 vcc_hi, #imm first
-    // v15 = local invocation index = x + y * size_x (v0, v1 = local id x, y)
+    // v15 = local invocation index = x + y * size_x + z * size_x * size_y (v0..v2 = local id)
     u32 log2x = 0;
     while ((1u << log2x) < t.wg[0]) ++log2x;
     c.VLshlrevB32(15, Inline(log2x), 1);
     c.Vop2(37, 15, 15, Vgpr(0)); // v_add_i32 v15, v0, v15
+    if (t.wg[2] > 1) { // + z * size_x * size_y (v2 = local id z, read before the parameter load)
+        u32 log2y = 0;
+        while ((1u << log2y) < t.wg[1]) ++log2y;
+        c.VLshlrevB32(14, Inline(log2x + log2y), 2);
+        c.Vop2(37, 15, 15, Vgpr(14)); // v_add_i32 v15, v14, v15
+    }
     c.VLshlrevB32(1, Inline(5), 15);
     Code::BufFields p{.offen = true, .vaddr = 1, .vdata = 2, .srsrc = 4};
     c.Mubuf(BUFFER_LOAD_DWORDX4, p); // v2 active, v3 vindex, v4 voffset, v5 data0
@@ -1521,6 +1611,94 @@ void AddWaveCases() {
             }
         }
     }
+    // Wave operations under divergent exec (s_and_saveexec scopes) in compute workgroups of one
+    // subgroup (16/24/32 invocations: one GCN wave, lanes beyond the workgroup absent): exact with
+    // native subgroup operations. 33 invocations span two subgroups: still loud by design.
+    for (u32 x : {16u, 24u, 32u, 33u, 64u}) {
+        const std::string shape = " [" + std::to_string(x) + "x1]";
+        for (auto [name, w] : {std::pair{"wave: under saveexec: v_readfirstlane, s_bcnt1 exec, masked v_mov", Wave::Exec1},
+                               std::pair{"wave: under saveexec: s_mov_b64 exec, v_mbcnt over exec", Wave::Exec2},
+                               std::pair{"wave: s_cbranch_execz scope: v_readfirstlane, VOPC ballot s_bcnt1", Wave::Exec3}}) {
+            if (x == 64 && w != Wave::Exec3) continue; // the 64x1 saveexec shapes are covered above
+            Template t;
+            t.name = std::string(name) + shape;
+            t.op.kind = GCN_LOAD;
+            t.wave = w;
+            t.wg = {x, 1, 1};
+            t.wave_divergent = x > 32;
+            const u32 tt = AddTemplate(t);
+            for (const M& m : masks) {
+                const std::string mn = m.name;
+                if (mn != "even" && mn != "lanes5+40" && mn != "lower32" && mn != "all") continue;
+                Job& j = NewJob("wave64", tt, RawV(64), 0);
+                j.label += " exec=" + mn;
+                for (u32 l = 0; l < x; ++l) {
+                    SetLane(j, l, value(l), 0, {u32(l % 3 != 1), 0, 0, 0});
+                    j.lanes[l].active = u32((m.mask >> (l % 64)) & 1);
+                }
+            }
+        }
+    }
+    // One-subgroup workgroups in 1D/2D/3D shapes: lane = LocalInvocationIndex & 63 in every shape,
+    // ballots/mbcnt/writelane and the execz-scope ballot.
+    for (const std::array<u32, 3>& wg : {std::array<u32, 3>{16, 1, 1}, std::array<u32, 3>{32, 1, 1},
+                                         std::array<u32, 3>{4, 4, 1}, std::array<u32, 3>{2, 4, 2},
+                                         std::array<u32, 3>{4, 4, 2}}) {
+        const u32 threads = wg[0] * wg[1] * wg[2];
+        const std::string shape = " [" + std::to_string(wg[0]) + "x" + std::to_string(wg[1]) + "x" + std::to_string(wg[2]) + "]";
+        for (auto [name, w] : {std::pair{"wave1sg: v_mbcnt(-1) lane id + VOPC ballot + s_bcnt1", Wave::Lane},
+                               std::pair{"wave1sg: v_mbcnt over VCC + s_mov_b64 vcc + v_cndmask", Wave::MbcntMask},
+                               std::pair{"wave1sg: s_cbranch_execz scope: v_readfirstlane, VOPC ballot s_bcnt1", Wave::Exec3},
+                               std::pair{"wave1sg: s_and_saveexec, then v_readfirstlane + s_bcnt1 exec (empty exec reads lane 0)", Wave::Exec1},
+                               std::pair{"wave1sg: v_writelane lane 5 and lane 37", Wave::WriteLane}}) {
+            Template t;
+            t.name = std::string(name) + shape;
+            t.op.kind = GCN_LOAD;
+            t.wave = w;
+            t.wg = wg;
+            const u32 tt = AddTemplate(t);
+            for (const M& m : masks) {
+                const std::string mn = m.name;
+                if (mn != "all" && mn != "even" && mn != "lanes5+40" && !(mn == "none" && w == Wave::Exec1)) continue;
+                if (w == Wave::WriteLane && mn != "all") continue;
+                Job& j = NewJob("wave64", tt, RawV(64), 0);
+                j.label += " mask=" + mn;
+                for (u32 l = 0; l < threads; ++l) {
+                    const u32 bit = u32((m.mask >> (l % 64)) & 1);
+                    if (w == Wave::Exec3 || w == Wave::Exec1) {
+                        SetLane(j, l, value(l), 0, {u32(l % 3 != 1), 0, 0, 0});
+                        j.lanes[l].active = bit;
+                    } else {
+                        SetLane(j, l, value(l), 0, {bit, 0, 0, 0});
+                    }
+                }
+            }
+        }
+    }
+    // Opt-in repro (BB_REPRO_SGPR_LIVEOUT=1, group "repro"): SGPRs written inside an
+    // s_and_saveexec + s_cbranch_execz scope, read after it by lanes that were inactive in the
+    // scope. GCN: SGPRs are wave-wide, so every lane sees the new value. Promoted to the default
+    // suite once the recompiler keeps scope-written SGPRs wave-uniform.
+    if (std::getenv("BB_REPRO_SGPR_LIVEOUT")) {
+        for (u32 x : {16u, 32u}) {
+            Template t;
+            t.name = "repro: SGPRs written in an execz scope, read after it by every lane [" + std::to_string(x) + "x1]";
+            t.op.kind = GCN_LOAD;
+            t.wave = Wave::Exec3Out;
+            t.wg = {x, 1, 1};
+            const u32 tt = AddTemplate(t);
+            for (const M& m : masks) {
+                const std::string mn = m.name;
+                if (mn != "even" && mn != "lanes5+40" && mn != "all") continue;
+                Job& j = NewJob("repro", tt, RawV(64), 0);
+                j.label += " exec=" + mn;
+                for (u32 l = 0; l < x; ++l) {
+                    SetLane(j, l, value(l), 0, {u32(l % 3 != 1), 0, 0, 0});
+                    j.lanes[l].active = u32((m.mask >> (l % 64)) & 1);
+                }
+            }
+        }
+    }
     // V_CVT_PKRTZ_F16_F32 (VOP2 47, VOP3 303 with a negated src1): truncation, overflow to the
     // largest finite half, f16 subnormals, infinities, NaNs, f32 denormals, signed zeros.
     {
@@ -1681,6 +1859,26 @@ void AddWaveCases() {
         const u32 tt = AddTemplate(t);
         NewJob("wave64", tt, RawV(64), 0);
     }
+#ifdef BB_MIRROR_PROFILE_WAVE64
+    // Dynamic v_readlane lanes a one-subgroup workgroup cannot read exactly (Sol-2's review of
+    // 5df42f2): a lane taken before the divergence, an unrelated selector, a bare s_ff1, and
+    // v_readfirstlane where exec may be empty and lane 0 may not execute. All must be rejected.
+    for (auto [name, w] : {std::pair{"s_ff1 of exec saved before an execz scope, v_readlane inside it", Wave::RlBeforeDiv},
+                           std::pair{"s_ff1 of exec behind an unrelated s_cselect, v_readlane", Wave::RlCselect},
+                           std::pair{"bare s_ff1 of exec as the v_readlane lane", Wave::RlBareFf1},
+                           std::pair{"v_readfirstlane after an inner exec change in an execz scope", Wave::RlEmptyExec}}) {
+        Template t;
+        t.name = std::string("wave1sg: ") + name + " [16x1] (compile)";
+        t.op.kind = GCN_LOAD;
+        t.wave = w;
+        t.compile_only = true;
+        t.compute_compile = true;
+        t.wg = {16, 1, 1};
+        t.expect_loud = true;
+        const u32 tt = AddTemplate(t);
+        NewJob("wave64", tt, RawV(64), 0);
+    }
+#endif
     // Divergent exit hidden behind a uniform break condition (if (c) { break; }), compile-only.
     for (u32 x : {64u, 128u}) {
 #ifndef BB_MIRROR_PROFILE_WAVE64
@@ -2209,6 +2407,10 @@ struct DeviceCaps {
     u32 subgroup_stages, subgroup_ops;
     u32 explicit_layout; // VK_KHR_workgroup_memory_explicit_layout
     u32 depth_bounds;    // VkPhysicalDeviceFeatures::depthBounds
+    // float controls (VkPhysicalDeviceVulkan12Properties), as PipelineCache fills the Profile
+    u32 denorm_independence, rounding_independence;
+    u32 fp16_denorm_preserve, fp16_denorm_flush, fp16_rtz, fp32_denorm_preserve, fp32_denorm_flush, fp32_rtz;
+    u32 fp64_denorm_preserve, fp64_denorm_flush, fp64_rtz, fp16_szinp, fp32_szinp, fp64_szinp;
 };
 
 vk::UniqueInstance CreateInstance() {
@@ -2236,7 +2438,7 @@ DeviceCaps QueryCaps() {
                                        vk::PhysicalDeviceVulkan12Features, vk::PhysicalDeviceRobustness2FeaturesEXT,
                                        vk::PhysicalDeviceVulkan13Features>();
     auto props = physical.getProperties2<vk::PhysicalDeviceProperties2, vk::PhysicalDeviceSubgroupProperties,
-                                         vk::PhysicalDeviceVulkan13Properties>();
+                                         vk::PhysicalDeviceVulkan13Properties, vk::PhysicalDeviceVulkan12Properties>();
     const auto& f = chain.get<vk::PhysicalDeviceFeatures2>().features;
     const auto& f12 = chain.get<vk::PhysicalDeviceVulkan12Features>();
     const auto& r2 = chain.get<vk::PhysicalDeviceRobustness2FeaturesEXT>();
@@ -2256,6 +2458,23 @@ DeviceCaps QueryCaps() {
     c.buffer_int64_atomics = f12.shaderBufferInt64Atomics;
     c.max_shared = p.limits.maxComputeSharedMemorySize;
     c.depth_bounds = f.depthBounds;
+    {
+        const auto& v12 = props.get<vk::PhysicalDeviceVulkan12Properties>();
+        c.denorm_independence = v12.denormBehaviorIndependence != vk::ShaderFloatControlsIndependence::eNone;
+        c.rounding_independence = v12.roundingModeIndependence != vk::ShaderFloatControlsIndependence::eNone;
+        c.fp16_denorm_preserve = v12.shaderDenormPreserveFloat16;
+        c.fp16_denorm_flush = v12.shaderDenormFlushToZeroFloat16;
+        c.fp16_rtz = v12.shaderRoundingModeRTZFloat16;
+        c.fp32_denorm_preserve = v12.shaderDenormPreserveFloat32;
+        c.fp32_denorm_flush = v12.shaderDenormFlushToZeroFloat32;
+        c.fp32_rtz = v12.shaderRoundingModeRTZFloat32;
+        c.fp64_denorm_preserve = v12.shaderDenormPreserveFloat64;
+        c.fp64_denorm_flush = v12.shaderDenormFlushToZeroFloat64;
+        c.fp64_rtz = v12.shaderRoundingModeRTZFloat64;
+        c.fp16_szinp = v12.shaderSignedZeroInfNanPreserveFloat16;
+        c.fp32_szinp = v12.shaderSignedZeroInfNanPreserveFloat32;
+        c.fp64_szinp = v12.shaderSignedZeroInfNanPreserveFloat64;
+    }
     const auto& p13 = props.get<vk::PhysicalDeviceVulkan13Properties>();
     const auto& f13 = chain.get<vk::PhysicalDeviceVulkan13Features>();
     const auto& sg = props.get<vk::PhysicalDeviceSubgroupProperties>();
@@ -2306,6 +2525,25 @@ Shader::Profile MakeProfile(const DeviceCaps& c) {
     p.support_int16 = c.int16;
     p.support_int64 = c.int64;
     p.support_float16 = c.float16;
+    // Float controls exactly as PipelineCache fills them (fields absent on older trees are skipped).
+    [&](auto& pr) {
+        if constexpr (requires { pr.support_fp16_signed_zero_inf_nan_preserve; }) {
+            pr.supports_denorm_behavior_independence = c.denorm_independence;
+            pr.supports_rounding_mode_independence = c.rounding_independence;
+            pr.support_fp16_denorm_preserve = c.fp16_denorm_preserve;
+            pr.support_fp16_denorm_flush = c.fp16_denorm_flush;
+            pr.support_fp16_round_to_zero = c.fp16_rtz;
+            pr.support_fp32_denorm_preserve = c.fp32_denorm_preserve;
+            pr.support_fp32_denorm_flush = c.fp32_denorm_flush;
+            pr.support_fp32_round_to_zero = c.fp32_rtz;
+            pr.support_fp64_denorm_preserve = c.fp64_denorm_preserve;
+            pr.support_fp64_denorm_flush = c.fp64_denorm_flush;
+            pr.support_fp64_round_to_zero = c.fp64_rtz;
+            pr.support_fp16_signed_zero_inf_nan_preserve = c.fp16_szinp;
+            pr.support_fp32_signed_zero_inf_nan_preserve = c.fp32_szinp;
+            pr.support_fp64_signed_zero_inf_nan_preserve = c.fp64_szinp;
+        }
+    }(p);
     p.support_float64 = c.float64;
     p.supports_buffer_int64_atomics = c.buffer_int64_atomics;
     p.needs_buffer_offsets = c.storage_align > 4;
@@ -3121,6 +3359,20 @@ std::vector<u32> WaveExpected(const Job& j) {
             r[0] = value(gcn_first_lane(exec)); r[1] = gcn_popcount64(exec);
             if (exec >> lane & 1) r[3] = value(lane);
             break;
+        case Wave::WriteLane:
+            if (lane == 5) r[0] = 0xABCD1234u;
+            if (lane == 37) r[1] = 0xABCD1234u;
+            break;
+        case Wave::Exec3Out: // GCN: every lane of the wave sees the scope's SGPR results
+            r[0] = exec ? value(gcn_first_lane(exec)) : 0xDEAD0000u;
+            r[1] = exec ? gcn_popcount64(ballot & exec) : 0xDEAD0001u;
+            break;
+        case Wave::Exec3:
+            if (exec >> lane & 1) {
+                r[0] = value(gcn_first_lane(exec));
+                r[1] = gcn_popcount64(ballot & exec);
+            }
+            break;
         case Wave::Exec2:
             r[0] = u32(exec); r[1] = u32(exec >> 32);
             if (exec >> lane & 1) r[2] = gcn_mbcnt(u32(exec >> 32), gcn_mbcnt(u32(exec), 0, lane, 0), lane, 1);
@@ -3337,6 +3589,7 @@ struct Options {
     std::array<u32, 16> ud{};
     std::vector<u32> ud_ptr; // --compile-only: UD[n:n+1] point at a zeroed host table (extended user data)
     bool ud_table_vsharp = false; // --compile-only: that table holds valid raw buffer V#s instead of zeros
+    std::array<u32, 3> wg{64, 1, 1}; // --compile-only --stage cs: workgroup shape
 };
 
 void FillPristine(Gpu& g, const std::vector<u32>& jobs) {
@@ -4395,6 +4648,223 @@ int Bench(const Options& opt) {
 
 // --disasm FILE: decode a GCN binary with the production decoder and flag wave-level operations
 // (results depend on the 64-lane wave; see the wave64 group).
+// --census-sgpr FILE...: static scan for SGPRs (and VCC/M0) written inside an s_cbranch_execz
+// scope (between a forward execz branch and its target) and read at or after the target before
+// being rewritten. The recompiler builds such a scope as a per-lane if, so lanes that skipped it
+// read the old value where GCN gives every lane the new one (SGPRs are wave-wide). A linear scan:
+// candidates, not proof (no loops, no SCC, implicit M0/VCC reads not seen). Writers are tagged
+// "value" (smem, v_readlane/v_readfirstlane, 32-bit and arithmetic s_* ops: one number per wave)
+// or "mask" (v_cmp, carry-outs, s_*saveexec and 64-bit bitwise s_* ops, which the recompiler
+// keeps as one bit per lane; there only lanes whose bit GCN would change can differ). Readers are
+// tagged the same way: a value written in the scope and used as a value after it is the live-out
+// bug class; a value read only by mask operations is a register the game reuses (typically a dead
+// value feeding a mask that is cleared later).
+int CensusSgpr(int argc, char** argv, int first) {
+    using namespace Shader::Gcn;
+    using OF = OperandField;
+    // S_ names end in one or two type tokens: dst type then src type (S_BCNT1_I32_B64).
+    auto is_type = [](const std::string& tok) {
+        return tok.size() == 3 && std::strchr("BUIF", tok[0]) && std::isdigit(u8(tok[1])) && std::isdigit(u8(tok[2]));
+    };
+    auto type_width = [](const std::string& tok) -> u32 { return tok.size() == 3 && tok.substr(1) == "64" ? 2 : 1; };
+    auto tokens = [](const std::string& name) {
+        std::vector<std::string> t;
+        size_t p = 0, q;
+        while ((q = name.find('_', p)) != std::string::npos) { t.push_back(name.substr(p, q - p)); p = q + 1; }
+        t.push_back(name.substr(p));
+        return t;
+    };
+    auto smem_count = [](const std::string& name) -> u32 {
+        const auto x = name.rfind('X');
+        return name.find("DWORDX") != std::string::npos ? u32(std::stoul(name.substr(x + 1))) : 1;
+    };
+    auto add = [](const InstOperand& op, u32 base, u32 w, std::vector<u32>& out) {
+        if (op.field == OF::ScalarGPR) for (u32 k = 0; k < w; ++k) out.push_back(base + k);
+        else if (op.field == OF::VccLo) { out.push_back(106); if (w > 1) out.push_back(107); }
+        else if (op.field == OF::VccHi) out.push_back(107);
+        else if (op.field == OF::M0) out.push_back(124);
+    };
+    auto dsts = [&](const GcnInst& in, const std::string& name, std::vector<u32>& out) {
+        const auto t = tokens(name);
+        for (u32 d = 0; d < in.dst_count; ++d) {
+            const auto& op = in.dst[d];
+            u32 w = 1;
+            if (in.encoding == InstEncoding::SMRD) w = smem_count(name);
+            else if (name.rfind("S_", 0) == 0) {
+                const bool two = t.size() >= 2 && is_type(t[t.size() - 2]) && is_type(t.back());
+                w = type_width(two ? t[t.size() - 2] : t.back());
+            } else if (name.rfind("V_", 0) == 0 && name.find("READLANE") == std::string::npos &&
+                       name.find("READFIRSTLANE") == std::string::npos) w = 2; // lane mask / carry-out
+            add(op, op.code, w, out);
+        }
+    };
+    auto srcs = [&](const GcnInst& in, const std::string& name, std::vector<u32>& out) {
+        const auto t = tokens(name);
+        const bool mem = in.encoding == InstEncoding::SMRD || in.encoding == InstEncoding::MUBUF ||
+                         in.encoding == InstEncoding::MTBUF || in.encoding == InstEncoding::MIMG;
+        for (u32 i = 0; i < (mem ? 4u : in.src_count); ++i) { // memory encodings fill fixed slots
+            const auto& op = in.src[i];
+            if (op.field == OF::Undefined) continue;
+            u32 base = op.code, w = 1;
+            if (in.encoding == InstEncoding::SMRD && i == 0) { base = op.code * 2; w = name.find("BUFFER") != std::string::npos ? 4 : 2; }
+            else if ((in.encoding == InstEncoding::MUBUF || in.encoding == InstEncoding::MTBUF) && i == 2) { base = op.code * 4; w = 4; }
+            else if (in.encoding == InstEncoding::MIMG && i == 2) { base = op.code * 4; w = 8; }
+            else if (in.encoding == InstEncoding::MIMG && i == 3) { base = op.code * 4; w = 4; }
+            else if (name.rfind("S_", 0) == 0) w = type_width(t.back());
+            else if (name.rfind("V_", 0) == 0 && (name.find("CNDMASK") != std::string::npos || name.find("ADDC") != std::string::npos ||
+                                                  name.find("SUBB") != std::string::npos || name.find("DIV_FMAS") != std::string::npos) &&
+                     (op.field == OF::VccLo || i == 2)) w = 2;
+            add(op, base, w, out);
+        }
+        if (in.opcode == Opcode::S_CBRANCH_VCCZ || in.opcode == Opcode::S_CBRANCH_VCCNZ) { out.push_back(106); out.push_back(107); }
+    };
+    auto is_mask_writer = [](const std::string& w) {
+        if (w.rfind("V_", 0) == 0) return w.find("READLANE") == std::string::npos && w.find("READFIRSTLANE") == std::string::npos;
+        if (w.find("SAVEEXEC") != std::string::npos) return true;
+        static const char* bitwise[] = {"S_AND_B64", "S_OR_B64", "S_XOR_B64", "S_ANDN2_B64", "S_ORN2_B64", "S_NAND_B64",
+                                        "S_NOR_B64", "S_XNOR_B64", "S_NOT_B64", "S_MOV_B64", "S_CSELECT_B64"};
+        return std::find(std::begin(bitwise), std::end(bitwise), w) != std::end(bitwise);
+    };
+    auto reg_name = [](u32 r) {
+        if (r == 106) return std::string("vcc_lo");
+        if (r == 107) return std::string("vcc_hi");
+        if (r == 124) return std::string("m0");
+        return "s" + std::to_string(r);
+    };
+    std::map<std::string, std::array<u32, 4>> by_stage; // stage -> scanned, value->value, value->mask, mask
+    std::vector<std::string> value_hashes, reuse_hashes, mask_hashes;
+    // Controls, scanned first: the Exec3Out shape (s_readfirstlane and s_bcnt1 results written in
+    // the scope, read after it) must be value->value; Exec3 (copied inside the scope) must be clean.
+    std::vector<std::pair<std::string, std::vector<u32>>> inputs;
+    for (bool out : {true, false}) {
+        using GcnAsm::Inline, GcnAsm::VCC_LO, GcnAsm::EXEC_LO;
+        GcnAsm::Code c;
+        c.SMovLiteral(21, 0xDEAD0000u);
+        c.SMovLiteral(24, 0xDEAD0001u);
+        c.VCmpNeU32(Inline(0), 2);
+        c.SAndSaveexecB64(22, VCC_LO);
+        const size_t br = c.words.size();
+        c.Sopp(8, 0);
+        c.VReadfirstlane(21, 3);
+        c.VCmpNeU32(Inline(0), 5);
+        c.SBcnt1B64(24, VCC_LO);
+        if (!out) { c.VMov(10, 21); c.VMov(11, 24); }
+        c.words[br] |= u32(int32_t(c.words.size()) - int32_t(br + 1)) & 0xFFFF;
+        c.SMovB64(EXEC_LO, 22);
+        if (out) { c.VMov(10, 21); c.VMov(11, 24); }
+        c.SEndpgm();
+        inputs.emplace_back(out ? "control_read-after-scope" : "control_copied-in-scope", c.words);
+    }
+    for (int a = first; a < argc; ++a) {
+        FILE* f = std::fopen(argv[a], "rb");
+        if (!f) { std::perror(argv[a]); return 2; }
+        std::vector<u32> code;
+        u32 w;
+        while (std::fread(&w, 4, 1, f) == 1) code.push_back(w);
+        std::fclose(f);
+        inputs.emplace_back(std::filesystem::path(argv[a]).filename().string(), std::move(code));
+    }
+    for (const auto& [base, code] : inputs) {
+        struct D { u32 pc; GcnInst inst; std::string name; };
+        std::vector<D> insts;
+        GcnCodeSlice slice(code.data(), code.data() + code.size());
+        GcnDecodeContext decoder;
+        for (u32 pc = 0; !slice.atEnd();) {
+            const auto inst = decoder.decodeInstruction(slice);
+            insts.push_back({pc, inst, std::string(magic_enum::enum_name(inst.opcode))});
+            pc += inst.length / 4;
+            if (inst.opcode == Opcode::S_ENDPGM) break;
+        }
+        const bool control = base.rfind("control_", 0) == 0;
+        std::array<u32, 4> scratch{};
+        auto& st = control ? scratch : by_stage[base.substr(0, base.find('_'))];
+        ++st[0];
+        if (std::getenv("BB_CENSUS_LIST")) { // the scalar registers each instruction reads and writes
+            for (const auto& d : insts) {
+                std::vector<u32> rd, wr;
+                srcs(d.inst, d.name, rd);
+                dsts(d.inst, d.name, wr);
+                std::printf("%s %5x: %-28s", base.c_str(), d.pc * 4, d.name.c_str());
+                if (d.inst.opcode == Opcode::S_CBRANCH_EXECZ) std::printf(" -> %x", (d.pc + 1 + d.inst.control.sopp.simm) * 4);
+                for (u32 r : wr) std::printf(" w:%s", reg_name(r).c_str());
+                for (u32 r : rd) std::printf(" r:%s", reg_name(r).c_str());
+                std::printf("\n");
+            }
+        }
+        bool value_hit = false, mask_hit = false, reuse_hit = false;
+        for (size_t i = 0; i < insts.size(); ++i) {
+            if (insts[i].inst.opcode != Opcode::S_CBRANCH_EXECZ || insts[i].inst.control.sopp.simm <= 0) continue;
+            const u32 target = insts[i].pc + 1 + u32(insts[i].inst.control.sopp.simm);
+            std::map<u32, std::string> written; // reg -> last writer inside the scope
+            size_t j = i + 1;
+            for (; j < insts.size() && insts[j].pc < target; ++j) {
+                std::vector<u32> rs;
+                dsts(insts[j].inst, insts[j].name, rs);
+                for (u32 r : rs) written[r] = insts[j].name;
+            }
+            // Scan on from the target; follow each loop back-edge once (the loop head may read it).
+            std::set<size_t> followed;
+            for (size_t k = j; k < insts.size() && !written.empty(); ++k) {
+                std::vector<u32> reads, writes;
+                srcs(insts[k].inst, insts[k].name, reads);
+                for (u32 r : reads) {
+                    const auto it = written.find(r);
+                    if (it == written.end()) continue;
+                    const bool mask = is_mask_writer(it->second);
+                    const bool mask_reader = (insts[k].name.rfind("S_", 0) == 0 && is_mask_writer(insts[k].name)) ||
+                                             insts[k].name.find("CNDMASK") != std::string::npos;
+                    (mask ? mask_hit : mask_reader ? reuse_hit : value_hit) = true;
+                    // Whether the register holds a value before the scope (else the recompiler's
+                    // phi is (undefined, scope value) and every lane may see the scope value).
+                    std::string prior = " (no prior write)";
+                    for (size_t b = i; b-- > 0;) {
+                        std::vector<u32> ws;
+                        dsts(insts[b].inst, insts[b].name, ws);
+                        if (std::ranges::contains(ws, r)) {
+                            char buf[96];
+                            std::snprintf(buf, sizeof(buf), " (prior write @%#x by %s)", insts[b].pc * 4, insts[b].name.c_str());
+                            prior = buf;
+                            break;
+                        }
+                    }
+                    std::printf("%s: %s execz @%#x..%#x: %s written by %s, read @%#x by %s%s\n", base.c_str(),
+                                mask ? "mask->any  " : mask_reader ? "value->mask" : "value->value", insts[i].pc * 4, target * 4, reg_name(r).c_str(),
+                                it->second.c_str(), insts[k].pc * 4, insts[k].name.c_str(), prior.c_str());
+                    written.erase(it);
+                }
+                dsts(insts[k].inst, insts[k].name, writes);
+                for (u32 r : writes) written.erase(r);
+                const auto& in = insts[k].inst;
+                if (in.encoding == InstEncoding::SOPP && insts[k].name.find("BRANCH") != std::string::npos &&
+                    in.control.sopp.simm < 0 && followed.insert(k).second) {
+                    const u32 head = insts[k].pc + 1 + in.control.sopp.simm;
+                    for (size_t h = 0; h < insts.size(); ++h)
+                        if (insts[h].pc == head) { k = h - 1; break; }
+                }
+            }
+        }
+        if (control) {
+            const bool want = base == "control_read-after-scope";
+            if (value_hit != want || reuse_hit || mask_hit) {
+                std::fprintf(stderr, "census: control %s misclassified (value %d reuse %d mask %d)\n", base.c_str(),
+                             value_hit, reuse_hit, mask_hit);
+                return 1;
+            }
+            continue;
+        }
+        if (value_hit) { ++st[1]; value_hashes.push_back(base); }
+        if (reuse_hit) { ++st[2]; reuse_hashes.push_back(base); }
+        if (mask_hit) { ++st[3]; mask_hashes.push_back(base); }
+    }
+    std::printf("census (%d shaders; controls passed):\n", argc - first);
+    for (auto& [stage, n] : by_stage)
+        std::printf("  %-4s scanned %4u: value->value %u, value->mask %u, mask->any %u\n", stage.c_str(), n[0], n[1], n[2], n[3]);
+    for (auto& h : value_hashes) std::printf("  value->value: %s\n", h.c_str());
+    for (auto& h : reuse_hashes) std::printf("  value->mask:  %s\n", h.c_str());
+    for (auto& h : mask_hashes) std::printf("  mask->any:    %s\n", h.c_str());
+    return 0;
+}
+
 int Disasm(const char* path) {
     FILE* f = std::fopen(path, "rb");
     if (!f) { std::perror(path); return 2; }
@@ -4442,6 +4912,7 @@ int Disasm(const char* path) {
 
 int main(int argc, char** argv) {
     if (argc == 3 && std::string(argv[1]) == "--disasm") return Disasm(argv[2]);
+    if (argc >= 3 && std::string(argv[1]) == "--census-sgpr") return CensusSgpr(argc, argv, 2);
     Options opt;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -4460,6 +4931,11 @@ int main(int argc, char** argv) {
         else if (a == "--fs-export" && i + 1 < argc) g_fs_export = u32(std::atoi(argv[++i]));
         else if (a == "--ud-ptr" && i + 1 < argc) opt.ud_ptr.push_back(u32(std::atoi(argv[++i])));
         else if (a == "--ud-table-vsharp") opt.ud_table_vsharp = true;
+        else if (a == "--wg" && i + 1 < argc) { // compute workgroup x,y,z
+            u32 v[3] = {1, 1, 1};
+            std::sscanf(argv[++i], "%u,%u,%u", &v[0], &v[1], &v[2]);
+            opt.wg = {v[0], v[1], v[2]};
+        }
         else if (a == "--ud" && i + 1 < argc) {
             std::string list = argv[++i];
             u32 k = 0;
@@ -4548,6 +5024,10 @@ int main(int argc, char** argv) {
         if (which == 2) { if constexpr (requires { prof.emulate_vertex_fetch; }) { present = true; on = prof.emulate_vertex_fetch; } }
         return !present ? "absent" : (on ? "ON" : "off");
     };
+    std::printf("float controls: fp16 %u (signed-zero/inf/nan preserve %u, denorm preserve %u flush %u, RTZ %u), "
+                "fp32 preserve %u, fp64 preserve %u\n",
+                g_caps.float16, g_caps.fp16_szinp, g_caps.fp16_denorm_preserve, g_caps.fp16_denorm_flush, g_caps.fp16_rtz,
+                g_caps.fp32_szinp, g_caps.fp64_szinp);
     std::printf("profile: null_descriptors %d, robust_buffer_access %s, wave64 %s, vertex_fetch %s; "
                 "robustBufferAccess %s\n",
                 g_profile.emulate_null_descriptors, flag(g_profile, 0), flag(g_profile, 1), flag(g_profile, 2),
@@ -4567,6 +5047,7 @@ int main(int argc, char** argv) {
         std::fclose(f);
         t.fragment = opt.stage == "fs";
         t.vertex = opt.stage == "vs";
+        t.wg = opt.wg;
         t.hash = 0x9e3779b97f4a7c15ull ^ t.code.size();
         for (u32 x : t.code) t.hash = (t.hash ^ x) * 0x100000001b3ull;
         g_templates.push_back(t);
@@ -4591,7 +5072,9 @@ int main(int argc, char** argv) {
         g_jobs.push_back(j);
         CompileAll(opt.outdir);
         ValidateModules(opt.outdir);
-        const Job& r = g_jobs[0];
+        Job& r = g_jobs[0];
+        // compile-only translates and validates; images/samplers only matter for execution
+        if (r.status == Status::HarnessError && r.message == "shader uses images/samplers") r.status = Status::Ok;
         const bool invalid = g_spirv_invalid.count({0, r.perm});
         std::printf("%s: %s%s\n%s", t.name.c_str(),
                     r.status == Status::Ok ? "compiled" : (r.status == Status::LoudCompile ? "LOUD ABORT" : "CRASH"),
