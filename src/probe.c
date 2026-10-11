@@ -714,8 +714,6 @@ static int probe_main(int argc, char **argv) {
         memcpy(image + relocs[i].target, &value, 8);
     }
     if (patch_file) apply_patches(patch_file, segments, ns, relocs, nr);
-    /* Before BB_GUEST_ENTRY_TRACE writes its breakpoints into the code it checks. */
-    runtime_movie_handoff_configure(image, size);
 #if defined(_WIN32) || defined(__APPLE__)
     printf("Guest TCB loads redirected to the host TLS slot: %" PRIu64 "\n", patch_tcb_loads(segments, ns));
 #endif
