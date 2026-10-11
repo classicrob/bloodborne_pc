@@ -161,7 +161,8 @@ static double measure(Runner run, unsigned iterations, int fill, double *segment
     return median(walls, SAMPLES);
 }
 
-static int check(const char *what, const double *ms, double wall, double base_ms, int assert_contract) {
+static int check(const char *what, const double *ms, double wall, double base_ms, int assert_scaling,
+                 int assert_contract) {
     double total = 0;
     for (unsigned i = 0; i < SEGMENTS; ++i) total += ms[i];
     const double r2 = ms[1] / ms[0], r4 = ms[2] / ms[0], repeat = ms[4] / ms[0];
@@ -178,9 +179,14 @@ static int check(const char *what, const double *ms, double wall, double base_ms
     // 0.26-2.7 ms (5-30% of the unit), a repeat of 0.0-0.22x and x2/x4 as low as 0.33x/2.2x.
     // Spans that do not follow the work at all read about 1x. The empty-segment check is the
     // sharpest; the lower bounds catch spans that stop scaling.
-    if (!(r2 > 1.2)) { fprintf(stderr, "%s: x2 work did not scale\n", what); ok = 0; }
-    if (!(r4 > 2.0)) { fprintf(stderr, "%s: x4 work did not scale\n", what); ok = 0; }
-    if (!(repeat > 0.5)) { fprintf(stderr, "%s: repeated segment is too short\n", what); ok = 0; }
+    // Scaling is asserted on memory-bound fills only. A compute loop's duration follows the GPU
+    // clock, which changes under other GPU users (a full --test once measured compute x4 at 1.77x
+    // with a 0.44x repeat while fills scaled 1.93x/4.38x and the empty segment read 0.003 ms):
+    // that is the workload changing speed, not the timestamps. Compute keeps the empty-segment
+    // and wall-time checks, which catch the in-buffer misattribution.
+    if (assert_scaling && !(r2 > 1.2)) { fprintf(stderr, "%s: x2 work did not scale\n", what); ok = 0; }
+    if (assert_scaling && !(r4 > 2.0)) { fprintf(stderr, "%s: x4 work did not scale\n", what); ok = 0; }
+    if (assert_scaling && !(repeat > 0.5)) { fprintf(stderr, "%s: repeated segment is too short\n", what); ok = 0; }
     if (!(ms[3] < 0.05 * ms[0] && ms[3] < 0.1)) { fprintf(stderr, "%s: empty segment is not empty\n", what); ok = 0; }
     if (!(total <= wall * 1.02 + 0.05)) { fprintf(stderr, "%s: GPU time exceeds CPU wall time\n", what); ok = 0; }
     return ok;
@@ -307,12 +313,12 @@ int main(int argc, char **argv) {
         iterations *= 2;
     }
     for (unsigned i = 0; i < 4; ++i) measure(run_per_submission, iterations, 0, ms);
-    int ok = check("per-submission compute", ms, measure(run_per_submission, iterations, 0, ms), 0.4, 1);
+    int ok = check("per-submission compute", ms, measure(run_per_submission, iterations, 0, ms), 0.4, 0, 1);
     // Transfer work (Metal blit encoders): 64/128/256 MiB fills.
-    ok &= check("per-submission fill", ms, measure(run_per_submission, 64u << 20, 1, ms), 0.05, 1);
+    ok &= check("per-submission fill", ms, measure(run_per_submission, 64u << 20, 1, ms), 0.05, 1, 1);
     printf("MEASURED (diagnostic, not used by BB_PERF):\n");
-    check("  in-buffer compute", ms, measure(run_in_buffer, iterations, 0, ms), 0, 0);
-    check("  in-buffer fill", ms, measure(run_in_buffer, 64u << 20, 1, ms), 0, 0);
+    check("  in-buffer compute", ms, measure(run_in_buffer, iterations, 0, ms), 0, 0, 0);
+    check("  in-buffer fill", ms, measure(run_in_buffer, 64u << 20, 1, ms), 0, 0, 0);
     if (!ok) {
         fprintf(stderr, "MoltenVK timestamps do not measure GPU work; BB_PERF results would be invalid\n");
         return 1;
