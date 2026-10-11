@@ -119,3 +119,20 @@ and overflow are therefore exact: finite values beyond the half range give the l
 has no half-precision FP_DENORM field) or about NaN payloads. The suite accepts either reading for
 denormal results, kept or flushed (one reading for the whole job, reported), and any NaN for a NaN
 input.
+
+## Number formats and packed layouts (groups `vertex-format`, typed loads)
+Table 8.13 lists the buffer data and number formats but not the conversions or packed bit
+layouts. The model uses the D3D10+/AMD conventions:
+- UNORM x/(2^n-1); SNORM max(x/(2^(n-1)-1), -1) (the most negative code clamps to -1);
+  SNORM_OGL (2x+1)/(2^n-1); USCALED/SSCALED float(x); UINT/SINT the zero/sign-extended integer;
+  FLOAT 32-bit as is, 16-bit halves and the unsigned 11/10-bit floats widened exactly.
+- Packed formats are named MSB first, X in the low bits of the name's last field:
+  2_10_10_10 has X in bits 9:0 and W in 31:30 (Mesa maps R10G10B10A2 to BUF_DATA_FORMAT_2_10_10_10);
+  10_10_10_2 has X (2 bits) in 1:0 and W in 31:22; 10_11_11 has X (11 bits) in 10:0, Z (10) in 31:22;
+  11_11_10 has X (10 bits) in 9:0, Z (11) in 31:21. A tree that reverses a layout FAILs and the
+  report shows it; the layout is a convention, not ISA text, so check it against hardware data.
+- Not fixed by the ISA, accepted as PASS(ambiguous) with the reason named: NaN payloads of FLOAT
+  formats (any NaN), and the last bit of UNORM/SNORM conversions (division vs a reciprocal
+  multiply: within 1 ulp, same sign).
+- dst_sel ONE: integer 1 for UINT/SINT (literal reading, §8.1.3), 1.0f for every other number
+  format; SEL1_FLOAT (1.0f for integers too) stays an accepted reading.

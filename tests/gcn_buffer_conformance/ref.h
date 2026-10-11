@@ -76,10 +76,20 @@ typedef struct {
 /* Data formats (Table in §8, same numbering as the V# data_format field). */
 enum {
     GCN_DFMT_INVALID = 0, GCN_DFMT_8 = 1, GCN_DFMT_16 = 2, GCN_DFMT_8_8 = 3, GCN_DFMT_32 = 4,
-    GCN_DFMT_16_16 = 5, GCN_DFMT_8_8_8_8 = 10, GCN_DFMT_32_32 = 11, GCN_DFMT_16_16_16_16 = 12,
+    GCN_DFMT_16_16 = 5, GCN_DFMT_10_11_11 = 6, GCN_DFMT_11_11_10 = 7, GCN_DFMT_10_10_10_2 = 8,
+    GCN_DFMT_2_10_10_10 = 9, GCN_DFMT_8_8_8_8 = 10, GCN_DFMT_32_32 = 11, GCN_DFMT_16_16_16_16 = 12,
     GCN_DFMT_32_32_32 = 13, GCN_DFMT_32_32_32_32 = 14
 };
-enum { GCN_NFMT_UINT = 4, GCN_NFMT_FLOAT = 7 };
+enum { GCN_NFMT_UNORM = 0, GCN_NFMT_SNORM = 1, GCN_NFMT_USCALED = 2, GCN_NFMT_SSCALED = 3,
+       GCN_NFMT_UINT = 4, GCN_NFMT_SINT = 5, GCN_NFMT_SNORM_OGL = 6, GCN_NFMT_FLOAT = 7 };
+
+/* Component layout of a buffer data format: element size and each component's bit offset and
+ * width (packed formats are named MSB first: 2_10_10_10 has X in bits 9:0, W in 31:30). */
+int gcn_format_bits(uint32_t dfmt, uint32_t* elem_bytes, uint32_t* ncomp, uint32_t shift[4], uint32_t width[4]);
+/* A component's register value for a number format (VGPR bits): UNORM x/(2^n-1), SNORM
+ * max(x/(2^(n-1)-1), -1), SCALED float(x), UINT/SINT the extended integer, FLOAT 32/16/11/10-bit
+ * floats as f32. Returns 0 for a combination the model does not know (sets *unknown). */
+uint32_t gcn_convert_component(uint32_t raw, uint32_t width, uint32_t nfmt, int* unknown);
 
 /* Returns 0 when the format is outside what the model supports. */
 int gcn_format_layout(uint32_t dfmt, uint32_t* ncomp, uint32_t* comp_bytes);
