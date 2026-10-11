@@ -43,6 +43,10 @@ Darwin)
     cmake_platform=(-DCMAKE_OSX_ARCHITECTURES=x86_64 -DCMAKE_IGNORE_PREFIX_PATH=/opt/homebrew
                     -DCMAKE_C_COMPILER="${CC:-/usr/bin/clang}" -DCMAKE_CXX_COMPILER="${CXX:-/usr/bin/clang++}")
     default_lto=OFF
+    # Reproducible output: ld64 and ar record input modification times (the debug map's N_OSO
+    # entries, archive members) unless ZERO_AR_DATE is set. With it, two clean builds of one
+    # commit give byte-identical libbbgpu.dylib and bb-probe.
+    export ZERO_AR_DATE=1
     ninja_jobs=(-j "${BB_BUILD_JOBS:-8}")
     # No compiler cache: one cached object differed from a clean compile and clean builds are not
     # yet bit-reproducible, so a cache cannot be shown equivalent to clean. The launchers are
@@ -156,7 +160,23 @@ if [[ ! -f out/libatrac9.a || -n $(find third_party/LibAtrac9/C/src -newer out/l
     for source in "${atrac9[@]}"; do "$CC" "${platform_flags[@]}" -std=c99 -O2 -g -w -c "$source" -o "out/atrac9/$(basename "${source%.c}").o"; done
     ar rcs out/libatrac9.a out/atrac9/*.o
 fi
+if [[ $(uname -s) == Darwin ]]; then
+    # Objects at stable paths: the debug map names each object, so compiling and linking in one
+    # step (random temporary object names) made every bb-probe build differ.
+    # The debug map points at out/probe-obj; an old one-step build's bb-probe.dSYM would be stale.
+    rm -rf out/probe-obj out/bb-probe.dSYM && mkdir -p out/probe-obj
+    probe_objects=()
+    for source in src/probe.c "${runtime[@]}" src/vulkan_smoke.c; do
+        object=out/probe-obj/$(basename "${source%.c}").o
+        "$CC" "${platform_flags[@]}" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread "${includes[@]}" -I. -Isrc \
+            -c "$source" -o "$object"
+        probe_objects+=("$object")
+    done
+    "$CC" "${platform_flags[@]}" -g -pthread "${probe_link_flags[@]}" "${probe_objects[@]}" out/libatrac9.a -lm \
+        "${gpu[@]}" "${libraries[@]}" -o out/bb-probe
+else
 "$CC" "${platform_flags[@]}" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread "${probe_link_flags[@]}" "${includes[@]}" -I. -Isrc src/probe.c "${runtime[@]}" src/vulkan_smoke.c out/libatrac9.a -lm "${gpu[@]}" "${libraries[@]}" -o out/bb-probe
+fi
 sign_darwin out/bb-probe
 echo "Built $PWD/out/bb-probe"
 if [[ $(uname -s) == Darwin ]]; then
