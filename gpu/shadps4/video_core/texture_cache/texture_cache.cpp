@@ -1201,7 +1201,6 @@ void TextureCache::GarbageCollectImages() {
         if (num_deletions == 0) {
             return true;
         }
-        --num_deletions;
         auto& image = slot_images[image_id];
         const bool download = image.SafeToDownload();
         const bool tiled = image.info.IsTiled();
@@ -1212,6 +1211,10 @@ void TextureCache::GarbageCollectImages() {
         if (download && !pressured) {
             return false;
         }
+        // bbport: only an eviction uses the pass's budget. The skips above used it too, so the
+        // oldest GPU-written images (kept unless under pressure) used up every pass and nothing
+        // was freed (upstream ARM_bloodborne_pc 2026-10-06, "the collector freed nothing").
+        --num_deletions;
         if (download) {
             // bbport: synchronously, while the image still protects its pages. A deferred
             // write-back landed after FreeImage had unprotected them, over whatever the game
