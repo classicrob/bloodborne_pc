@@ -129,6 +129,18 @@ node itself need not be an index buffer: its completion allows reuse of the payl
 describes. Submit-time command snapshots preserve the packet containing INDEX_BASE, not the
 bytes later read through that address by Metal.
 
+Renderer source review confirms the Apple binding side: `BindIndexBuffer` calls
+`buffer_cache.ObtainBuffer(index_address, size, false)`, whose Apple path returns the imported
+guest-memory arena. Vertex and storage/constant buffers use the same import path. The small
+read-only constant ring is an exception: stage A copies those bytes before recording. Thus the
+index-data lifetime chain above reaches actual zero-copy binding, not merely a hypothetical
+renderer implementation. A clinic A/B with GPU-completion label writes is still needed to
+attribute the observed intermittent geometry/colour corruption to this mechanism.
+
+The native stream path copies small read-only buffers at recording time, but larger index and
+vertex buffers can remain bound in place on Linux/Windows too. Their completion-label ordering
+needs a separate audit; the small-buffer copy path does not establish native immunity.
+
 ### Consequences for removing the idle throttle
 
 - Completion value 4 must mean that earlier GPU uses of the protected payload are complete,
