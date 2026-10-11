@@ -22,6 +22,8 @@ class Rasterizer;
 /// BB_REPLAY_CAPTURE is set. v1 feasibility gate, inventory stage:
 ///   BB_REPLAY_CAPTURE=inventory:<frames>   arm at the <frames>th retired frame end (1..100000)
 ///   BB_REPLAY_HOLD_MS=<ms>                 hold bound, 1..60000 (default 3000)
+///   BB_REPLAY_TRIGGER=<file>               count <frames> from when this file appears (polled
+///                                          every 30 retired frame ends and removed), not launch
 /// A malformed value disables the capture loudly. A retired frame end is a sceGnmSubmitDone
 /// after which GpuIdle was raised with nothing queued; a frame end that found submissions already
 /// queued is not counted, so the held frame can be later than <frames> + 1.

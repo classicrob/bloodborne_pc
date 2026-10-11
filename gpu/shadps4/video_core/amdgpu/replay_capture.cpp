@@ -58,8 +58,10 @@ void CountRegion(Pm4Census& census, std::span<const u32> words) {
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 #include <vector>
 #include <fmt/format.h>
@@ -80,6 +82,7 @@ enum class State { Off, Waiting, Holding, Released, Done };
 struct Config {
     u64 arm_frames = 0;
     std::chrono::milliseconds hold_bound{3000};
+    const char* trigger = nullptr; ///< BB_REPLAY_TRIGGER: frames count from its removal
     bool valid = false;
 };
 
@@ -118,10 +121,15 @@ const Config& Settings() {
             }
             c.hold_bound = std::chrono::milliseconds(static_cast<std::chrono::milliseconds::rep>(*bound));
         }
+        if (const char* trigger = std::getenv("BB_REPLAY_TRIGGER"); trigger && *trigger) {
+            c.trigger = trigger;
+        }
         c.valid = true;
-        std::fprintf(stderr, "\n*** BB_REPLAY_CAPTURE: inventory at retired frame end %llu, hold bound "
-                             "%lld ms (diagnostic: holds the GPU command thread for one frame) ***\n\n",
+        std::fprintf(stderr, "\n*** BB_REPLAY_CAPTURE: inventory at retired frame end %llu %s%s, hold "
+                             "bound %lld ms (diagnostic: holds the GPU command thread for one frame) "
+                             "***\n\n",
                      static_cast<unsigned long long>(c.arm_frames),
+                     c.trigger ? "after creating " : "from launch", c.trigger ? c.trigger : "",
                      static_cast<long long>(c.hold_bound.count()));
         return c;
     }();
@@ -132,6 +140,33 @@ std::atomic<State> state{State::Off};
 std::atomic<u64> asc_submits{0}; // monotonic while a capture is in progress
 u64 asc_at_checkpoint = 0;
 u64 frames_seen = 0;
+bool triggered = false;
+u64 trigger_polls = 0;
+
+/// With BB_REPLAY_TRIGGER, whether its file has been seen (and removed), polled every 30 retired
+/// frame ends. A failure other than a missing file disables the capture loudly.
+bool Triggered() {
+    if (triggered || !Settings().trigger) {
+        return true;
+    }
+    if (++trigger_polls % 30 != 0) {
+        return false;
+    }
+    if (std::remove(Settings().trigger) != 0) {
+        if (errno != ENOENT) {
+            fmt::print("Replay capture DISABLED: BB_REPLAY_TRIGGER={} cannot be removed: {}\n",
+                       Settings().trigger, std::strerror(errno));
+            std::fflush(stdout);
+            state = State::Done;
+        }
+        return false;
+    }
+    triggered = true;
+    fmt::print("Replay capture: trigger {} seen; arming at retired frame end {} from now\n",
+               Settings().trigger, Settings().arm_frames);
+    std::fflush(stdout);
+    return false; // this frame end counts as 0
+}
 std::chrono::steady_clock::time_point hold_start, release_time;
 
 /// PM4 type-3 opcodes that matter to a replay cut (capture-replay.md "Dependencies without a
@@ -184,7 +219,8 @@ bool Armed() {
 }
 
 bool OnFrameRetired(Vulkan::Rasterizer* rasterizer) {
-    if (!Armed() || state.load() != State::Waiting || ++frames_seen < Settings().arm_frames) {
+    if (!Armed() || state.load() != State::Waiting || !Triggered() ||
+        ++frames_seen < Settings().arm_frames) {
         return false;
     }
     if (!rasterizer) {
