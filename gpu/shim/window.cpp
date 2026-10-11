@@ -1,5 +1,10 @@
 // bbport: SDL3 window for the Vulkan swapchain.
+#include <cerrno>
+#include <cstdio>
 #include <cstdlib>
+#include <limits>
+#include <tuple>
+#include <utility>
 #include <cstring>
 #include <SDL3/SDL.h>
 #ifdef __APPLE__
@@ -13,9 +18,77 @@
 
 namespace Frontend {
 
+#ifdef __APPLE__
+namespace {
+/// "AxB" (separator `sep`) as two ints, or a stop: a malformed or out-of-range value is a setup
+/// error.
+std::pair<int, int> ParsePair(const char* name, const char* value, char sep) {
+    const auto parse = [&](const char* start, char terminator, const char** next) {
+        char* end = nullptr;
+        errno = 0;
+        const long number = std::strtol(start, &end, 10);
+        ASSERT_MSG(end != start && *end == terminator && errno != ERANGE &&
+                       number >= std::numeric_limits<int>::min() &&
+                       number <= std::numeric_limits<int>::max(),
+                   "{}={} is not of the form A{}B with A and B integers", name, value, sep);
+        *next = end;
+        return int(number);
+    };
+    const char* end = nullptr;
+    const int first = parse(value, sep, &end);
+    const int second = parse(end + 1, '\0', &end);
+    return {first, second};
+}
+
+/// "1" or "0" (or unset/empty: off); anything else stops.
+bool ParseFlag(const char* name, const char* value) {
+    if (!value || !*value || !std::strcmp(value, "0")) {
+        return false;
+    }
+    ASSERT_MSG(!std::strcmp(value, "1"), "{}={} must be 0 or 1", name, value);
+    return true;
+}
+} // namespace
+#endif
+
 WindowSDL::WindowSDL(s32 width_, s32 height_, const char* title) : width{width_}, height{height_} {
 #ifdef __APPLE__
     ASSERT_MSG(pthread_main_np(), "SDL video must be initialized on the process main thread");
+#endif
+#ifdef __APPLE__
+    // bbport: test runs on a Mac someone is using (play_route). BB_WINDOW_SIZE=WxH (points; the
+    // render size is unchanged, the swapchain follows the window), BB_WINDOW_POS=X,Y (instead of
+    // centred) and BB_WINDOW_BACKGROUND=1 (an accessory app whose window is never activated and
+    // takes no focus: input comes from BB_PAD_FILE). Off by default; malformed values stop.
+    const char* size_env = std::getenv("BB_WINDOW_SIZE");
+    const char* pos_env = std::getenv("BB_WINDOW_POS");
+    const bool background = ParseFlag("BB_WINDOW_BACKGROUND", std::getenv("BB_WINDOW_BACKGROUND"));
+    if (background) {
+        // Before the video subsystem registers the app with Cocoa. Override priority, and checked:
+        // a hint set elsewhere (environment) must not quietly bring activation back.
+        for (const auto& [hint, value] : {std::pair{SDL_HINT_MAC_BACKGROUND_APP, "1"},
+                                          std::pair{SDL_HINT_WINDOW_ACTIVATE_WHEN_SHOWN, "0"}}) {
+            ASSERT_MSG(SDL_SetHintWithPriority(hint, value, SDL_HINT_OVERRIDE),
+                       "BB_WINDOW_BACKGROUND: SDL refused hint {}={}: {}", hint, value,
+                       SDL_GetError());
+            const char* effective = SDL_GetHint(hint);
+            ASSERT_MSG(effective && !std::strcmp(effective, value),
+                       "BB_WINDOW_BACKGROUND: hint {} is {}, not {}", hint,
+                       effective ? effective : "(unset)", value);
+        }
+    }
+    if (size_env && *size_env) {
+        const auto [w, h] = ParsePair("BB_WINDOW_SIZE", size_env, 'x');
+        ASSERT_MSG(w > 0 && h > 0, "BB_WINDOW_SIZE={} must be positive", size_env);
+        width_ = w;
+        height_ = h;
+    }
+    int x = SDL_WINDOWPOS_CENTERED, y = SDL_WINDOWPOS_CENTERED;
+    if (pos_env && *pos_env) {
+        std::tie(x, y) = ParsePair("BB_WINDOW_POS", pos_env, ',');
+    }
+#else
+    const int x = SDL_WINDOWPOS_CENTERED, y = SDL_WINDOWPOS_CENTERED;
 #endif
     // Gamepads are sampled by runtime_pad.c; their events are pumped here with the window's.
     if (!SDL_InitSubSystem(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) {
@@ -23,8 +96,8 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, const char* title) : width{width_}
     }
     SDL_PropertiesID props = SDL_CreateProperties();
     SDL_SetStringProperty(props, SDL_PROP_WINDOW_CREATE_TITLE_STRING, title);
-    SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_X_NUMBER, SDL_WINDOWPOS_CENTERED);
-    SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_Y_NUMBER, SDL_WINDOWPOS_CENTERED);
+    SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_X_NUMBER, x);
+    SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_Y_NUMBER, y);
     SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_WIDTH_NUMBER, width_);
     SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_HEIGHT_NUMBER, height_);
     SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_RESIZABLE_BOOLEAN, true);
@@ -32,6 +105,11 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, const char* title) : width{width_}
     SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_METAL_BOOLEAN, true);
 #else
     SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_VULKAN_BOOLEAN, true);
+#endif
+#ifdef __APPLE__
+    if (background) {
+        SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_FOCUSABLE_BOOLEAN, false);
+    }
 #endif
     const char* fullscreen = std::getenv("BB_FULLSCREEN");
     SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_FULLSCREEN_BOOLEAN, fullscreen && fullscreen[0] == '1');
@@ -76,6 +154,15 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, const char* title) : width{width_}
     width = w;
     height = h;
     LOG_INFO(Frontend, "Window {}x{} on {}", w, h, driver);
+#ifdef __APPLE__
+    if ((size_env && *size_env) || (pos_env && *pos_env) || background) {
+        int at_x = 0, at_y = 0;
+        SDL_GetWindowPosition(window, &at_x, &at_y);
+        std::printf("Window: %dx%d points (%dx%d pixels) at %d,%d%s\n", width_, height_, w, h,
+                    at_x, at_y, background ? ", background (no activation, not focusable)" : "");
+        std::fflush(stdout);
+    }
+#endif
 }
 
 WindowSDL::~WindowSDL() {
