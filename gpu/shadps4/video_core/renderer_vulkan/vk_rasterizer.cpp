@@ -132,6 +132,7 @@ bool Rasterizer::FilterDraw() {
     if (regs.color_control.mode == AmdGpu::ColorControl::OperationMode::FmaskDecompress) {
         // TODO: check for a valid MRT1 to promote the draw to the resolve pass.
         LOG_TRACE(Render_Vulkan, "FMask decompression pass skipped");
+        CountDrawDrop(DrawDrop::FmaskDecompress);
         ScopedMarkerInsert("FmaskDecompress");
         return false;
     }
@@ -142,6 +143,7 @@ bool Rasterizer::FilterDraw() {
     }
     if (regs.primitive_type == AmdGpu::PrimitiveType::None) {
         LOG_TRACE(Render_Vulkan, "Primitive type 'None' skipped");
+        CountDrawDrop(DrawDrop::PrimitiveNone);
         ScopedMarkerInsert("PrimitiveTypeNone");
         return false;
     }

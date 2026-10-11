@@ -24,6 +24,7 @@ Pipeline::Pipeline(const Instance& instance_, Scheduler& scheduler_, DescriptorH
 Pipeline::~Pipeline() = default;
 
 std::atomic<u64> g_bb_pipeline_wait_ns;
+std::array<std::atomic<u64>, static_cast<size_t>(DrawDrop::Count)> g_bb_draw_drops{};
 
 void Pipeline::SetBuilt() {
     {

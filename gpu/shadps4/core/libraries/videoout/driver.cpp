@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <string>
 #include <vector>
 #include <chrono>
 #include <cstdio>
@@ -29,6 +30,7 @@
 #include "core/libraries/videoout/videoout_error.h"
 #include "imgui/renderer/imgui_core.h"
 #include "video_core/amdgpu/liverpool.h"
+#include "video_core/renderer_vulkan/vk_pipeline_common.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 
@@ -498,6 +500,22 @@ void VideoOutDriver::Flip(const Request& req) {
                         wait_delta(BbStats::tick_wait_ns, 6) / (window * 1e7),
                         frames ? double(BbStats::reduced_draws.exchange(0)) / frames : 0.0,
                         frames ? double(BbStats::scene_draws.exchange(0)) / frames : 0.0);
+            {
+                // Every draw the renderer did not draw, by reason (none: no line).
+                static constexpr const char* names[] = {
+                    "stage disabled", "stage without program", "stage combination",
+                    "ES/GS reported", "primitive None", "FMASK decompress"};
+                static_assert(std::size(names) == size_t(Vulkan::DrawDrop::Count));
+                std::string drops;
+                for (size_t i = 0; i < std::size(names); ++i) {
+                    if (const u64 n = Vulkan::g_bb_draw_drops[i].exchange(0)) {
+                        drops += fmt::format("{}{} {}", drops.empty() ? "" : ", ", names[i], n);
+                    }
+                }
+                if (!drops.empty()) {
+                    std::printf("Draws not drawn: %s\n", drops.c_str());
+                }
+            }
             const u64 pipeline_wait_ns = Vulkan::g_bb_pipeline_wait_ns.exchange(0);
             if (compiles || pipeline_wait_ns) {
                 std::printf("Compiles: %u shader translations %.1f ms, %u pipeline creations %.1f ms "

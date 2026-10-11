@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <array>
+
 #include <atomic>
 #include <condition_variable>
 #include <mutex>
@@ -99,5 +101,23 @@ protected:
 
 /// bbport: time threads spent waiting for pipelines built on workers (BB_FRAME_STATS).
 extern std::atomic<u64> g_bb_pipeline_wait_ns;
+
+/// bbport: draws not drawn, by reason (BB_FRAME_STATS "Draws not drawn"). The pipeline
+/// selection refuses a draw (a needed stage disabled or without a program, a stage combination
+/// with no pipeline, an ES/GS configuration the GS emulation reports), or the draw filter drops
+/// one with nothing to draw here (primitive type None, FMASK decompression).
+enum class DrawDrop : u32 {
+    StageDisabled,
+    NullProgram,
+    StageCombination,
+    GsReported,
+    PrimitiveNone,
+    FmaskDecompress,
+    Count,
+};
+extern std::array<std::atomic<u64>, static_cast<size_t>(DrawDrop::Count)> g_bb_draw_drops;
+inline void CountDrawDrop(DrawDrop reason) {
+    g_bb_draw_drops[static_cast<size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
+}
 
 } // namespace Vulkan

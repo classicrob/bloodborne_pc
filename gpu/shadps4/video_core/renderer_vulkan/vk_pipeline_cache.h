@@ -115,6 +115,8 @@ struct PipelineSelection {
     std::array<vk::ShaderModule, MaxShaderStages> modules{};
     std::optional<Shader::Gcn::FetchShaderData> fetch_shader{};
     GraphicsPipelineKey graphics_key{};
+    /// Why RefreshGraphicsKey refused the last draw it refused (BB_FRAME_STATS).
+    DrawDrop refusal{DrawDrop::StageCombination};
     bool motion = false;
     /// bbport (Apple): ES and GS of an emulated geometry stage (vk_gs_emulation.h).
     struct GsEmulationProgram {

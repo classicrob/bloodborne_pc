@@ -497,7 +497,9 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
         }
     }
     sel.draw_indirect_params = params;
+    sel.refusal = DrawDrop::StageCombination;
     if (!RefreshGraphicsKey(sel)) {
+        CountDrawDrop(sel.refusal);
         return nullptr;
     }
     const auto [it, is_new] = graphics_pipelines.try_emplace(sel.graphics_key);
@@ -882,6 +884,7 @@ bool PipelineCache::RefreshGraphicsStages(PipelineSelection& sel) {
         if (!regs.stage_enable.IsStageEnabled(stage_in_idx)) {
             key.stage_hashes[stage_out_idx] = 0;
             sel.infos[stage_out_idx] = nullptr;
+            sel.refusal = DrawDrop::StageDisabled;
             return false;
         }
 
@@ -889,6 +892,7 @@ bool PipelineCache::RefreshGraphicsStages(PipelineSelection& sel) {
         if (!pgm || !pgm->Address<u32*>()) {
             key.stage_hashes[stage_out_idx] = 0;
             sel.infos[stage_out_idx] = nullptr;
+            sel.refusal = DrawDrop::NullProgram;
             return false;
         }
 
@@ -920,6 +924,7 @@ bool PipelineCache::RefreshGraphicsStages(PipelineSelection& sel) {
         // No geometry stage: the ES and GS become compute pipelines (owned by the graphics
         // pipeline, vk_gs_emulation.h) and the copy shader is the draw's vertex shader.
         if (const char* gap = GsEmulationUnsupported(regs)) {
+            sel.refusal = DrawDrop::GsReported;
             return ReportGeometryStages(regs, gap);
         }
         {
@@ -994,6 +999,7 @@ bool PipelineCache::RefreshGraphicsStages(PipelineSelection& sel) {
         }
         if (!instance.IsGeometryStageSupported()) {
 #ifdef __APPLE__
+            sel.refusal = DrawDrop::GsReported;
             return ReportGeometryStages(regs, "tessellation feeding a geometry shader (LS/HS/ES/GS)");
 #endif
             LOG_WARNING(Render_Vulkan, "Geometry shader stage unsupported, skipping");
@@ -1024,6 +1030,7 @@ bool PipelineCache::RefreshGraphicsStages(PipelineSelection& sel) {
         break;
     default:
         LOG_WARNING(Render_Vulkan, "unimplemented shader stage {}", (u32)regs.stage_enable.raw);
+        sel.refusal = DrawDrop::StageCombination;
         return false;
     }
 
