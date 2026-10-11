@@ -292,6 +292,28 @@ GraphicsPipeline::GraphicsPipeline(
     }
 
 #ifdef __APPLE__
+    // Layered rendering and clip distances from a vertex or tessellation-evaluation stage (an
+    // emulated geometry shader's copy shader writes the cube face and two clip distances,
+    // docs/macos/shader-sweep.md) need shaderOutputLayer and shaderClipDistance; without them
+    // those outputs are invalid. M4 Max / MoltenVK 1.4.2 has both.
+    for (const auto pre_raster : {Shader::SwStage::Vertex, Shader::SwStage::TessellationEval}) {
+        const auto* pre = stages[u32(pre_raster)];
+        if (!pre) {
+            continue;
+        }
+        if (pre->stores.GetAny(Shader::IR::Attribute::RenderTargetIndex) &&
+            !instance.IsShaderOutputLayerSupported()) {
+            UNREACHABLE_MSG("macOS: shader {:#x} writes the render-target layer, which needs "
+                            "shaderOutputLayer; this device lacks it",
+                            pre->pgm_hash);
+        }
+        if (pre->stores.GetAny(Shader::IR::Attribute::ClipDistance) &&
+            !instance.IsShaderClipDistanceSupported()) {
+            UNREACHABLE_MSG("macOS: shader {:#x} writes clip distances, which need "
+                            "shaderClipDistance; this device lacks it",
+                            pre->pgm_hash);
+        }
+    }
     // GCN lets the pixel shader read a parameter the last pre-rasterization stage never exported
     // (value undefined); Metal refuses to link such a pipeline. The auxiliary RectList/QuadList
     // stages forward zero for these. A direct VS/TES -> FS pipeline cannot yet: the producing
