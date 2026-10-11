@@ -54,6 +54,8 @@ private:
     void OnError() override;
     void OnEOF() override;
 
+    // Requires shared or exclusive ownership of m_source_mutex.
+    bool StopLocked();
     void OnPlaybackStateChanged(AvState state);
     std::optional<bool> OnBufferingCheckEvent(u32 num_frames);
 

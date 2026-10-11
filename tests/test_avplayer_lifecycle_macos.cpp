@@ -1,6 +1,7 @@
 // Actual AvPlayer demux/decode/Stop with real FFmpeg and low-stack HLE workers.
 // Logging, path translation and GPU invalidation are isolated from the renderer.
 #include "core/libraries/avplayer/avplayer_source.h"
+#include "core/libraries/avplayer/avplayer_state.h"
 #include "core/memory.h"
 #include <cassert>
 #include <cstring>
@@ -26,6 +27,12 @@ void Write(std::string_view, Level, const char*, int, const char*, std::string&&
 }
 namespace Core {
 void MemoryManager::InvalidateMemory(VAddr, u64) {}
+}
+namespace Libraries::Kernel {
+int PS4_SYSV_ABI sceKernelGetCompiledSdkVersion(int* version) {
+    *version = 0x04500000;
+    return 0;
+}
 }
 using namespace Libraries::AvPlayer;
 using namespace std::chrono_literals;
@@ -96,14 +103,15 @@ struct Poller {
     AvPlayerSource* source;
     std::atomic<bool>* stopped;
     std::atomic<unsigned>* calls;
+    std::atomic<unsigned>* frames;
     bool audio;
 };
 static void poll_frames(void* opaque) {
     auto& p = *static_cast<Poller*>(opaque);
     while (!p.stopped->load()) {
         AvPlayerFrameInfo info{};
-        if (p.audio) p.source->GetAudioData(info);
-        else p.source->GetVideoData(info);
+        bool got = p.audio ? p.source->GetAudioData(info) : p.source->GetVideoData(info);
+        if (got) ++*p.frames;
         p.source->CurrentTime();
         p.source->IsActive();
         ++*p.calls;
@@ -132,17 +140,73 @@ static void polling_stop(void* path) {
     for (int i = 0; i < source.GetStreamCount(); ++i) assert(source.EnableStream(i));
     assert(source.Start());
     std::atomic<bool> stopped{};
-    std::atomic<unsigned> calls{};
-    Poller a{&source, &stopped, &calls, true}, v{&source, &stopped, &calls, false};
+    std::atomic<unsigned> calls{}, audio_frames{}, video_frames{};
+    Poller a{&source, &stopped, &calls, &audio_frames, true};
+    Poller v{&source, &stopped, &calls, &video_frames, false};
     std::jthread audio([&] { runtime_thread_run_host(poll_frames, &a); });
     std::jthread video([&] { runtime_thread_run_host(poll_frames, &v); });
-    while (calls < 128) std::this_thread::yield();
+    while (calls < 128 || !audio_frames || !video_frames) std::this_thread::yield();
     std::this_thread::sleep_for(5ms);
     assert(source.Stop());
     stopped = true;
     audio.join(); video.join();
     assert(source.Stop());
     assert(state.errors == 0 && allocations == frees);
+}
+
+struct Events {
+    std::atomic<unsigned> ready{}, play{}, stops{};
+    std::atomic<bool> hold_stop{}, release_stop{};
+};
+static void PS4_SYSV_ABI event_callback(void* opaque, AvPlayerEvents event, s32, void*) {
+    auto& events = *static_cast<Events*>(opaque);
+    if (event == AvPlayerEvents::StateReady) ++events.ready;
+    if (event == AvPlayerEvents::StatePlay) ++events.play;
+    if (event == AvPlayerEvents::StateStop) {
+        unsigned n = ++events.stops;
+        // Hold the EOF notification on the controller while explicit Stop runs.
+        if (n == 1 && events.hold_stop) {
+            while (!events.release_stop) std::this_thread::yield();
+        }
+    }
+}
+static void state_lifecycle(void* path) {
+    Events events;
+    AvPlayerInitData init{};
+    init.memory_replacement = {nullptr, allocate, deallocate, allocate, deallocate};
+    init.num_output_video_framebuffers = 2;
+    init.event_replacement = {&events, event_callback};
+    {
+        AvPlayerState state(init);
+        assert(!state.Start()); // No source.
+        assert(state.AddSource(static_cast<const char*>(path), AvPlayerSourceType::FileMp4));
+        while (!events.ready) std::this_thread::yield();
+        for (int i = 0; i < state.GetStreamCount(); ++i) assert(state.EnableStream(i));
+        state.SetAvSyncMode(AvPlayerAvSyncMode::None);
+        assert(state.Start());
+        assert(state.Start()); // Play/Buffering -> Stop -> Start, no recursive lock.
+        assert(events.stops == 1);
+        assert(state.Stop());
+        assert(events.stops == 2);
+        assert(!state.Stop());
+        assert(events.stops == 2);
+        // A new run owns a new stop-notification claim.
+        events.stops = 0;
+        events.hold_stop = true;
+        assert(state.Start());
+        unsigned audio = 0, video = 0;
+        while (!events.stops) {
+            AvPlayerFrameInfo frame{};
+            audio += state.GetAudioData(frame);
+            video += state.GetVideoData(frame);
+            std::this_thread::yield();
+        }
+        assert(audio && video);
+        assert(state.Stop());
+        assert(events.stops == 1); // EOF already claimed this run's notification.
+        events.release_stop = true;
+    }
+    assert(allocations == frees);
 }
 
 int main(int argc, char** argv) {
@@ -155,6 +219,9 @@ int main(int argc, char** argv) {
     }
     for (unsigned i = 0; i < 32; ++i)
         runtime_thread_run_host(polling_stop, argv[1]);
+    for (unsigned i = 0; i < 4; ++i)
+        runtime_thread_run_host(state_lifecycle, argv[1]);
+    std::puts("PASS: actual controller restart, EOF callback concurrent with explicit Stop, one notification per run");
     std::puts("PASS: concurrent audio/video pollers versus Stop, stopped output/clock, atomic queues");
     std::puts("PASS: actual AvPlayer natural EOF, concurrent/repeated Stop, full-buffer cancellation, destruction, low callbacks");
 }
