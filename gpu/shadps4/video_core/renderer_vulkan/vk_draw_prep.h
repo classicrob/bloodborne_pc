@@ -111,6 +111,13 @@ public:
     void BeginSubmission(u64 seq, const AmdGpu::Regs& regs, u64 reg_checksum);
     void EndSubmission();
 
+    /// GPU thread, between submissions, before submission `seq` and any later one is enqueued
+    /// (the perf replay restoring the register state of its cut before each iteration): the
+    /// workers restart from `regs` and `reg_checksum` at `seq`. Queued submissions are dropped.
+    /// Without it the scanner keeps applying deltas to the previous iteration's end state and
+    /// no prepared draw matches the GPU thread's checksum again (correct, but never used).
+    void ResetBaseline(u64 seq, const AmdGpu::Regs& regs, u64 reg_checksum);
+
     /// GPU thread: the prepared state for the next direct draw of the current submission.
     const PreparedDraw* NextDraw();
 
@@ -146,6 +153,9 @@ private:
     u64 tail_checksum{};
     u64 rebases = 0; ///< scanner restarts from the GPU thread state (BB_FRAME_STATS)
     bool baseline_ready{}; ///< guarded by `mutex`
+    /// Bumped by ResetBaseline: the scanner and workers restart from the tail state. Guarded by
+    /// `mutex`.
+    u64 generation = 0;
     std::mutex mutex;
     std::condition_variable_any cv;
     std::deque<std::shared_ptr<Submission>> submissions; ///< ordered by seq
