@@ -86,7 +86,7 @@ u8 CanaryByte(u64 va) { return u8(Hash32(va ^ 0xC0FFEE123ull) % 255 + 1); }
 enum class SoffSrc { Inline, Sgpr };
 enum class SmemSrc { None, Imm, Sgpr };
 // Wave64 lane-semantics programs (no buffer access under test).
-enum class Wave { None, Lane, MbcntMask, Readlane, Exec1, Exec2, LoopReadFirstLane, Lds, CtrlPhi, CtrlBreak };
+enum class Wave { None, Lane, MbcntMask, Readlane, Exec1, Exec2, LoopReadFirstLane, Lds, CtrlPhi, CtrlBreak, Pkrtz, Pkrtz3 };
 
 struct Template {
     std::string name;
@@ -225,6 +225,13 @@ u64 BoundSize(const gcn_vsharp& v) { // AmdGpu::Buffer::GetSize(): u32 arithmeti
 void AssembleWave(GcnAsm::Code& c, Wave w) {
     using namespace GcnAsm;
     switch (w) {
+    case Wave::Pkrtz: // v_cvt_pkrtz_f16_f32 v10, v5 (data0), v3 (vindex): VOP2 47
+        c.Vop2(47, 10, 3, Vgpr(5));
+        break;
+    case Wave::Pkrtz3: // VOP3a 303 with neg on src1: v10 = {f16(-v3), f16(v5)}
+        c.words.push_back(0xD0000000u | (303u << 17) | 10u);
+        c.words.push_back((2u << 29) | (Vgpr(3) << 9) | Vgpr(5));
+        break;
     case Wave::Lane: // lane id via mbcnt(-1), ballot via VOPC -> VCC, s_bcnt1 of the ballot
         c.VMbcnt(false, 10, InlineNeg1, 9);
         c.VMbcnt(true, 10, InlineNeg1, 10);
@@ -1460,6 +1467,25 @@ void AddWaveCases() {
                     SetLane(j, l, value(l), 0, {u32((l < 64 ? m.mask : rotl(m.mask, 7)) >> (l % 64) & 1), 0, 0, 0});
                 }
             }
+        }
+    }
+    // V_CVT_PKRTZ_F16_F32 (VOP2 47, VOP3 303 with a negated src1): truncation, overflow to the
+    // largest finite half, f16 subnormals, infinities, NaNs, f32 denormals, signed zeros.
+    {
+        const u32 in[] = {0x00000000u, 0x80000000u, 0x3F800000u, 0xBF800000u, 0x477FE000u, 0x477FFFFFu, 0x47800000u,
+                          0x7F7FFFFFu, 0x7F800000u, 0xFF800000u, 0x3F9FFFFFu, 0x3F7FFFFFu, 0x38800000u, 0x38000000u,
+                          0x33800000u, 0x33000000u, 0x387FFFFFu, 0xB87FFFFFu, 0x00000001u, 0x7FC00000u, 0x7F800001u,
+                          0xFFC00123u, 0xC77FEFFFu, 0x3EAAAAABu};
+        const u32 n = u32(std::size(in));
+        for (auto [name, w] : {std::pair{"alu: v_cvt_pkrtz_f16_f32 (VOP2)", Wave::Pkrtz},
+                               std::pair{"alu: v_cvt_pkrtz_f16_f32 (VOP3, neg src1)", Wave::Pkrtz3}}) {
+            Template t;
+            t.name = name;
+            t.op.kind = GCN_LOAD;
+            t.wave = w;
+            const u32 tt = AddTemplate(t);
+            Job& j = NewJob("alu", tt, RawV(64), 0);
+            for (u32 l = 0; l < 64; ++l) SetLane(j, l, in[(l + 7) % n], 0, {in[l % n], 0, 0, 0});
         }
     }
     // Loop-carried divergence: one wave -> exact; two waves -> the loop exit differs per wave, so a
@@ -2920,6 +2946,9 @@ std::vector<u32> WaveExpected(const Job& j) {
             r[1] = s20;
             break;
         }
+        case Wave::Pkrtz:
+        case Wave::Pkrtz3:
+            break; // EvaluatePkrtz
         case Wave::Lds: {
             const Lane& L = j.lanes[l];
             if (t.lds_cross == 1) {
@@ -3740,6 +3769,40 @@ std::string CheckSpillImage(Gpu& g, const Job& j) {
     return "  " + std::to_string(bad) + " spill-buffer bytes wrong\n" + d;
 }
 
+// V_CVT_PKRTZ_F16_F32: each half exactly as gcn_f32_to_f16_rtz, under one reading of the
+// unspecified f16 denormal output (kept or flushed) for the whole job; any NaN for NaN inputs.
+JobResult EvaluatePkrtz(const Job& j, const u32* res) {
+    const bool neg1 = g_templates[j.tmpl].wave == Wave::Pkrtz3;
+    auto is_nan16 = [](u32 h) { return (h & 0x7C00u) == 0x7C00u && (h & 0x3FFu) != 0; };
+    std::string why[2];
+    u32 bad[2] = {0, 0};
+    for (u32 flush = 0; flush < 2; ++flush) {
+        for (u32 l = 0; l < 64; ++l) {
+            const u32 s0 = j.lanes[l].data[0], s1 = j.lanes[l].vindex ^ (neg1 ? 0x80000000u : 0u);
+            const u32 want[2] = {gcn_f32_to_f16_rtz(s0, int(flush)), gcn_f32_to_f16_rtz(s1, int(flush))};
+            const u32 got[2] = {res[l * 4] & 0xFFFFu, res[l * 4] >> 16};
+            for (u32 h = 0; h < 2; ++h) {
+                const bool ok = is_nan16(want[h]) ? is_nan16(got[h]) : got[h] == want[h];
+                if (!ok && bad[flush]++ < 6) {
+                    char b[160];
+                    std::snprintf(b, sizeof(b), "    lane %u %s: f32 %#010x -> got %#06x want %#06x\n", l, h ? "hi (S1)" : "lo (S0)",
+                                  h ? s1 : s0, got[h], want[h]);
+                    why[flush] += b;
+                }
+            }
+            for (u32 i = 1; i < 4; ++i) {
+                if (res[l * 4 + i] != VgprMarker + i && bad[flush]++ < 6) why[flush] += "    a marker VGPR was clobbered\n";
+            }
+        }
+    }
+    if (!bad[0] && !bad[1]) return {Verdict::Strict, ""};
+    if (!bad[0] || !bad[1]) {
+        return {Verdict::Ambiguous, std::string("  matched reading: f16 denormal results ") + (!bad[0] ? "kept" : "flushed") + "\n"};
+    }
+    return {Verdict::Fail, "  no reading matches (kept: " + std::to_string(bad[0]) + ", flushed: " + std::to_string(bad[1]) +
+                               " wrong halves)\n" + why[0]};
+}
+
 // Same-halfword LDS contention: lanes 3g, 3g+1 read the same value, one of the two written; lane
 // 3g+2 reads its own halfword.
 JobResult EvaluateLdsContend(const Job& j, const u32* res) {
@@ -3901,6 +3964,10 @@ std::map<u32, JobResult> RunBatch(Gpu& g, const std::vector<u32>& jobs) {
         const u32* res = reinterpret_cast<const u32*>(g.results.data + u64(j.slot) * ResultSlot);
         if (g_templates[j.tmpl].lds_contend) {
             out[ji] = EvaluateLdsContend(j, res);
+            continue;
+        }
+        if (g_templates[j.tmpl].wave == Wave::Pkrtz || g_templates[j.tmpl].wave == Wave::Pkrtz3) {
+            out[ji] = EvaluatePkrtz(j, res);
             continue;
         }
         if (g_templates[j.tmpl].wave == Wave::Lds) {

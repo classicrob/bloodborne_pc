@@ -96,6 +96,10 @@ uint32_t gcn_mbcnt(uint32_t s0, uint32_t s1, uint32_t lane, int hi);
 /* V_READFIRSTLANE_B32: Lane# = FindFirst1fromLSB(exec), lane 0 if exec is zero. */
 uint32_t gcn_first_lane(uint64_t exec);
 uint32_t gcn_popcount64(uint64_t x);
+/* V_CVT_PKRTZ_F16_F32 component: flt32_to_flt16 with round-toward-zero (ISA ch. 12). The ISA
+ * does not say how denormal f16 results or NaN payloads come out: `flush_out` selects the
+ * flushed reading; NaN inputs return 0x7E00 | sign and callers accept any NaN. */
+uint16_t gcn_f32_to_f16_rtz(uint32_t bits, int flush_out);
 
 #ifdef __cplusplus
 }
