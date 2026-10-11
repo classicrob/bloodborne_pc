@@ -330,6 +330,12 @@ def launch(args):
     # hold on, so the game's heavy.sh runs it directly instead of waiting for its own caller.
     heavy = {k: os.environ[k] for k in ('BB_HEAVY_DIR', 'BB_HEAVY_PLAYTEST_SLOTS', 'BB_HEAVY_HELD',
                                         'BB_HEAVY_GPU') if k in os.environ}
+    games = set(translated_games())  # a recorded pid counts only while it is still a bb-probe
+    mine = [r for r in BASE.glob('2*/manifest.json') if not (r.parent / 'exit.json').exists()
+            and manifest(r.parent).get('pid') in games]
+    if mine and not args.parallel:
+        die(f'a game of this worktree is still running ({mine[0].parent.name}); one at a time while the '
+            'user works on this Mac (--parallel overrides when the orchestrator allows it)')
     running = translated_games()
     if len(running) >= 4:
         die(f'{len(running)} bb-probe processes are already running ({running}); the Rosetta limit is four')
@@ -377,6 +383,10 @@ def launch(args):
                BB_CONFIG=str(run / 'bbport.ini'),
                BB_PAD_FILE=str(run / 'pad.txt'), BB_IME_TEXT=args.name, BB_FPS=args.fps,
                BB_FRAME_STATS='1', BB_MODS_ENABLED='0', BB_TIMEOUT=str(args.timeout))
+    # The user works on this Mac while games run: the game is an accessory app (no Dock icon,
+    # never activated) and its window does not take focus when shown. SDL3 reads hints from the
+    # environment. Input comes from BB_PAD_FILE, so the window never needs keyboard focus.
+    env.update(SDL_MAC_BACKGROUND_APP='1', SDL_WINDOW_ACTIVATE_WHEN_SHOWN='0')
     if args.gpu_log:
         env['BB_GPU_LOG'] = args.gpu_log
     if args.perf:
@@ -473,7 +483,7 @@ def supervise(run):
         env = dict(os.environ, **{k: v for k, v in heavy.items() if k.startswith('BB_HEAVY_')},
                    BB_HEAVY_ANNOUNCE='1')
         command = [str(ROOT / 'tools/macos/heavy.sh'), '--pool', 'playtest', f'game {run.name}', '--',
-                   '/bin/bash', str(ROOT / 'run.sh')]
+                   '/usr/bin/nice', '-n', '5', '/bin/bash', str(ROOT / 'run.sh')]  # below the user's apps
         p = subprocess.Popen(command, cwd=ROOT, stdout=log, stderr=subprocess.STDOUT,
                              stdin=subprocess.DEVNULL, env=env)
         info['pid'] = p.pid  # heavy.sh and run.sh exec into bb-probe, so this is the game's pid
@@ -764,6 +774,8 @@ def main():
         p.add_argument('--probe', required=True, help='signed production bb-probe (gpu/libbbgpu.dylib beside it)')
         p.add_argument('--output', choices=sorted(SETTINGS), default='1080p')
         p.add_argument('--label', default='')
+        p.add_argument('--parallel', action='store_true',
+                       help='allow another game of this worktree to run at the same time (orchestrator approval)')
         p.add_argument('--name', default='Hunter', help='BB_IME_TEXT: the text every IME dialog accepts')
         p.add_argument('--fps', default='60', help='BB_FPS frame-rate patch')
         p.add_argument('--timeout', type=int, default=3600, help='BB_TIMEOUT seconds')
