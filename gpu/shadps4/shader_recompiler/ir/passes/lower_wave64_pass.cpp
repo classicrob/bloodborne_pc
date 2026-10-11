@@ -333,7 +333,19 @@ bool IsCrossLane(IR::Opcode op) {
            op == Opcode::QuadBroadcast;
 }
 
-// Vertex shaders where the device has no subgroup operations (Apple: Metal vertex functions).
+const char* StageName(SwStage stage) {
+    switch (stage) {
+    case SwStage::Vertex: return "vertex";
+    case SwStage::TessellationControl: return "tessellation control";
+    case SwStage::TessellationEval: return "tessellation evaluation";
+    case SwStage::Geometry: return "geometry";
+    case SwStage::Fragment: return "fragment";
+    default: return "compute";
+    }
+}
+
+// Graphics stages where the device has no subgroup operations (Apple: Metal vertex functions, for
+// vertex and tessellation evaluation shaders).
 // A VS wave's lanes are vertices, and the recompiler keeps exec and VOPC/VOP3 compare masks as one
 // bit per lane; a ballot of such a predicate is only ever read back by InverseBallot (this lane's
 // bit). Ballot(x) becomes the lane's own bit in every position (x ? ~0 : 0), which pure bitwise
@@ -343,7 +355,7 @@ bool IsCrossLane(IR::Opcode op) {
 // allowed only when it is the skip edge of an if whose condition also encloses the read: every
 // lane that executes the read went through the ballot. Anything else (another reader of a mask,
 // a mask as data, any other subgroup operation) stops compilation naming the shader.
-void LowerWave64VertexWithoutSubgroups(IR::Program& program) {
+void LowerWave64WithoutSubgroups(IR::Program& program) {
     using Type = IR::AbstractSyntaxNode::Type;
     const auto strip = [](const IR::Inst* c) {
         if (c && c->GetOpcode() == IR::Opcode::ConditionRef) c = c->Arg(0).TryInst();
@@ -467,10 +479,10 @@ void LowerWave64VertexWithoutSubgroups(IR::Program& program) {
             const auto op = inst.GetOpcode();
             if (op == IR::Opcode::InverseBallot) {
                 ASSERT_MSG(valid64(inst.Arg(0), enclosing[block], 0),
-                           "Apple wave64: vertex shader {:#x} reads a lane bit of a value that is not "
-                           "provably this lane's own ballot bit (vertex functions have no subgroup "
-                           "operations)",
-                           program.info.pgm_hash);
+                           "Apple wave64: {} shader {:#x} reads a lane bit of a value that is not "
+                           "provably this lane's own ballot bit (this stage has no subgroup "
+                           "operations on the device)",
+                           StageName(program.info.sw_stage), program.info.pgm_hash);
                 reads.push_back(&inst);
             } else if (op == IR::Opcode::Ballot) {
                 ballots.push_back(&inst);
@@ -478,9 +490,9 @@ void LowerWave64VertexWithoutSubgroups(IR::Program& program) {
                        op == IR::Opcode::WriteLane || op == IR::Opcode::WarpId ||
                        (op == IR::Opcode::GetAttributeU32 &&
                         inst.Arg(0).Attribute() == IR::Attribute::SubgroupLtMask)) {
-                UNREACHABLE_MSG("Apple wave64: vertex shader {:#x} uses {}, which needs subgroup "
-                                "operations; vertex functions have none on this device",
-                                program.info.pgm_hash, op);
+                UNREACHABLE_MSG("Apple wave64: {} shader {:#x} uses {}, which needs subgroup "
+                                "operations; this stage has none on the device",
+                                StageName(program.info.sw_stage), program.info.pgm_hash, op);
             }
         }
     }
@@ -509,18 +521,18 @@ void LowerWave64VertexWithoutSubgroups(IR::Program& program) {
                     continue;
                 }
                 ASSERT_MSG(plumbing || op == IR::Opcode::InverseBallot,
-                           "Apple wave64: vertex shader {:#x} uses a ballot mask as data ({}); vertex "
-                           "functions have no subgroup operations",
-                           program.info.pgm_hash, op);
+                           "Apple wave64: {} shader {:#x} uses a ballot mask as data ({}); this "
+                           "stage has no subgroup operations on the device",
+                           StageName(program.info.sw_stage), program.info.pgm_hash, op);
                 if (plumbing && seen.insert(use.user).second) work.push_back(use.user);
             }
         }
     }
     if (smem_zero) {
         LOG_WARNING(Render_Recompiler,
-                    "Apple wave64: vertex shader {:#x} reads out-of-range scalar buffer dwords as 0 "
+                    "Apple wave64: {} shader {:#x} reads out-of-range scalar buffer dwords as 0 "
                     "(SMEM_ZERO reading): a compare mask is also an s_buffer_load destination",
-                    program.info.pgm_hash);
+                    StageName(program.info.sw_stage), program.info.pgm_hash);
         for (IR::Block* block : program.blocks) {
             for (IR::Inst& inst : block->Instructions()) {
                 if (inst.GetOpcode() == IR::Opcode::ReadConstBuffer) inst.SetArg(2, IR::Value{0u});
@@ -538,9 +550,26 @@ void LowerWave64VertexWithoutSubgroups(IR::Program& program) {
     }
 }
 
-void LowerWave64Graphics(IR::Program& program, const Profile& profile) {
-    if (program.info.hw_stage == HwStage::Vertex && !profile.supports_vertex_subgroup_ops) {
-        LowerWave64VertexWithoutSubgroups(program);
+// The VkShaderStageFlags bit of the stage this program is emitted as (emit_spirv.cpp
+// DefineEntryPoint): the geometry-emulation ES/GS roles are compute kernels.
+u32 EmittedStageBit(const IR::Program& program, const RuntimeInfo& runtime_info) {
+    if (runtime_info.gs_role == GsEmulationRole::EsCompute ||
+        runtime_info.gs_role == GsEmulationRole::GsCompute) {
+        return 0x20;
+    }
+    switch (program.info.sw_stage) {
+    case SwStage::Vertex: return 0x1;
+    case SwStage::TessellationControl: return 0x2;
+    case SwStage::TessellationEval: return 0x4;
+    case SwStage::Geometry: return 0x8;
+    case SwStage::Fragment: return 0x10;
+    default: return 0x20;
+    }
+}
+
+void LowerWave64Graphics(IR::Program& program, const RuntimeInfo& runtime_info, const Profile& profile) {
+    if (!(profile.subgroup_supported_stages & EmittedStageBit(program, runtime_info))) {
+        LowerWave64WithoutSubgroups(program);
         return;
     }
     for (IR::Block* block : program.blocks) {
@@ -963,7 +992,7 @@ void LowerWave64BallotPass(IR::Program& program, const RuntimeInfo& runtime_info
         if (program.info.hw_stage == HwStage::Compute) {
             LowerWave64Compute(program, runtime_info, profile);
         } else {
-            LowerWave64Graphics(program, profile);
+            LowerWave64Graphics(program, runtime_info, profile);
         }
         return;
     }

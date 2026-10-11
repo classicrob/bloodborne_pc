@@ -402,9 +402,9 @@ public:
         return vk11_props.subgroupSize;
     }
 
-    /// Returns true if subgroup operations are supported in vertex shaders.
-    bool IsVertexSubgroupSupported() const {
-        return static_cast<bool>(vk11_props.subgroupSupportedStages & vk::ShaderStageFlagBits::eVertex);
+    /// Returns the shader stages that support subgroup operations (VkShaderStageFlags).
+    u32 SubgroupSupportedStages() const {
+        return static_cast<u32>(vk11_props.subgroupSupportedStages);
     }
 
     /// Returns the maximum size of compute shared memory.
