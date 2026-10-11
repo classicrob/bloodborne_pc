@@ -1,7 +1,10 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <array>
 #include <atomic>
+#include <memory>
 #include <thread>
 #include <magic_enum/magic_enum.hpp>
 
@@ -173,10 +176,24 @@ bool EqueueInternal::RemoveEvent(u64 id, s16 filter) {
 }
 
 int EqueueInternal::WaitForEvents(OrbisKernelEvent* ev, int num, const OrbisKernelUseconds* timo) {
+    ASSERT(num > 0);
+    // Consume into host storage: a guest output fault may wait on a GPU trigger,
+    // which needs m_mutex. The ordinary small event request needs no allocation.
+    std::array<OrbisKernelEvent, 16> local;
+    std::unique_ptr<OrbisKernelEvent[]> large;
+    if (static_cast<size_t>(num) > local.size()) large = std::make_unique<OrbisKernelEvent[]>(num);
+    auto* staged = large ? large.get() : local.data();
+    const int count = WaitForEventsStaged(staged, num, timo);
+    std::copy_n(staged, count, ev);
+    return count;
+}
+
+int EqueueInternal::WaitForEventsStaged(OrbisKernelEvent* ev, int num, const OrbisKernelUseconds* timo) {
     if (timo != nullptr && *timo == 0) {
         // Effectively acts as a poll; only events that have already
         // arrived at the time of this function call can be received
-        return GetTriggeredEvents(ev, num);
+        std::scoped_lock lock{m_mutex};
+        return GetTriggeredEventsLocked(ev, num);
     }
     const auto micros = timo ? *timo : 0u;
 
@@ -188,7 +205,7 @@ int EqueueInternal::WaitForEvents(OrbisKernelEvent* ev, int num, const OrbisKern
     int count = 0;
 
     const auto predicate = [&] {
-        count = GetTriggeredEvents(ev, num);
+        count = GetTriggeredEventsLocked(ev, num);
         return count > 0;
     };
 
@@ -229,7 +246,7 @@ bool EqueueInternal::TriggerEvent(u64 ident, s16 filter, void* trigger_data) {
     return has_found;
 }
 
-int EqueueInternal::GetTriggeredEvents(OrbisKernelEvent* ev, int num) {
+int EqueueInternal::GetTriggeredEventsLocked(OrbisKernelEvent* ev, int num) {
     int count = 0;
     for (auto it = m_events.begin(); it != m_events.end();) {
         if (it->IsTriggered()) {
