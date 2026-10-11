@@ -186,10 +186,18 @@ def status():
             print(f'{name}: held by {describe(holder(name))}')
 
 
+def announce(label):
+    """With BB_HEAVY_ANNOUNCE set (play_route.py sets it), says on stderr that the command starts
+    now: everything before was waiting for a slot or the GPU, not the command's own startup."""
+    if os.environ.get('BB_HEAVY_ANNOUNCE'):
+        print(f'heavy: {label}: running', file=sys.stderr, flush=True)
+
+
 def run(pool, priority, gpu, label, command):
     if os.environ.get('BB_HEAVY_HELD'):
         if gpu:
             take_gpu(gpu, label)
+        announce(label)
         os.execvp(command[0], command)
     names = (['build-priority'] if priority else []) + slot_names(pool)
     started, reported = time.monotonic(), time.monotonic()
@@ -214,6 +222,7 @@ def run(pool, priority, gpu, label, command):
             os.environ['BB_HEAVY_HELD'] = f'{name}:{label}'
             if gpu:
                 take_gpu(gpu, label)
+            announce(label)
             if pool == 'quick':
                 supervise_quick(label, command)
             try:

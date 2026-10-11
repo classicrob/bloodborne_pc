@@ -423,16 +423,23 @@ def launch(args):
     # A detached supervisor owns the game, so its exit status is recorded however the run ends.
     subprocess.Popen([sys.executable, __file__, '_supervise', str(run)], start_new_session=True,
                      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
-    deadline, slot_taken = time.time() + 60, False
-    while time.time() < deadline:
+    # Waiting for a heavy-job slot or the GPU (heavy.sh) is not startup: the 60 s start when
+    # heavy.sh says the game is running (BB_HEAVY_ANNOUNCE). The wait is reported, not failed.
+    deadline, waited_since, reported = None, time.time(), time.time()
+    while deadline is None or time.time() < deadline:
         time.sleep(1)
         info = manifest(run)  # the supervisor writes it (pid); only read here
-        # Waiting for a heavy-job slot is not startup: the 60 s start when the slot is taken.
-        heavy_lines = [l for l in log_lines(run) if l.startswith('heavy: ')]
-        if heavy_lines and 'waiting for a slot' in heavy_lines[-1]:
-            deadline = time.time() + 60
-        elif heavy_lines and ' got ' in heavy_lines[-1] and not slot_taken:
-            slot_taken, deadline = True, time.time() + 60
+        if deadline is None:
+            heavy_lines = [l for l in log_lines(run) if l.startswith('heavy: ')]
+            if any(l.endswith(': running') for l in heavy_lines):
+                deadline = time.time() + 60
+                if time.time() - waited_since >= 1:
+                    print(f'play_route: waited {time.time() - waited_since:.0f} s for heavy.sh '
+                          '(slot/GPU), not counted as startup', file=sys.stderr)
+            elif time.time() - reported >= 60:
+                print(f'play_route: still waiting for heavy.sh after {time.time() - waited_since:.0f} s: '
+                      f'{heavy_lines[-1] if heavy_lines else "(no report yet)"}', file=sys.stderr)
+                reported = time.time()
         if (run / 'exit.json').exists():
             die(f'game exited during startup: {(run / "exit.json").read_text().strip()}; log {run / "game.log"}')
         if info.get('pid') and any(l.startswith('Runtime:') for l in log_lines(run)):
@@ -446,7 +453,8 @@ def supervise(run):
     with (run / 'game.log').open('wb') as log:
         info = manifest(run)
         heavy = info['heavy']
-        env = dict(os.environ, **{k: v for k, v in heavy.items() if k.startswith('BB_HEAVY_')})
+        env = dict(os.environ, **{k: v for k, v in heavy.items() if k.startswith('BB_HEAVY_')},
+                   BB_HEAVY_ANNOUNCE='1')
         command = [str(ROOT / 'tools/macos/heavy.sh'), '--pool', 'playtest', f'game {run.name}', '--',
                    '/bin/bash', str(ROOT / 'run.sh')]
         p = subprocess.Popen(command, cwd=ROOT, stdout=log, stderr=subprocess.STDOUT,

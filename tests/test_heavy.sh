@@ -117,6 +117,15 @@ fi
 "$heavy" status | grep -q '^gpu: free' || fail "GPU lock not free after the jobs"
 export BB_HEAVY_PLAYTEST_SLOTS=2
 
+# BB_HEAVY_ANNOUNCE (play_route.py): "running" on stderr when the command starts, after any wait,
+# also for a nested call; nothing without it.
+err=$(BB_HEAVY_ANNOUNCE=1 "$heavy" --pool playtest G9 -- true 2>&1 >/dev/null)
+[[ $err == *'heavy: G9: running'* ]] || fail "no running announcement ('$err')"
+err=$(BB_HEAVY_ANNOUNCE=1 "$heavy" --pool quick --gpu exclusive T4 -- "$heavy" --pool playtest G10 -- true 2>&1 >/dev/null)
+[[ $err == *'heavy: G10: running'* ]] || fail "no running announcement for a nested call ('$err')"
+err=$("$heavy" --pool playtest G11 -- true 2>&1 >/dev/null)
+[[ $err != *running* ]] || fail "announced without BB_HEAVY_ANNOUNCE ('$err')"
+
 # Bad usage is an error, not a silent no-op.
 if "$heavy" G true 2>/dev/null; then fail "missing -- accepted"; fi
 if BB_HEAVY_BUILD_SLOTS=0 "$heavy" H -- true 2>/dev/null; then fail "zero slots accepted"; fi
@@ -133,4 +142,4 @@ assert any(l['label'] == 'B' and l['waited_s'] >= 1 for l in starts), 'B waited'
 assert all({'pool', 'slot', 'waited_s', 'load', 'held'} <= set(l) for l in starts)
 assert any(l['label'] == 'Q4' and l['status'] == 124 for l in ends), 'Q4 killed'
 PY
-echo "heavy.sh: history log, build/playtest/quick pools, quick hints and time limit, waiting, priority slot, GPU shared/exclusive lock with gate, release on SIGKILL, nesting, exit status, usage errors PASS"
+echo "heavy.sh: history log, build/playtest/quick pools, quick hints and time limit, waiting, priority slot, GPU shared/exclusive lock with gate, start announcement, release on SIGKILL, nesting, exit status, usage errors PASS"
