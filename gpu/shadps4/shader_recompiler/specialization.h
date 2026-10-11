@@ -3,6 +3,9 @@
 
 #pragma once
 
+#ifdef __APPLE__
+#include "bbport_frame_marks.h"
+#endif
 #include <bitset>
 #include <cstring>
 #include <string>
@@ -118,7 +121,7 @@ struct StageSpecialization {
 #ifdef __APPLE__
         // BB_CMD_DATA_CHECK: where the descriptor's table read came from (submitted command
         // memory, its chunk tail, or elsewhere).
-        const std::string source = BbCmdData::LastRead();
+        const std::string source = BbCmdData::LastRead() + BbFrameMarks::Describe();
 #else
         const std::string source;
 #endif
