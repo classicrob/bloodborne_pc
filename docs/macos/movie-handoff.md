@@ -39,7 +39,9 @@ wait for GX's done event.
   method (event vtable +0x18 = 0x207e8f0), in 100 ms slices.
   - That method waits once and returns 0 for any wake, so 0 is never taken as done. Done is
     checked again under the mutex.
-  - One absolute deadline (5 s) covers every outcome.
+  - A 5 s deadline is checked after every check of done, so done seen only past it still
+    stops. It bounds repeated waits that return; it is not a watchdog against a lock or wait
+    that never returns.
 - **If GX already finished within the 20 ms**, done is set and nothing waits.
 - **If only the main thread kicks GX** (not established, see below), no kick can come between
   the wait and the draw. The draw then follows GX's frame.
@@ -74,7 +76,8 @@ Output (stdout):
   - R or G is null;
   - the done event is not initialized, or its wait method is not 0x207e8f0;
   - locking or unlocking the event's mutex fails, or a wait fails;
-  - GX's frame is not done within 5 s, whether the waits time out or wake without done.
+  - GX's frame is not done within 5 s, whether the waits time out, wake without done, or see
+    done only after the deadline.
 
 ### Not established (why it is opt-in)
 

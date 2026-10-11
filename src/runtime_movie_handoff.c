@@ -13,8 +13,9 @@
  * (0x21b6aa0). Done is read only under the event's mutex (event+8, through the engine's own
  * mutex imports); while it is clear the step waits on the event's condition through the engine's
  * wait method (event vtable +0x18 = 0x207e8f0), in slices. That method waits once and returns 0
- * for any wake, so a 0 is never taken as done: done is checked again under the mutex. One
- * absolute deadline (5 s) covers every outcome and stops loudly.
+ * for any wake, so a 0 is never taken as done: done is checked again under the mutex. A 5 s
+ * deadline is checked after every check of done and stops loudly; it bounds repeated waits that
+ * return, not a lock or wait that never returns.
  *
  * If only the main thread kicks GX (not established; the qualification run records the kick's
  * caller threads), no kick can come between this wait and the draw, and the draw then follows
@@ -135,8 +136,8 @@ static uintptr_t handoff_pointer(uintptr_t at, const char *what) {
     return value;
 }
 
-/* Bit 1 of the event's state, read under the event's mutex as the engine reads it. */
-static int done_locked(void *done, uintptr_t gx) {
+/* The event's state, read under the event's mutex as the engine reads it (bit 1: done). */
+static uint32_t state_locked(void *done, uintptr_t gx) {
     void *mutex=(char *)done+EventMutex;
     const int32_t locked=((MutexCall)(handoff_image+MutexLockStub))(mutex);
     if (locked) handoff_stop("locking GX's done event failed",(uint64_t)(uint32_t)locked,gx);
@@ -144,7 +145,7 @@ static int done_locked(void *done, uintptr_t gx) {
     memcpy(&state,(const char *)done+EventState,sizeof(state));
     const int32_t unlocked=((MutexCall)(handoff_image+MutexUnlockStub))(mutex);
     if (unlocked) handoff_stop("unlocking GX's done event failed",(uint64_t)(uint32_t)unlocked,gx);
-    return (state&2)!=0;
+    return state;
 }
 
 void runtime_movie_handoff_after_sleep(const uintptr_t *return_slot) {
@@ -177,13 +178,18 @@ void runtime_movie_handoff_after_sleep(const uintptr_t *return_slot) {
     }
 
     ++steps;
+    /* The limit is checked after every check of done, so done seen past it still stops. It is a
+     * deadline between engine calls, not a watchdog: a lock or wait that never returns is not
+     * bounded by it. */
     const uint64_t start=handoff_now_ns();
     int was_done=1;
-    while (!done_locked(done,gx)) {
-        was_done=0;
+    for (;;) {
+        const uint32_t now_state=state_locked(done,gx);
         if (handoff_now_ns()-start>wait_limit_ns)
-            handoff_stop("GX's frame is not done within the wait limit (deadlock?): G, state",gx,
-                         *(const volatile uint32_t *)((const char *)done+EventState));
+            handoff_stop("GX's frame was not done within the wait limit (deadlock?): G, state",gx,
+                         now_state);
+        if (now_state&2) break;
+        was_done=0;
         const int32_t result=((EventWait)wait)(done,WAIT_SLICE_US);
         if (result && result!=-3) handoff_stop("GX's done event wait failed",(uint64_t)(uint32_t)result,gx);
     }
