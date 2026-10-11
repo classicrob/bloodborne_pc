@@ -274,6 +274,8 @@ if [[ ${1:-} == --test ]]; then
         BB_DEPS_PREFIX="$deps" bash tests/macos_external_host/run.sh
         BB_DEPS_PREFIX="$deps" bash tests/macos_metalfx/signature.sh
         BB_DEPS_PREFIX="$deps" bash tests/macos_metalfx/run.sh
+        # The production module (gpu/shim/macos_metalfx.mm) as the provider, incl. off-thread teardown.
+        BB_DEPS_PREFIX="$deps" bash tests/macos_metalfx/run.sh --module
         BB_DEPS_PREFIX="$deps" bash tests/macos_metalfx/jitter.sh
         BB_GPU_BUILD="$PWD/out/gpu" sh tests/macos_metalfx/library.sh
         # Every tests/test_*.py (a skipped test fails).
