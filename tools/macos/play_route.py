@@ -508,6 +508,7 @@ REPORT = {
     'builder_rejected': r'rejected a \d+-dword command buffer request',
     'gpu_copy_gap': r'runs on the GPU',
     'cmd_overlap': r'CMD-OVERLAP',
+    'audio_health_failure': r'AUDIO HEALTH FAILURE',  # software input health, not audibility
 }
 
 
