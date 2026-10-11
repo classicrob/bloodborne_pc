@@ -926,8 +926,17 @@ public:
     [[nodiscard]] u32 NumPendingOperations() const noexcept {
         return num_pending_ops.load(std::memory_order_acquire);
     }
-    [[nodiscard]] u64 OutstandingLabels() {
-        return labels.Outstanding();
+    /// Priority operations issued and not yet run to the end (including the one the runner
+    /// thread has taken and is waiting for or running).
+    [[nodiscard]] u64 PriorityOperationsOutstanding() const noexcept {
+        return priority_ops_issued.load(std::memory_order_acquire) -
+               priority_ops_completed.load(std::memory_order_acquire);
+    }
+    /// Deferred signals (labels, fences) issued and not yet written, whether or not their
+    /// writer has taken them.
+    [[nodiscard]] u64 DeferredSignalsOutstanding() const noexcept {
+        return deferred_signals_issued.load(std::memory_order_acquire) -
+               deferred_signals_done->load(std::memory_order_acquire);
     }
 #endif
 
@@ -942,6 +951,9 @@ public:
     /// Defers an operation until the gpu has reached the current cpu tick.
     /// Runs as soon as possible in another thread.
     void DeferPriorityOperation(Common::UniqueFunction<void>&& func) {
+#ifdef __APPLE__
+        priority_ops_issued.fetch_add(1, std::memory_order_acq_rel);
+#endif
         {
             std::unique_lock lk(priority_pending_ops_mutex);
             priority_pending_ops.emplace(std::move(func), CurrentTick());
@@ -987,6 +999,9 @@ private:
     std::mutex priority_pending_ops_mutex;
     std::condition_variable_any priority_pending_ops_cv;
     std::jthread priority_pending_ops_thread;
+#ifdef __APPLE__
+    std::atomic<u64> priority_ops_issued{0}, priority_ops_completed{0}; ///< frame capture
+#endif
     RenderState render_state;
     bool is_rendering = false;
     // bbport: threaded recording

@@ -653,6 +653,9 @@ void Scheduler::PriorityPendingOpsThread(std::stop_token stoken) {
         }
 
         op.callback();
+#ifdef __APPLE__
+        priority_ops_completed.fetch_add(1, std::memory_order_acq_rel);
+#endif
     }
 }
 

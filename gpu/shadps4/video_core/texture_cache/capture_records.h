@@ -16,8 +16,10 @@ struct CaptureImageRecord {
     u32 samples;
     u32 mips;
     u32 layers;
-    /// nullptr: can be written back exactly (TileImage); else why not: "msaa", "depth+stencil",
-    /// "metadata", "bc gpu-written", "scene proxy".
+    /// nullptr: eligible, i.e. not one of the known-unsupported kinds; exact write-back (TileImage,
+    /// whole allocation incl. padding, this format and tiling) is still to be qualified when
+    /// export is implemented. Else why not: "msaa", "depth+stencil", "metadata",
+    /// "bc gpu-written", "scene proxy".
     const char* reject;
 };
 
