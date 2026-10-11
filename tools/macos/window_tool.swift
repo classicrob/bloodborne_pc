@@ -3,6 +3,10 @@
 //                              owned by <pid>; exits 2 when there is none.
 //   window_tool diff <a> <b>   prints the fraction of changed pixels (largest channel delta > 24).
 //   window_tool screen         prints the main display's size in points as WxH.
+//   window_tool roidiff <a> <b> <x0> <y0> <x1> <y1>
+//                              compares a region (fractions of width/height) of two same-size images:
+//                              mean absolute luma difference (0..255) and the fraction of pixels whose
+//                              largest channel difference exceeds 24.
 //   window_tool stats <png>    prints JSON image statistics: width, height, the fraction of
 //                              pixels with any RGB channel above 16, the mean luma (0..255) and
 //                              the fraction of strongly saturated pixels (max - min channel > 96).
@@ -21,7 +25,7 @@ if args.count == 2 && args[1] == "screen" {
     print("\(Int(b.width))x\(Int(b.height))")
     exit(0)
 }
-guard args.count >= 3 else { fail("usage: window_tool window <pid> | stats <png> | diff <a> <b> | screen", 64) }
+guard args.count >= 3 else { fail("usage: window_tool window <pid> | stats <png> | diff <a> <b> | roidiff <a> <b> <x0> <y0> <x1> <y1> | screen", 64) }
 
 switch args[1] {
 case "window":
@@ -64,6 +68,40 @@ case "stats":
     }
     let count = Double(width * height)
     print("{\"width\": \(width), \"height\": \(height), \"nonblack\": \(Double(nonblack) / count), \"mean_luma\": \(luma / count), \"saturated\": \(Double(saturated) / count)}")
+case "roidiff":
+    guard args.count == 8, let x0 = Double(args[4]), let y0 = Double(args[5]), let x1 = Double(args[6]),
+          let y1 = Double(args[7]), x0 < x1, y0 < y1 else { fail("usage: window_tool roidiff <a> <b> <x0> <y0> <x1> <y1>", 64) }
+    func pixels(_ path: String) -> (Int, Int, [UInt8]) {
+        guard let source = CGImageSourceCreateWithURL(URL(fileURLWithPath: path) as CFURL, nil),
+              let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else { fail("roidiff: cannot read \(path)", 1) }
+        let w = image.width, h = image.height
+        var px = [UInt8](repeating: 0, count: w * h * 4)
+        px.withUnsafeMutableBytes { b in
+            CGContext(data: b.baseAddress, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
+                      space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                      bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue)!
+                .draw(image, in: CGRect(x: 0, y: 0, width: w, height: h))
+        }
+        return (w, h, px)
+    }
+    let a = pixels(args[2]), b = pixels(args[3])
+    if a.0 != b.0 || a.1 != b.1 { fail("roidiff: images differ in size", 1) }
+    let (w, h) = (a.0, a.1)
+    let xa = max(0, Int(x0 * Double(w))), xb = min(w, Int(x1 * Double(w)))
+    let ya = max(0, Int(y0 * Double(h))), yb = min(h, Int(y1 * Double(h)))
+    var sum = 0.0, changed = 0, n = 0
+    for y in ya..<yb {
+        for x in xa..<xb {
+            let i = (y * w + x) * 4
+            let la = 0.2126 * Double(a.2[i]) + 0.7152 * Double(a.2[i + 1]) + 0.0722 * Double(a.2[i + 2])
+            let lb = 0.2126 * Double(b.2[i]) + 0.7152 * Double(b.2[i + 1]) + 0.0722 * Double(b.2[i + 2])
+            sum += abs(la - lb)
+            let d = max(abs(Int(a.2[i]) - Int(b.2[i])), abs(Int(a.2[i + 1]) - Int(b.2[i + 1])), abs(Int(a.2[i + 2]) - Int(b.2[i + 2])))
+            if d > 24 { changed += 1 }
+            n += 1
+        }
+    }
+    print("{\"mean_abs\": \(n > 0 ? sum / Double(n) : 0), \"changed\": \(n > 0 ? Double(changed) / Double(n) : 0)}")
 case "diff":
     // window_tool diff <a.png> <b.png>: the fraction of pixels whose largest channel difference
     // exceeds 24 (same-size images; a size change counts as fully changed).
