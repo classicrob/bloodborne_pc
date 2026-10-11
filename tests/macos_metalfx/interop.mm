@@ -15,6 +15,7 @@
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 #include <sys/sysctl.h>
 
@@ -453,6 +454,12 @@ int main(int argc,char** argv) {
             }
             present(e,output,done,17);
             if(provider) provider->Drain(); else metalComplete(cb);
+        }
+        if(provider) {
+            // The renderer may destroy the provider after its encoding thread has stopped: the
+            // destructor must not require the encoding thread (it aborted here before).
+            std::thread([&]{ provider.reset(); }).join();
+            std::puts("PASS: provider destroyed off its encoding thread");
         }
         for(bool isTemporal:{true,false}) {
             std::vector<double> times;

@@ -63,6 +63,8 @@ struct TemporalScaler::Impl {
     void CheckOwner() const {
         Require(owner == std::this_thread::get_id(), "provider must have one encoding thread");
     }
+    /// Waits for every submitted MetalFX command buffer (thread-safe: waitUntilCompleted).
+    void WaitAll();
     id<MTLTexture> ExportImage(VkImage image, VkImageAspectFlagBits aspect) const {
         Require(image != VK_NULL_HANDLE, "required color/depth/motion/output/reactive image is absent");
         VkExportMetalTextureInfoEXT texture{};
@@ -162,7 +164,14 @@ TemporalScaler::TemporalScaler(VkDevice device, PFN_vkGetDeviceProcAddr get_proc
     }
 }
 
-TemporalScaler::~TemporalScaler() { Drain(); }
+// The destructor is the scaler's last user, so it may run on any thread (the renderer may be torn
+// down after the encoding thread has stopped): it waits for the pending work without the owner
+// check that guards concurrent encoding.
+TemporalScaler::~TemporalScaler() {
+    @autoreleasepool {
+        impl->WaitAll();
+    }
+}
 
 std::shared_ptr<Textures> TemporalScaler::Register(Images images) {
     @autoreleasepool {
@@ -242,14 +251,18 @@ void TemporalScaler::Submit(const std::shared_ptr<Textures>& textures, Frame fra
     }
 }
 
+void TemporalScaler::Impl::WaitAll() {
+    for (auto command : pending) {
+        [command waitUntilCompleted];
+        Completed(command);
+    }
+    Reap();
+}
+
 void TemporalScaler::Drain() {
     @autoreleasepool {
         impl->CheckOwner();
-        for (auto command : impl->pending) {
-            [command waitUntilCompleted];
-            Completed(command);
-        }
-        impl->Reap();
+        impl->WaitAll();
     }
 }
 double TemporalScaler::LastGpuMilliseconds() const {
