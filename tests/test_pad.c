@@ -7,6 +7,7 @@ static bool test_pad_init(SDL_InitFlags flags) { return fail_init ? SDL_SetError
 #define SDL_InitSubSystem test_pad_init
 #include "../src/runtime_pad.c"
 #undef SDL_InitSubSystem
+static bool virtual_sensors(void *user,bool enabled) { (void)user; (void)enabled; return true; }
 static int fail_rumble, rumble_calls;
 static Uint16 rumble_low,rumble_high;
 static bool virtual_rumble(void *user,Uint16 low,Uint16 high) {
@@ -62,6 +63,8 @@ int main(void) {
     desc.vendor_id=0x1d50;
     desc.product_id=0x6189;
     desc.Rumble=virtual_rumble;
+    SDL_VirtualJoystickSensorDesc sensors[2]={{.type=SDL_SENSOR_ACCEL,.rate=100},{.type=SDL_SENSOR_GYRO,.rate=100}};
+    desc.nsensors=2; desc.sensors=sensors; desc.SetSensorsEnabled=virtual_sensors;
     desc.ntouchpads=1;
     desc.touchpads=&touch;
     SDL_JoystickID id=SDL_AttachVirtualJoystick(&desc);
@@ -77,6 +80,40 @@ int main(void) {
     assert(gamepad && data.touch_count==2 && (data.buttons & BTN_TOUCHPAD));
     assert(data.touches[0].x==1439 && data.touches[0].y==471 && data.touches[0].id==0);
     assert(data.touches[1].x==480 && data.touches[1].y==942 && data.touches[1].id==1);
+#ifdef __APPLE__
+    assert(SDL_GamepadSensorEnabled(gamepad,SDL_SENSOR_ACCEL));
+    assert(SDL_GamepadSensorEnabled(gamepad,SDL_SENSOR_GYRO));
+    float accel[3]={SDL_STANDARD_GRAVITY,2*SDL_STANDARD_GRAVITY,-SDL_STANDARD_GRAVITY};
+    float gyro[3]={0,0,1.57079632679f};
+    assert(SDL_SendJoystickVirtualSensorData(joystick,SDL_SENSOR_ACCEL,1,accel,3));
+    assert(SDL_SendJoystickVirtualSensorData(joystick,SDL_SENSOR_GYRO,1,gyro,3));
+    SDL_UpdateJoysticks(); SDL_UpdateGamepads();
+    assert(!pad_read_state(1,&data));
+    assert(fabsf(data.acceleration[0]-1)<1e-6f && fabsf(data.acceleration[1]-2)<1e-6f && fabsf(data.acceleration[2]+1)<1e-6f);
+    assert(fabsf(data.angular_velocity[2]-gyro[2])<1e-6f);
+    for (int i=1;i<=10;++i) {
+        assert(SDL_SendJoystickVirtualSensorData(joystick,SDL_SENSOR_GYRO,1+(Uint64)i*100000000,gyro,3));
+        SDL_UpdateJoysticks(); SDL_UpdateGamepads();
+    }
+    assert(!pad_read_state(1,&data));
+    assert(fabsf(data.orientation[2]-sqrtf(0.5f))<1e-5f && fabsf(data.orientation[3]-sqrtf(0.5f))<1e-5f);
+    SDL_Event event={.type=SDL_EVENT_GAMEPAD_SENSOR_UPDATE};
+    event.gsensor.which=id; event.gsensor.sensor=SDL_SENSOR_GYRO;
+    event.gsensor.timestamp=SDL_GetTicksNS(); event.gsensor.sensor_timestamp=500000001;
+    event.gsensor.data[0]=100;
+    motion_event(NULL,&event);
+    assert(!pad_read_state(1,&data) && data.angular_velocity[0]==0);
+    assert(!pad_reset_orientation(1)); assert(!pad_read_state(1,&data));
+    assert(data.orientation[0]==0 && data.orientation[1]==0 && data.orientation[2]==0 && data.orientation[3]==1);
+    assert(!pad_motion_enable(1,0)); assert(!pad_read_state(1,&data));
+    assert(data.acceleration[0]==0 && data.angular_velocity[2]==0);
+    assert(!pad_motion_enable(1,1));
+    assert(SDL_SendJoystickVirtualSensorData(joystick,SDL_SENSOR_ACCEL,2000000001,accel,3));
+    SDL_UpdateJoysticks(); SDL_UpdateGamepads();
+    SDL_Delay(260);
+    assert(!pad_read_state(1,&data) && data.acceleration[0]==0 && motion.warned);
+    puts("PASS: SDL motion event samples, g/rad-s units, quaternion rotation, repeated-time rejection, reset/disable/stale data");
+#endif
     uint8_t motors[]={17,91};
     assert(!pad_vibration(1,motors));
     assert(rumble_calls && rumble_low==17*257 && rumble_high==91*257);

@@ -82,6 +82,11 @@ static void touch_click(PadData *d, int right) {
     d->touches[0]=(PadTouch){.x=right ? 1440 : 480,.y=471,.id=0};
 }
 
+#ifdef __APPLE__
+static SDL_Gamepad *current_gamepad(void);
+#include "runtime_pad_motion_mac.h"
+#endif
+
 /* Opens the first gamepad SDL knows about; called under lock. */
 static SDL_Gamepad *current_gamepad(void) {
     if (!sdl_ready) {
@@ -101,6 +106,9 @@ static SDL_Gamepad *current_gamepad(void) {
         if (ids && count>0) {
             gamepad=SDL_OpenGamepad(ids[0]);
             if (gamepad) {
+#ifdef __APPLE__
+                motion_connect(gamepad);
+#endif
                 ++connected_count;
                 const char *name=SDL_GetGamepadName(gamepad);
                 printf("Runtime: gamepad connected: %s (vendor %04x product %04x)\n",
@@ -124,6 +132,9 @@ static void sample_host(PadData *d) {
     if (bbgpu_overlay_captures_input()) return; /* settings menu open: neutral input */
     const bool *k=SDL_WasInit(SDL_INIT_VIDEO) ? SDL_GetKeyboardState(NULL) : NULL;
     if (g) {
+#ifdef __APPLE__
+        motion_sample(d);
+#endif
         static const struct { SDL_GamepadButton sdl; uint32_t ps; } map[]={
             {SDL_GAMEPAD_BUTTON_SOUTH,BTN_CROSS}, {SDL_GAMEPAD_BUTTON_EAST,BTN_CIRCLE},
             {SDL_GAMEPAD_BUTTON_WEST,BTN_SQUARE}, {SDL_GAMEPAD_BUTTON_NORTH,BTN_TRIANGLE},
@@ -382,16 +393,25 @@ static ABI int32_t pad_vibration(int32_t handle, const uint8_t *param) {
     pthread_mutex_unlock(&lock);
     return 0;
 }
+#ifndef __APPLE__
 static ABI int32_t pad_ok_handle(int32_t handle) { return handle==PAD_HANDLE && opened ? 0 : ERR_INVALID_HANDLE; }
 static ABI int32_t pad_ok_handle_flag(int32_t handle, uint8_t flag) { (void)flag; return pad_ok_handle(handle); }
+
+#endif
 
 static const RuntimeExport exports[]={
     {"scePadInit",pad_init}, {"scePadOpen",pad_open}, {"scePadClose",pad_close},
     {"scePadReadState",pad_read_state}, {"scePadRead",pad_read},
     {"scePadGetControllerInformation",pad_info}, {"scePadSetVibration",pad_vibration},
+#ifdef __APPLE__
+    {"scePadResetOrientation",pad_reset_orientation},
+    {"scePadSetAngularVelocityDeadbandState",pad_motion_filter}, {"scePadSetTiltCorrectionState",pad_motion_filter},
+    {"scePadSetMotionSensorState",pad_motion_enable},
+#else
     {"scePadResetOrientation",pad_ok_handle},
     {"scePadSetAngularVelocityDeadbandState",pad_ok_handle_flag}, {"scePadSetTiltCorrectionState",pad_ok_handle_flag},
     {"scePadSetMotionSensorState",pad_ok_handle_flag},
+#endif
 };
 uintptr_t runtime_pad_resolve(const char *name) { return RUNTIME_LOOKUP(exports,name); }
 void runtime_pad_report(void) {
