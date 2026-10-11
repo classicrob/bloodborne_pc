@@ -559,11 +559,11 @@ inline std::string LastRead() {
                   static_cast<unsigned long long>(last.address),
                   static_cast<unsigned long long>(last.size));
     std::string out = text + Describe(last.result);
-    char origin[320];
+    char origin[640];
     // Frames between an origin and this read; origins are recorded under the owner's lock the
     // read's flip sample was taken under, so none should be newer: say so if one is.
     const auto age = [](std::uint64_t then, std::uint64_t now) {
-        char text[96];
+        char text[192];
         if (then > now) {
             std::snprintf(text, sizeof(text), "after this read's frame sample");
         } else {

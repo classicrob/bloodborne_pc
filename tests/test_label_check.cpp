@@ -425,6 +425,8 @@ int main() {
                    split.find("high word was written separately, by a SET_SH_REG of the "
                               "graphics stream at 0x7039500180") != std::string::npos &&
                    split.find("after this read's frame sample") != std::string::npos &&
+                   named.find("retained state is a candidate, not by itself a defect)") !=
+                       std::string::npos &&
                    unwritten.find("not written by any tracked SET_SH_REG since the check "
                                   "started") != std::string::npos &&
                    elsewhere.find("not a tracked graphics user-data register") !=
