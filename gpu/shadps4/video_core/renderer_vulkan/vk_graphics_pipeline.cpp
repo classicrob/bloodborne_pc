@@ -620,8 +620,12 @@ void GraphicsPipeline::BuildDescSetLayout(bool preloading) {
                 .stageFlags = stage_bit,
             });
         }
-        for (const auto& image : stage->images) {
-            const u32 num_bindings = image.NumBindings(*stage);
+        for (u32 image_index = 0; image_index < stage->images.size(); ++image_index) {
+            const auto& image = stage->images[image_index];
+            // As compiled into the permutation (no live user data when built from the cache).
+            const u32 num_bindings = image.permutation_bindings;
+            ASSERT_MSG(num_bindings, "Image {} of shader {:#x} has no recorded binding count",
+                       image_index, stage->pgm_hash);
             bindings.push_back({
                 .binding = binding,
                 .descriptorType = image.is_written ? vk::DescriptorType::eStorageImage

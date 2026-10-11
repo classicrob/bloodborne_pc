@@ -158,8 +158,13 @@ struct StageSpecialization {
                              spec.is_srgb = sharp.GetNumberFmt() == AmdGpu::NumberFormat::Srgb;
                          }
                          spec.num_conversion = sharp.GetNumberConversion();
-                         spec.num_bindings = desc.NumBindings(*info);
                      });
+        // bbport: every image's descriptor count as the emitter declares it (NumBindings),
+        // null images included: it decides the SPIR-V (the mip array size) and the bindings
+        // after it, and the stored permutation records it for its pipeline layouts.
+        for (size_t i = 0; i < info->images.size(); ++i) {
+            images[i].num_bindings = info->images[i].NumBindings(*info);
+        }
         ForEachSharp(binding, fmasks, info->fmasks,
                      [](auto& spec, const auto& desc, AmdGpu::Image sharp) {
                          spec.width = sharp.width;
@@ -257,6 +262,18 @@ struct StageSpecialization {
 #endif
              ) && start != other.start) {
             return false;
+        }
+
+        // bbport: every image's descriptor count decides the SPIR-V (the mip array size) and the
+        // bindings after it, null images included, so it is compared for all of them before the
+        // validity bits are consulted.
+        if (images.size() != other.images.size()) {
+            return false;
+        }
+        for (size_t i = 0; i < images.size(); ++i) {
+            if (images[i].num_bindings != other.images[i].num_bindings) {
+                return false;
+            }
         }
 
         // Retain the native resource-free module reuse behavior.

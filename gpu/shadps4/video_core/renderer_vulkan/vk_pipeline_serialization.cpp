@@ -18,7 +18,7 @@ static constexpr u32 ShaderBinaryVersion = 24u; // Wave64: SMEM_ZERO for diverge
 #else
 static constexpr u32 ShaderBinaryVersion = 14u; // Integer buffer swizzle constants and packed SNORM minima.
 #endif
-static constexpr u32 ShaderMetaVersion = 10u; // RuntimeInfo carries the geometry emulation role and GSVS layout.
+static constexpr u32 ShaderMetaVersion = 11u; // ImageResource records its permutation's binding count.
 static constexpr u32 PipelineKeyVersion = 11u; // Keys name the ES/GS of an emulated geometry stage.
 } // namespace Serialization
 

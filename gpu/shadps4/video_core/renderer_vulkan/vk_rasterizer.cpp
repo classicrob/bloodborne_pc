@@ -2598,7 +2598,9 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
                                                         ? vk::Format::eD32Sfloat
                                                         : vk::Format::eR32G32B32A32Sfloat;
                 desc.info.num_samples = tsharp.NumSamples();
-                const u32 count = image_desc.NumBindings(stage);
+                const u32 count = image_desc.permutation_bindings;
+                ASSERT_MSG(count, "Image of shader {:#x} has no recorded binding count",
+                           stage.pgm_hash);
                 for (u32 i = 0; i < count; ++i) {
                     image_bindings.emplace_back(VideoCore::ImageId{}, &desc);
                     image_binding_entries.push_back(nullptr);
@@ -2607,10 +2609,17 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
                 image_descriptor_array_sizes.push_back(count);
                 set_ok = false;
             } else {
-                image_bindings.emplace_back(VideoCore::ImageId{}, &image_desc_storage.emplace_back());
-                image_binding_entries.push_back(nullptr);
-                binding_proxy_ok.push_back(false);
-                image_descriptor_array_sizes.push_back(1);
+                // The permutation's span, as its layout declares it.
+                const u32 count = image_desc.permutation_bindings;
+                ASSERT_MSG(count, "Image of shader {:#x} has no recorded binding count",
+                           stage.pgm_hash);
+                auto& desc = image_desc_storage.emplace_back();
+                for (u32 i = 0; i < count; ++i) {
+                    image_bindings.emplace_back(VideoCore::ImageId{}, &desc);
+                    image_binding_entries.push_back(nullptr);
+                    binding_proxy_ok.push_back(false);
+                }
+                image_descriptor_array_sizes.push_back(count);
             }
             continue;
         }
@@ -2627,19 +2636,32 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
                         "data_format={}, num_format={}",
                         tsharp.Address(), tsharp.pitch, tsharp.width, static_cast<u32>(data_fmt),
                         static_cast<u32>(num_fmt));
-            image_bindings.emplace_back(VideoCore::ImageId{}, &image_desc_storage.emplace_back());
-            image_binding_entries.push_back(nullptr);
-            binding_proxy_ok.push_back(false);
-            image_descriptor_array_sizes.push_back(1);
+            // The permutation's span, as its layout declares it.
+            const u32 count = image_desc.permutation_bindings;
+            ASSERT_MSG(count, "Image of shader {:#x} has no recorded binding count",
+                       stage.pgm_hash);
+            auto& desc = image_desc_storage.emplace_back();
+            for (u32 i = 0; i < count; ++i) {
+                image_bindings.emplace_back(VideoCore::ImageId{}, &desc);
+                image_binding_entries.push_back(nullptr);
+                binding_proxy_ok.push_back(false);
+            }
+            image_descriptor_array_sizes.push_back(count);
             continue;
         }
 
         const Shader::MipStorageFallbackMode mip_fallback_mode = image_desc.mip_fallback_mode;
-        // Same as image_desc.NumBindings(stage), without fetching the T# again.
-        const u32 num_bindings =
+        // The permutation's count. The live T# (image_desc.NumBindings, without fetching it again)
+        // selected that permutation, so they agree; a difference means the specialization key
+        // misses what decides the count.
+        const u32 num_bindings = image_desc.permutation_bindings;
+        const u32 live_bindings =
             mip_fallback_mode == Shader::MipStorageFallbackMode::DynamicIndex
                 ? static_cast<u32>(tsharp.last_level - tsharp.base_level + 1)
                 : 1u;
+        ASSERT_MSG(num_bindings == live_bindings,
+                   "Image {} of shader {:#x}: permutation compiled with {} bindings, its T# needs {}",
+                   image_index, stage.pgm_hash, num_bindings, live_bindings);
         const bool proxy_candidate = sample_proxies && num_bindings == 1 &&
                                      !image_desc.needs_native && !image_desc.is_written &&
                                      mip_fallback_mode == Shader::MipStorageFallbackMode::None;

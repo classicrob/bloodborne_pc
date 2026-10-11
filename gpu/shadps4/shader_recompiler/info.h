@@ -236,9 +236,17 @@ struct Info : InfoPersistent {
         }
     }
 
+    /// The bindings a stored permutation takes (cache hits and preloads; a compiled stage
+    /// advances them itself): an image takes its permutation's descriptor count.
     void AddBindings(Backend::Bindings& bnd) const {
         bnd.buffer += buffers.size();
-        bnd.unified += buffers.size() + images.size() + samplers.size();
+        u32 image_bindings = 0;
+        for (const auto& image : images) {
+            ASSERT_MSG(image.permutation_bindings,
+                       "Image of shader {:#x} has no recorded binding count", pgm_hash);
+            image_bindings += image.permutation_bindings;
+        }
+        bnd.unified += buffers.size() + image_bindings + samplers.size();
         bnd.user_data += ud_mask.NumRegs();
     }
 

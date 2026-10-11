@@ -71,6 +71,19 @@ struct Program {
             return;
         }
         auto info = std::make_unique<Shader::Info>(std::move(metadata));
+        // bbport: image descriptor counts as compiled into this permutation (its specialization
+        // records every image's, null ones included). Pipeline layouts, binding offsets and
+        // descriptor writes use these, also for pipelines rebuilt from the stage cache without
+        // live user data.
+        ASSERT_MSG(spec.images.size() == info->images.size(),
+                   "Permutation of {:#x} specializes {} images, its info has {}", info->pgm_hash,
+                   spec.images.size(), info->images.size());
+        for (size_t i = 0; i < info->images.size(); ++i) {
+            ASSERT_MSG(spec.images[i].num_bindings,
+                       "Permutation of {:#x}: image {} specializes no binding count",
+                       info->pgm_hash, i);
+            info->images[i].permutation_bindings = spec.images[i].num_bindings;
+        }
         auto snapshot = std::make_unique<const Shader::Info>(*info);
         spec.info = info.get();
         modules[perm_idx] = {module, std::move(spec), std::move(info), std::move(snapshot)};
