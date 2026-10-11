@@ -6,6 +6,7 @@
 #include "bbport_copy.h"
 
 #include <deque>
+#include <source_location>
 #ifdef __APPLE__
 #include "video_core/buffer_cache/host_import_arena.h"
 #endif
@@ -38,6 +39,16 @@ namespace VideoCore {
 class TextureCache;
 class MemoryTracker;
 class PageManager;
+
+/// bbport (Apple): the draw or dispatch being recorded on this thread, for loud stops in the buffer
+/// cache (which resource binding asked for unmapped guest memory).
+struct RecordContext {
+    const char* kind = "none"; ///< "draw", "indirect draw", "dispatch", "indirect dispatch"
+    u64 shader0 = 0;           ///< vertex or compute shader hash
+    u64 shader1 = 0;           ///< pixel shader hash (draws)
+    u64 sequence = 0;          ///< recorded draws/dispatches on this thread
+};
+inline thread_local RecordContext record_context{};
 
 class BufferCache {
     static constexpr u64 ADDRESS_SPACE_BITS = 40;
@@ -93,9 +104,9 @@ public:
     void ReadMemory(VAddr device_addr, u64 size, bool is_write = false, bool assume_locks = false);
 
     /// Finds a buffer for the specified region.
-    [[nodiscard]] std::pair<const Buffer*, u64> ObtainBuffer(VAddr device_addr, u32 size,
-                                                             bool is_written,
-                                                             bool is_texel_buffer = false);
+    [[nodiscard]] std::pair<const Buffer*, u64> ObtainBuffer(
+        VAddr device_addr, u32 size, bool is_written, bool is_texel_buffer = false,
+        std::source_location caller = std::source_location::current());
 
     /// Attempts to obtain a buffer without modifying the cache contents.
     [[nodiscard]] std::pair<const Buffer*, u64> ObtainBufferForImage(VAddr device_addr, u32 size);

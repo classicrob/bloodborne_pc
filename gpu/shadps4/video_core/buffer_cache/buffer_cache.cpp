@@ -21,6 +21,9 @@
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
+#ifdef __APPLE__
+#include "../../../../src/runtime_memory.h"
+#endif
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/texture_cache/texture_cache.h"
 
@@ -320,16 +323,41 @@ void PrintBufferStats() {
 }
 } // namespace
 
+#ifdef __APPLE__
+/// Stops with everything known about a request for guest memory the runtime does not report as
+/// mapped: unmapped, or live but untracked (the low host/code/stack arena has no VMAs).
+[[noreturn]] static void UnmappedImportRange(VAddr device_addr, u32 size,
+                                             const std::source_location& caller) {
+    std::array<RuntimeMemoryAlias, 1> rows{};
+    RuntimeMemoryAliasSnapshot snapshot{};
+    const int tracked = runtime_memory_alias_snapshot(device_addr, rows.data(), rows.size(),
+                                                      &snapshot);
+    const auto& context = record_context;
+    UNREACHABLE_MSG("macOS host-import buffer range {:#x}+{:#x} is untracked or unmapped guest "
+                    "memory; requested by "
+                    "{}:{} ({}) while recording {} #{} (shaders {:#x} {:#x}); runtime mapping of "
+                    "the start: {}",
+                    device_addr, size, caller.file_name(), caller.line(), caller.function_name(),
+                    context.kind, context.sequence, context.shader0, context.shader1,
+                    tracked == 1 ? fmt::format("{:#x}-{:#x} prot {} (generation {})",
+                                               snapshot.start, snapshot.end, snapshot.prot,
+                                               snapshot.generation)
+                                 : fmt::format("none (alias query {})", tracked));
+}
+#endif
+
 std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 size,
-                                                        bool is_written, bool is_texel_buffer) {
+                                                        bool is_written, bool is_texel_buffer,
+                                                        std::source_location caller) {
     const bool stats = BufferStatsEnabled();
     if (stats) {
         PrintBufferStats();
         NoteHotUse(device_addr, size);
     }
 #ifdef __APPLE__
-    ASSERT_MSG(size && memory->ClampRangeSize(device_addr, size) == size,
-               "macOS host-import buffer range {:#x}+{:#x} is not fully mapped", device_addr, size);
+    if (!size || memory->ClampRangeSize(device_addr, size) != size) [[unlikely]] {
+        UnmappedImportRange(device_addr, size, caller);
+    }
     const auto* imported = GetArena(device_addr >> block_shift,
                                     (device_addr + size - 1) >> block_shift);
     EnsureResident(imported, device_addr >> block_shift,

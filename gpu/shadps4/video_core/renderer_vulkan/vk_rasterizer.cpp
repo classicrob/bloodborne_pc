@@ -978,8 +978,24 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const PreparedDraw* pre
     DrawRecord(pipeline, used_prepared, is_indexed, index_offset);
 }
 
+void Rasterizer::NoteRecordContext(const char* kind, const Pipeline* pipeline) {
+    // For loud stops in the buffer cache: which draw or dispatch asked for a resource.
+    auto& context = VideoCore::record_context;
+    context.kind = kind;
+    if (pipeline->IsCompute()) {
+        context.shader0 = pipeline->GetStage(Shader::SwStage::Compute).pgm_hash;
+        context.shader1 = 0;
+    } else {
+        context.shader0 = pipeline->GetStage(Shader::SwStage::Vertex).pgm_hash;
+        const auto* ps = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
+        context.shader1 = ps ? ps->pgm_hash : 0;
+    }
+    ++context.sequence;
+}
+
 void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw* used_prepared,
                             bool is_indexed, u32 index_offset) {
+    NoteRecordContext("draw", pipeline);
     if (DrawPipe::OnStageB()) {
         FrameCapture::Poll();
         scheduler.PopPendingOperations();
@@ -1286,6 +1302,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
 
 void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_indexed,
                                     const IndirectDraw& indirect) {
+    NoteRecordContext("indirect draw", pipeline);
     if (DrawPipe::OnStageB()) {
         FrameCapture::Poll();
         scheduler.PopPendingOperations();
@@ -1434,6 +1451,7 @@ void Rasterizer::DispatchDirect() {
 }
 
 void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
+    NoteRecordContext("dispatch", pipeline);
     FrameCapture::Poll();
     gbuffer_draw = false;
 
@@ -1506,6 +1524,7 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
 
 void Rasterizer::DispatchIndirectRecord(const ComputePipeline* pipeline, VAddr address,
                                         u32 size) {
+    NoteRecordContext("indirect dispatch", pipeline);
     scheduler.PopPendingOperations();
     const u32 offset = 0;
 
