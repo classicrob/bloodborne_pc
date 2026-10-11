@@ -4224,14 +4224,53 @@ namespace {
 //   skip 120-340        skip the frame's draws 120 to 340 (inclusive; "skip 7" is one draw)
 //   skip vs 0x1234abcd  skip every draw whose vertex shader has this hash ("ps": pixel shader)
 //   skip rt 0x...       skip every draw whose first color target is at this guest address
-//   skip vb 0xLO-0xHI   skip every draw whose index range or a fetched vertex buffer overlaps
-//                       the guest range LO..HI (inclusive)
+//   skip vb 0xLO-0xHI   skip every draw whose bound index range (direct indexed draws) or a
+//                       bound fetched vertex buffer range (not emulated ES/GS fetch) overlaps
+//                       LO..HI, inclusive: the whole bound range, not the bytes indices select
 //   dump vs 0x1234abcd  for the next frame's draws with this vertex shader, print its user data
 //                       s0-s15 and, per fetch attribute, where its V# is read and its raw words
 //   list 7              a new value lists every draw of the frame that starts at the next flip
 // Rules add up. A line that does not parse, or a file that cannot be read, rejects the whole file
 // (nothing is skipped) loudly. Write the file elsewhere and rename it over the control file, so
 // that a flip never reads it half written.
+/// A fetch attribute's V#, read under this thread's fault recovery: the vertex table it reads is
+/// guest memory, and these diagnostics run before the draw binds it; nothing if it is unreadable.
+std::optional<AmdGpu::Buffer> GuardedSharp(const Shader::Gcn::VertexAttribute& attribute,
+                                           const Shader::Info& vs) {
+    auto* const previous = runtime_fault_recover;
+    sigjmp_buf recover;
+    if (sigsetjmp(recover, 0)) {
+        runtime_fault_recover = previous;
+        return std::nullopt;
+    }
+    runtime_fault_recover = &recover;
+    const AmdGpu::Buffer sharp = attribute.GetSharp(vs);
+    runtime_fault_recover = previous;
+    return sharp;
+}
+
+/// The 4 words of a fetch attribute's V# as stored (Info::ReadUdReg, before GetSharp applies the
+/// instruction offset and format override), under the same recovery; nothing if unreadable.
+std::optional<std::array<u32, 4>> GuardedRawSharp(const Shader::Gcn::VertexAttribute& attribute,
+                                                  const Shader::Info& vs) {
+    auto* const previous = runtime_fault_recover;
+    sigjmp_buf recover;
+    if (sigsetjmp(recover, 0)) {
+        runtime_fault_recover = previous;
+        return std::nullopt;
+    }
+    runtime_fault_recover = &recover;
+    const auto words = vs.ReadUdReg<std::array<u32, 4>>(attribute.sgpr_base,
+                                                        attribute.dword_offset);
+    runtime_fault_recover = previous;
+    return words;
+}
+
+/// The bytes a V# describes, in 64 bits (GetSize's u32 product can wrap for a malformed one).
+u64 SharpSpan(const AmdGpu::Buffer& sharp) {
+    return sharp.stride ? u64(sharp.num_records) * sharp.stride : u64(sharp.num_records);
+}
+
 struct DrawBisect {
     struct Range {
         u32 first, last;
@@ -4448,12 +4487,18 @@ bool Rasterizer::DrawBisectSkip(const GraphicsPipeline* pipeline, bool is_indexe
     const auto contains = [](const auto& values, u64 value) {
         return std::ranges::find(values, value) != values.end();
     };
-    // Whether the draw's index range or a fetched vertex buffer overlaps a "skip vb" range.
+    // Whether the draw's bound index range or a bound fetched vertex buffer range overlaps a "skip
+    // vb" range (the whole bound range, not the bytes the indices select). Spans are 64-bit and
+    // addresses 48-bit, so the inclusive end cannot wrap; an unreadable V# matches nothing.
     const auto reads_vb_range = [&] {
         const auto overlaps = [&](VAddr address, u64 size) {
-            return size && std::ranges::any_of(b.vb_ranges, [&](const auto& range) {
-                       return address <= range.second && range.first <= address + size - 1;
-                   });
+            if (size == 0) {
+                return false;
+            }
+            const u64 last = address + (size - 1);
+            return std::ranges::any_of(b.vb_ranges, [&](const auto& range) {
+                return address <= range.second && range.first <= last;
+            });
         };
         if (is_indexed && !indirect) {
             const u32 index_size =
@@ -4466,8 +4511,8 @@ bool Rasterizer::DrawBisectSkip(const GraphicsPipeline* pipeline, bool is_indexe
         // The copy shader of an emulated geometry stage has no fetch of its own here.
         if (const auto& fetch = pipeline->GetFetchShader(); fetch && !pipeline->GsEmulation()) {
             for (const auto& attribute : fetch->attributes) {
-                const auto sharp = attribute.GetSharp(vs);
-                if (overlaps(sharp.base_address, sharp.GetSize())) {
+                const auto sharp = GuardedSharp(attribute, vs);
+                if (sharp && overlaps(sharp->base_address, SharpSpan(*sharp))) {
                     return true;
                 }
             }
@@ -4505,13 +4550,18 @@ bool Rasterizer::DrawBisectSkip(const GraphicsPipeline* pipeline, bool is_indexe
         if (const auto& fetch = pipeline->GetFetchShader(); fetch && !pipeline->GsEmulation()) {
             std::vector<VAddr> seen;
             for (const auto& attribute : fetch->attributes) {
-                const auto sharp = attribute.GetSharp(vs);
-                if (contains(seen, sharp.base_address)) {
+                const auto sharp = GuardedSharp(attribute, vs);
+                if (!sharp) {
+                    line += fmt::format(" vb (attr {}: vertex table unreadable)",
+                                        attribute.semantic);
                     continue;
                 }
-                seen.push_back(sharp.base_address);
-                line += fmt::format(" vb {:#x}+{} stride {}", sharp.base_address, sharp.GetSize(),
-                                    sharp.GetStride());
+                if (contains(seen, sharp->base_address)) {
+                    continue;
+                }
+                seen.push_back(sharp->base_address);
+                line += fmt::format(" vb {:#x}+{} stride {}", sharp->base_address,
+                                    SharpSpan(*sharp), sharp->GetStride());
             }
         }
         std::printf("%s\n", line.c_str());
@@ -4527,23 +4577,40 @@ bool Rasterizer::DrawBisectSkip(const GraphicsPipeline* pipeline, bool is_indexe
         }
         if (const auto& fetch = pipeline->GetFetchShader(); fetch && !pipeline->GsEmulation()) {
             for (const auto& attribute : fetch->attributes) {
-                VAddr table = 0;
-                if (attribute.sgpr_base != Shader::IR::NumScalarRegs &&
-                    attribute.sgpr_base + 1u < ud.size()) {
-                    table = (VAddr(ud[attribute.sgpr_base + 1]) << 32 | ud[attribute.sgpr_base]) &
-                            0xFFFFFFFFFFFFULL;
+                // Where the V# is read: a table whose pointer is in user data s[sgpr_base:+1],
+                // or (sgpr_base == NumScalarRegs) the user data itself.
+                std::string source;
+                if (attribute.sgpr_base == Shader::IR::NumScalarRegs) {
+                    source = fmt::format("user data s{}-s{}", attribute.dword_offset,
+                                         attribute.dword_offset + 3);
+                } else if (attribute.sgpr_base + 1u < ud.size()) {
+                    const VAddr table =
+                        (VAddr(ud[attribute.sgpr_base + 1]) << 32 | ud[attribute.sgpr_base]) &
+                        0xFFFFFFFFFFFFULL;
+                    source = fmt::format("table s[{}:{}]={:#x} + {} dwords = {:#x}",
+                                         attribute.sgpr_base, attribute.sgpr_base + 1, table,
+                                         attribute.dword_offset,
+                                         table + attribute.dword_offset * 4u);
+                } else {
+                    source = fmt::format("table pointer s{} beyond the user data",
+                                         attribute.sgpr_base);
                 }
-                const auto sharp = attribute.GetSharp(vs);
-                std::array<u32, 4> words{};
-                std::memcpy(words.data(), &sharp, sizeof(words));
+                const auto raw = GuardedRawSharp(attribute, vs);
+                const auto sharp = GuardedSharp(attribute, vs);
+                if (!raw || !sharp) {
+                    text += fmt::format("; attr {} from {}: UNREADABLE", attribute.semantic,
+                                        source);
+                    continue;
+                }
                 text += fmt::format(
-                    "; attr {} sgpr_base {} dword_offset {} table {:#x} at {:#x}: {:08x} {:08x} "
-                    "{:08x} {:08x} (base {:#x} size {} stride {} fmt {}/{} records {}{})",
-                    attribute.semantic, attribute.sgpr_base, attribute.dword_offset, table,
-                    table ? table + attribute.dword_offset * 4u : VAddr{0}, words[0], words[1],
-                    words[2], words[3], sharp.base_address, sharp.GetSize(), sharp.GetStride(),
-                    u32(sharp.data_format), u32(sharp.num_format), sharp.num_records,
-                    sharp.Valid() ? "" : " INVALID");
+                    "; attr {} from {}: raw {:08x} {:08x} {:08x} {:08x}; effective (inst_offset {}"
+                    ", format override {}/{}) base {:#x} span {} stride {} fmt {}/{} records "
+                    "{}{}",
+                    attribute.semantic, source, (*raw)[0], (*raw)[1], (*raw)[2], (*raw)[3],
+                    attribute.inst_offset, attribute.data_format, attribute.num_format,
+                    sharp->base_address, SharpSpan(*sharp), sharp->GetStride(),
+                    u32(sharp->data_format), u32(sharp->num_format), sharp->num_records,
+                    sharp->Valid() ? "" : " INVALID");
             }
         }
         std::printf("%s\n", text.c_str());
