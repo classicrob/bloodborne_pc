@@ -3264,6 +3264,8 @@ struct Options {
     std::string compile_only, stage = "cs";
     bool bench = false;
     std::array<u32, 16> ud{};
+    std::vector<u32> ud_ptr; // --compile-only: UD[n:n+1] point at a zeroed host table (extended user data)
+    bool ud_table_vsharp = false; // --compile-only: that table holds valid raw buffer V#s instead of zeros
 };
 
 void FillPristine(Gpu& g, const std::vector<u32>& jobs) {
@@ -4357,6 +4359,8 @@ int main(int argc, char** argv) {
         else if (a == "--push-descriptors") g_force_sets = false;
         else if (a == "--stage" && i + 1 < argc) opt.stage = argv[++i];
         else if (a == "--fs-export" && i + 1 < argc) g_fs_export = u32(std::atoi(argv[++i]));
+        else if (a == "--ud-ptr" && i + 1 < argc) opt.ud_ptr.push_back(u32(std::atoi(argv[++i])));
+        else if (a == "--ud-table-vsharp") opt.ud_table_vsharp = true;
         else if (a == "--ud" && i + 1 < argc) {
             std::string list = argv[++i];
             u32 k = 0;
@@ -4471,6 +4475,20 @@ int main(int argc, char** argv) {
         j.group = "compile-only";
         j.label = t.name;
         j.ud = opt.ud;
+        static std::vector<u32> table(1024, 0); // 4 KiB of zeros for SRT walkers
+        if (opt.ud_table_vsharp) { // non-null descriptors, so loads stay real (data-dependent flow survives)
+            gcn_vsharp tv = RawV(0x10000);
+            tv.base = 0x100000;
+            const auto pk = Pack(tv);
+            for (u32 k = 0; k < table.size(); ++k) table[k] = pk[k % 4];
+        }
+        for (u32 n : opt.ud_ptr) {
+            const u64 ptr = reinterpret_cast<u64>(table.data());
+            if (n + 1 < 16) {
+                j.ud[n] = u32(ptr);
+                j.ud[n + 1] = u32(ptr >> 32);
+            }
+        }
         g_jobs.push_back(j);
         CompileAll(opt.outdir);
         ValidateModules(opt.outdir);
