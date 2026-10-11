@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <atomic>
+#include <cstring>
 #include "gnm_error.h"
 #include "gnmdriver.h"
 
@@ -111,12 +112,37 @@ struct PacingStats {
 static PacingStats pacing; ///< under m_submit_lock
 #endif
 
+#ifdef __APPLE__
+/// BB_SUBMIT_THROTTLE=none (UNSAFE diagnostic, Apple): submissions and sceGnmSubmitDone never wait
+/// for GPU idle; sceGnmAreSubmitsAllowed still reports the throttle. Validated and announced at
+/// the first submission. With BB_LABEL_CHECK=1 it gives supporting evidence on whether the content
+/// at end-of-pipe labels changes before they are written once the guest is not held
+/// (docs/macos/gpu-idle.md). It can corrupt the guest heap: for that measurement only.
+static bool ThrottleOff() {
+    static const bool off = [] {
+        const char* env = std::getenv("BB_SUBMIT_THROTTLE");
+        if (!env || !*env || !std::strcmp(env, "idle")) {
+            return false;
+        }
+        if (std::strcmp(env, "none")) {
+            std::fprintf(stderr, "STOP: BB_SUBMIT_THROTTLE must be 'idle' or 'none'\n");
+            std::abort();
+        }
+        std::fprintf(stderr, "WARNING: BB_SUBMIT_THROTTLE=none: the guest is never held for GPU "
+                             "idle (UNSAFE diagnostic; the guest heap may be corrupted)\n");
+        return true;
+    }();
+    return off;
+}
+#endif
+
 /// Returns the microseconds it blocked on Apple (0 if the throttle was not set; elsewhere 0).
 static u64 WaitGpuIdle() {
     HLE_TRACE;
     std::unique_lock lock{m_wait_idle};
 #ifdef __APPLE__
-    if (submission_lock == 0) {
+    // Evaluated first, so the mode is validated and announced at the first submission.
+    if (ThrottleOff() || submission_lock == 0) {
         return 0;
     }
     const auto start = std::chrono::steady_clock::now();

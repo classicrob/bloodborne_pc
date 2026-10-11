@@ -33,6 +33,7 @@
 #include "core/platform.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "bbport_write_log.h"
+#include "bbport_label_check.h"
 #include "video_core/amdgpu/pm4_cmds.h"
 #include "video_core/renderdoc.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
@@ -383,14 +384,42 @@ bool PipelinedOpcode(PM4ItOpcode opcode) {
 } // namespace
 
 namespace {
+#ifdef __APPLE__
+/// BB_LABELS_AT_GPU_COMPLETE: labels are written on the label writer thread. A faulting store
+/// there could enter the write-fault handler (DrainDrawPipe, cache locks) while a recording thread
+/// waits for this very label, so labels are stored only through the memory's backing, which
+/// cannot fault; a label without a backing stops.
+void WriteLabelBacking(void* address, u64 data, u32 num_bytes) {
+    ASSERT_MSG(Core::Memory::Instance()->TryWriteBacking(address, &data, num_bytes),
+               "macOS: label {} ({} bytes) has no backing write path; the label writer does not "
+               "store through a faulting mapping",
+               fmt::ptr(address), num_bytes);
+}
+#endif
+
 void SignalEop(const PM4CmdEventWriteEop& eop) {
     eop.SignalFence(
         [](void* address, u64 data, u32 num_bytes) {
             auto* memory = Core::Memory::Instance();
+#ifdef __APPLE__
+            if (BbLabelCheck::Enabled()) {
+                BbLabelCheck::BeforeWrite(reinterpret_cast<u64>(address), num_bytes);
+            }
+#endif
             BbWriteLog::Note(reinterpret_cast<u64>(address), &data, num_bytes, BbWriteLog::Fence);
-            if (!memory->TryWriteBacking(address, &data, num_bytes)) {
+#ifdef __APPLE__
+            if (Vulkan::Scheduler::LabelsAtGpuComplete()) {
+                WriteLabelBacking(address, data, num_bytes);
+            } else
+#endif
+                if (!memory->TryWriteBacking(address, &data, num_bytes)) {
                 memcpy(address, &data, num_bytes);
             }
+#ifdef __APPLE__
+            if (BbLabelCheck::Enabled()) {
+                BbLabelCheck::AfterWrite(reinterpret_cast<u64>(address), data, num_bytes);
+            }
+#endif
         },
         [] { Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxEop); });
 }
@@ -408,6 +437,12 @@ void RunEventWriteEop(Vulkan::Rasterizer& rasterizer, const u8* data) {
         const char* env = std::getenv("BB_ASYNC_FENCES");
         return env && env[0] == '1';
     }();
+#ifdef __APPLE__
+    if (Vulkan::Scheduler::LabelsAtGpuComplete()) {
+        rasterizer.SignalAtGpuCompletion([eop] { SignalEop(eop); });
+        return;
+    }
+#endif
     if (async_fences && !BbToggle::Disabled(BbToggle::AsyncFences)) {
         BbCopy::AfterCopies([eop] { SignalEop(eop); });
     } else if (Vulkan::DrawPipe::OnStageB() && !BbToggle::Disabled(BbToggle::RecorderFences)) {
@@ -485,19 +520,37 @@ void RunWriteData(Vulkan::Rasterizer& rasterizer, const u8* data) {
 #endif
 }
 
-void RunEventWriteEos(Vulkan::Rasterizer& rasterizer, const u8* data) {
-    const auto& event_eos = *reinterpret_cast<const PM4CmdEventWriteEos*>(data);
-    // Copies deferred to the recording thread precede writes the guest sees.
-    rasterizer.WaitHostCopies();
-    rasterizer.WaitDeferredSignals();
-    rasterizer.ProcessDownloadImages();
+void SignalEos(const PM4CmdEventWriteEos& event_eos) {
     event_eos.SignalFence([](void* address, u64 value, u32 num_bytes) {
         auto* memory = Core::Memory::Instance();
         BbWriteLog::Note(reinterpret_cast<u64>(address), &value, num_bytes, BbWriteLog::Fence);
+#ifdef __APPLE__
+        if (Vulkan::Scheduler::LabelsAtGpuComplete()) {
+            WriteLabelBacking(address, value, num_bytes);
+            return;
+        }
+#endif
         if (!memory->TryWriteBacking(address, &value, num_bytes)) {
             memcpy(address, &value, num_bytes);
         }
     });
+}
+
+void RunEventWriteEos(Vulkan::Rasterizer& rasterizer, const u8* data) {
+    const auto& event_eos = *reinterpret_cast<const PM4CmdEventWriteEos*>(data);
+#ifdef __APPLE__
+    if (Vulkan::Scheduler::LabelsAtGpuComplete() &&
+        event_eos.command != PM4CmdEventWriteEos::Command::GdsStore) {
+        rasterizer.ProcessDownloadImages();
+        rasterizer.SignalAtGpuCompletion([event_eos] { SignalEos(event_eos); });
+        return;
+    }
+#endif
+    // Copies deferred to the recording thread precede writes the guest sees.
+    rasterizer.WaitHostCopies();
+    rasterizer.WaitDeferredSignals();
+    rasterizer.ProcessDownloadImages();
+    SignalEos(event_eos);
     if (event_eos.command == PM4CmdEventWriteEos::Command::GdsStore) {
         ASSERT(event_eos.size == 1);
         rasterizer.Finish();
@@ -1345,6 +1398,16 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
             case PM4ItOpcode::EventWriteEop: {
                 const auto* event_eop = reinterpret_cast<const PM4CmdEventWriteEop*>(header);
+#ifdef __APPLE__
+                // Before the hand-over: the recording thread may write the label at once.
+                if (BbLabelCheck::Enabled()) {
+                    event_eop->SignalFence(
+                        [](void* address, u64, u32 num_bytes) {
+                            BbLabelCheck::NoteParsed(reinterpret_cast<u64>(address), num_bytes);
+                        },
+                        [] {});
+                }
+#endif
                 if (rasterizer) {
                     if (rasterizer->RunInOrder(&RunEventWriteEop, event_eop, sizeof(*event_eop))) {
                         NotePendingFences(*event_eop);
@@ -1927,6 +1990,41 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             const auto* release_mem = reinterpret_cast<const PM4CmdReleaseMem*>(header);
             if (rasterizer) {
                 rasterizer->ProcessDownloadImages();
+#ifdef __APPLE__
+                // Compute end-of-pipe label: after the GPU completed the work before it, in
+                // order with the graphics labels, stored through the backing (it runs on the
+                // label writer).
+                if (Vulkan::Scheduler::LabelsAtGpuComplete()) {
+                    const u32 pipe_id = queue.pipe_id;
+                    const auto irq = [pipe_id] {
+                        Platform::IrqC::Instance()->Signal(
+                            static_cast<Platform::InterruptId>(pipe_id));
+                    };
+                    if (release_mem->data_sel.Value() != DataSelect::GdsMemStore) {
+                        const PM4CmdReleaseMem packet = *release_mem;
+                        rasterizer->SignalAtGpuCompletion([packet, irq] {
+                            packet.SignalFence(WriteLabelBacking, irq,
+                                               [](VAddr, u16, u16) { UNREACHABLE(); });
+                        });
+                        break;
+                    }
+                    // A GDS store is a GPU copy: record it, let the GPU complete it, and let the
+                    // labels before it land; only then the interrupt.
+                    bool raise = false;
+                    release_mem->SignalFence([&raise] { raise = true; },
+                                             [this](VAddr dst, u16 gds_index, u16 num_dwords) {
+                                                 rasterizer->CopyBuffer(dst, gds_index,
+                                                                        num_dwords * sizeof(u32),
+                                                                        false, true);
+                                             });
+                    rasterizer->Finish();
+                    rasterizer->WaitDeferredSignals();
+                    if (raise) {
+                        irq();
+                    }
+                    break;
+                }
+#endif
             }
             release_mem->SignalFence(
                 [pipe_id = queue.pipe_id] {

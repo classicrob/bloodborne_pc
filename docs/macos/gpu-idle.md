@@ -157,3 +157,63 @@ For a targeted follow-up, framed entry probes can cover `0x26d6e50` (RDI identif
 (RDI allocator, RSI node). The existing 64-byte entry windows do not include F/B or a payload
 range's end through its neighbor; those need separately bounded safe reads. Avoid a global
 node-pool allocation probe unless the specific allocator is filtered: that pool helper is shared.
+
+## Label content check (`BB_LABEL_CHECK=1`, diagnostic)
+
+The guest frees per-frame objects holding end-of-pipe labels (48-byte heap blocks, label at
+offset 0) once the submitDone throttle releases it. A label written after that corrupts its heap
+(guest fault 0x263b8e7, `docs/history/SESSION_2026-09-30.md`). With `BB_LABEL_CHECK=1`, each EOP
+label is sampled when the EOP is parsed and again just before it is written. A change in between
+that does not match one of our recorded EOP writes (WRITE_DATA, EOS and DMA writes are not
+tracked) is logged as `LABEL-CHECK`, with the values, the 16-byte
+aligned 48 bytes around the label, and the time since the parse sample. Every 4096 checks a summary
+gives the checked, changed, unreadable, unmatched and mixed-width counts.
+
+This is supporting evidence, not proof:
+- A change need not be a guest free; another writer may have changed the memory.
+- No change does not prove the lifetime is right. A free that leaves the value equal, ABA, or a
+  change after the second sample are invisible.
+- Guest memory is only read with non-faulting Mach reads; unreadable samples are counted and not
+  compared.
+- Slots where a 32-bit and a 64-bit EOP meet are counted as mixed and not compared.
+
+Test: `label-check-test`.
+
+`BB_SUBMIT_THROTTLE=none` (UNSAFE diagnostic) never holds the guest for GPU idle. It is validated
+and announced at the first submission. With `BB_LABEL_CHECK=1` it shows whether label contents
+start to change before their writes once the guest is not held, and how soon after the parse they
+are checked. It may corrupt the guest heap, so it is not for play.
+
+## Labels at GPU completion (`BB_LABELS_AT_GPU_COMPLETE=1`, the fix under A/B)
+
+End-of-pipe labels (EOP, EOS, compute RELEASE_MEM) were written once the recording side had passed
+the work before them and its guest-memory copies were done. That is before Metal executes the
+work. Guest buffers bound zero-copy are read by the GPU at execution. The guest's label-governed
+reclaimer frees nodes once their label reads 4, even mid-frame, and those nodes own GPU-read data
+such as index buffers (node+8 is passed to INDEX_BASE; Astra-2, 50b01dc). So the guest could
+overwrite memory that recorded but not yet executed draws still read.
+
+With `BB_LABELS_AT_GPU_COMPLETE=1`:
+- EOP, EOS and RELEASE_MEM labels, and their interrupts, are written only once the GPU has
+  completed the command buffer holding everything recorded before them.
+- That command buffer is submitted at once, one submission per label, so a guest or a
+  WAIT_REG_MEM waiting on the label is never left waiting for a submission that only comes at the
+  frame's end.
+- A dedicated label writer thread writes labels strictly in the order they were issued in the
+  stream (`gpu/shim/bbport_label_sequencer.h`), across the graphics and compute queues and across
+  deferred and direct recording. A label that becomes ready early waits for the earlier ones. Each
+  is written after its submission's timeline tick. It is not the priority runner, whose other ops
+  may wait for ticks submitted only at the frame's end.
+- Labels are stored only through the memory's backing, which cannot fault. A faulting store on the
+  writer could enter the write-fault handler while a recording thread waits for that very label.
+  A label without a backing stops.
+- At shutdown, labels not written are counted as done (nothing waits for them) and reported.
+- WaitDeferredSignals, and with it GpuIdle, waits for them.
+- A RELEASE_MEM GDS store is a GPU copy. It is recorded, the GPU completes it (Rasterizer::Finish),
+  the labels before it land, and only then is the interrupt raised. The guest reads the destination
+  through the buffer cache's GPU-modified tracking.
+- WRITE_DATA and DMA_DATA are unchanged. The command processor executes them in stream order
+  without waiting for earlier draws, so the guest cannot take them as "GPU done".
+
+This is the exact fix candidate, kept toggleable for an A/B on corruption and FPS, and the
+precondition for dropping the submit throttle.

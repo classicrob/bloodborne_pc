@@ -17,6 +17,9 @@
 #include <utility>
 #include <vector>
 #include <mutex>
+#ifdef __APPLE__
+#include "bbport_label_sequencer.h"
+#endif
 #include <thread>
 #include <queue>
 
@@ -699,7 +702,8 @@ public:
 
     /// Sends the current execution context to the GPU
     /// and increments the scheduler timeline semaphore.
-    void Flush(SubmitInfo& info);
+    /// Returns the timeline value the submission signals.
+    u64 Flush(SubmitInfo& info);
 
     /// The next submission waits for `semaphore` to reach `value` before any of its commands
     /// (MetalFX: its output is consumed after the Metal queue signals; docs/macos/
@@ -708,7 +712,7 @@ public:
 
     /// Sends the current execution context to the GPU
     /// and increments the scheduler timeline semaphore.
-    void Flush();
+    u64 Flush();
 
     /// Sends the current execution context to the GPU and waits for it to complete.
     void Finish();
@@ -847,6 +851,18 @@ public:
     /// it to the copy threads' completion (BbCopy::AfterCopies).
     void SignalAfterHostCopies(std::function<void()> signal);
 
+#ifdef __APPLE__
+    /// bbport (Apple, BB_LABELS_AT_GPU_COMPLETE=1, under A/B): like SignalAfterHostCopies, but
+    /// `signal` runs only once the GPU has completed the command buffer holding everything
+    /// recorded before it. That buffer is submitted at once, so the GPU reaches it without
+    /// waiting for the frame's end (a guest or WAIT_REG_MEM waiting on the label would never
+    /// see it otherwise). Signals keep their order, and WaitDeferredSignals waits for them.
+    void SignalAtGpuCompletion(std::function<void()> signal);
+
+    /// Whether BB_LABELS_AT_GPU_COMPLETE=1.
+    static bool LabelsAtGpuComplete();
+#endif
+
     /// bbport: before a guest-visible write that is not deferred (WriteData, end-of-shader
     /// fences, flip): waits until every signal handed to SignalAfterHostCopies ran, so that
     /// the write cannot overtake an earlier fence. Otherwise the guest, seeing the later value,
@@ -916,7 +932,7 @@ private:
 
     void RecorderThread(std::stop_token stoken);
 
-    void SubmitExecution(SubmitInfo& info);
+    u64 SubmitExecution(SubmitInfo& info);
 
     void PriorityPendingOpsThread(std::stop_token stoken);
 
@@ -970,6 +986,18 @@ private:
     // compares thread ids, which on Windows (libc++ over winpthreads) costs two system calls.
     bool recording_threaded{false};
     std::jthread recorder_thread;
+#ifdef __APPLE__
+    /// SignalAtGpuCompletion's writer: labels only, in issue order (BbLabels::Sequencer), each
+    /// after its own (already submitted) timeline tick. Not the priority runner, whose other ops
+    /// may wait for ticks submitted only at the frame's end. Declared last: the thread stops
+    /// before the sequencer goes.
+    void LabelThread(std::stop_token stoken);
+    /// Waits in slices until the GPU passed `tick`; false if stopped first.
+    bool WaitLabelTick(u64 tick, const std::stop_token& stoken);
+    BbLabels::Sequencer labels;
+    std::once_flag label_thread_once;
+    std::jthread label_thread;
+#endif
     tracy::VkCtxScope* profiler_scope{};
 };
 

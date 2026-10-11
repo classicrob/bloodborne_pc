@@ -197,6 +197,100 @@ void Scheduler::SignalAfterHostCopies(std::function<void()> signal) {
     KickRecording(true);
 }
 
+#ifdef __APPLE__
+bool Scheduler::LabelsAtGpuComplete() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("BB_LABELS_AT_GPU_COMPLETE");
+        const bool on = env && env[0] == '1';
+        if (on) {
+            std::fprintf(stderr, "BB_LABELS_AT_GPU_COMPLETE=1: EOP/EOS/RELEASE_MEM labels are "
+                                 "written once the GPU completed the work before them (one "
+                                 "submission per label)\n");
+        }
+        return on;
+    }();
+    return enabled;
+}
+
+void Scheduler::SignalAtGpuCompletion(std::function<void()> signal) {
+    const u64 tick = CurrentTick(); // the next submission signals this value
+    // Issued now, in stream order; the writer takes labels only in this order, whichever
+    // becomes ready first (deferred ones after the copy threads, direct ones at once).
+    const u64 sequence = labels.Issue();
+    deferred_signals_issued.fetch_add(1, std::memory_order_relaxed);
+    std::call_once(label_thread_once, [this] {
+        label_thread = std::jthread([this](std::stop_token stoken) { LabelThread(stoken); });
+    });
+    if (!IsRecordingDeferred()) {
+        const u64 submitted = Flush();
+        ASSERT_MSG(submitted == tick,
+                   "macOS: a label's submission signals timeline value {}, its writer waits for {}",
+                   submitted, tick);
+        WaitHostCopies(); // the guest-memory copies issued before it
+        labels.Ready(sequence, tick, std::move(signal));
+        return;
+    }
+    BbCopy::FlushBatch();
+    Record([this, tick, sequence, signal = std::move(signal)](vk::CommandBuffer) mutable {
+        // After the copies queued before it; the writer then waits for `tick`.
+        BbCopy::AfterCopies([this, tick, sequence, signal = std::move(signal)]() mutable {
+            labels.Ready(sequence, tick, std::move(signal));
+        });
+    });
+    const u64 submitted = Flush();
+    // The writer waits for `tick`: it must be the submission holding the label and the work
+    // recorded before it (no other submission came between).
+    ASSERT_MSG(submitted == tick,
+               "macOS: a label's submission signals timeline value {}, its writer waits for {}",
+               submitted, tick);
+}
+
+bool Scheduler::WaitLabelTick(u64 tick, const std::stop_token& stoken) {
+    // Waited in slices so that a stop (exit, possibly after a device loss) is never stuck here;
+    // a failed wait stops loudly.
+    work_semaphore.Refresh();
+    while (!work_semaphore.IsFree(tick)) {
+        if (stoken.stop_requested()) {
+            return false;
+        }
+        const vk::Semaphore semaphore = work_semaphore.Handle();
+        const vk::SemaphoreWaitInfo wait_info = {
+            .semaphoreCount = 1,
+            .pSemaphores = &semaphore,
+            .pValues = &tick,
+        };
+        const vk::Result result =
+            instance.GetDevice().waitSemaphores(&wait_info, 10'000'000); // 10 ms
+        ASSERT_MSG(result == vk::Result::eSuccess || result == vk::Result::eTimeout,
+                   "macOS: the label writer's wait for timeline value {} failed: {}", tick,
+                   vk::to_string(result));
+        work_semaphore.Refresh();
+    }
+    return true;
+}
+
+void Scheduler::LabelThread(std::stop_token stoken) {
+    Common::SetCurrentThreadName("shadPS4:GpuLabelWriter");
+    u64 dropped = 0;
+    while (auto label = labels.Next(stoken)) {
+        if (!WaitLabelTick(label->tick, stoken)) {
+            ++dropped; // taken, its work not complete
+            break;
+        }
+        label->write();
+        deferred_signals_done->fetch_add(1, std::memory_order_release);
+    }
+    // Stopping (exit): labels not written are dropped, and counted as done so that nothing is
+    // left waiting for them (WaitDeferredSignals).
+    dropped += labels.Outstanding();
+    if (dropped) {
+        deferred_signals_done->fetch_add(dropped, std::memory_order_release);
+        std::fprintf(stderr, "Labels at GPU completion: %llu labels not written at shutdown\n",
+                     static_cast<unsigned long long>(dropped));
+    }
+}
+#endif
+
 void Scheduler::WaitDeferredSignals() {
     const u64 issued = deferred_signals_issued.load(std::memory_order_relaxed);
     if (deferred_signals_done->load(std::memory_order_acquire) >= issued ||
@@ -319,14 +413,14 @@ void Scheduler::RecorderThread(std::stop_token stoken) {
     }
 }
 
-void Scheduler::Flush(SubmitInfo& info) {
+u64 Scheduler::Flush(SubmitInfo& info) {
     // When flushing, we only send data to the driver; no waiting is necessary.
-    SubmitExecution(info);
+    return SubmitExecution(info);
 }
 
-void Scheduler::Flush() {
+u64 Scheduler::Flush() {
     SubmitInfo info{};
-    Flush(info);
+    return Flush(info);
 }
 
 void Scheduler::WaitBeforeNextSubmit(vk::Semaphore semaphore, u64 value) {
@@ -407,7 +501,7 @@ void Scheduler::AllocateWorkerCommandBuffers() {
 #endif
 }
 
-void Scheduler::SubmitExecution(SubmitInfo& info) {
+u64 Scheduler::SubmitExecution(SubmitInfo& info) {
     std::scoped_lock lk{submit_mutex};
     const u64 signal_value = work_semaphore.NextTick();
 
@@ -476,6 +570,7 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
 
     // Apply pending operations
     PopPendingOperations();
+    return signal_value;
 }
 
 #ifdef __APPLE__
