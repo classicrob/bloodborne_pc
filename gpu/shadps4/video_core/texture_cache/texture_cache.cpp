@@ -105,9 +105,9 @@ void NoteRefresh(const Image& image, ImageFlagBits entry_flags, u64 hashed, u64 
     census.since = now;
     lk.unlock();
     constexpr double MB = 1024.0 * 1024.0;
-    LOG_INFO(Render, "Image refresh census ({:.1f} s): {} refreshes of {} images, {:.0f} MB "
-                     "entered, {:.0f} MB hashed, {:.0f} MB copied (per second: {:.0f} / {:.0f} / "
-                     "{:.0f} MB)",
+    // Printed like the Stall and Draw pipe lines: Info-level logging is filtered in perf runs.
+    fmt::print("Image refresh census ({:.1f} s): {} refreshes of {} images, {:.0f} MB entered, "
+               "{:.0f} MB hashed, {:.0f} MB copied (per second: {:.0f} / {:.0f} / {:.0f} MB)\n",
              seconds, total_refreshes, top.size(), total_entered / MB, total_hashed / MB,
              total_copied / MB, total_entered / MB / seconds, total_hashed / MB / seconds,
              total_copied / MB / seconds);
@@ -120,10 +120,9 @@ void NoteRefresh(const Image& image, ImageFlagBits entry_flags, u64 hashed, u64 
                                        e.by_source[s]);
             }
         }
-        LOG_INFO(Render,
-                 "  {:#x} {:.1f} MB {}x{} {} usage{}{}{}{}{}: {} refreshes ({} unchanged), "
-                 "{:.0f} MB entered, {:.0f} hashed, {:.0f} copied; flags seen{}{}{}{}; dirty by "
-                 "{}; last {} {:#x}",
+        fmt::print("  {:#x} {:.1f} MB {}x{} {} usage{}{}{}{}{}: {} refreshes ({} unchanged), "
+                   "{:.0f} MB entered, {:.0f} hashed, {:.0f} copied; flags seen{}{}{}{}; dirty by "
+                   "{}; last {} {:#x}\n",
                  address, e.size / MB, e.width, e.height, vk::to_string(e.format),
                  e.usage & 1 ? " texture" : "", e.usage & 2 ? " storage" : "",
                  e.usage & 4 ? " render-target" : "", e.usage & 8 ? " depth" : "",
@@ -135,6 +134,7 @@ void NoteRefresh(const Image& image, ImageFlagBits entry_flags, u64 hashed, u64 
                  e.flags_seen & u32(ImageFlagBits::GpuModified) ? " GpuModified" : "", sources,
                  DirtySourceNames[std::min<u32>(e.source, 4)], e.detail);
     }
+    std::fflush(stdout);
 }
 } // namespace
 #endif

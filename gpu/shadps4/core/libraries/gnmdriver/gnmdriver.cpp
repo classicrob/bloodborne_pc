@@ -2580,15 +2580,16 @@ static void NoteFramePacing() {
     if (++pacing.frames < 600) {
         return;
     }
-    LOG_INFO(Lib_GnmDriver,
-             "Frame pacing ({} frames): frame {:.1f} ms mean, {:.1f} ms "
-             "max; waits in sceGnmSubmitDone {} ({:.1f} ms mean, {:.1f} ms max), in submissions "
-             "{} ({:.1f} ms mean, {:.1f} ms max)",
+    // Printed like the Stall lines: Info-level logging is filtered in perf runs.
+    fmt::print("Submit pacing ({} frames): frame {:.1f} ms mean, {:.1f} ms max; waits for GPU "
+               "idle in sceGnmSubmitDone {} ({:.1f} ms mean, {:.1f} ms max), in submissions {} "
+               "({:.1f} ms mean, {:.1f} ms max)\n",
              pacing.frames,
              pacing.frame_interval.MeanMs(), pacing.frame_interval.max_us / 1000.0,
              pacing.in_submit_done.count, pacing.in_submit_done.MeanMs(),
              pacing.in_submit_done.max_us / 1000.0, pacing.in_submits.count,
              pacing.in_submits.MeanMs(), pacing.in_submits.max_us / 1000.0);
+    std::fflush(stdout);
     const auto last_frame = pacing.last_frame;
     pacing = {};
     pacing.last_frame = last_frame;
