@@ -3,6 +3,7 @@
 
 #include <array>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <condition_variable>
 #include <csetjmp>
@@ -137,7 +138,9 @@ void BuilderTrace::Report(const u32* at) {
     for (const auto& call : Around(at - Window, at + Window, 8)) {
         LOG_CRITICAL(Render, "  #{} thread {} {} cmdbuf {} ({:+} dwords from the packet) size {}",
                      call.seq, call.thread, call.builder, fmt::ptr(call.cmdbuf),
-                     call.cmdbuf - at, call.size);
+                     (std::bit_cast<intptr_t>(call.cmdbuf) - std::bit_cast<intptr_t>(at)) /
+                         intptr_t{sizeof(u32)},
+                     call.size);
     }
 }
 
