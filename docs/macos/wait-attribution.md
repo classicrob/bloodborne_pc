@@ -130,3 +130,11 @@ Rosetta host and native controls oversleep too. A polling loop could be stretche
 by that latency. Connecting it to frame time still requires the game's requested
 N and evidence that the sleeping thread gates rendering. Do not shorten requested
 sleeps, change QoS, or introduce a busy wait based on these measurements alone.
+
+## Per-import CPU calibration
+
+The follow-up [HLE call-cost report](hle-call-cost.md) separates ordinary guest
+PLT call cost from summary instrumentation and import-body work. It includes the
+signed production-runtime microbenchmark and a reproducible ranking of the nine
+observed main/GX rows; full-sync counts remain necessary for mutex/clock/TLS
+attribution.
