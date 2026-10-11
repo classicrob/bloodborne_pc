@@ -681,6 +681,22 @@ static bool IsReadConstSource(const IR::Value base) {
            inst->GetOpcode() == IR::Opcode::ReadConstBuffer;
 }
 
+/// The translator builds every ReadConst base as (sgpr, sgpr + 1) (S_LOAD_DWORD) and every
+/// ReadConstBuffer V# as four consecutive SGPRs (S_BUFFER_LOAD_DWORD); this pass reads their
+/// components. Any other shape (a phi of whole values after divergent control flow) would be
+/// read as if it were those components: stop and name the shader. Called before anything here
+/// looks inside the base.
+void ValidateReadConstShape(const IR::Inst& inst, u64 pgm_hash) {
+    const bool is_const = inst.GetOpcode() == IR::Opcode::ReadConst;
+    const IR::Opcode want =
+        is_const ? IR::Opcode::CompositeConstructU32x2 : IR::Opcode::CompositeConstructU32x4;
+    const IR::Inst* base = inst.Arg(0).TryInst();
+    ASSERT_MSG(base && base->GetOpcode() == want, "{} base of shader {:#x} is {}, not {}",
+               is_const ? "ReadConst" : "ReadConstBuffer", pgm_hash,
+               base ? magic_enum::enum_name(base->GetOpcode()) : "an immediate",
+               magic_enum::enum_name(want));
+}
+
 void SimplifyReadConstAddressAdd(IR::Inst& inst) {
     // This handles the following pattern by combining the addition with the offset
     // s_add_u32    s12, s2, <offset>
@@ -769,6 +785,7 @@ void FlattenExtendedUserdataPass(IR::Program& program) {
                 }
             }
 
+            ValidateReadConstShape(inst, program.info.pgm_hash);
             SimplifyReadConstAddressAdd(inst);
 
             all_readconsts.push_back(&inst);
@@ -786,6 +803,7 @@ void FlattenExtendedUserdataPass(IR::Program& program) {
                 if (inst->GetOpcode() == IR::Opcode::ReadConstBuffer) {
                     auto buffer_inst_info = inst->Flags<IR::BufferInstInfo>();
                     if (!buffer_inst_info.sharp_source.Value()) {
+                        ValidateReadConstShape(*inst, program.info.pgm_hash);
                         all_readconsts.push_back(inst);
                         auto offset = inst->Arg(1);
                         if (!offset.IsImmediate()) {
