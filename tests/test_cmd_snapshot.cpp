@@ -2,11 +2,16 @@
 // CmdSnapshot (macOS submit-time command copies): the parser must see what the guest submitted,
 // including nested and constant indirect buffers, regardless of later guest writes; unreadable IB
 // targets are recorded, not fatal; unparsed ranges and guest rewrites are reported exactly.
+// Stream writes parsed before a submit but not landed yet are waited for (StreamWrites).
+#include <chrono>
 #include <csetjmp>
 #include <csignal>
 #include <cstdio>
+#include <thread>
 #include <vector>
 #include <sys/mman.h>
+#include <sys/wait.h>
+#include <unistd.h>
 #include "video_core/amdgpu/cmd_snapshot.h"
 #include "video_core/amdgpu/pm4_cmds.h"
 
@@ -144,6 +149,86 @@ int main() {
     auto partial = CmdSnapshot::Take(truncated, {});
     Expect("truncated stream copied, no IB followed",
            partial->copied_bytes == truncated.size() * sizeof(u32));
+
+    // A WRITE_DATA parsed before the submit patches a command chunk the submission calls; the
+    // recording thread lands it later. The CP would fetch the chunk after the write.
+    {
+        std::vector<u32> chunk(4, 0u); // stale: zeros, as a fresh chunk
+        std::vector<u32> sub;
+        AppendNop(sub, 0x9999);
+        AppendIb(sub, PM4ItOpcode::IndirectBuffer, chunk.data(), u32(chunk.size()));
+        StreamWrites::Add(reinterpret_cast<VAddr>(chunk.data()), chunk.size() * sizeof(u32));
+        std::thread recorder([&] {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            const u32 words[] = {Header(PM4ItOpcode::Nop, 1), 0xAAAA, Header(PM4ItOpcode::Nop, 1),
+                                 0xBBBB};
+            std::copy(std::begin(words), std::end(words), chunk.begin());
+            StreamWrites::Landed(false);
+        });
+        auto patched = CmdSnapshot::Take(sub, {});
+        recorder.join();
+        auto* chunk_r = patched->Find(chunk.data(), u32(chunk.size()), false);
+        Expect("pending write into a called chunk waited for",
+               patched->writes_waited == 1);
+        Expect("chunk copied with the write applied",
+               chunk_r && chunk_r->copied && patched->Words(*chunk_r).size() == 4 &&
+                   patched->Words(*chunk_r)[1] == 0xAAAA && patched->Words(*chunk_r)[3] == 0xBBBB);
+    }
+
+    // The submitted buffer itself is patched: the walk sees the IB packet the write puts there.
+    {
+        std::vector<u32> target;
+        AppendNop(target, 0xCCCC);
+        std::vector<u32> sub{Header(PM4ItOpcode::Nop, 3), 0, 0, 0}; // placeholder for an IB
+        StreamWrites::Add(reinterpret_cast<VAddr>(sub.data()), sub.size() * sizeof(u32));
+        std::thread recorder([&] {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            std::vector<u32> ib;
+            AppendIb(ib, PM4ItOpcode::IndirectBuffer, target.data(), u32(target.size()));
+            std::copy(ib.begin(), ib.end(), sub.begin());
+            StreamWrites::Landed(false);
+        });
+        auto patched = CmdSnapshot::Take(sub, {});
+        recorder.join();
+        Expect("patched DCB copied after the write",
+               patched->Words(patched->Dcb())[0] == Header(PM4ItOpcode::IndirectBuffer, 3));
+        Expect("IB written by the pending write is captured",
+               patched->Find(target.data(), u32(target.size()), false) != nullptr);
+    }
+
+    // A pending write elsewhere does not hold the submit up.
+    {
+        std::vector<u32> elsewhere(4, 0u), sub;
+        AppendNop(sub, 0xDDDD);
+        StreamWrites::Add(reinterpret_cast<VAddr>(elsewhere.data()), 16);
+        auto unaffected = CmdSnapshot::Take(sub, {});
+        Expect("non-overlapping pending write not waited for", unaffected->writes_waited == 0);
+        StreamWrites::Landed(false);
+        Expect("nothing pending after it landed",
+               StreamWrites::WaitLanded(reinterpret_cast<VAddr>(elsewhere.data()), 16) == 0);
+    }
+
+    // A DMA_DATA into the chunk recorded as a GPU copy cannot be in the copy: a hard error.
+    {
+        std::fflush(stderr);
+        const pid_t child = fork();
+        if (child == 0) {
+            std::vector<u32> chunk(2, 0u), sub;
+            AppendIb(sub, PM4ItOpcode::IndirectBuffer, chunk.data(), u32(chunk.size()));
+            StreamWrites::Add(reinterpret_cast<VAddr>(chunk.data()), 8);
+            std::thread recorder([] {
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                StreamWrites::Landed(true);
+            });
+            auto never = CmdSnapshot::Take(sub, {});
+            recorder.join();
+            std::_Exit(0);
+        }
+        int status = 0;
+        waitpid(child, &status, 0);
+        Expect("GPU-side DMA into submitted command memory stops (exit 23)",
+               WIFEXITED(status) && WEXITSTATUS(status) == 23);
+    }
 
     std::fprintf(stderr, "%s: %u failures\n", failures ? "FAIL" : "PASS", failures);
     return failures ? 1 : 0;

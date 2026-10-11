@@ -1,9 +1,15 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // bbport (macOS): submit-time copies of graphics command memory (cmd_snapshot.h).
 
+#include <array>
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <csetjmp>
 #include <cstring>
+#include <deque>
+#include <mutex>
+#include <vector>
 #include "bbport_toggles.h"
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -32,7 +38,68 @@ bool CopyGuest(u32* dst, const u32* src, u32 count) {
     return true;
 }
 
+struct StreamWrite {
+    VAddr begin, end;
+    u64 seq;
+};
+std::mutex stream_writes_mutex;
+std::condition_variable stream_writes_landed;
+std::deque<StreamWrite> stream_writes; ///< added, not landed yet; oldest first
+u64 stream_writes_added = 0;
+u32 stream_write_waiters = 0;
+/// How recent writes landed, by sequence number, for a waiter to check the ones it waited for.
+struct LandedWrite {
+    u64 seq = ~u64{0};
+    bool through_gpu = false;
+};
+std::array<LandedWrite, 4096> stream_writes_history;
+
 } // namespace
+
+void StreamWrites::Add(VAddr address, u64 size) {
+    std::scoped_lock lk{stream_writes_mutex};
+    stream_writes.push_back({address, address + size, stream_writes_added++});
+}
+
+void StreamWrites::Landed(bool through_gpu) {
+    std::unique_lock lk{stream_writes_mutex};
+    ASSERT_MSG(!stream_writes.empty(), "macOS: a stream write landed that was never added");
+    const u64 seq = stream_writes.front().seq;
+    stream_writes_history[seq % stream_writes_history.size()] = {seq, through_gpu};
+    stream_writes.pop_front();
+    if (stream_write_waiters) {
+        lk.unlock();
+        stream_writes_landed.notify_all();
+    }
+}
+
+u32 StreamWrites::WaitLanded(VAddr address, u64 size) {
+    std::unique_lock lk{stream_writes_mutex};
+    const VAddr end = address + size;
+    std::vector<u64> overlapping;
+    for (const auto& write : stream_writes) {
+        if (address < write.end && write.begin < end) {
+            overlapping.push_back(write.seq);
+        }
+    }
+    if (overlapping.empty()) {
+        return 0;
+    }
+    const u64 last = overlapping.back();
+    ++stream_write_waiters;
+    stream_writes_landed.wait(
+        lk, [&] { return stream_writes.empty() || stream_writes.front().seq > last; });
+    --stream_write_waiters;
+    for (const u64 seq : overlapping) {
+        const auto& landed = stream_writes_history[seq % stream_writes_history.size()];
+        ASSERT_MSG(landed.seq == seq, "macOS: stream write history overrun while waiting");
+        ASSERT_MSG(!landed.through_gpu,
+                   "macOS: command memory {:#x}+{:#x} is submitted after a DMA_DATA into it that "
+                   "runs on the GPU; the copy taken at submit cannot include it (not implemented)",
+                   address, size);
+    }
+    return static_cast<u32>(overlapping.size());
+}
 
 std::shared_ptr<CmdSnapshot> CmdSnapshot::Take(std::span<const u32> dcb,
                                                std::span<const u32> ccb) {
@@ -46,6 +113,10 @@ std::shared_ptr<CmdSnapshot> CmdSnapshot::Take(std::span<const u32> dcb,
                       .copy_offset = static_cast<u32>(words.size()),
                       .constant = constant,
                       .copied = true};
+        // The command processor fetches this after executing the stream writes parsed before
+        // the submit; the ones still on their way to guest memory land first.
+        snapshot->writes_waited +=
+            StreamWrites::WaitLanded(reinterpret_cast<VAddr>(guest), size_t(size_dw) * sizeof(u32));
         words.resize(words.size() + size_dw);
         if (submitted) {
             // The guest handed these buffers over: reading them cannot legitimately fault.
@@ -106,6 +177,15 @@ std::shared_ptr<CmdSnapshot> CmdSnapshot::Take(std::span<const u32> dcb,
         }
     }
 
+    if (snapshot->writes_waited) {
+        static std::atomic<u64> waits = 0;
+        if (const u64 n = ++waits; n <= 8 || (n & 1023) == 0) {
+            LOG_INFO(Render,
+                     "Command snapshot #{} of submission at {} waited for {} stream writes into "
+                     "its command memory",
+                     n, fmt::ptr(dcb.data()), snapshot->writes_waited);
+        }
+    }
     snapshot->copied_bytes = words.size() * sizeof(u32);
     snapshot->copy_ns = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                              std::chrono::steady_clock::now() - start)
