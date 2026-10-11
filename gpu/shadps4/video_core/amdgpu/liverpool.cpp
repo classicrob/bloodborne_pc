@@ -8,6 +8,7 @@
 #include <pthread.h>
 #ifdef __APPLE__
 #include "bb_mac_compat.h"
+#include "../../../../src/runtime_hle_trace.h"
 #include "../../../../src/runtime_memory.h"
 #endif
 #ifndef _WIN32
@@ -144,6 +145,9 @@ static void ReportParserStop() {
     // BB_WRITE_LOG: GPU-side writes into the command chunk around it (256 KiB each way).
     BbWriteLog::DumpNear(reinterpret_cast<u64>(parsing_guest) - 256_KB,
                          reinterpret_cast<u64>(parsing_guest) + 256_KB, "the stop");
+    // BB_HLE_TRACE: the import calls (waits, submits, flips) each guest thread made before it.
+    // Non-blocking (reports "busy" instead of waiting); a no-op when off.
+    runtime_hle_trace_dump();
 }
 
 /// BB_CMD_SNAPSHOT_CHECK=1: command snapshot diagnostics (guest rewrites, CMD-OVERLAP).
