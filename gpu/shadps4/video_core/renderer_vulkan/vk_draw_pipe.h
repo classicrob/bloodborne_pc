@@ -200,6 +200,12 @@ private:
             }
             const u64 start = __rdtsc();
             handler(context, reinterpret_cast<const u8*>(header + 1), header->payload);
+            if (after_packet) {
+                // Before the packet counts as consumed: a stage A drain also waits for this.
+                // `idle`: nothing more is published yet.
+                after_packet(context,
+                             published.load(std::memory_order_acquire) == at + header->size);
+            }
             busy_cycles.fetch_add(__rdtsc() - start, std::memory_order_relaxed);
             at += header->size;
             consumed.store(at, std::memory_order_release);
@@ -208,6 +214,10 @@ private:
 
     static inline thread_local bool on_stage_b = false;
     Handler handler;
+    /// bbport: optional, on stage B after each packet, before it counts as consumed (labels
+    /// batched at GPU completion).
+    void (*after_packet)(void* context, bool idle) = nullptr;
+    friend class Rasterizer;
     void* context;
     std::unique_ptr<u8[]> ring;
     u64 head = 0; ///< stage A's write position

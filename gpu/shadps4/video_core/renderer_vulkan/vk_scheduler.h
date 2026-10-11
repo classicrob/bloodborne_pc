@@ -857,7 +857,15 @@ public:
     /// recorded before it. That buffer is submitted at once, so the GPU reaches it without
     /// waiting for the frame's end (a guest or WAIT_REG_MEM waiting on the label would never
     /// see it otherwise). Signals keep their order, and WaitDeferredSignals waits for them.
-    void SignalAtGpuCompletion(std::function<void()> signal);
+    /// `batch` (stage B): the command buffer is not submitted at once; FlushLabels submits it
+    /// at the next packet boundary where the draw pipe goes idle or the oldest label waited
+    /// LabelBatchAge.
+    void SignalAtGpuCompletion(std::function<void()> signal, bool batch = false);
+
+    /// Stage B, between packets: submits the labels recorded since the last submission when
+    /// `idle` or once the oldest has waited LabelBatchAge.
+    void FlushLabels(bool idle);
+    static constexpr auto LabelBatchAge = std::chrono::microseconds(500);
 
     /// Whether labels are written at GPU completion now: BB_LABELS_AT_GPU_COMPLETE=1 for the
     /// whole run, or toggle bit 59 (switchable live). Read when a label is issued.
@@ -996,6 +1004,11 @@ private:
     /// Waits in slices until the GPU passed `tick`; false if stopped first.
     bool WaitLabelTick(u64 tick, const std::stop_token& stoken);
     BbLabels::Sequencer labels;
+    /// Labels recorded and not yet submitted (batched), the tick their submission must signal,
+    /// and when the oldest was recorded. Set by the recording thread, cleared by a submission.
+    std::atomic<bool> labels_unflushed{false};
+    u64 unflushed_tick = 0;
+    std::chrono::steady_clock::time_point unflushed_since{};
     std::once_flag label_thread_once;
     std::jthread label_thread;
 #endif
