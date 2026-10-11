@@ -70,8 +70,7 @@ static_assert(std::has_unique_object_representations_v<RenderState>);
 struct SubmitInfo {
     std::array<vk::Semaphore, 4> wait_semas;
     std::array<u64, 4> wait_ticks;
-    /// Stages each wait blocks. Without an explicit stage: AllCommands, except
-    /// ColorAttachmentOutput for the second wait (the presenter's frame-ready wait).
+    /// Stages each wait blocks (AllCommands unless the caller says otherwise).
     std::array<vk::PipelineStageFlags, 4> wait_stages;
     std::array<vk::Semaphore, 4> signal_semas;
     std::array<u64, 4> signal_ticks;
@@ -79,13 +78,10 @@ struct SubmitInfo {
     u32 num_wait_semas;
     u32 num_signal_semas;
 
-    void AddWait(vk::Semaphore semaphore, u64 tick = 1, vk::PipelineStageFlags stage = {}) {
+    void AddWait(vk::Semaphore semaphore, u64 tick = 1,
+                 vk::PipelineStageFlags stage = vk::PipelineStageFlagBits::eAllCommands) {
         ASSERT_MSG(num_wait_semas < wait_semas.size(), "SubmitInfo holds at most {} waits",
                    wait_semas.size());
-        if (!stage) {
-            stage = num_wait_semas == 1 ? vk::PipelineStageFlagBits::eColorAttachmentOutput
-                                        : vk::PipelineStageFlagBits::eAllCommands;
-        }
         wait_semas[num_wait_semas] = semaphore;
         wait_stages[num_wait_semas] = stage;
         wait_ticks[num_wait_semas++] = tick;
