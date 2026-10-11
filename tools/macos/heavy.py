@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
 """Machine-wide limit on heavy jobs (GPU builds, test suites, game runs, benchmarks).
 
-  tools/macos/heavy.sh [--pool build|playtest] [--priority] LABEL -- COMMAND [ARG...]
+  tools/macos/heavy.sh [--pool build|playtest|quick] [--priority] LABEL -- COMMAND [ARG...]
   tools/macos/heavy.sh status
 
-Two pools of slots, each slot an flock on a file in BB_HEAVY_DIR (default ~/bbport-deps/locks):
+Pools of slots, each slot an flock on a file in BB_HEAVY_DIR (default ~/bbport-deps/locks):
   build     BB_HEAVY_BUILD_SLOTS (1) for builds, test suites, benchmarks and probes, plus one
             slot that only --priority jobs (shared builds, the critical lane) may take;
-  playtest  BB_HEAVY_PLAYTEST_SLOTS (3) for game runs (play_route.py), parallel correctness runs.
+  playtest  BB_HEAVY_PLAYTEST_SLOTS (3) for game runs (play_route.py), parallel correctness runs;
+  quick     BB_HEAVY_QUICK_SLOTS (2) for jobs that are short by declaration: one-TU compile
+            checks, a single test link or run, a driver-only build. A quick job is told to use
+            4 jobs (BB_BUILD_JOBS, MAKEFLAGS, CMAKE_BUILD_PARALLEL_LEVEL), warned on stderr after
+            BB_HEAVY_QUICK_WARN (300) s, and killed with its whole process group, reported, and
+            exit 124 after BB_HEAVY_QUICK_LIMIT (600) s: a long job belongs in the build pool.
 A job takes a slot of its pool, then execs COMMAND with the locked descriptor inherited: the slot
 stays held by the job and every process it starts, and the kernel releases it when the last of
 them exits or is killed. There is no lease to expire and nothing to clean up. A command started
@@ -18,6 +23,8 @@ import datetime
 import fcntl
 import json
 import os
+import signal
+import subprocess
 import sys
 import time
 
@@ -35,7 +42,9 @@ def lock_dir():
     return path
 
 
-POOLS = {'build': ('BB_HEAVY_BUILD_SLOTS', 1), 'playtest': ('BB_HEAVY_PLAYTEST_SLOTS', 3)}
+POOLS = {'build': ('BB_HEAVY_BUILD_SLOTS', 1), 'playtest': ('BB_HEAVY_PLAYTEST_SLOTS', 3),
+         'quick': ('BB_HEAVY_QUICK_SLOTS', 2)}
+QUICK_JOBS = '4'
 
 
 def slot_names(pool):
@@ -71,7 +80,7 @@ def describe(info):
 
 
 def status():
-    for name in ['build-priority'] + slot_names('build') + slot_names('playtest'):
+    for name in ['build-priority'] + slot_names('build') + slot_names('quick') + slot_names('playtest'):
         fd = try_lock(name)
         if fd is not None:
             os.close(fd)
@@ -101,6 +110,8 @@ def run(pool, priority, label, command):
                 print(f'heavy: {label}: got {name} after {waited:.0f} s', file=sys.stderr, flush=True)
             os.set_inheritable(fd, True)
             os.environ['BB_HEAVY_HELD'] = f'{name}:{label}'
+            if pool == 'quick':
+                supervise_quick(label, command)
             try:
                 os.execvp(command[0], command)
             except OSError as error:
@@ -110,6 +121,50 @@ def run(pool, priority, label, command):
             print(f'heavy: {label}: waiting for a slot ({held})', file=sys.stderr, flush=True)
             reported = time.monotonic()
         time.sleep(1)
+
+
+def seconds(variable, default):
+    value = os.environ.get(variable, str(default))
+    if not value.isdigit() or int(value) < 1:
+        fail(f'{variable} must be a positive whole number of seconds')
+    return int(value)
+
+
+def supervise_quick(label, command):
+    """Runs a quick job as a child in its own process group, enforcing the time limit; exits."""
+    warn, limit = seconds('BB_HEAVY_QUICK_WARN', 300), seconds('BB_HEAVY_QUICK_LIMIT', 600)
+    for name in ('BB_BUILD_JOBS', 'CMAKE_BUILD_PARALLEL_LEVEL'):
+        os.environ[name] = QUICK_JOBS
+    os.environ['MAKEFLAGS'] = f'-j{QUICK_JOBS}'
+    try:
+        child = subprocess.Popen(command, start_new_session=True, close_fds=False)
+    except OSError as error:
+        fail(f'cannot run {command[0]}: {error}', 127)
+    started, warned = time.monotonic(), False
+    forward = lambda signum, _: os.killpg(child.pid, signum)
+    for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(signum, forward)
+    while True:
+        try:
+            status = child.wait(timeout=1)
+            sys.exit(status if status >= 0 else 128 - status)
+        except subprocess.TimeoutExpired:
+            pass
+        elapsed = time.monotonic() - started
+        if not warned and elapsed >= warn:
+            print(f'heavy: WARNING: quick job {label} still running after {warn} s '
+                  f'(killed at {limit} s; long jobs belong in the build pool)', file=sys.stderr, flush=True)
+            warned = True
+        if elapsed >= limit:
+            print(f'heavy: KILLED quick job {label} after {limit} s: {" ".join(command)}',
+                  file=sys.stderr, flush=True)
+            os.killpg(child.pid, signal.SIGTERM)
+            try:
+                child.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                os.killpg(child.pid, signal.SIGKILL)
+                child.wait()
+            sys.exit(124)
 
 
 def main(argv):
@@ -122,11 +177,11 @@ def main(argv):
         elif argv[0] == '--pool' and len(argv) > 1 and argv[1] in POOLS:
             pool, argv = argv[1], argv[2:]
         else:
-            fail(f'unknown option {argv[0]} (--pool build|playtest, --priority)')
+            fail(f'unknown option {argv[0]} (--pool build|playtest|quick, --priority)')
     if priority and pool != 'build':
         fail('--priority is for the build pool (shared builds); the playtest pool is dedicated already')
     if len(argv) < 3 or argv[1] != '--' or not argv[0]:
-        fail('usage: heavy.sh [--pool build|playtest] [--priority] LABEL -- COMMAND [ARG...] | heavy.sh status')
+        fail('usage: heavy.sh [--pool build|playtest|quick] [--priority] LABEL -- COMMAND [ARG...] | heavy.sh status')
     run(pool, priority, argv[0], argv[2:])
 
 
