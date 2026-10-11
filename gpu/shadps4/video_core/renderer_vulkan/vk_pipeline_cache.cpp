@@ -1336,6 +1336,9 @@ void PipelineCache::VerifyReusedPipeline(const GraphicsPipeline& pipeline, u64 p
         }
     }
     ++verify_pipelines;
+    if (!differences.empty()) {
+        ++verify_pipeline_mismatches; // before the summary, which may print for this reuse
+    }
     if ((verify_pipelines & 4095) == 0) {
         LOG_INFO(Render_Vulkan,
                  "PIPELINE-VERIFY summary: {} pipeline reuses checked, {} differ; {} preloaded "
@@ -1347,7 +1350,6 @@ void PipelineCache::VerifyReusedPipeline(const GraphicsPipeline& pipeline, u64 p
     if (differences.empty()) {
         return;
     }
-    ++verify_pipeline_mismatches;
     if (verify_pipeline_mismatches <= 64 || (verify_pipeline_mismatches & 1023) == 0) {
         LOG_CRITICAL(Render_Vulkan,
                      "PIPELINE-VERIFY: {} pipeline {:#x} reused for a draw that differs in: {} "
