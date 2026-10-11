@@ -1,16 +1,50 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <xxhash.h>
 #include "bbport_toggles.h"
 #include "common/assert.h"
+#include "common/logging/log.h"
 #include "shader_recompiler/frontend/decode.h"
 #include "shader_recompiler/frontend/fetch_shader.h"
 
 namespace Shader::Gcn {
+
+void NoteVertexAttributeFormat(u64 pgm_hash, const VertexAttribute& attribute, const AmdGpu::Buffer& sharp) {
+    static const bool enabled = [] {
+        const char* value = std::getenv("BB_VERTEX_CENSUS");
+        return value && value[0] == '1';
+    }();
+    if (!enabled) {
+        return;
+    }
+    const u32 dfmt = sharp.data_format, nfmt = sharp.num_format;
+    const u32 dst_sel = sharp.dst_sel_x | sharp.dst_sel_y << 3 | sharp.dst_sel_z << 6 | sharp.dst_sel_w << 9;
+    const u64 key = u64(dfmt) | u64(nfmt) << 6 | u64(sharp.stride) << 9 | u64(attribute.num_elements) << 23 |
+                    u64(attribute.inst_offset) << 26 | u64(sharp.base_address & 15) << 34 | u64(dst_sel) << 38 |
+                    u64(attribute.instance_data) << 50 | u64(attribute.data_format != 0) << 52 |
+                    u64(sharp.swizzle_enable) << 53 | u64(sharp.add_tid_enable) << 54;
+    static std::mutex mutex;
+    static std::unordered_set<u64> seen;
+    {
+        std::scoped_lock lock{mutex};
+        if (!seen.insert(key).second) {
+            return;
+        }
+    }
+    LOG_WARNING(Render_Recompiler,
+                "Vertex format census: dfmt {} nfmt {} stride {} components {} inst_offset {} base%16 {} "
+                "dst_sel {:o} step {} typed_inst {} swizzle {} add_tid {} num_records {} (first vs {:#x})",
+                dfmt, nfmt, u32(sharp.stride), u32(attribute.num_elements), u32(attribute.inst_offset),
+                u32(sharp.base_address & 15), dst_sel, u32(attribute.instance_data), attribute.data_format != 0,
+                u32(sharp.swizzle_enable), u32(sharp.add_tid_enable), u32(sharp.num_records), pgm_hash);
+}
 
 /**
  * s_load_dwordx4 s[8:11], s[2:3], 0x00

@@ -55,6 +55,11 @@ struct VertexAttribute {
     }
 };
 
+/// BB_VERTEX_CENSUS=1: log every distinct vertex attribute format (data/number format, stride,
+/// components, instruction offset, base alignment, dst_sel, step rate) once, with the first VS
+/// that used it, so conformance can cover exactly what the game fetches. Off otherwise.
+void NoteVertexAttributeFormat(u64 pgm_hash, const VertexAttribute& attribute, const AmdGpu::Buffer& sharp);
+
 struct FetchShaderData {
     u32 size = 0;
     u64 code_hash = 0;
