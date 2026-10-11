@@ -43,6 +43,10 @@ struct Profile {
     bool supports_workgroup_explicit_memory_layout{};
     bool supports_amd_shader_explicit_vertex_parameter{};
     bool supports_fragment_shader_barycentric{};
+    /// bbport: the device translates PerVertexKHR fragment inputs (raw per-vertex parameter
+    /// reads). False on Apple: MoltenVK/SPIRV-Cross cannot express them in MSL even though it
+    /// reports fragment-shader barycentrics (docs/macos/feature-audit.md).
+    bool supports_fragment_per_vertex_inputs{true};
     bool supports_shader_subgroup_clock{};
     bool has_broken_spirv_clamp{};
     bool lower_left_origin_mode{};

@@ -523,6 +523,14 @@ void EmitContext::DefineInputs() {
             const IR::Attribute param = IR::Attribute::Param0 + i;
             const u32 num_components = info.loads.NumComponents(param);
             const auto [primary, auxiliary] = info.fs_interpolation[i];
+            if (primary == Qualifier::PerVertex && !profile.supports_fragment_per_vertex_inputs) {
+                UNREACHABLE_MSG("Fragment shader {:#x} reads parameter {} per vertex "
+                                "(PerVertexKHR; SPI_PS_INPUT_CNTL param {} flat {} default {}), "
+                                "which this device cannot translate (macOS: Metal has no "
+                                "per-vertex fragment inputs); not lowered yet",
+                                info.pgm_hash, i, u32(input.param_index), input.is_flat,
+                                input.is_default);
+            }
             const Id type = F32[num_components];
             const Id attr_id = [&] {
                 const auto bind_location = input.param_index + (has_clip_distance_inputs ? 1 : 0);

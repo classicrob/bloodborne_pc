@@ -139,6 +139,14 @@ GraphicsPipeline::GraphicsPipeline(
     };
 
     if (!instance.IsProvokingVertexSupported()) {
+#ifdef __APPLE__
+        // Without VK_EXT_provoking_vertex the first vertex provokes (Metal has no last-vertex
+        // mode). A guest asking for the last vertex would get flat values from another vertex.
+        ASSERT_MSG(key.provoking_vtx_last == AmdGpu::ProvokingVtxLast::First,
+                   "macOS: pipeline {} needs the last vertex as provoking vertex "
+                   "(PA_SU_SC_MODE_CNTL.PROVOKING_VTX_LAST), which this device cannot do",
+                   GetDebugString());
+#endif
         raster_chain.unlink<vk::PipelineRasterizationProvokingVertexStateCreateInfoEXT>();
     }
     if (!instance.IsDepthClipEnableSupported()) {

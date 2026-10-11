@@ -353,6 +353,11 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         .supports_amd_shader_explicit_vertex_parameter =
             instance_.IsAmdShaderExplicitVertexParameterSupported(),
         .supports_fragment_shader_barycentric = instance_.IsFragmentShaderBarycentricSupported(),
+#ifdef __APPLE__
+        // MoltenVK reports barycentrics but SPIRV-Cross rejects PerVertexKHR inputs
+        // (spirv_msl.cpp, "PerVertexKHR decoration is not supported in MSL").
+        .supports_fragment_per_vertex_inputs = false,
+#endif
         .supports_shader_subgroup_clock = instance_.IsShaderSubgroupClockSupported(),
         .needs_manual_interpolation = instance.IsFragmentShaderBarycentricSupported() &&
                                       instance.GetDriverID() == vk::DriverId::eNvidiaProprietary,
