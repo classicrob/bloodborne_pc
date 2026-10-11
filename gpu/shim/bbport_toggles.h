@@ -77,6 +77,11 @@ enum : std::uint64_t {
     // after a switch waits for every label issued before it, and the switch is logged with the
     // time (docs/macos/gpu-idle.md), so one run can alternate the modes for an A/B.
     LabelsAtGpuComplete = 1ull << 59,
+    // Diagnostic A/B (Apple): bit set releases staging allocations at their request tick, as
+    // before 6850bc0 (Retire finds them released). This can free a buffer before its last use
+    // (the device-loss bug), so it is only for load A/Bs. BB_STAGING_RELEASE_AT_REQUEST=1 sets
+    // it for the whole run; read at each request.
+    StagingReleaseAtRequest = 1ull << 61,
     // Bits 20-29 are used as raw debug toggles by the camera/object motion and the upscaler.
 };
 inline bool Disabled(std::uint64_t bit) {
