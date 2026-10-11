@@ -260,10 +260,14 @@ struct Info : InfoPersistent {
         RefreshFlatBuf(user_data, flattened_ud_buf);
     }
 
-    void RefreshFlatBuf(std::span<const u32> data, std::vector<u32>& flat) const {
+    void InitFlatBuf(std::span<const u32> data, std::vector<u32>& flat) const {
         flat.resize(srt_info.flattened_bufsize_dw);
         ASSERT(data.size() <= NUM_USER_DATA_REGS);
         std::memcpy(flat.data(), data.data(), data.size_bytes());
+    }
+
+    void RefreshFlatBuf(std::span<const u32> data, std::vector<u32>& flat) const {
+        InitFlatBuf(data, flat);
         if (srt_info.walker_func) {
             srt_info.walker_func(data.data(), flat.data());
         }

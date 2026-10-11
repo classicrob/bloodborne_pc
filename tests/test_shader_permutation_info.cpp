@@ -22,11 +22,30 @@
 
 extern "C" __thread sigjmp_buf* runtime_fault_recover;
 
-static void RecoverWorkerRead(int, siginfo_t*, void*) {
+static volatile sig_atomic_t recovered_reads = 0;
+
+static void RecoverWorkerRead(int signal, siginfo_t*, void*) {
     if (runtime_fault_recover) {
+        recovered_reads = recovered_reads + 1;
+        sigset_t unblock;
+        sigemptyset(&unblock);
+        sigaddset(&unblock, signal);
+        sigprocmask(SIG_UNBLOCK, &unblock, nullptr);
         siglongjmp(*runtime_fault_recover, 1);
     }
     std::_Exit(3);
+}
+
+// Two cached SRT layouts, both producing the descriptor at flat[4..7], but reading
+// different root pointers. Install them in actual compiled permutations below to isolate
+// candidate walking from the compiler's choice of SRT layout.
+template <u32 Root>
+static void CandidateTable(const u32* data, u32* flat) {
+    uintptr_t address;
+    std::memcpy(&address, data + Root, sizeof(address));
+    const auto* source = reinterpret_cast<const volatile u32*>(address);
+    flat[4] = 0xbadbad;
+    for (u32 i = 0; i < 4; ++i) flat[4 + i] = source[i];
 }
 
 static GcnAsm::Code Fetch(bool second) {
@@ -212,6 +231,7 @@ int main() {
     regs.vgt_esgs_ring_itemsize = 4;
     regs.vgt_gs_max_vert_out = 3;
     regs.vgt_gs_vert_itemsize[0] = 4;
+    regs.vgt_gs_out_prim_type.outprim_type = AmdGpu::GsOutputPrimitiveType::TriangleStrip;
     GcnAsm::Code shared_shader;
     shared_shader.SBufferLoad(1, 12, 4, true, 0);
     shared_shader.SWaitcntAll();
@@ -332,6 +352,55 @@ int main() {
     assert(std::get<1>(select(first_fetch)) == std::get<1>(first));
     assert(!fault_worker.failed && fault_worker.stages.size() == 1);
     assert(Shader::Info::num_ud_snapshots == 1);
+
+    // On the direct path, try the last-used (wrong-layout) permutation first. Its missing
+    // table must reject only that candidate, despite a partial write to the scratch flat
+    // buffer. The following candidate must hit, without recompiling or publishing bad data.
+    auto* layout_a_info = const_cast<Shader::Info*>(same_a_info);
+    auto* layout_b_info = const_cast<Shader::Info*>(same_b_info);
+    const auto old_a_walker = layout_a_info->srt_info.walker_func;
+    const auto old_b_walker = layout_b_info->srt_info.walker_func;
+    layout_a_info->srt_info.walker_func = CandidateTable<0>;
+    layout_b_info->srt_info.walker_func = CandidateTable<2>;
+    const auto a_descriptor = table[0];
+    const auto b_descriptor = same_b_table[0];
+    const uintptr_t a_table = reinterpret_cast<uintptr_t>(&a_descriptor);
+    const uintptr_t b_table = reinterpret_cast<uintptr_t>(&b_descriptor);
+    std::memcpy(same_a_ud.data(), &a_table, sizeof(a_table));
+    std::memcpy(same_b_ud.data() + 2, &b_table, sizeof(b_table));
+    selection.worker = nullptr;
+    const sig_atomic_t before_reads = recovered_reads;
+    sigjmp_buf outer_recovery;
+    if (sigsetjmp(outer_recovery, 1)) {
+        std::fputs("Candidate SRT fault escaped to the caller's recovery point\n", stderr);
+        return 2;
+    }
+    runtime_fault_recover = &outer_recovery;
+    for (unsigned repeat = 0; repeat < 8; ++repeat) {
+        const auto b_before = same_b_info->flattened_ud_buf;
+        const auto hit_a = same_select(same_a_ud);
+        assert(std::get<0>(hit_a) == same_a_info);
+        assert(std::get<1>(hit_a) == std::get<1>(same_a));
+        assert(std::get<3>(hit_a) == std::get<3>(same_a));
+        assert(same_b_info->flattened_ud_buf == b_before);
+        assert(same_b_info->user_data.data() == same_b_ud.data());
+        const auto a_before = same_a_info->flattened_ud_buf;
+        const auto hit_b = same_select(same_b_ud);
+        assert(std::get<0>(hit_b) == same_b_info);
+        assert(std::get<1>(hit_b) == std::get<1>(same_b));
+        assert(std::get<3>(hit_b) == std::get<3>(same_b));
+        assert(same_a_info->flattened_ud_buf == a_before);
+        assert(same_a_info->user_data.data() == same_a_ud.data());
+        assert(runtime_fault_recover == &outer_recovery);
+        assert(Shader::Info::num_ud_snapshots == 1);
+        assert(same_a_info->ProgramBase() == 0x1234);
+        assert(same_a_info->FlatUserData().data() == same_b_flat.data());
+    }
+    assert(recovered_reads - before_reads >= 15);
+    runtime_fault_recover = nullptr;
+    layout_a_info->srt_info.walker_func = old_a_walker;
+    layout_b_info->srt_info.walker_func = old_b_walker;
+    std::puts("Unreadable SRT candidates: two layouts, 16 cache hits, outer recovery preserved PASS");
     assert(sigaction(SIGSEGV, &old_segv, nullptr) == 0);
     assert(sigaction(SIGBUS, &old_bus, nullptr) == 0);
     Shader::Info::num_ud_snapshots = 0;

@@ -1167,6 +1167,39 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
     return module;
 }
 
+static bool RefreshCandidateFlatBuf(const Shader::Info& info, std::span<const u32> data,
+                                    std::vector<u32>& flat) {
+#ifdef __APPLE__
+    // A cached candidate can require tables that this draw does not supply. Keep allocation
+    // outside the recovery region: only the generated walk may jump back, across no destructors.
+    info.InitFlatBuf(data, flat);
+    if (!info.srt_info.walker_func) {
+        return true;
+    }
+    sigjmp_buf recover;
+    auto* const previous_recovery = runtime_fault_recover;
+    if (sigsetjmp(recover, 0)) {
+        runtime_fault_recover = previous_recovery;
+        static thread_local u64 unreadable_candidates = 0;
+        const u64 count = ++unreadable_candidates;
+        if (count <= 8 || count % 1024 == 0) {
+            LOG_WARNING(Render_Vulkan,
+                        "Rejecting unreadable SRT candidate for {} shader {:#x}, stage {}, "
+                        "walker {:#x} ({} rejected on this thread)",
+                        info.hw_stage, info.pgm_hash, u32(info.sw_stage),
+                        reinterpret_cast<uintptr_t>(info.srt_info.walker_func), count);
+        }
+        return false;
+    }
+    runtime_fault_recover = &recover;
+    info.srt_info.walker_func(data.data(), flat.data());
+    runtime_fault_recover = previous_recovery;
+#else
+    info.RefreshFlatBuf(data, flat);
+#endif
+    return true;
+}
+
 PipelineCache::Result PipelineCache::GetProgram(PipelineSelection& sel, HwStage hw_stage,
                                                 SwStage sw_stage,
                                                 const Shader::ShaderParams& params,
@@ -1196,11 +1229,12 @@ PipelineCache::Result PipelineCache::GetProgram(PipelineSelection& sel, HwStage 
             // A different fetch program can walk different tables. Reject it before the walker.
             if (!info.has_fetch_shader ||
                 Shader::Gcn::ParseFetchShader(info) == module.spec.fetch_shader_data) {
-                info.RefreshFlatBuf(params.user_data, candidate_flat);
-                view.flat = candidate_flat.data();
-                view.flat_size = u32(candidate_flat.size());
-                matches = module.spec ==
-                    Shader::StageSpecialization(info, runtime_info, profile, binding);
+                if (RefreshCandidateFlatBuf(info, params.user_data, candidate_flat)) {
+                    view.flat = candidate_flat.data();
+                    view.flat_size = u32(candidate_flat.size());
+                    matches = module.spec ==
+                        Shader::StageSpecialization(info, runtime_info, profile, binding);
+                }
             }
         } catch (...) {
             Shader::Info::num_ud_snapshots = saved_snapshots;
