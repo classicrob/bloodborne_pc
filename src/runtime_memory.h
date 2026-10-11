@@ -91,6 +91,9 @@ int runtime_memory_layout(RuntimeMemoryView *views, size_t view_capacity, size_t
  * it, *total_bytes in all), or NULL before the pool exists. Reads through it bypass guest and
  * GPU page protection: capture only. */
 const void *runtime_memory_backing(uint64_t *direct_bytes, uint64_t *total_bytes);
+/* The guest executable image as loaded (a host allocation outside the VMA table): 0 and its
+ * range, or -1 before it is loaded. Defined by the launcher (probe.c). */
+int runtime_guest_image(uintptr_t *start, uint64_t *size);
 #endif
 #ifdef __cplusplus
 }

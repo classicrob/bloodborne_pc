@@ -37,7 +37,10 @@ namespace AmdGpu {
 
 union PM4Header;
 
+class ReplayStateAccess;
+
 struct Liverpool {
+    friend class ReplayStateAccess; ///< perf replay capture/restore (replay_perf_capture.cpp)
     static constexpr u32 GfxQueueId = 0u;
     static constexpr u32 NumGfxRings = 1u;     // actually 2, but HP is reserved by system software
     static constexpr u32 NumComputePipes = 7u; // actually 8, but #7 is reserved by system software

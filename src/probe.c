@@ -44,6 +44,9 @@ static LinkedModule modules[16];
 static uint64_t module_count;
 static int entered_game;
 static int gpu_enabled;
+/* The loaded eboot image (perf replay capture: runtime_guest_image). */
+static uintptr_t guest_image_start;
+static uint64_t guest_image_size;
 int vulkan_smoke(void);
 
 static __attribute__((noreturn)) void fail(const char *message) {
@@ -662,6 +665,7 @@ static int probe_main(int argc, char **argv) {
         }
     }
     image = allocate(round_host_page(size));
+    guest_image_start=(uintptr_t)image; guest_image_size=size;
     if (fread(image, 1, size, f) != size || fgetc(f) != EOF) fail("incorrect memory image size");
     fclose(f);
     if (!cpu_only) {
@@ -789,6 +793,12 @@ static int probe_worker(void *argument) {
     return probe_main(args->argc,args->argv);
 }
 #endif
+int runtime_guest_image(uintptr_t *start, uint64_t *size) {
+    if (!start || !size || !guest_image_start) return -1;
+    *start=guest_image_start; *size=guest_image_size;
+    return 0;
+}
+
 int main(int argc, char **argv) {
 #ifdef __APPLE__
     if (argc==2 && !strcmp(argv[1],"--verify-macos-host")) {
