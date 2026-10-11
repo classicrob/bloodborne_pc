@@ -94,6 +94,7 @@ private:
     VideoCore::TextureCache& texture_cache;
     Runtime& runtime;
     bool debug_overlay = false;
+    bool camera_only = false; ///< BB_MOTION_CAMERA_ONLY (diagnostic)
     bool for_upscaler = false;
     vk::UniqueDescriptorSetLayout motion_desc_layout;
     vk::UniquePipelineLayout motion_pipeline_layout;
