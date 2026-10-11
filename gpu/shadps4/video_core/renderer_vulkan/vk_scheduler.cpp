@@ -342,9 +342,13 @@ void Scheduler::WaitRecorderSignals() {
     // counts are stable.
     const u64 issued = deferred_signals_issued.load(std::memory_order_relaxed) -
                        labels_issued.load(std::memory_order_relaxed);
+    // done before written, clamped: a label counted written but not yet done (or written
+    // between the two reads) can only make this smaller, never larger, than the recorder-side
+    // count, so the wait may be longer, never shorter (an unsigned wrap would end it at once).
     const auto recorder_done = [this] {
+        const u64 done = deferred_signals_done->load(std::memory_order_acquire);
         const u64 written = labels_written.load(std::memory_order_acquire);
-        return deferred_signals_done->load(std::memory_order_acquire) - written;
+        return done > written ? done - written : 0;
     };
     if (recorder_done() >= issued || BbToggle::Disabled(BbToggle::OrderedGuestWrites)) {
         return;
