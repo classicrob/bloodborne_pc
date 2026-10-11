@@ -188,21 +188,28 @@ Liverpool::~Liverpool() {
     process_thread.join();
 }
 
-void Liverpool::ProcessCommands() {
+u32 Liverpool::ProcessCommands(bool* stopped_at_cpu_flip) {
     if (num_commands && rasterizer) {
         rasterizer->DrainDrawPipe(Vulkan::DrawPipe::ReasonCommands); // bbport: commands touch the caches
     }
     // Process incoming commands with high priority
+    u32 ran = 0;
     while (num_commands) {
         Common::UniqueFunction<void> callback{};
         {
             std::scoped_lock lk{submit_mutex};
-            callback = std::move(command_queue.front());
+            if (stopped_at_cpu_flip && command_queue.front().cpu_flip) {
+                *stopped_at_cpu_flip = true;
+                break;
+            }
+            callback = std::move(command_queue.front().func);
             command_queue.pop();
             --num_commands;
         }
         callback();
+        ++ran;
     }
+    return ran;
 }
 
 void Liverpool::Process(std::stop_token stoken) {
@@ -227,8 +234,11 @@ void Liverpool::Process(std::stop_token stoken) {
 #ifdef __APPLE__
             if (replay_hold) {
                 // Replay capture hold (replay_capture.h): host commands and the guest's frame end
-                // wake this thread; held submissions wait, for at most the hold bound.
-                submit_cv.wait_for(lk, ReplayCapture::HoldRemaining(),
+                // wake this thread; held submissions wait, for at most the hold bound. Slices keep
+                // a stop request (checked below) prompt.
+                using namespace std::chrono_literals;
+                submit_cv.wait_for(lk, std::min<std::chrono::steady_clock::duration>(
+                                           ReplayCapture::HoldRemaining(), 100ms),
                                    [this] { return num_commands || submit_done; });
             } else
 #endif
@@ -245,23 +255,42 @@ void Liverpool::Process(std::stop_token stoken) {
 
 #ifdef __APPLE__
         if (replay_hold) {
-            if (num_commands) {
-                const u32 before = num_commands;
-                ProcessCommands();
-                replay_hold_commands += before - std::min<u32>(before, num_commands);
-            }
-            if (submit_done || ReplayCapture::HoldRemaining() == std::chrono::steady_clock::duration::zero()) {
-                // The held frame: every submission not parsed yet (all arrived after the cut).
-                std::vector<std::shared_ptr<CmdSnapshot>> held;
+            // Blocking host commands (buffer synchronize, import pause) must run, or the guest
+            // never ends the frame. A CPU flip must not: it would present the held frame's
+            // framebuffer before its draws parse, so it ends the hold and rejects the cut.
+            bool cpu_flip = false;
+            replay_hold_commands += ProcessCommands(&cpu_flip);
+            if (cpu_flip || submit_done ||
+                ReplayCapture::HoldRemaining() == std::chrono::steady_clock::duration::zero()) {
+                // The held work: no queue task was resumed since the cut, so the queues hold
+                // exactly what was submitted since; the gfx snapshots not parsed yet match them.
+                // Gfx queue lock before snapshots_mutex, as SubmitGfx.
+                std::vector<std::shared_ptr<CmdSnapshot>> held_gfx;
+                u32 gfx_tasks = 0, asc_tasks = 0;
                 {
-                    std::scoped_lock lk{snapshots_mutex};
+                    auto& gfx_queue = mapped_queues[GfxQueueId];
+                    std::scoped_lock lk{gfx_queue.m_access, snapshots_mutex};
+                    gfx_tasks = static_cast<u32>(gfx_queue.submits.size());
                     for (const auto& snapshot : gfx_snapshots) {
                         if (!snapshot->done) {
-                            held.push_back(snapshot);
+                            held_gfx.push_back(snapshot);
                         }
                     }
                 }
-                ReplayCapture::HoldEnded(rasterizer, submit_done, held, replay_hold_commands);
+                for (u32 qid = GfxQueueId + 1; qid < NumTotalQueues; ++qid) {
+                    std::scoped_lock lk{mapped_queues[qid].m_access};
+                    asc_tasks += static_cast<u32>(mapped_queues[qid].submits.size());
+                }
+                ReplayCapture::HoldEnded(
+                    rasterizer,
+                    {.frame_ended = submit_done,
+                     .ended_early = cpu_flip ? "a CPU (non-EOP) flip arrived; it would present the "
+                                               "held frame's framebuffer before its draws parse"
+                                             : nullptr,
+                     .gfx = held_gfx,
+                     .gfx_tasks = gfx_tasks,
+                     .asc_tasks = asc_tasks,
+                     .host_commands = replay_hold_commands});
                 replay_hold = false;
             }
             continue; // the held submissions (and the frame end, if it came) run next

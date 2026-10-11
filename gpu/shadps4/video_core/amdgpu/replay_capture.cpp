@@ -3,6 +3,56 @@
 
 #include "video_core/amdgpu/replay_capture.h"
 
+namespace ReplayCapture::Detail {
+
+std::optional<u64> ParseBounded(std::string_view text, u64 max) {
+    if (text.empty()) {
+        return std::nullopt;
+    }
+    u64 value = 0;
+    for (const char c : text) {
+        if (c < '0' || c > '9') {
+            return std::nullopt;
+        }
+        const u64 digit = static_cast<u64>(c - '0');
+        if (value > (max - digit) / 10) {
+            return std::nullopt; // above max (and so never wraps)
+        }
+        value = value * 10 + digit;
+    }
+    return value;
+}
+
+void CountRegion(Pm4Census& census, std::span<const u32> words) {
+    for (size_t i = 0; i < words.size();) {
+        const u32 header = words[i];
+        const u32 type = header >> 30;
+        if (type == 2) {
+            ++census.type2;
+            ++i;
+            continue;
+        }
+        if (type == 1) { // not a valid header: the rest of this region is not a packet stream
+            ++census.bad_header_regions;
+            return;
+        }
+        const u64 length = u64{(header >> 16) & 0x3FFF} + 2; // header + count + 1 payload dwords
+        if (length > words.size() - i) {
+            ++census.truncated_regions;
+            return;
+        }
+        if (type == 3) {
+            ++census.opcodes[(header >> 8) & 0xFF];
+            ++census.packets;
+        } else {
+            ++census.type0;
+        }
+        i += length;
+    }
+}
+
+} // namespace ReplayCapture::Detail
+
 #ifdef __APPLE__
 
 #include <algorithm>
@@ -22,6 +72,9 @@
 namespace ReplayCapture {
 namespace {
 
+using Detail::ParseBounded;
+using Detail::Pm4Census;
+
 enum class State { Off, Waiting, Holding, Released, Done };
 
 struct Config {
@@ -30,6 +83,9 @@ struct Config {
     bool valid = false;
 };
 
+constexpr u64 MaxArmFrames = 100000;
+constexpr u64 MaxHoldMs = 60000;
+
 const Config& Settings() {
     static const Config config = [] {
         Config c;
@@ -37,26 +93,34 @@ const Config& Settings() {
         if (!value || !*value) {
             return c;
         }
-        const std::string text{value};
+        const std::string_view text{value};
         constexpr std::string_view prefix = "inventory:";
-        if (text.rfind(prefix, 0) != 0) {
+        if (!text.starts_with(prefix)) {
             std::fprintf(stderr, "*** BB_REPLAY_CAPTURE=%s: only inventory:<frames> is implemented; "
                                  "capture disabled ***\n", value);
             return c;
         }
-        char* end = nullptr;
-        c.arm_frames = std::strtoull(text.c_str() + prefix.size(), &end, 10);
-        if (!end || *end != '\0' || c.arm_frames == 0) {
-            std::fprintf(stderr, "*** BB_REPLAY_CAPTURE=%s: <frames> must be a positive integer; "
-                                 "capture disabled ***\n", value);
+        const auto frames = ParseBounded(text.substr(prefix.size()), MaxArmFrames);
+        if (!frames || *frames == 0) {
+            std::fprintf(stderr, "*** BB_REPLAY_CAPTURE=%s: <frames> must be decimal digits, 1..%llu; "
+                                 "capture disabled ***\n", value,
+                         static_cast<unsigned long long>(MaxArmFrames));
             return c;
         }
+        c.arm_frames = *frames;
         if (const char* ms = std::getenv("BB_REPLAY_HOLD_MS")) {
-            c.hold_bound = std::chrono::milliseconds(std::strtoull(ms, nullptr, 10));
+            const auto bound = ParseBounded(ms, MaxHoldMs);
+            if (!bound || *bound == 0) {
+                std::fprintf(stderr, "*** BB_REPLAY_HOLD_MS=%s: must be decimal digits, 1..%llu; "
+                                     "capture disabled ***\n", ms,
+                             static_cast<unsigned long long>(MaxHoldMs));
+                return c;
+            }
+            c.hold_bound = std::chrono::milliseconds(static_cast<std::chrono::milliseconds::rep>(*bound));
         }
         c.valid = true;
-        std::fprintf(stderr, "\n*** BB_REPLAY_CAPTURE: inventory at frame end %llu, hold bound %lld ms "
-                             "(diagnostic: holds the GPU command thread for one frame) ***\n\n",
+        std::fprintf(stderr, "\n*** BB_REPLAY_CAPTURE: inventory at retired frame end %llu, hold bound "
+                             "%lld ms (diagnostic: holds the GPU command thread for one frame) ***\n\n",
                      static_cast<unsigned long long>(c.arm_frames),
                      static_cast<long long>(c.hold_bound.count()));
         return c;
@@ -71,36 +135,6 @@ std::chrono::steady_clock::time_point hold_start, release_time;
 
 /// PM4 type-3 opcodes that matter to a replay cut (capture-replay.md "Dependencies without a
 /// guest CPU"), and the rest by count.
-struct Pm4Census {
-    std::array<u64, 256> opcodes{};
-    u64 packets = 0, type0 = 0, type2 = 0, bad_regions = 0, uncopied_regions = 0;
-    u64 regions = 0, constant_regions = 0, words = 0;
-};
-
-void CountRegion(Pm4Census& census, std::span<const u32> words) {
-    for (size_t i = 0; i < words.size();) {
-        const u32 header = words[i];
-        const u32 type = header >> 30;
-        if (type == 2) {
-            ++census.type2;
-            ++i;
-            continue;
-        }
-        if (type == 1) { // not a valid header: the rest of this region is not a packet stream
-            ++census.bad_regions;
-            return;
-        }
-        const u32 count = (header >> 16) & 0x3FFF;
-        if (type == 3) {
-            ++census.opcodes[(header >> 8) & 0xFF];
-            ++census.packets;
-        } else {
-            ++census.type0;
-        }
-        i += count + 2;
-    }
-}
-
 const char* OpcodeName(u32 op) {
     switch (op) {
     case 0x15: return "DISPATCH_DIRECT";
@@ -166,7 +200,6 @@ bool OnFrameRetired(Vulkan::Rasterizer* rasterizer) {
         state = State::Done;
         return false;
     }
-    asc_submits = 0;
     hold_start = std::chrono::steady_clock::now();
     state = State::Holding;
     fmt::print("Replay capture: frame end {} retired; holding the next frame's submissions "
@@ -181,39 +214,44 @@ std::chrono::steady_clock::duration HoldRemaining() {
 }
 
 void NoteAscSubmit() {
-    const State s = state.load(std::memory_order_relaxed);
-    if (s == State::Holding || s == State::Released) {
+    if (state.load(std::memory_order_relaxed) == State::Released) {
         asc_submits.fetch_add(1, std::memory_order_relaxed);
     }
 }
 
-void HoldEnded(Vulkan::Rasterizer* rasterizer, bool frame_ended,
-               std::span<const std::shared_ptr<AmdGpu::CmdSnapshot>> held, u32 host_commands) {
+void HoldEnded(Vulkan::Rasterizer* rasterizer, const Held& held) {
     const double hold_ms =
         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - hold_start).count();
     std::vector<std::string> rejected;
 
     // G1: the cut.
-    if (!frame_ended) {
+    if (held.ended_early) {
+        rejected.push_back(fmt::format("the hold ended early: {}", held.ended_early));
+    } else if (!held.frame_ended) {
         rejected.push_back(fmt::format(
             "the guest did not end the held frame within {} ms ({} submissions held): it waits on "
             "GPU work it submitted before ending the frame, so a whole-frame hold cannot be a cut",
-            Settings().hold_bound.count(), held.size()));
+            Settings().hold_bound.count(), held.gfx.size()));
     }
     std::string quiesce_why;
     const bool quiescent = rasterizer->QuiesceForCapture(quiesce_why);
     if (!quiescent) {
         rejected.push_back("renderer not quiescent at the cut: " + quiesce_why);
     }
-    if (host_commands) {
+    if (held.host_commands) {
         rejected.push_back(fmt::format("{} host commands ran during the hold (memory mapping or "
-                                       "cache operations inside the cut window)", host_commands));
+                                       "cache operations inside the cut window)", held.host_commands));
+    }
+    if (held.gfx_tasks != held.gfx.size()) {
+        rejected.push_back(fmt::format("{} graphics tasks queued but {} unparsed graphics snapshots: the "
+                                       "held set is not the queued work", held.gfx_tasks,
+                                       held.gfx.size()));
     }
 
     // G2: the held frame's command stream.
     Pm4Census census;
     u64 snapshot_bytes = 0;
-    for (const auto& snapshot : held) {
+    for (const auto& snapshot : held.gfx) {
         snapshot_bytes += snapshot->copied_bytes;
         for (const auto& region : snapshot->Regions()) {
             ++census.regions;
@@ -223,17 +261,22 @@ void HoldEnded(Vulkan::Rasterizer* rasterizer, bool frame_ended,
                 continue;
             }
             census.words += region.size_dw;
-            CountRegion(census, snapshot->Words(region));
+            Detail::CountRegion(census, snapshot->Words(region));
         }
     }
-    const u32 asc = asc_submits.load();
-    if (asc) {
-        rejected.push_back(fmt::format("{} asynchronous-compute submissions in the window (v1 has "
-                                       "no ASC capture)", asc));
+    if (!census.Complete()) {
+        rejected.push_back(fmt::format(
+            "command census incomplete ({} regions not copied, {} stopped at an invalid header, {} at "
+            "a truncated packet): the opcode counts cover only the scanned part",
+            census.uncopied_regions, census.bad_header_regions, census.truncated_regions));
+    }
+    if (held.asc_tasks) {
+        rejected.push_back(fmt::format("{} asynchronous-compute submissions held (v1 has no ASC "
+                                       "capture)", held.asc_tasks));
     }
     if (census.opcodes[0x59]) {
-        rejected.push_back(fmt::format("{} REWIND packets (v1 rejects live command refetch)",
-                                       census.opcodes[0x59]));
+        rejected.push_back(fmt::format("{} potential REWIND packets (v1 rejects live command "
+                                       "refetch)", census.opcodes[0x59]));
     }
 
     // G2: memory and image authority.
@@ -241,12 +284,12 @@ void HoldEnded(Vulkan::Rasterizer* rasterizer, bool frame_ended,
     const bool memory_ok = runtime_memory_inventory(&memory) == 0;
     std::vector<VideoCore::CaptureImageRecord> images;
     rasterizer->GetTextureCache().ReportGpuModifiedForCapture(images);
-    u64 image_bytes = 0, flushable_bytes = 0;
+    u64 image_bytes = 0, eligible_bytes = 0;
     std::vector<std::pair<std::string, u32>> reasons;
     for (const auto& image : images) {
         image_bytes += image.size;
         if (!image.reject) {
-            flushable_bytes += image.size;
+            eligible_bytes += image.size;
             continue;
         }
         auto it = std::find_if(reasons.begin(), reasons.end(),
@@ -258,21 +301,27 @@ void HoldEnded(Vulkan::Rasterizer* rasterizer, bool frame_ended,
         }
     }
     for (const auto& [why, count] : reasons) {
-        rejected.push_back(fmt::format("{} GPU-modified images that cannot be flushed exactly ({})",
+        rejected.push_back(fmt::format("{} GPU-modified images not eligible for writeback ({})",
                                        count, why));
     }
 
     // Report.
     fmt::print("Replay capture inventory (frame end {}, inventory only, nothing written):\n",
                frames_seen);
-    fmt::print("  G1 cut: {} after {:.1f} ms hold; {} submissions held ({:.1f} KiB copied at submit); "
-               "renderer quiescent: {}; host commands during hold: {}\n",
-               frame_ended ? "frame fully submitted" : "NOT REACHED", hold_ms, held.size(),
-               snapshot_bytes / 1024.0, quiescent ? "yes" : ("no, " + quiesce_why), host_commands);
-    fmt::print("  G2 commands: {} regions ({} constant, {} not copied), {} dwords, {} packets "
-               "({} type-0, {} type-2), {} bad regions\n",
+    fmt::print("  G1 cut: {} after {:.1f} ms hold; {} graphics submissions held ({:.1f} KiB copied at "
+               "submit, {} graphics tasks queued); renderer quiescent: {}; host commands during "
+               "hold: {}\n",
+               held.ended_early ? "ENDED EARLY"
+               : held.frame_ended ? "frame fully submitted"
+                                  : "NOT REACHED",
+               hold_ms, held.gfx.size(), snapshot_bytes / 1024.0, held.gfx_tasks,
+               quiescent ? "yes" : ("no, " + quiesce_why), held.host_commands);
+    fmt::print("  G2 commands (raw scan, potential packets): {} regions ({} constant, {} not copied), "
+               "{} dwords, {} type-3 ({} type-0, {} type-2); scan stopped early: {} invalid header, "
+               "{} truncated\n",
                census.regions, census.constant_regions, census.uncopied_regions, census.words,
-               census.packets, census.type0, census.type2, census.bad_regions);
+               census.packets, census.type0, census.type2, census.bad_header_regions,
+               census.truncated_regions);
     std::string named, others;
     std::vector<std::pair<u64, u32>> by_count;
     for (u32 op = 0; op < 256; ++op) {
@@ -287,12 +336,12 @@ void HoldEnded(Vulkan::Rasterizer* rasterizer, bool frame_ended,
         }
     }
     fmt::print("  G2 opcodes:{}\n  G2 other opcodes:{}\n", named, others.empty() ? " none" : others);
-    fmt::print("  G2 asynchronous compute submissions in window: {}\n", asc);
+    fmt::print("  G2 asynchronous compute submissions held: {}\n", held.asc_tasks);
     if (memory_ok) {
         fmt::print("  G2 memory: {} direct views ({:.1f} MiB), {} flexible views ({:.1f} MiB), {} "
-                   "reservations; unique backing {:.1f} MiB ({} views share backing); allocator: direct "
-                   "live {:.1f} MiB, flexible in use {:.1f} MiB; low/untracked allocations not "
-                   "counted\n",
+                   "reservations; unique backing {:.1f} MiB ({} views share backing); allocator: "
+                   "direct live {:.1f} MiB, flexible in use {:.1f} MiB; low/untracked allocations "
+                   "not counted\n",
                    memory.direct_vmas, memory.direct_view_bytes / 1048576.0, memory.flexible_vmas,
                    memory.flexible_view_bytes / 1048576.0, memory.reserved_vmas,
                    memory.unique_backing_bytes / 1048576.0, memory.shared_backing_views,
@@ -300,8 +349,9 @@ void HoldEnded(Vulkan::Rasterizer* rasterizer, bool frame_ended,
     } else {
         rejected.push_back("runtime memory inventory failed");
     }
-    fmt::print("  G2 images: {} GPU-modified ({:.1f} MiB), flushable {:.1f} MiB\n", images.size(),
-               image_bytes / 1048576.0, flushable_bytes / 1048576.0);
+    fmt::print("  G2 images: {} GPU-modified ({:.1f} MiB), writeback-eligible {:.1f} MiB (eligible "
+               "only: writeback not exercised)\n",
+               images.size(), image_bytes / 1048576.0, eligible_bytes / 1048576.0);
     for (const auto& image : images) {
         fmt::print("    image {:#x} {} bytes vk format {} tile {} aspects {:#x} samples {} mips {} "
                    "layers {}{}\n",
@@ -310,7 +360,11 @@ void HoldEnded(Vulkan::Rasterizer* rasterizer, bool frame_ended,
                    image.reject ? fmt::format(" REJECT ({})", image.reject) : std::string{});
     }
     if (rejected.empty()) {
-        fmt::print("  VERDICT: cut admissible for v1\n");
+        fmt::print("  VERDICT: no inventoried blocker found; capture NOT yet qualified. Unproven here: "
+                   "guest CPU and HLE writers are not rendezvoused at the cut; low/untracked host "
+                   "memory is omitted; images without a reject are writeback-eligible only; the "
+                   "command census counts potential, not executed, packets; asynchronous compute "
+                   "submitted after release is reported when the window closes\n");
     } else {
         fmt::print("  VERDICT: cut REJECTED:\n");
         for (const auto& why : rejected) {
@@ -318,6 +372,7 @@ void HoldEnded(Vulkan::Rasterizer* rasterizer, bool frame_ended,
         }
     }
     std::fflush(stdout);
+    asc_submits = 0;
     release_time = std::chrono::steady_clock::now();
     state = State::Released;
 }
@@ -326,11 +381,13 @@ void OnReleasedFrameRetired() {
     if (state.load() != State::Released) {
         return;
     }
+    const u32 asc = asc_submits.load();
     fmt::print("Replay capture: released frame retired {:.1f} ms after release; {} asynchronous "
-               "compute submissions in the window; capture done\n",
+               "compute submissions between release and retirement{}; capture done\n",
                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
                                                          release_time).count(),
-               asc_submits.load());
+               asc, asc ? " (v1 cannot tell whether the held frame depends on them: NOT qualified)"
+                        : "");
     std::fflush(stdout);
     state = State::Done;
 }
@@ -349,7 +406,7 @@ bool OnFrameRetired(Vulkan::Rasterizer*) {
 std::chrono::steady_clock::duration HoldRemaining() {
     return {};
 }
-void HoldEnded(Vulkan::Rasterizer*, bool, std::span<const std::shared_ptr<AmdGpu::CmdSnapshot>>, u32) {}
+void HoldEnded(Vulkan::Rasterizer*, const Held&) {}
 void NoteAscSubmit() {}
 void OnReleasedFrameRetired() {}
 } // namespace ReplayCapture
