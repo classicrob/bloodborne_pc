@@ -46,6 +46,12 @@ const char* Name(Format format) {
 
 int main() {
     Vulkan::Instance instance(0, false);
+    // Commands through an explicit dynamic dispatcher, as the other device tests do.
+    static vk::detail::DynamicLoader loader;
+    vk::detail::DispatchLoaderDynamic d;
+    d.init(loader.getProcAddress<PFN_vkGetInstanceProcAddr>("vkGetInstanceProcAddr"));
+    d.init(instance.GetInstance());
+    d.init(instance.GetDevice());
     Vulkan::Scheduler scheduler(instance);
     const auto device = instance.GetDevice();
     // An odd size, so the image is not a power of two and the buffer range is padded past it.
@@ -121,27 +127,27 @@ int main() {
                 .newLayout = to,
                 .image = vk::Image(image),
                 .subresourceRange = range};
-            cmd.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &barrier});
+            cmd.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &barrier}, d);
         };
         transition(vk::ImageLayout::eUndefined, vk::ImageLayout::eTransferDstOptimal);
         vk::ClearColorValue clear{};
         clear.float32 = c.value;
-        cmd.clearColorImage(vk::Image(image), vk::ImageLayout::eTransferDstOptimal, clear, range);
+        cmd.clearColorImage(vk::Image(image), vk::ImageLayout::eTransferDstOptimal, clear, range, d);
         transition(vk::ImageLayout::eTransferDstOptimal, vk::ImageLayout::eTransferSrcOptimal);
         const vk::BufferImageCopy region{.imageSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
                                          .imageExtent = {W, H, 1}};
-        cmd.copyImageToBuffer(vk::Image(image), vk::ImageLayout::eTransferSrcOptimal, host, region);
+        cmd.copyImageToBuffer(vk::Image(image), vk::ImageLayout::eTransferSrcOptimal, host, region, d);
         // The bytes the kernel writes: the pattern over texels plus padding, then canaries.
         const u64 fill_offset = Texels * MaxTexel;
         const u64 fill_bytes = Texels * u64(texel_bytes) + PaddingWords * 4;
         if (pattern) {
-            cmd.fillBuffer(host, fill_offset, fill_bytes, *pattern);
+            cmd.fillBuffer(host, fill_offset, fill_bytes, *pattern, d);
         }
         const vk::MemoryBarrier2 to_host{.srcStageMask = vk::PipelineStageFlagBits2::eAllTransfer,
                                          .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
                                          .dstStageMask = vk::PipelineStageFlagBits2::eHost,
                                          .dstAccessMask = vk::AccessFlagBits2::eHostRead};
-        cmd.pipelineBarrier2({.memoryBarrierCount = 1, .pMemoryBarriers = &to_host});
+        cmd.pipelineBarrier2({.memoryBarrierCount = 1, .pMemoryBarriers = &to_host}, d);
         scheduler.Finish();
 
         u32 texel_mismatches = 0;
