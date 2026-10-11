@@ -292,6 +292,22 @@ GraphicsPipeline::GraphicsPipeline(
     }
 
 #ifdef __APPLE__
+    // GCN pixel shaders can read a parameter's raw per-vertex values (Qualifier::PerVertex:
+    // v_interp_mov P0/P10/P20, custom interpolation); SPIR-V expresses that as PerVertexKHR
+    // inputs. MoltenVK advertises fragment-shader barycentrics and translates the barycentric
+    // built-ins, but not PerVertexKHR inputs, and Metal has no per-vertex fragment inputs. Stop
+    // here, naming the shader, until the recompiler lowers them. A pipeline record exists only for
+    // a pipeline that was created, so this cannot be reached from the stage cache.
+    if (const auto* fs = stages[u32(Shader::SwStage::Fragment)]) {
+        for (u32 param = 0; param < fs->fs_interpolation.size(); ++param) {
+            if (fs->fs_interpolation[param].primary == Shader::Qualifier::PerVertex) {
+                UNREACHABLE_MSG("macOS: fragment shader {:#x} reads parameter {} per vertex "
+                                "(PerVertexKHR); Metal has no per-vertex fragment inputs and the "
+                                "recompiler does not lower them yet",
+                                fs->pgm_hash, param);
+            }
+        }
+    }
     // Layered rendering and clip distances from a vertex or tessellation-evaluation stage (an
     // emulated geometry shader's copy shader writes the cube face and two clip distances,
     // docs/macos/shader-sweep.md) need shaderOutputLayer and shaderClipDistance; without them
