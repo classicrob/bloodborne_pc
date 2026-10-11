@@ -410,16 +410,12 @@ void LowerWave64Compute(IR::Program& program, const RuntimeInfo& runtime_info, c
                     if (inst.GetOpcode() == IR::Opcode::ReadConstBuffer) inst.SetArg(2, IR::Value{0u});
                 }
             }
-            // The masks and their phis/packing are dead now.
+            // The masks and their phis/packing are dead now: OnlyFeedsScalarLoadFallback proved
+            // every use of each of them is inside this set or a fallback operand zeroed above, so
+            // the whole set goes at once (loop-carried phi cycles included).
             chain.insert(chain.end(), divergent_cross_lane.begin(), divergent_cross_lane.end());
-            for (bool changed = true; changed;) {
-                changed = false;
-                for (IR::Inst* x : chain) {
-                    if (x->GetOpcode() != IR::Opcode::Void && !x->HasUses()) {
-                        x->Invalidate();
-                        changed = true;
-                    }
-                }
+            for (IR::Inst* x : chain) {
+                x->Invalidate();
             }
         }
     }

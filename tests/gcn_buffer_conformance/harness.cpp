@@ -137,7 +137,8 @@ struct Template {
     u32 workgroups = 1;              // compute dispatch width (spilled LDS: one region per workgroup)
     u32 pushud_mask = 0;             // pushud: user-data SGPRs the stage reads (s[0:3] = its V#)
     bool fs_count = false;           // pushud-style FS: buffer_atomic_add 1 at its V# (side-effect count)
-    u32 smemfb = 0;                  // SmemFallback: 0 in range, 1 mask also stored, 2 mask also a branch, 3 OOB too
+    u32 smemfb = 0;                  // SmemFallback: 0 in range, 1 mask also stored, 2 mask also a branch, 3 OOB too,
+                                     // 4 in range with the mask carried around a uniform loop (phi cycle)
     u32 Threads() const { return wg[0] * wg[1] * wg[2]; }
     std::vector<u32> code;
     u64 hash = 0;
@@ -232,6 +233,11 @@ u64 BoundSize(const gcn_vsharp& v) { // AmdGpu::Buffer::GetSize(): u32 arithmeti
 void AssembleSmemFallback(GcnAsm::Code& c, u32 variant) {
     using namespace GcnAsm;
     c.SMovLiteral(40, 0x1234u);
+    size_t loop = 0;
+    if (variant == 4) {
+        c.Sop1(3, 20, Inline(0)); // s_mov_b32 s20, 0
+        loop = c.words.size();
+    }
     c.VCmpNeU32(Inline(0), 5);
     c.SAndSaveexecB64(22, VCC_LO);
     c.words.push_back(0xD0000000u | (197u << 17) | 30u); // v_cmp_ne_u32 s[30:31], 0, v3 (VOP3)
@@ -243,6 +249,11 @@ void AssembleSmemFallback(GcnAsm::Code& c, u32 variant) {
         c.VMovLiteral(13, 0x77u);
     }
     c.SMovB64(EXEC_LO, 22);
+    if (variant == 4) { // two uniform iterations; s[30:31] is loop-carried
+        c.SAddU32(20, 20, Inline(1));
+        c.SCmpLtU32Literal(20, 2);
+        c.SCbranchScc1To(loop);
+    }
     c.SBufferLoad(1, 30, 0, true, variant == 3 ? 100 : 2); // s30 <- dword 2 (in range) or 100
     c.SBufferLoad(1, 40, 0, true, 100);                    // s40 <- dword 100: out of range
     c.SWaitcntAll();
@@ -1633,10 +1644,10 @@ void AddWaveCases() {
     // only matters if the load is out of range, so production reads out-of-range scalar dwords as
     // 0 for the whole shader (SMEM_ZERO reading); any other use of the mask stays loud.
     for (u32 x : {64u, 128u}) {
-        for (u32 variant : {0u, 3u, 1u, 2u}) {
+        for (u32 variant : {0u, 3u, 4u, 1u, 2u}) {
             Template t;
             static const char* vn[] = {"s30 in range", "mask also stored (must be loud)", "mask also a branch (must be loud)",
-                                       "s30 out of range"};
+                                       "s30 out of range", "s30 in range, mask loop-carried"};
             t.name = std::string("wave: divergent VOP3 compare into s[30:31], s_buffer_load s30/s40: ") + vn[variant] + " [" +
                      std::to_string(x) + "x1]";
             t.op.kind = GCN_LOAD;
