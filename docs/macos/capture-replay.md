@@ -201,6 +201,53 @@ native game render target before host upscaling, clearly label that output bound
 and retain the game's real rendering commands. Reproducing the presented frame needs
 host temporal-state capture or a warm-up prefix as well.
 
+### Perf replay v0 (approved 2026-10-11, in progress)
+
+Purpose: a fast loop for the stage A/B CPU cost (R0: the frame is bound by it). It replays
+one held frame's submissions through the real Liverpool and renderer N times in a process
+without a guest. **Pixel output is not qualified**, and the report says so. The inventory
+run's image rejections don't block it: v0 restores no images. Iteration 1 creates the
+texture- and buffer-cache state that live frames inherit, and is reported as warm-up.
+Steady state means iterations 2..N agree within noise, on times and on the "images
+registered" / "image uploads" counters.
+
+Capture (`BB_REPLAY_CAPTURE=perf:<frames>`, trigger as for inventory), at the end of the hold,
+after the inventory, into `out/replay/<id>/`. One capture at a time unless `df -h /` stays
+above 50 GiB.
+- `manifest.json`: version, frame, settings, the sizes and checksums of every file, and
+  "perf replay: pixel output not qualified".
+- `views.bin`: every committed direct/flexible view (VA range, kind, protection, memory
+  type, backing offset).
+- `backing.bin`: the union of their backing intervals, read from the backing pool (no
+  guest-VA reads, which the GPU page tracking would intercept). About 4.9 GiB in the clinic.
+- `image.bin`: the eboot image range. It is a host allocation outside the VMA table, and
+  SDK shaders and constants can live in it.
+- `liverpool.bin`: `Regs`, the CE counters and the 48 KiB constants heap, per-queue
+  `cs_state`, `indirect_args_addr`.
+- `submissions.bin`: the held frame, in order. Per submission: DCB/CCB guest spans, every
+  copied region (guest address, dwords, constant flag) with its submit-time words, and the
+  frame end.
+- `resets.bin`: the (address, length) ranges the frame's command processor writes or waits
+  on, with their bytes at the cut. These are EOP/EOS/RELEASE_MEM/WRITE_DATA/COPY_DATA/
+  ATOMIC_MEM destinations, DMA_DATA destinations, WAIT_REG_MEM/COND_EXEC addresses, and
+  indirect argument buffers. A WAIT_REG_MEM whose address no packet in the frame writes and
+  that is not satisfied at the cut makes the capture loud: the frame would wait on the guest.
+
+Replay (`BB_REPLAY_RUN=<dir>`, bb-probe):
+1. Reserve the guest range as usual, map every view at its VA with the same backing layout
+   (direct blocks at their original offsets), and fill the backing and the eboot image range.
+2. Initialise the GPU library. Then, per iteration on the GPU thread, with the GPU idle:
+   restore the reset ranges, `liverpool.bin` and the command words; submit the frame's
+   submissions and its frame end; wait for GpuIdle.
+3. Report per iteration: wall time, stage A/B counters (the "Parse split" fields), images
+   registered, image uploads.
+
+Not handled in v0, and stated rather than solved:
+- guest CPU/HLE writers (none run);
+- flips (a flip submission is replayed without presenting);
+- low/untracked memory outside the views and the eboot image (an access faults loudly);
+- asynchronous compute (a frame with any is refused).
+
 ## Dependencies without a guest CPU
 
 Replay is an input driver, not a replacement PS4 CPU emulator. It submits the recorded
