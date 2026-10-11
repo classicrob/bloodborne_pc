@@ -78,6 +78,14 @@ void runtime_thread_keys_cleanup(void);
 /* Guest-visible errno values are FreeBSD's. */
 int32_t runtime_guest_errno(int host_errno);
 void *runtime_low_map(size_t size, int prot);
+/* Diagnostic owner label; identical allocation semantics on every platform. */
+#ifdef __APPLE__
+void *runtime_low_map_named(size_t size,int prot,const char *owner);
+#else
+static inline void *runtime_low_map_named(size_t size,int prot,const char *owner) {
+    (void)owner; return runtime_low_map(size,prot);
+}
+#endif
 /* Host objects whose addresses enter the guest's 40-bit pointer fields. */
 #ifdef __APPLE__
 void *runtime_guest_malloc(size_t size);

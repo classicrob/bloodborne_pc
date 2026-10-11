@@ -13,6 +13,9 @@
 static pthread_mutex_t alloc_lock=PTHREAD_MUTEX_INITIALIZER;
 static uintptr_t next_low=UINT64_C(0x800000000);
 static int fail_after=-1;
+void *runtime_low_map_named(size_t n,int prot,const char *owner) {
+    (void)owner; return runtime_low_map(n,prot);
+}
 void *runtime_low_map(size_t n,int prot) {
     if (fail_after==0) return NULL;
     if (fail_after>0) --fail_after;

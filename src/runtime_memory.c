@@ -20,6 +20,7 @@
 #include <time.h>
 #include <errno.h>
 #ifdef __APPLE__
+#include <dlfcn.h>
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
 #endif
@@ -876,7 +877,37 @@ uintptr_t runtime_memory_resolve(const char *name) {
 /* Host-owned memory the guest can see (image, stacks, trampolines) lives in
  * [LOW_MIN, USER_MIN): PS4 code packs pointers into 40-bit fields. */
 static uintptr_t low_next=LOW_MIN;
-void *runtime_low_map(size_t size, int prot) {
+#ifdef __APPLE__
+static pthread_once_t low_trace_once=PTHREAD_ONCE_INIT;
+static int low_trace_enabled;
+static pthread_mutex_t low_trace_lock=PTHREAD_MUTEX_INITIALIZER;
+static uint64_t low_trace_sequence;
+static void low_trace_init(void) {
+    const char *value=getenv("BB_LOW_MAP_TRACE");
+    low_trace_enabled=value && !strcmp(value,"1");
+}
+/* Diagnostic only: map events are permanent mappings; alloc/free events describe
+ * suballocation ownership, not VM commits/decommits. Not a lifetime pin. */
+static void low_trace(const char *operation,const char *owner,void *pointer,size_t size,int prot,void *caller) {
+    pthread_once(&low_trace_once,low_trace_init);
+    if (!low_trace_enabled) return;
+    int saved_errno=errno;
+    Dl_info info={0};
+    dladdr(caller,&info);
+    pthread_mutex_lock(&low_trace_lock);
+    fprintf(stderr,"LOW-MEM #%" PRIu64 " %s owner=%s [%p,%p) bytes=%zu prot=%d caller=%p image=%s+0x%" PRIxPTR " symbol=%s\n",
+            ++low_trace_sequence,operation,owner,pointer,(void *)((uintptr_t)pointer+size),size,prot,caller,
+            info.dli_fname ? info.dli_fname : "unknown",
+            (uintptr_t)caller-(uintptr_t)info.dli_fbase,
+            info.dli_sname ? info.dli_sname : "unknown");
+    pthread_mutex_unlock(&low_trace_lock);
+    errno=saved_errno;
+}
+#endif
+static void *low_map(size_t size,int prot,const char *owner,void *caller) {
+#ifndef __APPLE__
+    (void)owner; (void)caller;
+#endif
     if (!size || size>LOW_MAX-LOW_MIN-PAGE) return NULL;
     size=align_up(size,PAGE);
 #ifdef __APPLE__
@@ -898,6 +929,7 @@ void *runtime_low_map(size_t size, int prot) {
         if (p!=MAP_FAILED) low_next+=size+PAGE;
     }
     write_unlock();
+    if (p!=MAP_FAILED) low_trace("map",owner,p,size,prot,caller);
     return p==MAP_FAILED ? NULL : p;
 #else
     void *p=MAP_FAILED;
@@ -911,6 +943,16 @@ void *runtime_low_map(size_t size, int prot) {
 #endif
 }
 #ifdef __APPLE__
+__attribute__((noinline)) void *runtime_low_map(size_t size,int prot) {
+    return low_map(size,prot,"unclassified",__builtin_return_address(0));
+}
+__attribute__((noinline)) void *runtime_low_map_named(size_t size,int prot,const char *owner) {
+    return low_map(size,prot,owner,__builtin_return_address(0));
+}
+#else
+void *runtime_low_map(size_t size,int prot) { return low_map(size,prot,NULL,NULL); }
+#endif
+#ifdef __APPLE__
 /* Small opaque handles share low chunks. Free blocks are split and coalesced,
  * so repeated synchronization-object creation cannot exhaust the low arena. */
 typedef struct GuestAllocation {
@@ -923,7 +965,7 @@ typedef struct GuestAllocation {
 #define GUEST_CHUNK ((size_t)1024*1024)
 static pthread_mutex_t guest_heap_lock=PTHREAD_MUTEX_INITIALIZER;
 static GuestAllocation *guest_heap;
-void *runtime_guest_malloc(size_t size) {
+__attribute__((noinline)) void *runtime_guest_malloc(size_t size) {
     if (!size) size=1;
     if (size>SIZE_MAX-GUEST_HEADER-GUEST_ALIGNMENT-PAGE) return NULL;
     size=(size+GUEST_ALIGNMENT-1)&~(GUEST_ALIGNMENT-1);
@@ -934,7 +976,7 @@ void *runtime_guest_malloc(size_t size) {
         size_t bytes=size+GUEST_HEADER;
         if (bytes<GUEST_CHUNK) bytes=GUEST_CHUNK;
         bytes=align_up(bytes,PAGE);
-        block=runtime_low_map(bytes,PROT_READ|PROT_WRITE);
+        block=runtime_low_map_named(bytes,PROT_READ|PROT_WRITE,"host-heap");
         if (!block) { pthread_mutex_unlock(&guest_heap_lock); return NULL; }
         *block=(GuestAllocation){.size=bytes-GUEST_HEADER,.free=1};
         if (last) last->next=block; else guest_heap=block;
@@ -945,6 +987,7 @@ void *runtime_guest_malloc(size_t size) {
         block->next=rest; block->size=size;
     }
     block->free=0;
+    low_trace("alloc","host-object",(unsigned char *)block+GUEST_HEADER,block->size,0,__builtin_return_address(0));
     pthread_mutex_unlock(&guest_heap_lock);
     return (unsigned char *)block+GUEST_HEADER;
 }
@@ -955,10 +998,11 @@ void *runtime_guest_calloc(size_t count, size_t size) {
     if (result) memset(result,0,bytes);
     return result;
 }
-void runtime_guest_free(void *pointer) {
+__attribute__((noinline)) void runtime_guest_free(void *pointer) {
     if (!pointer) return;
     GuestAllocation *block=(GuestAllocation *)((unsigned char *)pointer-GUEST_HEADER);
     pthread_mutex_lock(&guest_heap_lock);
+    low_trace("free","host-object",pointer,block->size,0,__builtin_return_address(0));
     block->free=1;
     for (GuestAllocation *at=guest_heap; at && at->next;) {
         GuestAllocation *next=at->next;
