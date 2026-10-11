@@ -152,7 +152,13 @@ bound, 1–60000, default 3000; malformed values disable it loudly) tests step 1
 At the `<frames>`th *retired* frame end (sceGnmSubmitDone after which GpuIdle was
 raised with nothing queued; a frame end that finds submissions already queued is not
 counted, so the held frame can be later than `<frames>` + 1) the GPU command thread
-stops parsing until the guest ends the next frame, then prints:
+stops parsing until the guest ends the next frame, then prints the report below. Frames
+count from launch, or with `BB_REPLAY_TRIGGER=<file>` from the poll that finds and
+removes that file (polled every 30 retired frame ends, so counting starts up to 30
+retired frame ends after the file appears), so a settled scene can be chosen by hand
+or by a playtest script.
+
+The report:
 
 - G1: whether the cut was reached, renderer quiescence, and blocking host commands that
   ran during the hold (buffer synchronize, import pause; they must run or the guest
