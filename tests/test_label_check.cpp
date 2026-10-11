@@ -259,43 +259,79 @@ int main() {
         Expect("  ... any other value stops", WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT);
     }
 
-    // BB_CMD_DATA_CHECK (bbport_cmd_data.h) with a fake snapshot lookup: one submitted region
-    // whose bytes are {1,2,3,4}; a read inside that matches, one that does not, one in the
-    // region's chunk tail, and the chunk arithmetic (256 KiB chunks from offset 0x20).
+    // BB_CMD_DATA_CHECK (bbport_cmd_data.h): the production classifier and its inputs.
     {
-        static const std::uint32_t submitted[4] = {1, 2, 3, 4};
-        static const std::uint64_t region = 0x703b400020 + 0x1000;
-        BbCmdData::lookup.store(+[](std::uint64_t address, std::uint64_t size) {
-            BbCmdData::Found found;
-            if (address >= region && address + size <= region + sizeof(submitted)) {
-                found.where = BbCmdData::Where::Inside;
-                found.copied = true;
-                std::memcpy(found.submitted,
-                            reinterpret_cast<const std::uint8_t*>(submitted) + (address - region),
-                            size);
-            } else if (address > region && address < BbCmdData::ChunkStart(region) + 0x40000) {
-                found.where = BbCmdData::Where::ChunkTail;
-                found.chunk_status = 2;
-            }
-            found.submission = 7;
-            found.region_start = region;
-            found.region_bytes = sizeof(submitted);
-            return found;
-        });
-        const std::uint32_t same[2] = {2, 3}, changed[2] = {2, 9};
-        BbCmdData::NoteRead("ud table", 0xabc, reinterpret_cast<const void*>(region + 4), 8, same);
-        BbCmdData::NoteRead("ud table", 0xabc, reinterpret_cast<const void*>(region + 4), 8,
-                            changed);
-        BbCmdData::NoteRead("ud table", 0xabc, reinterpret_cast<const void*>(region + 0x3e000), 16,
-                            same);
-        const auto& t = BbCmdData::detail::tallies[{"ud table", 0xabc}];
-        Expect("cmd data: inside reads compared with the submitted bytes, chunk tail counted",
-               t.inside == 2 && t.differs == 1 && t.chunk_tail == 1 && t.outside == 0);
-        Expect("  ... chunks of 256 KiB start at the 0x20 offset",
-               BbCmdData::ChunkStart(0x703b400020 + 0x40000 + 5) == 0x703b400020 + 0x40000 &&
-                   BbCmdData::ChunkStart(0x703b400020 + 0x3ffff) == 0x703b400020 &&
-                   BbCmdData::ChunkStart(0x703b40001f) == 0x703b400020 - 0x40000);
-        BbCmdData::lookup.store(nullptr);
+        using namespace BbCmdData;
+        // Two pools as captured (A1 starts 0x10 past 256 KiB alignment, A2 0x20).
+        std::vector<Pool> pools;
+        const bool parsed = ParsePools("0x7039400010:128,0x703b400020:384", 0x40000, pools);
+        static const std::uint8_t copy_a[16] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
+        static std::uint8_t copy_b[16];
+        std::memcpy(copy_b, copy_a, 16);
+        copy_b[4] = 99; // a second held copy of the same range, different bytes
+        const std::uint64_t a1_chunk = 0x7039400010 + 3 * 0x40000; // A1 chunk 3
+        const std::uint64_t region = a1_chunk + 0x100;
+        const std::vector<HeldRegion> held = {
+            {region, 16, 7, copy_a},
+            {region, 16, 9, copy_b}, // resubmitted
+        };
+        const Result same = Classify(region + 4, 4, copy_a + 4, held, pools, 9);
+        const Result newest = Classify(region + 4, 4, copy_a + 4, held, pools, 0);
+        Expect("cmd data: inside two held copies, one differs, the current one named",
+               parsed && same.where == Where::Inside && same.matches == 2 &&
+                   same.differing == 1 && same.current && same.submission == 9 &&
+                   !newest.current && newest.submission == 9);
+        const Result straddle = Classify(region + 12, 8, copy_a, held, pools, 0);
+        const Result tail = Classify(a1_chunk + 0x3ff00, 16, copy_a, held, pools, 0);
+        const Result next_chunk = Classify(a1_chunk + 0x40000 + 8, 8, copy_a, held, pools, 0);
+        const Result crossing = Classify(a1_chunk + 0x3fff8, 16, copy_a, held, pools, 0);
+        Expect("  ... straddling; a candidate tail in A1's chunk (offset 0x10); none in the next "
+               "chunk or across a chunk end",
+               straddle.where == Where::Straddles && tail.where == Where::ChunkTail &&
+                   tail.chunk_start == a1_chunk && tail.pool == 0 &&
+                   next_chunk.where == Where::Outside && crossing.where == Where::Outside);
+        const Result overflow = Classify(UINT64_MAX - 4, 16, copy_a, held, pools, 0);
+        static std::uint8_t big[512];
+        const std::vector<HeldRegion> big_held = {{0x1000, 512, 1, big}};
+        const Result uncompared = Classify(0x1000, 300, big, big_held, pools, 0);
+        Expect("  ... an overflowing range is invalid; over 256 bytes is located, not compared",
+               !overflow.valid_range && uncompared.where == Where::Inside &&
+                   !uncompared.compared && !uncompared.differing &&
+                   Describe(uncompared).find("not compared") != std::string::npos);
+        std::uint64_t v = 0;
+        std::vector<Pool> bad;
+        Expect("  ... strict numbers: no sign, no trailing text, no overflow, no empty pool",
+               ParseU64("0x40000", v) && v == 0x40000 && !ParseU64("-1", v) &&
+                   !ParseU64("+5", v) && !ParseU64("12x", v) &&
+                   !ParseU64("0x1ffffffffffffffff", v) && !ParsePools("0x1000:0", 0x40000, bad) &&
+                   !ParsePools("0x1000", 0x40000, bad) &&
+                   !ParsePools("0xffffffffffffff00:2", 0x40000, bad));
+        // The status word read after the lookup: readable, and in an unmapped page.
+        const long page = sysconf(_SC_PAGESIZE);
+        auto* two = static_cast<std::uint8_t*>(
+            mmap(nullptr, 2 * page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0));
+        const std::uint64_t status_value = 2;
+        std::memcpy(two + page - 8, &status_value, 8);
+        Result readable;
+        readable.where = Where::ChunkTail;
+        readable.chunk_start = reinterpret_cast<std::uint64_t>(two);
+        readable.chunk_bytes = page;
+        ReadStatus(readable);
+        Result unreadable = readable;
+        unreadable.chunk_start = reinterpret_cast<std::uint64_t>(two) + page;
+        munmap(two + page, page);
+        ReadStatus(unreadable);
+        Expect("  ... the chunk status is read without faulting, unreadable when unmapped",
+               readable.status_read && readable.chunk_status == 2 && !unreadable.status_read &&
+                   Describe(unreadable).find("unreadable") != std::string::npos);
+        // The latest read is formatted as observed, without touching its (now unmapped) address.
+        setenv("BB_CMD_DATA_CHECK", "1", 1);
+        last = {"ud table", 0xabc, reinterpret_cast<std::uint64_t>(two) + page, 16, same};
+        const std::string text = LastRead();
+        Expect("  ... the stop's latest-read text comes from the observation, not a re-read",
+               text.find("latest instrumented read: ud table") != std::string::npos &&
+                   text.find("some held copies differ") != std::string::npos);
+        munmap(two, page);
     }
 
     std::fprintf(stderr, "%s: %u failures\n", failures ? "FAIL" : "PASS", failures);

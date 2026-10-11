@@ -54,28 +54,45 @@ submitted `[begin, cmdptr)` range that the snapshot copies. The guest may reuse 
 believes the GPU is done with it. If we then read such data at parse time, we read bytes the
 guest has already replaced: for example, the GXFfxLightShaft vertex-buffer table read as floats.
 
-`BB_CMD_DATA_CHECK=1` (`gpu/shim/bbport_cmd_data.h`) classifies these parse-time guest reads
-against the snapshots still held:
+`BB_CMD_DATA_CHECK=1` (`gpu/shim/bbport_cmd_data.h`) locates these parse-time guest reads
+relative to the snapshots the GPU thread still holds:
 - `Info::ReadUdReg`: a descriptor table read through a user-data pointer, including the fetch
   shader's vertex-buffer table;
 - `Info::ReadTessConstantBuffer`.
 
-Each read falls into one of these:
-- **Inside a submitted region:** the bytes just read are compared with the submitted bytes.
-- **Straddling a region boundary.**
-- **In a submitted region's chunk tail:** past the region's end, in the same command chunk. The
-  chunk's status word (end − 8: 0 free, 1 claimed, 2 released) is reported as read now. The tail
-  is not copied at submit, so it cannot be compared.
-  - `BB_CMD_DATA_CHUNK`: the chunk size, default 262144.
-  - `BB_CMD_DATA_CHUNK_OFFSET`: where chunks start, modulo that size. The default 0x20 comes from
-    Astra-2's pool base, 0x703b400020.
-- **Outside command memory.**
+The classifier (`BbCmdData::Classify`) is pure. It runs under the snapshot lock against the
+snapshots' own copies and reads no guest memory. Each read falls into one of these:
+- **Inside:** every held region containing the range is compared with the bytes just read.
+  - The result says how many held copies contain it and how many differ. It also says whether
+    one of them is the parser's current submission (recorded per packet on the GPU thread; reads
+    on the draw thread have none).
+  - The selected region is the current submission's, else the newest.
+  - A resubmitted chunk shows up as several copies. A difference shows that a held copy differs
+    from the read, not by itself which submission's bytes the PS4 would have used.
+- **Straddling** a held region's boundary.
+- **A candidate chunk tail:** outside every held region, but in the same chunk of a known pool
+  as a held region that ends below it. The newest such submission is named.
+  - Pools come from `BB_CMD_DATA_POOLS` (`base:chunks,...`). The default is Astra-2's captured A1
+    at 0x7039400010 (128 chunks) and A2 at 0x703b400020 (384 chunks).
+  - `BB_CMD_DATA_CHUNK` is the chunk size, default 256 KiB.
+  - The geometry is assumed, and ownership of the address is not established.
+  - After the lock is released, the chunk's status word (its last 8 bytes: 0 free, 1 claimed,
+    2 released) is read without faulting (Mach). If that fails it is reported as unreadable.
+- **Outside the held regions and known pools.** Parsed snapshots are released, so this does not
+  mean outside command memory.
 
 **Output** goes to stdout:
-- `CMD-DATA #n` lines for the first 16 reads that are changed inside a region, or in a chunk
-  tail;
-- a summary every 65536 reads, per read kind and shader hash.
+- `CMD-DATA #n` lines for the first 16 notable reads: a held copy differs, straddling, or a
+  candidate tail;
+- a summary every 65536 reads across all kinds, with counts per read kind and shader hash.
 
-The `CheckNumberConversion` stop appends where this thread's latest instrumented read came from.
+The `CheckNumberConversion` stop appends this thread's latest instrumented read, **as observed
+then** (it never re-reads guest memory). That read is not necessarily the descriptor that stopped:
+it may have come from the uninstrumented flat buffer.
 
-**Not instrumented:** reads made by generated code (the SRT walker).
+**Limits:**
+- Supporting evidence only.
+- Reads made by generated code (the SRT walker) are not instrumented.
+- Each lookup takes the snapshot lock and scans the held regions. That serialises against
+  submissions and can change the timing of the race it observes.
+- Numeric settings are parsed strictly; a malformed value stops.
