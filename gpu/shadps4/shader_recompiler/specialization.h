@@ -135,6 +135,7 @@ struct StageSpecialization {
                              spec.is_null = emulate_null_descriptors &&
                                             (sharp.base_address == 0 || sharp.GetSize() == 0);
                              if (spec.is_null) return;
+                             Gcn::NoteVertexAttributeFormat(info->pgm_hash, desc, sharp);
                              using InstanceIdType = Shader::Gcn::VertexAttribute::InstanceIdType;
                              if (const auto step_rate = desc.GetStepRate();
                                  step_rate != InstanceIdType::None) {
