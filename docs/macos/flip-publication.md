@@ -97,3 +97,39 @@ The timeline check proves completion by observation time, not the internal
 ordering of the drawable callback: the latter inference additionally uses the
 pinned driver source. This fixture does not yet prove
 minimized/recreated swapchain behavior or exercise the production VideoOut path.
+
+## Runtime result and implementation decision
+
+The signed x86_64 qualifier exited **2** on October 11, 2026, under the quick
+pool and exclusive GPU lock. Installed MoltenVK dylib SHA-256:
+`583db6b034852823ad40c0c80fe0f5f145bd55b031310d356c29d685efe8d61c`.
+Compiler: Apple clang 21.0.0 (`clang-2100.0.123.102`); expanded build flags and
+output are in `out/flip-audit/present-timing.log`.
+
+- GOOGLE timing reported exactly IDs 1 through 28 of 30 FIFO presents. IDs 29
+  and 30 were still absent after the two-second tail with no further presents.
+- The observed GPU timeline reached 30, and zero-timeout present-wait for ID 30
+  returned success. That did not imply a corresponding drawable timing record.
+- The held-gate negative control was observed: one poll saw an unsignaled host
+  gate, GPU tick zero and no presentation timing row. It was not an unobserved
+  control hidden by a blocking submit/present call.
+
+This reproduces the documented final-callback progress limitation. It does not
+prove the two frames were not displayed, nor that callbacks can never arrive;
+it fails qualification for a guest that stops submitting while awaiting its
+last flip. No production publication change was made by this audit unit.
+
+After this result, the orchestrator explicitly selected **GPU retirement of the
+presenter's work for the frame** as the emulator's publication boundary. This
+supersedes the earlier physical-display requirement. The rationale is resource
+lifetime: after the presenter's final read/copy of the guest framebuffer
+retires, the swapchain owns the pixels independently and the guest can reuse
+its framebuffer. Vblank continues to model pacing. This is an explicit policy
+decision, not a claim that Metal command completion is physical display.
+
+Opus-PM4 owns the Apple-only implementation through ordered GPU completion,
+with an A/B toggle; Opus-Renderer reviews and must confirm there is no later
+guest-framebuffer read or zero-copy presentation path. Status/count, flip event
+and previous-buffer release must move together. The port-generation and
+swapchain-lifetime considerations above still apply; a skipped presentation
+must at least retire every preceding GPU read before releasing guest storage.
