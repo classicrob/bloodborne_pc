@@ -593,8 +593,29 @@ void Rasterizer::PostDraw(const Pipeline* pipeline, const PreparedDraw* used_pre
         }
     }
 #endif
-    const auto stages =
-        pipeline ? pipeline->GetStages() : std::span<const Shader::Info* const>{};
+    // The stages whose user data the recording thread binds: the pipeline's, and on Apple the
+    // ES and GS compute stages of an emulated geometry stage, which RecordGsEmulation binds on
+    // the recording thread too. Each gets its snapshot, or that thread would read the shared
+    // Info this thread refreshes for later draws of the same programs.
+    boost::container::static_vector<const Shader::Info*, Shader::MaxStageTypes> stages;
+    if (pipeline) {
+        for (const auto* stage : pipeline->GetStages()) {
+            if (stage) {
+                stages.push_back(stage);
+            }
+        }
+#ifdef __APPLE__
+        if (!pipeline->IsCompute()) {
+            if (const auto* gs = static_cast<const GraphicsPipeline*>(pipeline)->GsEmulation()) {
+                ASSERT_MSG(stages.size() + 2 <= stages.capacity(),
+                           "macOS geometry emulation: {} stages and the ES/GS exceed the draw "
+                           "packet's {} stage snapshots", stages.size(), stages.capacity());
+                stages.push_back(&gs->es->GetStage(Shader::SwStage::Compute));
+                stages.push_back(&gs->gs->GetStage(Shader::SwStage::Compute));
+            }
+        }
+#endif
+    }
     // Constants: copied here into the ring, the recording thread only binds them.
     thread_local std::array<boost::container::static_vector<RingBinding, Shader::NUM_BUFFERS>,
                             Shader::MaxStageTypes>
