@@ -123,3 +123,30 @@ destructor entry/exit with the queued render object's lifetime. Match any
 COND_EXEC/WRITE_DATA/EOP diagnostic to these concrete addresses before assigning
 causality. No guest patch, null-table bypass or rendering repair is justified
 by this static evidence alone.
+
+## Live dump: free GFX heap chunk, not a null resource
+
+The later production `d69ea95` run
+`20261010-212527-1080p-DIAG-pm4-d69ea95-3-newgame` captured the saved registers
+and memory with BB_FAULT_DUMP. At the same PC the fault address is **2**:
+RAX=0, RCX=2, R9=`0x7032033bf0`, R11=`0x70282adc00`,
+R14=`0x70282a2840`. R11 equals R14+0xb3c0; the list count is 2 and context ID 0.
+The second entry at R9 points to `0x70320335d0`, whose `+0x38` is 2.
+The actual saved frame is valid: `[RBP]=0x806b2bc10` and
+`[RBP+8]=0x80216aa85`. This resolves the earlier float-shaped unwind ambiguity.
+
+The pointed-to bytes are a **free heap chunk header**, rather than a valid
+resource with a merely null table. Its `+8` word is `0x70393fffe2`: next chunk
+boundary `0x70393fffe0` with flags 2 (free). The span is `0x73cca10` bytes,
+whose bin index is 26. Both links at `+0x10` and `+0x18` equal `0x80569a030`,
+exactly `GFX_heap_state(0x805699e78) + 0x18 + 26*16`.
+The allocation/free implementation at `0x2085730` / `0x20858a0` establishes
+this header layout and free-list calculation.
+
+Old CommandBuffer-looking bytes, including callback `0x8026af230` and userdata,
+remain in its payload. These are residue in free memory, **not evidence that a
+resource and command buffer are simultaneously allocated at the same address**.
+The concrete failure is a resource-list entry referring to freed/coalesced heap
+storage, or an entry corrupted into such a pointer. The underlying lifetime or
+corruption source remains open. The related lock audit and contention controls
+are recorded in `guest-heap-lock.md`.
