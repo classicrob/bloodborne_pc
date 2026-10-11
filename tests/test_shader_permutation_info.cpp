@@ -15,6 +15,8 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include <memory>
+#include <utility>
 
 static GcnAsm::Code Fetch(bool second) {
     GcnAsm::Code code;
@@ -119,5 +121,77 @@ int main() {
                           std::move(duplicate_info), 0);
     assert(preloaded.modules[0].info.get() == stable_info);
     assert(preloaded.modules[0].info->buffers.back().required_binding_bytes == 128);
-    std::puts("Permutation resource metadata: GPU + worker + preloaded storage PASS");
+    // Image descriptor counts (DynamicIndex mip fallback: one binding per mip level). The
+    // specialization records what the emitter declares, also for an image whose T# has no
+    // address but a mip range; the stored permutation records it, and a cache hit or a
+    // preloaded stage advances the bindings by those counts, not by one per image.
+    AmdGpu::Image null_tsharp{};
+    null_tsharp.base_address = 0;
+    null_tsharp.type = u64(AmdGpu::ImageType::Color2D);
+    null_tsharp.data_format = u64(AmdGpu::DataFormat::Format8_8_8_8);
+    null_tsharp.num_format = u64(AmdGpu::NumberFormat::Unorm);
+    null_tsharp.base_level = 0;
+    null_tsharp.last_level = 3;
+    Shader::ImageResource mip_image{};
+    mip_image.is_written = true;
+    mip_image.mip_fallback_mode = Shader::MipStorageFallbackMode::DynamicIndex;
+    std::memcpy(mip_image.sharp_fetch.immediates.data(), &null_tsharp, sizeof(null_tsharp));
+    mip_image.sharp_fetch.offsets.fill(0);
+    mip_image.sharp_fetch.load_mask = 0;
+    Shader::ImageResource plain_image = mip_image;
+    plain_image.mip_fallback_mode = Shader::MipStorageFallbackMode::None;
+    Shader::Info image_info{};
+    image_info.pgm_hash = 0x1111;
+    image_info.images.push_back(mip_image);
+    image_info.images.push_back(plain_image);
+    image_info.flattened_ud_buf.resize(16);
+    const Shader::StageSpecialization image_spec(image_info, Shader::RuntimeInfo{},
+                                                 cache.GetProfile(), {});
+    std::fprintf(stderr, "Image binding counts: specialized %u, %u\n",
+                 image_spec.images[0].num_bindings, image_spec.images[1].num_bindings);
+    assert(image_spec.images[0].num_bindings == 4);
+    assert(image_spec.images[1].num_bindings == 1);
+    // Specializations differing only in a null image's mip count select different
+    // permutations, in both directions: with every resource null, and with a valid one too.
+    const auto spec_with_levels = [&](u32 last_level, bool valid_plain) {
+        AmdGpu::Image tsharp = null_tsharp;
+        tsharp.last_level = last_level;
+        Shader::Info variant = image_info;
+        std::memcpy(variant.images[0].sharp_fetch.immediates.data(), &tsharp, sizeof(tsharp));
+        if (valid_plain) {
+            AmdGpu::Image valid = null_tsharp;
+            valid.base_address = 0x40000000ull >> 8;
+            std::memcpy(variant.images[1].sharp_fetch.immediates.data(), &valid, sizeof(valid));
+        }
+        auto info_copy = std::make_shared<Shader::Info>(variant);
+        return std::pair{info_copy, Shader::StageSpecialization(*info_copy, Shader::RuntimeInfo{},
+                                                                cache.GetProfile(), {})};
+    };
+    for (bool valid_plain : {false, true}) {
+        const auto four = spec_with_levels(3, valid_plain);
+        const auto two = spec_with_levels(1, valid_plain);
+        const auto four_again = spec_with_levels(3, valid_plain);
+        std::fprintf(stderr, "Image binding counts: null mips 4 vs 2 (valid other image %d): %u/%u\n",
+                     valid_plain, four.second.images[0].num_bindings,
+                     two.second.images[0].num_bindings);
+        assert(four.second.images[0].num_bindings == 4 && two.second.images[0].num_bindings == 2);
+        assert(!(four.second == two.second) && !(two.second == four.second));
+        assert(four.second == four_again.second);
+    }
+    Vulkan::Program image_program;
+    Shader::StageSpecialization stored_spec = image_spec;
+    image_program.InsertPermut(std::get<1>(first), std::move(stored_spec), Shader::Info{image_info},
+                               0);
+    const auto& stored = *image_program.modules[0].info;
+    assert(stored.images[0].permutation_bindings == 4);
+    assert(stored.images[1].permutation_bindings == 1);
+    assert(image_program.modules[0].info_template->images[0].permutation_bindings == 4);
+    // A later stage starts after all 5 image descriptors (compile and cache hit alike).
+    Shader::Backend::Bindings after{};
+    stored.AddBindings(after);
+    std::fprintf(stderr, "Image binding counts: stored stage advances unified by %u\n",
+                 after.unified);
+    assert(after.unified == stored.buffers.size() + 5 + stored.samplers.size());
+    std::puts("Permutation resource metadata: GPU + worker + preloaded storage + image binding "
+              "counts PASS");
 }

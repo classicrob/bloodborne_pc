@@ -18,7 +18,7 @@ static constexpr u32 ShaderBinaryVersion = 24u; // Wave64: SMEM_ZERO for diverge
 #else
 static constexpr u32 ShaderBinaryVersion = 14u; // Integer buffer swizzle constants and packed SNORM minima.
 #endif
-static constexpr u32 ShaderMetaVersion = 10u; // RuntimeInfo carries the geometry emulation role and GSVS layout.
+static constexpr u32 ShaderMetaVersion = 12u; // Persistent Info: image binding counts, attribute loads/stores.
 static constexpr u32 PipelineKeyVersion = 11u; // Keys name the ES/GS of an emulated geometry stage.
 } // namespace Serialization
 
@@ -151,7 +151,17 @@ bool ComputePipeline::SerializationSupport::Deserialize(Serialization::Archive& 
     return true;
 }
 
+void PipelineCache::ResetPreloadSelection() {
+    sel.infos.fill(nullptr);
+    sel.modules.fill(nullptr);
+    sel.fetch_shader.reset();
+    for (auto& runtime_info : sel.runtime_infos) {
+        runtime_info = Shader::RuntimeInfo{};
+    }
+}
+
 bool PipelineCache::LoadComputePipeline(Serialization::Archive& ar) {
+    ResetPreloadSelection();
     compute_key.Deserialize(ar);
 
     ComputePipeline::SerializationSupport sdata{};
@@ -220,6 +230,10 @@ bool GraphicsPipeline::SerializationSupport::Deserialize(Serialization::Archive&
 }
 
 bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
+    // bbport: a record starts from an empty selection. A record that failed part-way (missing
+    // stage metadata) leaves stages behind, and a later record without those stages would be
+    // built with them.
+    ResetPreloadSelection();
     sel.graphics_key.Deserialize(ar);
 
     GraphicsPipeline::SerializationSupport sdata{};
@@ -306,6 +320,10 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
             module = CompileSPV(spv, instance.GetDevice());
         }
     }
+    // bbport: the stage's runtime info as it was compiled (its specialization keeps it). Pipeline
+    // construction reads it even when preloading: the depth-bounds set of an Apple fragment
+    // shader, the pre-raster/fragment interface checks.
+    sel.runtime_infos[stage] = spec.runtime_info;
     it_pgm.value()->InsertPermut(module, std::move(spec), std::move(info), perm_idx);
 
     sel.infos[stage] = it_pgm.value()->modules[perm_idx].info.get();
@@ -395,6 +413,7 @@ void PipelineCache::WarmUp() {
                     num_total_pipelines - num_pipelines);
     }
 
+    ResetPreloadSelection();
     Storage::DataBase::Instance().FinishPreload();
 }
 

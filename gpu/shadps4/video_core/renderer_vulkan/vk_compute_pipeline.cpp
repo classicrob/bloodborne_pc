@@ -46,8 +46,12 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
             .stageFlags = vk::ShaderStageFlagBits::eCompute,
         });
     }
-    for (const auto& image : info->images) {
-        const u32 num_bindings = image.NumBindings(*info);
+    for (u32 image_index = 0; image_index < info->images.size(); ++image_index) {
+        const auto& image = info->images[image_index];
+        // As compiled into the permutation (no live user data when built from the cache).
+        const u32 num_bindings = image.permutation_bindings;
+        ASSERT_MSG(num_bindings, "Image {} of shader {:#x} has no recorded binding count",
+                   image_index, info->pgm_hash);
         bindings.push_back({
             .binding = binding,
             .descriptorType = image.is_written ? vk::DescriptorType::eStorageImage

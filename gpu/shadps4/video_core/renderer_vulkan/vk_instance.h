@@ -131,6 +131,12 @@ public:
         return vk12_features.drawIndirectCount;
     }
 
+    /// Vertex/tessellation-evaluation stages may write the render-target layer (layered
+    /// rendering without a geometry stage: the emulated GS's copy shader).
+    bool IsShaderOutputLayerSupported() const {
+        return vk12_features.shaderOutputLayer;
+    }
+
     /// Returns true if 16-bit floats are supported in shaders
     bool IsShaderFloat16Supported() const {
         return vk12_features.shaderFloat16;

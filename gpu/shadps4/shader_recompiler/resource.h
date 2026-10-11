@@ -142,6 +142,11 @@ struct ImageResource {
     u8 constant_mip_index{};
     MipStorageFallbackMode mip_fallback_mode{};
     SharpFetchPostOp post_op{};
+    /// bbport: descriptor count of this image in the permutation it belongs to, from its
+    /// specialization when the permutation is stored (0 before). Pipeline layouts and descriptor
+    /// writes use it: a pipeline rebuilt from the stage cache has no live user data, and
+    /// NumBindings (live) stays what selects the permutation.
+    u32 permutation_bindings{};
 
     constexpr AmdGpu::Image GetSharp(const auto& info) const noexcept {
         AmdGpu::Image image{};

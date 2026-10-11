@@ -292,6 +292,28 @@ GraphicsPipeline::GraphicsPipeline(
     }
 
 #ifdef __APPLE__
+    // Layered rendering and clip distances from a vertex or tessellation-evaluation stage (an
+    // emulated geometry shader's copy shader writes the cube face and two clip distances,
+    // docs/macos/shader-sweep.md) need shaderOutputLayer and shaderClipDistance; without them
+    // those outputs are invalid. M4 Max / MoltenVK 1.4.2 has both.
+    for (const auto pre_raster : {Shader::SwStage::Vertex, Shader::SwStage::TessellationEval}) {
+        const auto* pre = stages[u32(pre_raster)];
+        if (!pre) {
+            continue;
+        }
+        if (pre->stores.GetAny(Shader::IR::Attribute::RenderTargetIndex) &&
+            !instance.IsShaderOutputLayerSupported()) {
+            UNREACHABLE_MSG("macOS: shader {:#x} writes the render-target layer, which needs "
+                            "shaderOutputLayer; this device lacks it",
+                            pre->pgm_hash);
+        }
+        if (pre->stores.GetAny(Shader::IR::Attribute::ClipDistance) &&
+            !instance.IsShaderClipDistanceSupported()) {
+            UNREACHABLE_MSG("macOS: shader {:#x} writes clip distances, which need "
+                            "shaderClipDistance; this device lacks it",
+                            pre->pgm_hash);
+        }
+    }
     // GCN lets the pixel shader read a parameter the last pre-rasterization stage never exported
     // (value undefined); Metal refuses to link such a pipeline. The auxiliary RectList/QuadList
     // stages forward zero for these. A direct VS/TES -> FS pipeline cannot yet: the producing
@@ -521,7 +543,9 @@ GraphicsPipeline::GraphicsPipeline(
 
     auto [pipeline_result, pipe] =
         device.createGraphicsPipelineUnique(pipeline_cache, pipeline_info);
-    ASSERT_MSG(pipeline_result == vk::Result::eSuccess, "Failed to create graphics pipeline: {}",
+    ASSERT_MSG(pipeline_result == vk::Result::eSuccess,
+               "Failed to create graphics pipeline {} ({}): {}", debug_str,
+               preloading ? "preloaded from the pipeline cache" : "new",
                vk::to_string(pipeline_result));
     pipeline = std::move(pipe);
     SetObjectName(device, *pipeline, "Graphics Pipeline {}", debug_str);
@@ -620,8 +644,12 @@ void GraphicsPipeline::BuildDescSetLayout(bool preloading) {
                 .stageFlags = stage_bit,
             });
         }
-        for (const auto& image : stage->images) {
-            const u32 num_bindings = image.NumBindings(*stage);
+        for (u32 image_index = 0; image_index < stage->images.size(); ++image_index) {
+            const auto& image = stage->images[image_index];
+            // As compiled into the permutation (no live user data when built from the cache).
+            const u32 num_bindings = image.permutation_bindings;
+            ASSERT_MSG(num_bindings, "Image {} of shader {:#x} has no recorded binding count",
+                       image_index, stage->pgm_hash);
             bindings.push_back({
                 .binding = binding,
                 .descriptorType = image.is_written ? vk::DescriptorType::eStorageImage
