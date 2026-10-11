@@ -114,6 +114,7 @@ std::array<BuilderTrace::Call, 8192> builder_trace;
 u64 builder_trace_calls = 0;
 std::atomic<u32> builder_trace_threads = 0;
 std::array<std::array<char, 32>, 256> builder_thread_names{}; ///< by thread number (mod 256)
+std::array<uintptr_t, 256> builder_thread_ids{}; ///< pthread_self(), to match other diagnostics
 } // namespace
 
 u32 BuilderTrace::ThreadNumber() {
@@ -125,6 +126,10 @@ u32 BuilderTrace::ThreadNumber() {
 #endif
         std::scoped_lock lk{builder_trace_mutex};
         builder_thread_names[number % builder_thread_names.size()] = name;
+#ifndef _WIN32
+        builder_thread_ids[number % builder_thread_ids.size()] =
+            reinterpret_cast<uintptr_t>(pthread_self());
+#endif
         return number;
     }();
     return thread;
@@ -132,7 +137,9 @@ u32 BuilderTrace::ThreadNumber() {
 
 std::string BuilderTrace::ThreadName(u32 thread) {
     std::scoped_lock lk{builder_trace_mutex};
-    return builder_thread_names[thread % builder_thread_names.size()].data();
+    const u32 slot = thread % builder_thread_names.size();
+    return fmt::format("{} pthread {:#x}", builder_thread_names[slot].data(),
+                       builder_thread_ids[slot]);
 }
 
 void BuilderTrace::Note(const char* builder, const u32* cmdbuf, u32 size,

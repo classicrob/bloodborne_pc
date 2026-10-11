@@ -106,7 +106,8 @@ public:
     /// Guest thread, on entry to a builder. `frame`: the builder's frame pointer
     /// (__builtin_frame_address(0)), from which the guest call chain is walked; 0 for none.
     static void Note(const char* builder, const u32* cmdbuf, u32 size, uintptr_t frame = 0);
-    /// The name the given trace thread number had when it first called a builder.
+    /// The name the given trace thread number had when it first called a builder, and its
+    /// pthread_self() (which the guest entry probe also logs), as "name pthread 0x...".
     [[nodiscard]] static std::string ThreadName(u32 thread);
     /// The calling thread's number in the trace.
     [[nodiscard]] static u32 ThreadNumber();

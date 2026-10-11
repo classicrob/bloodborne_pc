@@ -272,7 +272,7 @@ int main() {
                    with_chain[0].chain[0] > here && with_chain[0].chain[0] < here + 64);
         Expect("trace: thread name recorded",
                with_chain.size() == 1 &&
-                   BuilderTrace::ThreadName(with_chain[0].thread) == "TraceNamed");
+                   BuilderTrace::ThreadName(with_chain[0].thread).starts_with("TraceNamed pthread 0x"));
         static u32 unchained[8];
         BuilderTrace::Note("NoFrame", unchained, 4, 0x10); // not on this stack: no chain
         const auto without = BuilderTrace::Around(unchained, unchained + 1, 0);
