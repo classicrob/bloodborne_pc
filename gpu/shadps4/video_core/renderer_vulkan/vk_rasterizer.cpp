@@ -1290,9 +1290,13 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
         BindIndexBuffer();
     }
 
-    const auto [buffer, base] =
-        buffer_cache.ObtainBuffer(indirect.args, stride * max_count, false);
-    needs_barrier |= runtime.IsBufferAccessed(buffer, base, stride * max_count);
+    // An emulated ES/GS draw read its arguments in RecordGsEmulationIndirect.
+    const auto [buffer, base] = gs_draw.indirect
+        ? std::pair<const VideoCore::Buffer*, u64>{nullptr, 0}
+        : buffer_cache.ObtainBuffer(indirect.args, stride * max_count, false);
+    if (buffer) {
+        needs_barrier |= runtime.IsBufferAccessed(buffer, base, stride * max_count);
+    }
 
     const VideoCore::Buffer* count_buffer;
     u64 count_offset;
@@ -1500,10 +1504,11 @@ void Rasterizer::Finish() {
 }
 
 void Rasterizer::OnSubmit() {
+    DrainDrawPipe();
 #ifdef __APPLE__
+    // After the drain: stage B creates the error words with the first indirect ES/GS draw.
     CheckGsEmulationErrors();
 #endif
-    DrainDrawPipe();
     if (fault_process_pending) {
         fault_process_pending = false;
         buffer_cache.ProcessFaultBuffer();

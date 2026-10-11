@@ -27,14 +27,23 @@ layout(push_constant) uniform Params {
     uint vertex_dwords;
     uint run_length;
     uint capacity_dwords; // dwords of the scratch range
+    uint args_address_lo; // guest address of the arguments, named in the report
+    uint args_address_hi;
 };
 
 // Header (gs_emulation.h)
 const uint RecordsPerInstance = 0, PrimsPerInstance = 1, Instances = 2, IndexKindField = 3,
            BaseVertex = 4, BaseInstance = 5, FirstIndex = 6, EsgsBase = 7, GsvsBase = 8,
            IndexBase = 9, EsDispatch = 16, GsDispatch = 19, StripDraw = 22, IndirectDwords = 32;
-// errors[]: [0] reports, [1] largest scratch dwords asked for, [2] index overruns
+// errors[]: [0] reports, [1] largest scratch dwords asked for, [2] index overruns,
+// [3..4] guest address of the last reported draw's arguments
 const uint WorkgroupSize = 64;
+
+void Report() {
+    atomicAdd(errors[0], 1);
+    errors[3] = args_address_lo;
+    errors[4] = args_address_hi;
+}
 
 void main() {
     uint count = args[args_skip + 0];
@@ -46,7 +55,7 @@ void main() {
         base_vertex = args[args_skip + 3]; // vertexOffset (int32 bits)
         base_instance = args[args_skip + 4];
         if (uint64_t(first_index) + count > index_count) {
-            atomicAdd(errors[0], 1);
+            Report();
             atomicAdd(errors[2], 1);
             count = 0;
         }
@@ -60,7 +69,7 @@ void main() {
     uint64_t gsvs = slots * max_vert_out * vertex_dwords;
     uint64_t needed = IndirectDwords + esgs + gsvs + slots * run_length;
     if (needed > capacity_dwords) {
-        atomicAdd(errors[0], 1);
+        Report();
         atomicMax(errors[1], needed > 0xFFFFFFFFul ? 0xFFFFFFFFu : uint(needed));
         count = 0;
         prims = 0;

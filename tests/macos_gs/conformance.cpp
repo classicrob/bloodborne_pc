@@ -85,6 +85,7 @@ struct SetupParams {
     u32 args_skip, indexed, index_kind, index_skip, index_count;
     u32 verts_per_prim, invocations, max_vert_out, esgs_dwords, vertex_dwords, run_length;
     u32 capacity_dwords;
+    u32 args_address_lo, args_address_hi;
 };
 
 u32 VertsPerPrim(AmdGpu::PrimitiveType t) {
@@ -762,7 +763,7 @@ bool RunCase(const Case& k, const std::string& spv_dir) {
     Buffer vertices = MakeBuffer(std::max<u64>(want.list.size(), 1) * sizeof(Vertex));
     std::memcpy(vertices.data, want.list.data(), want.list.size() * sizeof(Vertex));
     // Indirect: the guest command, the error words and the production setup kernel.
-    Buffer args = MakeBuffer(64), errors = MakeBuffer(16);
+    Buffer args = MakeBuffer(64), errors = MakeBuffer(32);
     VkPipeline setup_pipe = VK_NULL_HANDLE;
     Layout setup_layout{};
     SetupParams setup{};
@@ -784,12 +785,14 @@ bool RunCase(const Case& k, const std::string& spv_dir) {
                  .esgs_dwords = EsDwords,
                  .vertex_dwords = OutDwords,
                  .run_length = run_length,
-                 .capacity_dwords = u32(bytes / 4)};
+                 .capacity_dwords = u32(bytes / 4),
+                 .args_address_lo = 0x1234560,
+                 .args_address_hi = 0x7f};
         // The CPU header is not used: the kernel writes it.
         std::memset(scratch.data, 0xCD, GsEmu::IndirectDwords * 4);
         std::vector<VkDescriptorBufferInfo> r = {{args.buffer, 0, 64},
                                                  {scratch.buffer, 0, bytes},
-                                                 {errors.buffer, 0, 16}};
+                                                 {errors.buffer, 0, 32}};
         setup_layout = MakeLayout(VK_SHADER_STAGE_COMPUTE_BIT, r);
         // MakeLayout's push range is PushData-sized, which covers SetupParams.
         setup_pipe = ComputePipeline(Module(ReadFile(spv_dir + "/gs_indirect_setup.comp.spv")),
@@ -881,7 +884,8 @@ bool RunCase(const Case& k, const std::string& spv_dir) {
     if (k.indirect) {
         const u32* e = reinterpret_cast<const u32*>(errors.data);
         const bool want_report = k.overflow;
-        if ((e[0] != 0) != want_report || (want_report && e[1] != needed_bytes / 4)) {
+        if ((e[0] != 0) != want_report ||
+            (want_report && (e[1] != needed_bytes / 4 || e[3] != 0x1234560 || e[4] != 0x7f))) {
             char line[200];
             std::snprintf(line, sizeof line,
                           "    setup kernel reports %u (largest need %u dwords, %u index overruns); "

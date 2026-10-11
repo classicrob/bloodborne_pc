@@ -5,8 +5,8 @@
 #pragma once
 
 #include <memory>
-#include "shader_recompiler/gs_emulation.h"
 #include <optional>
+#include "shader_recompiler/gs_emulation.h"
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 

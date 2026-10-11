@@ -220,8 +220,9 @@ void Rasterizer::RecordGsBarrier(vk::PipelineStageFlags2 dst_stage, vk::AccessFl
 }
 
 namespace {
-/// errors[] of gs_indirect_setup.comp: reports, largest scratch dwords asked for, index overruns.
-constexpr u32 ErrorDwords = 4;
+/// errors[] of gs_indirect_setup.comp: reports, largest scratch dwords asked for, index overruns,
+/// guest address (low, high) of the indirect arguments of the last draw reported.
+constexpr u32 ErrorDwords = 8;
 /// Scratch range of one indirect ES/GS draw (its counts are only known to the GPU) and the ring
 /// they come from.
 constexpr u64 IndirectScratchBytes = 32_MB;
@@ -237,6 +238,7 @@ struct SetupParams {
     u32 args_skip, indexed, index_kind, index_skip, index_count;
     u32 verts_per_prim, invocations, max_vert_out, esgs_dwords, vertex_dwords, run_length;
     u32 capacity_dwords;
+    u32 args_address_lo, args_address_hi;
 };
 } // namespace
 
@@ -246,9 +248,11 @@ void Rasterizer::CheckGsEmulationErrors() {
     }
     const auto* errors = reinterpret_cast<const volatile u32*>(gs_errors->mapped_data.data());
     ASSERT_MSG(errors[0] == 0,
-               "macOS geometry emulation: {} indirect ES/GS draw(s) could not be emulated (largest "
-               "scratch need {} dwords of {}; {} read past the index buffer)",
-               errors[0], errors[1], IndirectScratchBytes / 4, errors[2]);
+               "macOS geometry emulation: {} indirect ES/GS draw(s) could not be emulated, the "
+               "last with arguments at {:#x} (largest scratch need {} dwords of {}; {} read past "
+               "the index buffer)",
+               errors[0], u64(errors[3]) | (u64(errors[4]) << 32), errors[1],
+               IndirectScratchBytes / 4, errors[2]);
 }
 
 GsEmulationDraw Rasterizer::RecordGsEmulationIndirect(const GraphicsPipeline* pipeline,
@@ -340,6 +344,8 @@ GsEmulationDraw Rasterizer::RecordGsEmulationIndirect(const GraphicsPipeline* pi
         .vertex_dwords = stages.vertex_dwords,
         .run_length = stages.run_length,
         .capacity_dwords = u32(IndirectScratchBytes / 4),
+        .args_address_lo = u32(args),
+        .args_address_hi = u32(args >> 32),
     };
     if (is_indexed) {
         ASSERT_MSG((regs.enable_primitive_restart & 1) == 0,
