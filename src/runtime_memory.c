@@ -1056,6 +1056,34 @@ int runtime_memory_backing_region(uintptr_t address,uintptr_t *start,uintptr_t *
     read_unlock();
     return found;
 }
+int runtime_memory_alias_snapshot(uintptr_t address,RuntimeMemoryAlias *aliases,
+                                 size_t capacity,RuntimeMemoryAliasSnapshot *snapshot) {
+    if (!snapshot || (capacity && !aliases)) return -1;
+    *snapshot=(RuntimeMemoryAliasSnapshot){0};
+    read_lock();
+    snapshot->generation=__atomic_load_n(&table_generation,__ATOMIC_ACQUIRE);
+    size_t source=vma_index(address);
+    int found=source<vma_count && vmas[source].start<=address &&
+              vmas[source].kind!=KIND_RESERVED;
+    if (found) {
+        const Vma *v=&vmas[source];
+        uint64_t byte=v->phys+(address-v->start);
+        snapshot->backing_byte=byte;
+        snapshot->start=v->start; snapshot->end=v->end; snapshot->prot=v->prot;
+        for (size_t i=0;i<vma_count;++i) {
+            v=&vmas[i];
+            if (i==source || v->kind==KIND_RESERVED || byte<v->phys ||
+                byte-v->phys>=v->end-v->start) continue;
+            ++snapshot->total;
+            if (snapshot->copied<capacity)
+                aliases[snapshot->copied++]=(RuntimeMemoryAlias){
+                    v->start,v->end,v->start+(byte-v->phys),v->phys,v->prot};
+        }
+        snapshot->truncated=snapshot->copied<snapshot->total;
+    }
+    read_unlock();
+    return found;
+}
 #endif
 /* GPU page tracking: restrict host access, never beyond the guest's own protection. */
 void runtime_memory_gpu_protect(uintptr_t address, uint64_t size, int read, int write) {

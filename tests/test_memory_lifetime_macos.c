@@ -49,9 +49,71 @@ static void end(void) {
     active=0; ++ends; assert(begins==ends); assert(!pthread_mutex_unlock(&gate));
 }
 static void balanced(void) { assert(!active && begins==ends && !lifetime_depth); }
+static void alias_diagnostic_test(void) {
+    RuntimeMemoryAlias rows[3], saved[3];
+    RuntimeMemoryAliasSnapshot snapshot;
+    assert(runtime_memory_alias_snapshot(LOW_MIN,NULL,1,&snapshot)==-1);
+    assert(runtime_memory_alias_snapshot(LOW_MIN,rows,3,NULL)==-1);
+    assert(!runtime_memory_alias_snapshot(LOW_MIN,NULL,0,&snapshot));
+    assert(!snapshot.total && !snapshot.copied && !snapshot.truncated);
+    int64_t physical;
+    assert(!direct_allocate(0,POOL_SIZE,5*PAGE,PAGE,0,&physical));
+    void *a=NULL,*b=NULL,*c=NULL;
+    assert(!direct_map(&a,5*PAGE,3,0,physical,PAGE));
+    assert(!direct_map(&b,2*PAGE,3,0,physical+PAGE,PAGE));
+    assert(!direct_map(&c,PAGE,1,0,physical+PAGE,PAGE));
+    uintptr_t query=(uintptr_t)a+PAGE+17;
+    assert(runtime_memory_alias_snapshot(query,rows,3,&snapshot)==1);
+    assert(snapshot.start==(uintptr_t)a && snapshot.end==(uintptr_t)a+5*PAGE);
+    assert(snapshot.backing_byte==(uint64_t)physical+PAGE+17 && snapshot.prot==3);
+    assert(snapshot.total==2 && snapshot.copied==2 && !snapshot.truncated);
+    assert(!(snapshot.generation&1));
+    uint64_t generation=snapshot.generation;
+    unsigned matches=0;
+    for (unsigned i=0;i<2;++i) {
+        assert(rows[i].backing_offset==(uint64_t)physical+PAGE);
+        if (rows[i].start==(uintptr_t)b) {
+            assert(rows[i].end==(uintptr_t)b+2*PAGE && rows[i].address==(uintptr_t)b+17);
+            assert(rows[i].prot==3); matches|=1;
+        } else if (rows[i].start==(uintptr_t)c) {
+            assert(rows[i].end==(uintptr_t)c+PAGE && rows[i].address==(uintptr_t)c+17);
+            assert(rows[i].prot==1); matches|=2;
+        } else assert(0);
+    }
+    assert(matches==3 && rows[0].start<rows[1].start);
+    memset(rows,0xa5,sizeof(rows)); memcpy(saved,rows,sizeof(rows));
+    assert(runtime_memory_alias_snapshot(query,rows,1,&snapshot)==1);
+    assert(snapshot.total==2 && snapshot.copied==1 && snapshot.truncated);
+    assert(!memcmp(rows+1,saved+1,2*sizeof(*rows)));
+    assert(runtime_memory_alias_snapshot(query,NULL,0,&snapshot)==1);
+    assert(snapshot.total==2 && !snapshot.copied && snapshot.truncated);
+    assert(snapshot.generation==generation);
+    /* The adjacent physical byte beyond b must not be reported as aliased. */
+    assert(runtime_memory_alias_snapshot((uintptr_t)a+3*PAGE,rows,3,&snapshot)==1);
+    assert(!snapshot.total && !snapshot.copied && !snapshot.truncated);
+    assert(!direct_release(physical+PAGE,PAGE));
+    assert(!runtime_memory_alias_snapshot(query,rows,3,&snapshot));
+    assert(snapshot.generation>generation && !snapshot.total && !snapshot.start);
+    assert(runtime_memory_alias_snapshot((uintptr_t)a+2*PAGE+9,rows,3,&snapshot)==1);
+    assert(snapshot.total==1 && snapshot.copied==1);
+    assert(rows[0].address==(uintptr_t)b+PAGE+9);
+    assert(rows[0].backing_offset==(uint64_t)physical+2*PAGE);
+    assert(!direct_release(physical,PAGE));
+    assert(!direct_release(physical+2*PAGE,3*PAGE));
+    void *flex=NULL,*reserved=NULL;
+    assert(!map_flexible(&flex,PAGE,3,0));
+    assert(runtime_memory_alias_snapshot((uintptr_t)flex+7,rows,3,&snapshot)==1);
+    assert(snapshot.backing_byte>=POOL_SIZE && !snapshot.total);
+    assert(!reserve_range(&reserved,PAGE,0,PAGE));
+    assert(!runtime_memory_alias_snapshot((uintptr_t)reserved,rows,3,&snapshot));
+    assert(!snapshot.start && !snapshot.backing_byte && !snapshot.total);
+    assert(!direct_unmap(flex,PAGE)); assert(!direct_unmap(reserved,PAGE));
+    puts("PASS: bounded alias snapshot, physical offsets, truncation, release splits, generations, untracked vs no aliases");
+}
 int main(void) {
     alarm(30);
     runtime_memory_reserve();
+    alias_diagnostic_test();
     runtime_memory_set_gpu_hooks(notify,notify,notify);
     runtime_memory_set_gpu_lifetime_hooks(begin,retire,end);
     int64_t physical;
