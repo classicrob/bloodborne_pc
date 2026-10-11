@@ -415,7 +415,11 @@ int main(int argc,char** argv) {
             submit(e,producer,nullptr,0,ready,value,nullptr);
             id<MTLCommandBuffer> cb=nil;
             if(provider && value<=8) {
-                provider->Submit(binding,{value,value,value-1,reactiveHistory?0:value,0,0});
+                // Alternate threads (the renderer's hook runs on whichever thread owns the
+                // scheduler); the provider only forbids overlapping calls.
+                const BbMetalFX::Frame frame{value,value,value-1,reactiveHistory?0:value,0,0};
+                if(value%2) provider->Submit(binding,frame);
+                else std::thread([&]{ provider->Submit(binding,frame); }).join();
             } else {
                 cb=[e.metalQueue commandBuffer];
                 [cb encodeWaitForEvent:readyMetal value:value];
@@ -442,7 +446,7 @@ int main(int argc,char** argv) {
                     "Vulkan -> MetalFX -> Vulkan pixel mismatch");
         }
         std::puts("PASS: same-texture interop, separate GPU queues, shared timeline events; 16 alternating frames");
-        if(provider) std::puts("PASS: standalone signed Apple module, cached exports, history reset and GPU event interop");
+        if(provider) std::puts("PASS: standalone signed Apple module, cached exports, history reset and GPU event interop, submits alternating threads");
         if(reactiveHistory) std::puts("PASS: reactive mask=1 rejects alternating color history with a continuous epoch");
         if(wantPresent) {
             id<MTLCommandBuffer> cb=nil;
