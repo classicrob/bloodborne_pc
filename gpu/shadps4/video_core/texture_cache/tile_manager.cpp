@@ -331,7 +331,7 @@ void TileManager::TileImage(Image& in_image, std::span<vk::BufferImageCopy> buff
     RecordTilingDispatch(GetTilingPipeline(info, true), tiled_buffer_info, linear_buffer_info,
                          params_buffer_info, dim_x);
     // The tiling dispatch is the staging buffer's last use.
-    runtime.GetStagingPool().RetireLarge(staging.buffer);
+    runtime.GetStagingPool().Retire(staging.buffer, staging.offset);
 
     runtime.AccessBuffer(out_buffer, out_offset, info.guest_size,
                          vk::PipelineStageFlagBits2::eComputeShader,

@@ -516,7 +516,7 @@ void Runtime::CopyColorAndDepth(VideoCore::Image* src, VideoCore::Image* dst) {
                 COPY_BUFFER_SIZE, VideoCore::MemoryType::DeviceLocal, 0, false, true);
             CopyImageWithBuffer(src, dst, copy_ref.buffer, copy_ref.offset);
             // The copy into dst is the intermediate buffer's last use.
-            staging_pool.RetireLarge(copy_ref.buffer);
+            staging_pool.Retire(copy_ref.buffer, copy_ref.offset);
         }
     } else if (src->info.num_samples == 1 && dst->info.num_samples > 1 &&
                dst->info.props.is_depth) {

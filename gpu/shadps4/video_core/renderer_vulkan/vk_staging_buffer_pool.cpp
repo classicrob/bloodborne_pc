@@ -64,7 +64,12 @@ StagingBufferRef StagingBufferPool::Request(u64 size, MemoryType type, u64 align
     if (deferred || size > BLOCK_SIZE) {
         return RequestLarge(size, type, deferred, retire);
     }
-    return RequestFromRing(ring, size, alignment, type);
+    const StagingBufferRef ref = RequestFromRing(ring, size, alignment, type);
+    if (retire) {
+        const auto* block = static_cast<const VideoCore::StreamBuffer*>(ref.buffer);
+        ring_retires.push_back({ref.buffer, ref.offset, block->LastTick()});
+    }
+    return ref;
 }
 
 StagingBufferRef StagingBufferPool::RequestFromRing(Ring& ring, u64 size, u64 alignment,
@@ -163,17 +168,28 @@ void StagingBufferPool::FreeDeferred(const StagingBufferRef& ref) {
     it->last_used_frame = frame;
 }
 
-void StagingBufferPool::RetireLarge(const VideoCore::Buffer* buffer) {
+void StagingBufferPool::Retire(const VideoCore::Buffer* buffer, u64 offset) {
     {
         std::scoped_lock lk{mutex};
+        const auto ring_it = std::ranges::find_if(ring_retires, [&](const RingRetire& entry) {
+            return entry.buffer == buffer && entry.offset == offset;
+        });
+        if (ring_it != ring_retires.end()) {
+            const u64 tick = ring_it->tick;
+            ring_retires.erase(ring_it);
+            // The last use was recorded on this thread just before: it lands in CurrentTick().
+            ASSERT_MSG(scheduler.CurrentTick() == tick,
+                       "Staging ring range at {:#x}: its block watches submission {}, its last "
+                       "use lands in submission {}; the range could be reused before that use",
+                       offset, tick, scheduler.CurrentTick());
+            return;
+        }
         const bool large = std::ranges::any_of(large_caches, [&](const auto& cache) {
             return std::ranges::any_of(cache, [&](const LargeBuffer& entry) {
                 return entry.buffer.get() == buffer && entry.retiring;
             });
         });
-        if (!large) {
-            return;
-        }
+        ASSERT_MSG(large, "Staging allocation retired twice or not requested with retire");
     }
     // Runs where the commands before it are recorded. CurrentTick() there is the submission
     // they land in, or the next one while a submission is syncing: never an earlier one.

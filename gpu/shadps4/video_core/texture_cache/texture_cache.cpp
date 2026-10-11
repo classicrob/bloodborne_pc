@@ -988,9 +988,9 @@ void TextureCache::RefreshImage(Image& image) {
     }
 
     runtime.UploadImage(&image, buffer, image_copies);
-    // The upload is the detiled staging buffer's last use (no-op when the image was not tiled).
+    // The upload is the detiled staging buffer's last use.
     if (buffer != in_buffer) {
-        runtime.GetStagingPool().RetireLarge(buffer);
+        runtime.GetStagingPool().Retire(buffer, offset);
     }
 }
 
