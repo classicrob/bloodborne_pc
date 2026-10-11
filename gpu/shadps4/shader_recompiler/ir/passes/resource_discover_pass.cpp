@@ -2,11 +2,14 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "common/assert.h"
+#include "common/logging/log.h"
 #include "shader_recompiler/ir/passes/ir_passes.h"
 #include "shader_recompiler/ir/passes/resource_pass.h"
 #include "shader_recompiler/ir/program.h"
 #include "shader_recompiler/profile.h"
 #include "shader_recompiler/resource.h"
+
+#include <cstdlib>
 
 namespace Shader::Optimization {
 
@@ -14,6 +17,19 @@ static bool IsSharpSource(const IR::Inst* inst) {
     return inst->GetOpcode() == IR::Opcode::GetUserData ||
            inst->GetOpcode() == IR::Opcode::ReadConst ||
            inst->GetOpcode() == IR::Opcode::ReadConstBuffer;
+}
+
+static void AuditSharpDword(u64 hash, const char* kind, size_t dword, IR::Value value) {
+    static const bool enabled = [] {
+        const char* setting = std::getenv("BB_SHADER_SHARP_AUDIT");
+        return setting && setting[0] == '1';
+    }();
+    const auto* source = value.TryInst();
+    if (enabled && source && !IsSharpSource(source)) {
+        // Report before recognizing post-ops, so the census includes supported computations.
+        LOG_WARNING(Render_Recompiler, "SHARP-COMPUTED shader={:#x} kind={} dword={} producer={}",
+                    hash, kind, dword, IR::NameOf(source->GetOpcode()));
+    }
 }
 
 struct StridePatchResult {
@@ -246,7 +262,7 @@ IR::Inst* FindSharpSource(IR::Inst* handle) {
     return handle;
 }
 
-void MarkReadConstBufferSharpSources(const SharpReference& sharp) {
+void MarkReadConstBufferSharpSources(const SharpReference& sharp, u64 hash) {
     // In cases of bindless sharp fetches mark all producer instructions
     // so the extended userdata flattening pass will include them.
     for (size_t i = 0; i < sharp.num_dwords; i++) {
@@ -254,7 +270,9 @@ void MarkReadConstBufferSharpSources(const SharpReference& sharp) {
         if (!source) {
             continue;
         }
-        ASSERT(IsSharpSource(source));
+        ASSERT_MSG(IsSharpSource(source),
+                   "Shader {:#x} sharp dword {} has unsupported producer {} after post-op {}",
+                   hash, i, IR::NameOf(source->GetOpcode()), u32(sharp.post_op));
         if (source->GetOpcode() == IR::Opcode::ReadConstBuffer) {
             auto flags = source->Flags<IR::BufferInstInfo>();
             flags.sharp_source.Assign(1u);
@@ -263,7 +281,8 @@ void MarkReadConstBufferSharpSources(const SharpReference& sharp) {
     }
 }
 
-void DiscoverBufferSharp(IR::Block& block, IR::Inst& inst, ResourceDiscoveryList& resources) {
+void DiscoverBufferSharp(IR::Block& block, IR::Inst& inst, ResourceDiscoveryList& resources,
+                         u64 hash) {
     IR::Inst* handle = inst.Arg(0).Inst();
     auto& resource = resources.emplace_back(&inst);
     auto& vsharp = resource.sharps[0];
@@ -272,6 +291,7 @@ void DiscoverBufferSharp(IR::Block& block, IR::Inst& inst, ResourceDiscoveryList
     vsharp.num_dwords = handle->NumArgs();
     for (size_t i = 0; i < handle->NumArgs(); ++i) {
         vsharp.dwords[i] = handle->Arg(i);
+        AuditSharpDword(hash, "buffer", i, vsharp.dwords[i]);
         if (auto* inst = vsharp.dwords[i].TryInst();
             inst && inst->GetOpcode() == IR::Opcode::ReadFirstLane) {
             vsharp.dwords[i] = inst->Arg(0);
@@ -289,10 +309,11 @@ void DiscoverBufferSharp(IR::Block& block, IR::Inst& inst, ResourceDiscoveryList
         vsharp.dwords[1] = dword1;
     }
 
-    MarkReadConstBufferSharpSources(vsharp);
+    MarkReadConstBufferSharpSources(vsharp, hash);
 }
 
-void DiscoverImageSharp(IR::Block& block, IR::Inst& inst, ResourceDiscoveryList& resources) {
+void DiscoverImageSharp(IR::Block& block, IR::Inst& inst, ResourceDiscoveryList& resources,
+                        u64 hash) {
     IR::Inst* image_handle = inst.Arg(0).Inst();
     ASSERT(image_handle->GetOpcode() == IR::Opcode::ImageHandle);
     auto& resource = resources.emplace_back(&inst);
@@ -309,6 +330,10 @@ void DiscoverImageSharp(IR::Block& block, IR::Inst& inst, ResourceDiscoveryList&
         }
     }
 
+    for (size_t i = 0; i < tsharp.num_dwords; ++i) {
+        AuditSharpDword(hash, "image", i, tsharp.dwords[i]);
+    }
+
     if (auto [tsharp_dw3, tsharp_dw4, found] =
             CheckCubeTo2DArrayPattern(tsharp.dwords[3], tsharp.dwords[4]);
         found) {
@@ -317,7 +342,7 @@ void DiscoverImageSharp(IR::Block& block, IR::Inst& inst, ResourceDiscoveryList&
         tsharp.dwords[4] = tsharp_dw4;
     }
 
-    MarkReadConstBufferSharpSources(tsharp);
+    MarkReadConstBufferSharpSources(tsharp, hash);
 
     if (inst.GetOpcode() != IR::Opcode::ImageSampleRaw &&
         inst.GetOpcode() != IR::Opcode::ImageQueryLod) {
@@ -330,6 +355,7 @@ void DiscoverImageSharp(IR::Block& block, IR::Inst& inst, ResourceDiscoveryList&
     auto& ssharp = resource.sharps[1];
     for (size_t i = 0; i < sampler->NumArgs(); ++i) {
         ssharp.dwords[ssharp.num_dwords++] = sampler->Arg(i);
+        AuditSharpDword(hash, "sampler", i, sampler->Arg(i));
     }
     if (auto [ssharp_dw0, tsharp_dw3, found] = CheckDisableAnisoLod0Pattern(ssharp.dwords[0]);
         found) {
@@ -349,7 +375,7 @@ void DiscoverImageSharp(IR::Block& block, IR::Inst& inst, ResourceDiscoveryList&
         ssharp.dwords[0] = ssharp_dw0;
     }
 
-    MarkReadConstBufferSharpSources(ssharp);
+    MarkReadConstBufferSharpSources(ssharp, hash);
 }
 
 ResourceDiscoveryList ResourceDiscoverPass(IR::Program& program, const Profile& profile) {
@@ -358,9 +384,9 @@ ResourceDiscoveryList ResourceDiscoverPass(IR::Program& program, const Profile& 
     for (IR::Block* const block : program.blocks) {
         for (IR::Inst& inst : block->Instructions()) {
             if (IsBufferInstruction(inst)) {
-                DiscoverBufferSharp(*block, inst, sharp_usages);
+                DiscoverBufferSharp(*block, inst, sharp_usages, program.info.pgm_hash);
             } else if (IsImageInstruction(inst)) {
-                DiscoverImageSharp(*block, inst, sharp_usages);
+                DiscoverImageSharp(*block, inst, sharp_usages, program.info.pgm_hash);
             } else if (IsDataRingInstruction(inst)) {
                 sharp_usages.emplace_back(&inst);
             }

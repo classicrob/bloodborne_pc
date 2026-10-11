@@ -55,3 +55,14 @@ state: render target formats from the export formats, clip space 0..W, one tesse
 per group, the texture and buffer types above. Shaders whose code depends on descriptor contents
 (texture type, buffer format) or on registers the file does not carry can still stop in game
 with other state; the in-game route remains the check for those.
+
+## Computed descriptor census
+
+The sweep enables `BB_SHADER_SHARP_AUDIT=1`. Resource discovery logs original buffer, image,
+and sampler dword producers before recognizing supported post-ops. `computed-sharps.tsv`
+lists every observed shader/stage, verdict, descriptor kind, dword and producer opcode whose
+value is neither immediate nor a direct user-data/constant-memory load. This includes
+ReadFirstLane wrappers and supported descriptor patches; it is a candidate list for review,
+not evidence that those shaders lose arithmetic. Unsupported residual producers already stop;
+the diagnostic now names the shader, dword and opcode. Compilation stops can prevent later
+resources from reaching discovery. Older libraries without this audit cannot supply the census.

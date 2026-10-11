@@ -124,6 +124,8 @@ class Worker:
     def finish(self, index, status, message, lines):
         errors = [strip_log(l) for l in lines
                   if '<Error>' in l or '<Critical>' in l or '<Warning>' in l]
+        computed_sharps = sorted(set(l.split('SHARP-COMPUTED ', 1)[1] for l in lines
+                                     if 'SHARP-COMPUTED ' in l))
         gs = {}
         for l in lines:
             if l.startswith('@@GS '):
@@ -135,7 +137,7 @@ class Worker:
                                        gs['gap'] + ' (draw-time check)')
         with self.lock:
             self.results[index] = {'status': status, 'message': message, 'errors': errors,
-                                   'gs': gs, 'log': lines[-40:]}
+                                   'gs': gs, 'computed_sharps': computed_sharps, 'log': lines[-40:]}
 
 
 def strip_log(line):
@@ -250,7 +252,7 @@ def main():
     if not os.path.isfile(icd):
         raise SystemExit(f'shader-sweep: no MoltenVK ICD at {icd} (set BB_DEPS_PREFIX)')
     env = dict(os.environ, BB_GPU_USER_DIR=user, BB_DUMP_SHADERS='1', BB_PIPELINE_CACHE='0',
-               BB_GPU_LOG='warning', VK_DRIVER_FILES=icd)
+               BB_GPU_LOG='warning', BB_SHADER_SHARP_AUDIT='1', VK_DRIVER_FILES=icd)
     results, lock = {}, threading.Lock()
     start = time.monotonic()
 
@@ -376,6 +378,15 @@ def compare(base_path, new_path):
 
 
 def write_reports(out, jobs, keep, results, compile_seconds, total_seconds):
+    computed_jobs = 0
+    with open(os.path.join(out, 'computed-sharps.tsv'), 'w') as f:
+        f.write('hash\tstage\tstatus\tproducer\tname\n')
+        for i in keep:
+            producers = results[i].get('computed_sharps', [])
+            computed_jobs += bool(producers)
+            for producer in producers:
+                f.write('\t'.join([jobs[i]['hash'], jobs[i]['kind'], results[i]['status'],
+                                   producer, jobs[i]['name']]) + '\n')
     with open(os.path.join(out, 'results.tsv'), 'w') as f:
         f.write('hash\tkind\tstatus\tmessage\tspirv_modules\tspirv_val\tmsl\tlogged\tname\n')
         for i in keep:
@@ -440,11 +451,18 @@ def write_reports(out, jobs, keep, results, compile_seconds, total_seconds):
     for key, indices in sorted(logged.items(), key=lambda kv: -len(kv[1])):
         lines.append(f'- x{len(indices)}: `{key}` e.g. ' + ', '.join(
             f'{jobs[i]["hash"]} {jobs[i]["kind"]}' for i in indices[:6]))
+    lines += ['', '## Computed descriptor dwords', '',
+              f'{computed_jobs} jobs have non-load, non-immediate descriptor producers. '
+              'Every observed shader/dword is listed in `computed-sharps.tsv`, including LOUD jobs. '
+              'The audit runs before recognized post-ops and includes ReadFirstLane wrappers; '
+              'presence is an audit candidate, not evidence of lost arithmetic. A job stopping '
+              'earlier in compilation may not reach all its descriptors. Requires a library '
+              'with BB_SHADER_SHARP_AUDIT support.']
     with open(os.path.join(out, 'report.md'), 'w') as f:
         f.write('\n'.join(lines) + '\n')
     write_census(out, jobs, keep, results)
     print('\n'.join(lines[:12 + len(kinds)]))
-    print(f'-> {out}/report.md, results.tsv, gs_census.md')
+    print(f'-> {out}/report.md, results.tsv, gs_census.md, computed-sharps.tsv')
 
 
 def write_census(out, jobs, keep, results):
