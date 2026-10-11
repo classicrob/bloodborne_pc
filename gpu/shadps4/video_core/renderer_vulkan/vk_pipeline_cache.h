@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <deque>
+#include <functional>
 #include <unordered_map>
 #include <shared_mutex>
 #include <variant>
@@ -137,8 +139,15 @@ public:
     void WarmUp();
     void Sync();
 
-    bool LoadComputePipeline(Serialization::Archive& ar);
-    bool LoadGraphicsPipeline(Serialization::Archive& ar);
+    /// bbport: pipelines WarmUp read from the store; their creation (the costly part: on Apple
+    /// MoltenVK's conversion and the Metal compile) runs afterwards on worker threads.
+    struct PreloadBatch {
+        std::vector<std::function<void()>> creations;
+        std::deque<std::pair<GraphicsPipelineKey, std::unique_ptr<GraphicsPipeline>>> graphics;
+        std::deque<std::pair<ComputePipelineKey, std::unique_ptr<ComputePipeline>>> compute;
+    };
+    bool LoadComputePipeline(Serialization::Archive& ar, PreloadBatch& batch);
+    bool LoadGraphicsPipeline(Serialization::Archive& ar, PreloadBatch& batch);
     bool LoadPipelineStage(Serialization::Archive& ar, size_t stage);
 
     const GraphicsPipeline* GetGraphicsPipeline(const DrawIndirectParams params = {},
