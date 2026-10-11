@@ -15,7 +15,8 @@ class PackagedVulkanTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        self.root = Path(self.tmp.name)
+        # Resolved: on macOS the temporary directory is behind the /var -> /private/var link.
+        self.root = Path(self.tmp.name).resolve()
         self.icds = self.root / "icds"
         self.libs = self.root / "host-libs"
         self.icds.mkdir()

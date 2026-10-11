@@ -7,7 +7,13 @@ clang -arch x86_64 -std=c11 -Wall -Wextra -Werror -I. -Isrc -I"$prefix/include" 
     tests/test_audio_macos.c src/compat_mac.c -L"$prefix/lib" -Wl,-rpath,"$prefix/lib" \
     -lSDL3 -lm -o out/mac-playability/test-audio
 arch -x86_64 out/mac-playability/test-audio --timer
-arch -x86_64 out/mac-playability/test-audio
+# Real CoreAudio output plays a short 440 Hz tone on the default device: opt-in, so build.sh
+# --test does not sound on the user's speakers.
+if [ "${BB_TEST_AUDIO_DEVICE:-0}" = 1 ]; then
+    arch -x86_64 out/mac-playability/test-audio
+else
+    echo "SKIP (opt-in): real CoreAudio output; BB_TEST_AUDIO_DEVICE=1 plays it"
+fi
 python3 - <<'PY'
 import os, subprocess
 result = subprocess.run(['out/mac-playability/test-audio'],

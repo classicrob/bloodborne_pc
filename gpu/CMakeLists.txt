@@ -314,8 +314,38 @@ if (APPLE)
     # gcn_buffer_conformance/gcn_asm.h assembles the test's GCN fetch shaders.
     target_include_directories(shader-permutation-info-test PRIVATE ../tests)
     target_include_directories(depth-bounds-shader-test PRIVATE third_party/sirit/externals/SPIRV-Headers/include)
+    # Unit tests of the GPU library's Apple paths (build.sh --test runs each).
+    add_executable(cmd-snapshot-test EXCLUDE_FROM_ALL ../tests/test_cmd_snapshot.cpp ../tests/test_gpu_runtime_stubs.cpp)
+    add_executable(cond-exec-test EXCLUDE_FROM_ALL ../tests/test_cond_exec.cpp ../tests/test_gpu_runtime_stubs.cpp)
+    add_executable(feature-checks-test EXCLUDE_FROM_ALL ../tests/test_feature_checks.cpp ../tests/test_gpu_runtime_stubs.cpp)
+    add_executable(image-view-storage-test EXCLUDE_FROM_ALL ../tests/test_image_view_storage.cpp ../tests/test_gpu_runtime_stubs.cpp)
+    add_executable(submit-info-bounds-test EXCLUDE_FROM_ALL ../tests/test_submit_info_bounds.cpp ../tests/test_gpu_runtime_stubs.cpp)
+    add_executable(vertex-fetch-translation-test EXCLUDE_FROM_ALL ../tests/test_vertex_fetch_translation.cpp ../tests/test_gpu_runtime_stubs.cpp)
+    add_executable(buffer-null-test EXCLUDE_FROM_ALL ../tests/test_buffer_null.cpp ../tests/test_gpu_runtime_stubs.cpp)
+    add_executable(rect-interface-test EXCLUDE_FROM_ALL ../tests/test_rect_interface.cpp ../tests/test_gpu_runtime_stubs.cpp)
+    add_executable(fence-address-test EXCLUDE_FROM_ALL ../tests/test_fence_address.cpp ../tests/test_gpu_runtime_stubs.cpp)
+    add_executable(overlay-concurrency-test EXCLUDE_FROM_ALL ../tests/test_overlay_concurrency.cpp ../tests/test_gpu_runtime_stubs.cpp)
+    add_executable(depth-bounds-probe-test EXCLUDE_FROM_ALL ../tests/macos_depth_bounds/probe.cpp ../tests/test_gpu_runtime_stubs.cpp)
+    set(apple_unit_test_targets cmd-snapshot-test cond-exec-test feature-checks-test image-view-storage-test submit-info-bounds-test vertex-fetch-translation-test buffer-null-test rect-interface-test fence-address-test overlay-concurrency-test depth-bounds-probe-test)
+    foreach(unit_target IN LISTS apple_unit_test_targets)
+        target_include_directories(${unit_target} PRIVATE shim shadps4 third_party/gcn/include)
+        target_compile_options(${unit_target} PRIVATE -UNDEBUG -fPIC)
+        target_link_libraries(${unit_target} PRIVATE bbgpu)
+    endforeach()
+    # gcn_buffer_conformance/gcn_asm.h; sirit and Vulkan for the rect interface test.
+    target_include_directories(vertex-fetch-translation-test PRIVATE ../tests)
+    target_include_directories(rect-interface-test PRIVATE third_party/sirit/include
+        third_party/sirit/externals/SPIRV-Headers/include)
+    target_link_libraries(rect-interface-test PRIVATE Vulkan::Vulkan)
+    target_include_directories(depth-bounds-probe-test PRIVATE third_party/sirit/include
+        third_party/sirit/externals/SPIRV-Headers/include)
+    target_link_libraries(depth-bounds-probe-test PRIVATE Vulkan::Vulkan)
+    target_include_directories(overlay-concurrency-test PRIVATE third_party/imgui third_party/imgui/backends)
+    # The test compiles the overlay itself, which embeds the overlay font.
+    target_compile_definitions(overlay-concurrency-test PRIVATE
+        BB_FONT_PATH="${CMAKE_CURRENT_SOURCE_DIR}/third_party/fonts/DejaVuSans.ttf")
     find_package(Python3 REQUIRED COMPONENTS Interpreter)
-    foreach(test_target motion-shader-test scene-resolution-test taa-shader-test camera-motion-test null-descriptor-test buffer-bounds-test buffer-bounds-benchmark buffer-dead-resources-test host-import-arena-test vertex-pulling-pipeline-test shader-permutation-info-test gpu-user-dir-test push-userdata-test macos-perf-test depth-bounds-shader-test)
+    foreach(test_target motion-shader-test scene-resolution-test taa-shader-test camera-motion-test null-descriptor-test buffer-bounds-test buffer-bounds-benchmark buffer-dead-resources-test host-import-arena-test vertex-pulling-pipeline-test shader-permutation-info-test gpu-user-dir-test push-userdata-test macos-perf-test depth-bounds-shader-test ${apple_unit_test_targets})
         add_custom_command(TARGET ${test_target} POST_BUILD
             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../packaging/macos/check-exports.py
                 $<TARGET_FILE:bbgpu> $<TARGET_FILE:${test_target}> VERBATIM)
