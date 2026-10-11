@@ -821,6 +821,18 @@ bool PipelineCache::RefreshGraphicsKey(PipelineSelection& sel) {
 
     if (sel.motion) {
         constexpr u32 mv = Shader::MotionVectors::Output;
+        // Targets the fragment shader does not write are not attached (PrepareRenderState). The
+        // pass above cleared them only below the shader's last output; widening the pipeline to
+        // the motion slot must clear the rest too, or the pipeline declares color attachments the
+        // pass never binds (Metal validation: "For color attachment 6, the renderPipelineState
+        // pixelFormat must be MTLPixelFormatInvalid"; the pipeline's per-sample tile storage then
+        // differs from the render pass's).
+        for (u32 cb = key.num_color_attachments; cb < mv; ++cb) {
+            std::memset(&key.color_buffers[cb], 0, sizeof(Shader::PsColorBuffer));
+            key.blend_controls[cb] = {};
+            key.write_masks[cb] = {};
+            key.color_samples[cb] = 0;
+        }
         key.motion_vectors = 1;
         key.mrt_mask |= 1u << mv;
         key.num_color_attachments = mv + 1;
