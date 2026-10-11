@@ -123,8 +123,9 @@ public:
 #endif
 #ifdef __APPLE__
     /// bbport (frame capture, docs/macos/capture-replay.md): on the GPU command thread at the
-    /// capture hold point. Drains the draw pipe, waits for every submission, runs deferred
-    /// operations, and waits (at most 2 s) until every priority operation and deferred signal
+    /// capture hold point. Drains the draw pipe, joins the binding helper and waits for every
+    /// submission (these block, unbounded), runs deferred operations, then polls up to 2 s
+    /// (Scheduler::WaitQuiescentForCapture) until every priority operation and deferred signal
     /// issued has run to the end; false and `why` if anything is still outstanding (the caller
     /// rejects the cut).
     bool QuiesceForCapture(std::string& why);

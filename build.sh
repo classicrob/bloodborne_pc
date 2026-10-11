@@ -253,7 +253,7 @@ if [[ ${1:-} == --test || ${1:-} == --test-dry ]]; then
         # GPU library unit tests: Apple paths (PM4 parsing, feature checks, views, scheduler,
         # vertex fetch, null buffers, rect interface, overlay) and the renderer's cross-platform
         # tests (motion, UI composition, scene resolution, TAA, camera motion).
-        unit_tests=(cmd-snapshot-test cond-exec-test label-check-test flip-publish-test videoout-lifecycle-test strmout-update-test equeue-concurrency-test feature-checks-test image-view-storage-test
+        unit_tests=(cmd-snapshot-test cond-exec-test label-check-test capture-quiesce-test flip-publish-test videoout-lifecycle-test strmout-update-test equeue-concurrency-test feature-checks-test image-view-storage-test
             submit-info-bounds-test vertex-fetch-translation-test buffer-null-test rect-interface-test
             fence-address-test overlay-concurrency-test depth-bounds-probe-test motion-history-test
             motion-shader-test
@@ -263,6 +263,7 @@ if [[ ${1:-} == --test || ${1:-} == --test-dry ]]; then
         t out/gpu/cmd-snapshot-test
         t out/gpu/cond-exec-test
         t out/gpu/label-check-test
+        t out/gpu/capture-quiesce-test
         t out/gpu/flip-publish-test
         t out/gpu/videoout-lifecycle-test
         t out/gpu/strmout-update-test

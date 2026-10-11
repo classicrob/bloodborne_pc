@@ -4761,33 +4761,14 @@ bool Rasterizer::QuiesceForCapture(std::string& why) {
         return false;
     }
     JoinBindHelper(this);
-    // Everything recorded is submitted and complete; then what runs after GPU completion on other
-    // threads (priority operations such as downloads, deferred signals such as labels) must have
-    // run to the end, counted issued-minus-completed. Waited unconditionally (WaitDeferredSignals
-    // returns early with OrderedGuestWrites off), for at most 2 s.
+    // Everything recorded is submitted and complete (Finish blocks until the GPU is done; a GPU
+    // that never finishes is a device loss, stopped there). Then what runs after GPU completion
+    // on other threads (priority operations such as downloads, deferred signals such as labels)
+    // must have run to the end, counted issued-minus-completed and checked unconditionally
+    // (WaitDeferredSignals returns early with OrderedGuestWrites off): polled for at most 2 s.
     scheduler.Finish();
     scheduler.PopPendingOperations();
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-    while ((scheduler.PriorityOperationsOutstanding() || scheduler.DeferredSignalsOutstanding()) &&
-           std::chrono::steady_clock::now() < deadline) {
-        BbCopy::WaitAsync(); // the copy threads deferred signals wait for
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
-    std::string outstanding;
-    if (const u32 ops = scheduler.NumPendingOperations()) {
-        outstanding += fmt::format("{} deferred operations; ", ops);
-    }
-    if (const u64 ops = scheduler.PriorityOperationsOutstanding()) {
-        outstanding += fmt::format("{} priority operations not finished; ", ops);
-    }
-    if (const u64 signals = scheduler.DeferredSignalsOutstanding()) {
-        outstanding += fmt::format("{} deferred signals (labels) not written; ", signals);
-    }
-    if (!outstanding.empty()) {
-        why = outstanding.substr(0, outstanding.size() - 2);
-        return false;
-    }
-    return true;
+    return scheduler.WaitQuiescentForCapture(std::chrono::seconds(2), why);
 }
 
 std::string Rasterizer::CaptureSettingsRefusal() const {

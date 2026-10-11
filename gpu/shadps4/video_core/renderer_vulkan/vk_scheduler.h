@@ -938,6 +938,11 @@ public:
         return deferred_signals_issued.load(std::memory_order_acquire) -
                deferred_signals_done->load(std::memory_order_acquire);
     }
+    /// The frame capture's completion check (Rasterizer::QuiesceForCapture calls it after
+    /// Finish): true once no deferred operation, priority operation or deferred signal issued
+    /// so far is left; polled without blocking (1 ms sleeps) for at most `limit`, then false
+    /// and `why` with the counts. It does not run or help the work it waits for.
+    bool WaitQuiescentForCapture(std::chrono::milliseconds limit, std::string& why);
 #endif
 
     /// Defers an operation until the gpu has reached the current cpu tick.
