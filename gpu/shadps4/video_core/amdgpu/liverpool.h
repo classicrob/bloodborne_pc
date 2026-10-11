@@ -100,6 +100,12 @@ struct Liverpool {
     } parse_lag;
     /// GpuIdle's wait split (docs/macos/throttle-relaxation.md, R0), per frame end that raised
     /// GpuIdle: from the guest's sceGnmSubmitDone to GpuIdle, and its parts (GPU thread only).
+    /// IT_SET_PREDICATION census (GPU command thread; Liverpool::NotePredication).
+    struct PredicationStats {
+        u64 packets{}, by_op[8]{}, continues{}, draws_while_set{};
+        bool active{};
+    } predication;
+    void NotePredication(const PM4Header* header);
     struct IdleSplitStats {
         u64 frames{}, total_ns{}, total_ns_max{}, drain_ns{}, recorder_ns{}, labels_ns{};
         u64 tail_frames{}, tail_ticks{}, unlabeled_frames{}, unpaired{};
