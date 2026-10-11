@@ -52,6 +52,14 @@ The user works on this Mac while the team runs. Heavy jobs yield to them by defa
 | playtest pool (correctness games) | nice 5 and a utility QoS clamp |
 | `--gpu exclusive` (perf_run, timing) | unchanged: the user approved perf runs separately |
 
+**When the user is away** (no keyboard or mouse input for `BB_HEAVY_IDLE_MINUTES`, 10, read
+from IOHIDSystem's HIDIdleTime), the build pool admits a second job (slot `build-idle`), and
+new build, quick and sweep jobs start at nice 5 with a utility QoS clamp (performance cores
+allowed; the parallelism cap stays). Jobs already running keep what they started with. Each
+job prints its decision ("user idle 75 min: nice 5, utility QoS, 8 jobs" or "user active (idle
+2 min): background QoS, 8 jobs"), and the history records it. An unreadable idle time counts as
+active and says so.
+
 It is applied once, when the slot is taken; nested calls inherit it. Builds take longer this
 way, by the user's choice. `BB_HEAVY_POLITE=0` turns it off (perf or shared builds while the
 user is away). Plain `ninja` ignores the parallelism hint: pass `-j "$BB_BUILD_JOBS"`.

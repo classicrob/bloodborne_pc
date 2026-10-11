@@ -40,6 +40,7 @@ import datetime
 import fcntl
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -169,7 +170,7 @@ def record(event):
 def busy_slots():
     """Slot names currently held (a non-blocking probe of each lock)."""
     held = []
-    for name in ['build-priority'] + slot_names('build') + slot_names('quick') + slot_names('sweep') + slot_names('playtest'):
+    for name in ['build-priority', 'build-idle'] + slot_names('build') + slot_names('quick') + slot_names('sweep') + slot_names('playtest'):
         fd = try_lock(name)
         if fd is None:
             held.append(name)
@@ -184,7 +185,7 @@ def describe(info):
 
 def status():
     print(f'gpu: {gpu_state()}')
-    for name in ['build-priority'] + slot_names('build') + slot_names('quick') + slot_names('sweep') + slot_names('playtest'):
+    for name in ['build-priority', 'build-idle'] + slot_names('build') + slot_names('quick') + slot_names('sweep') + slot_names('playtest'):
         fd = try_lock(name)
         if fd is not None:
             os.close(fd)
@@ -193,13 +194,46 @@ def status():
             print(f'{name}: held by {describe(holder(name))}')
 
 
-def polite(pool, priority, gpu, command):
+def user_idle_seconds():
+    """Seconds since the user last touched keyboard or mouse (IOHIDSystem HIDIdleTime), or None
+    when it cannot be read. BB_HEAVY_IDLE_SECONDS overrides it (tests)."""
+    override = os.environ.get('BB_HEAVY_IDLE_SECONDS')
+    if override is not None:
+        if not override.isdigit():
+            fail('BB_HEAVY_IDLE_SECONDS must be a whole number of seconds')
+        return int(override)
+    try:
+        out = subprocess.run(['ioreg', '-c', 'IOHIDSystem', '-d', '4'], capture_output=True, text=True,
+                             timeout=10).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    match = re.search(r'"HIDIdleTime" = (\d+)', out)
+    return int(match.group(1)) // 1_000_000_000 if match else None
+
+
+def user_state():
+    """(idle, description). The user counts as idle after BB_HEAVY_IDLE_MINUTES (10) without
+    input; an unreadable idle time counts as active, and says so."""
+    minutes = os.environ.get('BB_HEAVY_IDLE_MINUTES', '10')
+    if not minutes.isdigit():
+        fail('BB_HEAVY_IDLE_MINUTES must be a whole number of minutes')
+    idle = user_idle_seconds()
+    if idle is None:
+        return False, 'user idle time unreadable: treated as active'
+    if idle >= int(minutes) * 60:
+        return True, f'user idle {idle // 60} min'
+    return False, f'user active (idle {idle // 60} min)'
+
+
+def polite(pool, priority, gpu, command, idle=(False, '')):
     """The user shares this Mac and their apps were being starved: heavy jobs yield. Builds, tests
     and sweeps (build and quick pools) run as background QoS (taskpolicy -b: low CPU priority,
     efficiency cores, throttled I/O; slower, by the user's choice); correctness games (playtest
     pool) at nice 5 with a utility QoS clamp. Priority-lane jobs (P0 previews, shared builds) run
-    at nice 5 with a utility clamp too: background QoS made a preview take 37 minutes. They keep
-    the parallelism cap. Exclusive-GPU jobs (perf_run, timing) are exempt.
+    at nice 5 with a utility clamp too: background QoS made a preview take 37 minutes. While the
+    user is idle (user_state), new build, quick and sweep jobs also start at nice 5 with a utility
+    clamp (performance cores allowed); running jobs keep what they started with. All keep the
+    parallelism cap. Exclusive-GPU jobs (perf_run, timing) are exempt.
     Applied once, when the slot is taken, so nested calls inherit it. BB_HEAVY_POLITE=0 turns it
     off."""
     if os.environ.get('BB_HEAVY_POLITE', '1') == '0' or gpu == 'exclusive':
@@ -216,10 +250,14 @@ def polite(pool, priority, gpu, command):
         current = os.environ.get(name, '')
         os.environ[name] = str(min(int(current), int(cap))) if current.isdigit() else cap
     os.environ['MAKEFLAGS'] = f'-j{os.environ["BB_BUILD_JOBS"]}'
+    jobs = os.environ['BB_BUILD_JOBS']
     if priority:
         os.nice(5)
-        return ['taskpolicy', '-c', 'utility', *command], f'nice 5, utility QoS, {os.environ["BB_BUILD_JOBS"]} jobs'
-    return ['taskpolicy', '-b', *command], f'background QoS, {os.environ["BB_BUILD_JOBS"]} jobs'
+        return ['taskpolicy', '-c', 'utility', *command], f'nice 5, utility QoS, {jobs} jobs'
+    if idle[0]:
+        os.nice(5)
+        return ['taskpolicy', '-c', 'utility', *command], f'{idle[1]}: nice 5, utility QoS, {jobs} jobs'
+    return ['taskpolicy', '-b', *command], f'{idle[1]}: background QoS, {jobs} jobs'
 
 
 def announce(label):
@@ -241,9 +279,15 @@ def run(pool, priority, gpu, label, command, pool_given=False):
             take_gpu(gpu, label)
         announce(label)
         os.execvp(command[0], command)
-    names = (['build-priority'] if priority else []) + slot_names(pool)
     started, reported = time.monotonic(), time.monotonic()
+    idle, idle_checked = (False, ''), None
     while True:
+        # While the user is idle the build pool admits one more job (build-idle); a job already
+        # in it keeps running when the user returns. Checked at most every 10 s while waiting.
+        if pool in ('build', 'quick', 'sweep') and (idle_checked is None or time.monotonic() - idle_checked >= 10):
+            idle, idle_checked = user_state(), time.monotonic()
+        names = ((['build-priority'] if priority else []) + slot_names(pool) +
+                 (['build-idle'] if pool == 'build' and idle[0] else []))
         for name in names:
             fd = try_lock(name)
             if fd is None:
@@ -255,7 +299,9 @@ def run(pool, priority, gpu, label, command, pool_given=False):
             os.pwrite(fd, json.dumps(info).encode(), 0)
             os.fsync(fd)
             waited = time.monotonic() - started
-            command, policy = polite(pool, priority, gpu, command)
+            command, policy = polite(pool, priority, gpu, command, idle)
+            if pool in ('build', 'quick', 'sweep') and not priority and policy != 'normal':
+                print(f'heavy: {label}: {policy}', file=sys.stderr, flush=True)
             record({'event': 'start', 'label': label, 'pool': pool, 'slot': name, 'priority': priority,
                     'waited_s': round(waited, 1), 'load': [round(x, 2) for x in os.getloadavg()],
                     'held': busy_slots(), 'pid': os.getpid(), 'policy': policy})
