@@ -45,9 +45,12 @@ typedef struct SummaryThread {
     SummaryMetric metrics[TRACE_IMPORTS];
     const TraceImport *active_import;
     uint64_t active_start;
+    unsigned retired;
 } SummaryThread;
 static _Atomic(SummaryThread *) summary_threads;
 static _Thread_local SummaryThread *summary_thread;
+static _Thread_local unsigned depth;
+static pthread_key_t summary_key;
 static pthread_mutex_t summary_report_lock=PTHREAD_MUTEX_INITIALIZER;
 static unsigned summary_flips;
 static uint64_t summary_last_ns;
@@ -60,10 +63,21 @@ static void summary_lock(SummaryThread *t) {
     while(atomic_exchange_explicit(&t->gate,1,memory_order_acquire)) __asm__ volatile("pause");
 }
 static void summary_unlock(SummaryThread *t) { atomic_store_explicit(&t->gate,0,memory_order_release); }
+static void summary_retire(void *value) {
+    SummaryThread *t=value;summary_lock(t);
+    for(unsigned i=0;i<TRACE_IMPORTS;i++) {
+        t->metrics[i].abandoned+=t->metrics[i].inflight;
+        t->metrics[i].inflight=0;
+    }
+    t->active_import=NULL;t->active_start=0;t->retired=1;
+    summary_unlock(t);
+    summary_thread=NULL;depth=0;
+}
 static SummaryThread *summary_current(void) {
     if(summary_thread) return summary_thread;
     SummaryThread *t=calloc(1,sizeof(*t));
     if(!t) { fputs("STOP: HLE summary allocation failed\n",stderr);abort(); }
+    if(pthread_setspecific(summary_key,t)) { fputs("STOP: HLE summary TLS failed\n",stderr);abort(); }
     t->pthread=(uintptr_t)pthread_self();
     if(pthread_getname_np(pthread_self(),t->name,sizeof(t->name))) strcpy(t->name,"<unavailable>");
     for(unsigned i=0;i<sizeof(t->name)&&t->name[i];i++)
@@ -78,7 +92,6 @@ static _Atomic int gate;
 static uint64_t sequence;
 static TraceRecord records[TRACE_CAPACITY];
 static _Thread_local TraceCall calls[TRACE_DEPTH];
-static _Thread_local unsigned depth;
 void runtime_hle_trace_entry_bridge(void);
 void runtime_hle_trace_return_bridge(void);
 
@@ -90,6 +103,7 @@ static void configure(void) {
     if(summary && *summary && strcmp(summary,"0")) {
         char *end;errno=0;unsigned long n=strtoul(summary,&end,10);
         if(errno||*end||summary[0]<'1'||summary[0]>'9'||!n||n>1000000)die("invalid summary frame interval");
+        if(pthread_key_create(&summary_key,summary_retire))die("summary TLS key failed");
         summary_frames=(unsigned)n;
         summary_last_ns=monotonic_ns();
         atomic_store_explicit(&summary_interval,summary_frames,memory_order_release);
@@ -99,7 +113,7 @@ static void configure(void) {
     if(!ring_enabled) {
         if(!summary_frames)return;
         setting=getenv("BB_HLE_TRACE_SUMMARY_FILTER");
-        if(!setting||!*setting)setting="sync,gnm,videoout,avplayer";
+        if(!setting||!*setting)setting="waits,gnm,videoout,avplayer";
     }
     if (strlen(setting)>=sizeof(filter_storage)) die("filter is too long");
     strcpy(filter_storage,setting);
@@ -123,6 +137,8 @@ static int selected(const char *nid,const char *name) {
              strstr(name,"Label"))) return 1;
         if (!strcmp(f,"videoout") && strstr(name,"sceVideoOut")) return 1;
         if (!strcmp(f,"avplayer") && strstr(name,"sceAvPlayer")) return 1;
+        if (!strcmp(f,"waits") && (strstr(name,"Wait") || strstr(name,"wait") ||
+            strstr(name,"sleep") || strstr(name,"Sleep") || strstr(name,"Join") || strstr(name,"join"))) return 1;
         if (!strcmp(f,"sync") && (strstr(name,"Mutex") || strstr(name,"mutex") ||
             strstr(name,"Cond") || strstr(name,"cond") || strstr(name,"Sema") ||
             strstr(name,"EventFlag") || strstr(name,"Equeue") || strstr(name,"Usleep") ||
@@ -193,19 +209,19 @@ static void summary_report_locked(void) {
     summary_flips=0;
     for(SummaryThread *t=atomic_load_explicit(&summary_threads,memory_order_acquire);t;t=t->next) {
         SummaryMetric snapshot[TRACE_IMPORTS];
-        const TraceImport *active;uint64_t active_start;
+        const TraceImport *active;uint64_t active_start;unsigned retired;
         summary_lock(t);
         memcpy(snapshot,t->metrics,sizeof(snapshot));
         for(unsigned i=0;i<TRACE_IMPORTS;i++)t->metrics[i]=(SummaryMetric){.inflight=snapshot[i].inflight};
-        active=t->active_import;active_start=t->active_start;
+        active=t->active_import;active_start=t->active_start;retired=t->retired;
         summary_unlock(t);
         for(unsigned i=0;i<TRACE_IMPORTS;i++) {
             SummaryMetric *m=&snapshot[i];
             if(!m->count&&!m->abandoned&&!m->inflight)continue;
-            fprintf(stderr,"HLE-SUMMARY pthread=0x%lx name=\"%s\" import=%s completed=%llu call_wall_ms=%.3f max_ms=%.3f wall_pct=%.3f abandoned=%llu inflight=%llu\n",
+            fprintf(stderr,"HLE-SUMMARY pthread=0x%lx name=\"%s\" import=%s completed=%llu call_wall_ms=%.3f max_ms=%.3f wall_pct=%.3f abandoned=%llu inflight=%llu retired=%u\n",
                 (unsigned long)t->pthread,t->name,imports[i].name,(unsigned long long)m->count,
                 m->elapsed_ns/1e6,m->max_ns/1e6,window ? 100.0*m->elapsed_ns/window : 0.0,
-                (unsigned long long)m->abandoned,(unsigned long long)m->inflight);
+                (unsigned long long)m->abandoned,(unsigned long long)m->inflight,retired);
         }
         if(active)fprintf(stderr,"HLE-SUMMARY pthread=0x%lx active=%s pending_ms=%.3f (not yet charged)\n",
             (unsigned long)t->pthread,active->name,now>=active_start ? (now-active_start)/1e6 : 0.0);
