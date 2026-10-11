@@ -2,7 +2,7 @@
 // FlattenExtendedUserdataPass reads the components of every ReadConst base (a (low, high) SGPR
 // pair, S_LOAD_DWORD) and every sharp-source ReadConstBuffer V# (four SGPRs, S_BUFFER_LOAD_DWORD).
 // Any other shape, e.g. a phi of whole pointers after divergent control flow, must stop naming
-// the shader (exit 23) before anything reads it as components.
+// the shader (exit 23 with the pass's message) before anything reads it as components.
 // - Positive: a bindless V# loaded with s_buffer_load_dwordx4 and used by buffer loads, through
 //   the production recompiler (TranslateProgram); this is the shape a ReadConst-only (two SGPR)
 //   check would wrongly reject.
@@ -10,8 +10,10 @@
 //   is two SGPRs.
 #include <array>
 #include <cassert>
+#include <cerrno>
 #include <cstdio>
 #include <cstring>
+#include <string>
 #include <sys/mman.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -32,18 +34,56 @@ void Expect(const char* what, bool ok) {
     failures += ok ? 0 : 1;
 }
 
-// Runs `body` in a child; returns its exit status (or 128 + signal).
+struct ChildResult {
+    int status;         // exit code, or 128 + signal
+    std::string output; // what the child wrote to stderr
+};
+
+// Runs `body` in a child, capturing its stderr (echoed here as well).
 template <typename F>
-int InChild(F body) {
+ChildResult InChild(F body) {
     std::fflush(stderr);
+    int fds[2];
+    if (pipe(fds) != 0) {
+        std::perror("pipe");
+        std::exit(2);
+    }
     const pid_t child = fork();
+    if (child < 0) {
+        std::perror("fork");
+        std::exit(2);
+    }
     if (child == 0) {
+        close(fds[0]);
+        dup2(fds[1], STDERR_FILENO);
         body();
         std::_Exit(0);
     }
+    close(fds[1]);
+    ChildResult result{};
+    char buf[4096];
+    for (ssize_t n; (n = read(fds[0], buf, sizeof(buf))) != 0;) {
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0) break;
+        result.output.append(buf, size_t(n));
+        std::fwrite(buf, 1, size_t(n), stderr);
+    }
+    close(fds[0]);
     int status = 0;
-    waitpid(child, &status, 0);
-    return WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status);
+    pid_t waited;
+    while ((waited = waitpid(child, &status, 0)) < 0 && errno == EINTR) {
+    }
+    if (waited != child) {
+        std::perror("waitpid");
+        std::exit(2);
+    }
+    result.status = WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status);
+    return result;
+}
+
+// The child stopped through this pass's shape check (not an incidental assertion elsewhere).
+bool StoppedWith(const ChildResult& r, const char* message) {
+    return r.status == 23 && r.output.find(message) != std::string::npos;
 }
 
 // s_buffer_load_dwordx4 s[12:15], s[4:7], 0; buffer_load_dword v4, s[12:15];
@@ -124,11 +164,14 @@ void FlattenMalformed(Shape shape) {
 
 int main() {
     Expect("bindless V# (s_buffer_load_dwordx4) compiles through the production recompiler",
-           InChild(CompileBindlessBuffer) == 0);
+           InChild(CompileBindlessBuffer).status == 0);
     Expect("ReadConst on a whole-pointer phi stops (exit 23)",
-           InChild([] { FlattenMalformed(Shape::ReadConstPhi); }) == 23);
+           StoppedWith(InChild([] { FlattenMalformed(Shape::ReadConstPhi); }),
+                       "ReadConst base of shader 0xba5e5a9e is Phi, not CompositeConstructU32x2"));
     Expect("sharp-source ReadConstBuffer on a two-SGPR handle stops (exit 23)",
-           InChild([] { FlattenMalformed(Shape::BufferPair); }) == 23);
+           StoppedWith(InChild([] { FlattenMalformed(Shape::BufferPair); }),
+                       "ReadConstBuffer base of shader 0xba5e5a9e is CompositeConstructU32x2, "
+                       "not CompositeConstructU32x4"));
     std::fprintf(stderr, "%s: %u failures\n", failures ? "FAIL" : "PASS", failures);
     return failures ? 1 : 0;
 }
