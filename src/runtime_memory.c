@@ -1402,6 +1402,16 @@ const void *runtime_memory_backing(uint64_t *direct_bytes, uint64_t *total_bytes
     return backing_base;
 }
 #endif
+static uintptr_t guest_image_start;
+static uint64_t guest_image_size;
+void runtime_set_guest_image(uintptr_t start, uint64_t size) {
+    guest_image_start=start; guest_image_size=size;
+}
+int runtime_guest_image(uintptr_t *start, uint64_t *size) {
+    if (!start || !size || !guest_image_start) return -1;
+    *start=guest_image_start; *size=guest_image_size;
+    return 0;
+}
 /* GPU page tracking: restrict host access, never beyond the guest's own protection. */
 void runtime_memory_gpu_protect(uintptr_t address, uint64_t size, int read, int write) {
     read_lock();

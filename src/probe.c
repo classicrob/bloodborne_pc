@@ -44,11 +44,11 @@ static LinkedModule modules[16];
 static uint64_t module_count;
 static int entered_game;
 static int gpu_enabled;
-/* The loaded eboot image (perf replay capture: runtime_guest_image). */
-static uintptr_t guest_image_start;
-static uint64_t guest_image_size;
 #ifdef __APPLE__
 int runtime_memory_replay_map(const char *dir, char *why, size_t why_size); /* runtime_memory.h */
+#endif
+void runtime_set_guest_image(uintptr_t start, uint64_t size); /* runtime_memory.h */
+#ifdef __APPLE__
 static int run_replay(const char *dir, unsigned char *image_base, uint64_t image_size);
 #endif
 int vulkan_smoke(void);
@@ -669,7 +669,7 @@ static int probe_main(int argc, char **argv) {
         }
     }
     image = allocate(round_host_page(size));
-    guest_image_start=(uintptr_t)image; guest_image_size=size;
+    runtime_set_guest_image((uintptr_t)image,size);
     if (fread(image, 1, size, f) != size || fgetc(f) != EOF) fail("incorrect memory image size");
     fclose(f);
     if (!cpu_only) {
@@ -856,11 +856,6 @@ static int run_replay(const char *dir, unsigned char *image_base, uint64_t image
     return bbgpu_replay_run(dir,iterations);
 }
 #endif
-int runtime_guest_image(uintptr_t *start, uint64_t *size) {
-    if (!start || !size || !guest_image_start) return -1;
-    *start=guest_image_start; *size=guest_image_size;
-    return 0;
-}
 
 int main(int argc, char **argv) {
 #ifdef __APPLE__

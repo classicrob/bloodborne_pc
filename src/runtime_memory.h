@@ -92,8 +92,9 @@ int runtime_memory_layout(RuntimeMemoryView *views, size_t view_capacity, size_t
  * GPU page protection: capture only. */
 const void *runtime_memory_backing(uint64_t *direct_bytes, uint64_t *total_bytes);
 /* The guest executable image as loaded (a host allocation outside the VMA table): 0 and its
- * range, or -1 before it is loaded. Defined by the launcher (probe.c). */
+ * range, or -1 before the launcher set it (runtime_set_guest_image). */
 int runtime_guest_image(uintptr_t *start, uint64_t *size);
+void runtime_set_guest_image(uintptr_t start, uint64_t size);
 /* Writes through the backing view, bypassing guest/GPU page protection: 1, or 0 when part of
  * the range has no backing. */
 int runtime_memory_write_backing(uintptr_t address, const void *data, uint64_t size);
