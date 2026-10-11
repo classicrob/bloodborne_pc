@@ -4,6 +4,7 @@
 #include <xxhash.h>
 #ifdef __APPLE__
 #include <sys/stat.h>
+#include <charconv>
 #include <fstream>
 #include <sstream>
 #endif
@@ -4224,7 +4225,9 @@ namespace {
 //   skip vs 0x1234abcd  skip every draw whose vertex shader has this hash ("ps": pixel shader)
 //   skip rt 0x...       skip every draw whose first color target is at this guest address
 //   list 7              a new value lists every draw of the frame that starts at the next flip
-// Rules add up. A line that does not parse rejects the whole file (nothing is skipped) loudly.
+// Rules add up. A line that does not parse, or a file that cannot be read, rejects the whole file
+// (nothing is skipped) loudly. Write the file elsewhere and rename it over the control file, so
+// that a flip never reads it half written.
 struct DrawBisect {
     struct Range {
         u32 first, last;
@@ -4257,6 +4260,18 @@ const char* const draw_bisect_file = [] {
 }();
 DrawBisect draw_bisect;
 
+/// An unsigned number, decimal or 0x hex, and nothing else (no sign, no overflow).
+bool ParseBisectNumber(std::string_view text, u64& value) {
+    int base = 10;
+    if (text.starts_with("0x") || text.starts_with("0X")) {
+        text.remove_prefix(2);
+        base = 16;
+    }
+    const char* const end = text.data() + text.size();
+    const auto result = std::from_chars(text.data(), end, value, base);
+    return !text.empty() && result.ec == std::errc{} && result.ptr == end;
+}
+
 /// Re-reads the control file when its time or size changed. True when it did.
 bool ReadDrawBisect(DrawBisect& b) {
     struct stat st{};
@@ -4268,6 +4283,12 @@ bool ReadDrawBisect(DrawBisect& b) {
     }
     b.size = size;
     b.mtime = exists ? st.st_mtimespec : timespec{};
+    const auto reject = [&b] {
+        b.ranges.clear();
+        b.vs_hashes.clear();
+        b.ps_hashes.clear();
+        b.targets.clear();
+    };
     DrawBisect next;
     next.list_value = b.list_value;
     std::ifstream in(draw_bisect_file);
@@ -4292,24 +4313,21 @@ bool ReadDrawBisect(DrawBisect& b) {
                 next.listing = true;
             }
         } else if (ok && verb == "skip" && !what.empty() && value.empty()) {
-            u32 first = 0, last = 0;
-            char dash = 0;
-            std::istringstream range(what);
-            range >> first;
-            ok = !range.fail();
-            if (ok && range >> dash) {
-                ok = dash == '-' && (range >> last) && first <= last && range.peek() == EOF;
-            } else {
-                last = first;
+            const auto dash = what.find('-');
+            u64 first = 0, last = 0;
+            ok = ParseBisectNumber(std::string_view{what}.substr(0, dash), first);
+            last = first;
+            if (ok && dash != std::string::npos) {
+                ok = ParseBisectNumber(std::string_view{what}.substr(dash + 1), last);
             }
+            ok = ok && first <= last && last <= std::numeric_limits<u32>::max();
             if (ok) {
-                next.ranges.push_back({first, last});
+                next.ranges.push_back({u32(first), u32(last)});
             }
         } else if (ok && verb == "skip" && (what == "vs" || what == "ps" || what == "rt") &&
                    !value.empty()) {
-            char* end = nullptr;
-            const u64 number_value = std::strtoull(value.c_str(), &end, 0);
-            ok = end && *end == 0;
+            u64 number_value = 0;
+            ok = ParseBisectNumber(value, number_value);
             if (ok) {
                 if (what == "rt") {
                     next.targets.push_back(number_value);
@@ -4324,12 +4342,14 @@ bool ReadDrawBisect(DrawBisect& b) {
             std::printf("Draw bisect: %s line %u not understood: \"%s\"; the file is rejected, "
                         "nothing is skipped\n",
                         draw_bisect_file, number, line.c_str());
-            b.ranges.clear();
-            b.vs_hashes.clear();
-            b.ps_hashes.clear();
-            b.targets.clear();
+            reject();
             return true;
         }
+    }
+    if (exists && (!in.is_open() || in.bad())) {
+        std::printf("Draw bisect: %s could not be read; nothing is skipped\n", draw_bisect_file);
+        reject();
+        return true;
     }
     b.ranges = std::move(next.ranges);
     b.vs_hashes = std::move(next.vs_hashes);
