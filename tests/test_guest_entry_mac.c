@@ -87,6 +87,36 @@ static void *worker(void *arg) {
     for (unsigned i=0;i<4;++i) check_call();
     return NULL;
 }
+static void teardown_must_not_run(void) { abort(); }
+static void check_refusal(unsigned char *image,Segment *segment) {
+    int output[2];
+    assert(!pipe(output));
+    pid_t child=fork();
+    assert(child>=0);
+    if (!child) {
+        close(output[0]);
+        assert(dup2(output[1],STDERR_FILENO)==STDERR_FILENO);
+        close(output[1]);
+        assert(!atexit(teardown_must_not_run));
+        entry_trace_require(entry_trace_install("0x1",image,segment,1));
+        abort();
+    }
+    close(output[1]);
+    char message[256];size_t used=0;
+    for (;;) {
+        ssize_t n=read(output[0],message+used,sizeof(message)-1-used);
+        if (n<0 && errno==EINTR) continue;
+        assert(n>=0);
+        if (!n) break;
+        used+=(size_t)n;assert(used<sizeof(message)-1);
+    }
+    message[used]=0;close(output[0]);
+    int status;assert(waitpid(child,&status,0)==child);
+    assert(WIFEXITED(status) && WEXITSTATUS(status)==23);
+    assert(strstr(message,"ERROR: BB_GUEST_ENTRY_TRACE requires push-rbp (55) function entry"));
+    entry_trace_require(NULL);
+    puts("PASS: rejected entry prints its reason and exits 23 without teardown");
+}
 int main(int argc,char **argv) {
     (void)argv;
     int delayed=argc>1;
@@ -100,6 +130,7 @@ int main(int argc,char **argv) {
     assert(!mprotect(image,page,PROT_READ|PROT_EXEC));
     check_call(); /* Prime Rosetta translation before installing. */
     Segment segment={0,page,5};
+    check_refusal(image,&segment);
     assert(entry_trace_configure(NULL,"avplayer-start"));
     assert(entry_trace_configure("0x20","invalid"));
     assert(!entry_trace_configure("0x20",delayed ? "avplayer-start" : NULL));
