@@ -1598,8 +1598,11 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
     if (seq != NoSeq && BbStats::enabled) {
         BbStats::submissions.fetch_add(1, std::memory_order_relaxed);
 #ifdef __APPLE__
+        // The thread's borrowed port (set at the start of Process): compat_cpu_times(1) would
+        // take and release a port right (mach_thread_self) on every submission.
         int64_t user_us = 0, system_us = 0;
-        if (compat_cpu_times(1, &user_us, &system_us) == 0) {
+        if (compat_thread_cpu_times(BbStats::gpu_thread_port.load(std::memory_order_relaxed),
+                                    &user_us, &system_us) == 0) {
             BbStats::gpu_user_us.store(static_cast<u64>(user_us), std::memory_order_relaxed);
             BbStats::gpu_sys_us.store(static_cast<u64>(system_us), std::memory_order_relaxed);
         } else {
