@@ -20,9 +20,20 @@ Apple in `vk_pipeline_cache.cpp`) makes `lower_wave64_pass.cpp` rebuild every wa
   promise SubgroupLocalInvocationId == LocalInvocationIndex without full subgroups). It only
   relies on the whole workgroup being one subgroup (workgroup size <= subgroupSize, 32 on M4).
   v_readlane must name a lane that executes the instruction: an immediate launched lane in
-  workgroup-uniform flow, or the first active lane (v_readfirstlane); anything else is a hard
-  error. Per-lane operations (lane id, v_writelane, inverse ballot, mask find) use the same
-  lowering as larger workgroups.
+  workgroup-uniform flow, or v_readfirstlane's own selector (`B = Ballot(exec)`,
+  `lane = B == 0 ? 0 : FindLsb(B)`, all in the read's block). A non-empty `B` names an
+  invocation that executes the read. An empty `B` names lane 0 (v_readfirstlane ignores exec),
+  so it is accepted only where lane 0 surely executes (workgroup-uniform flow) or `B` cannot be
+  empty (its predicate is the condition of an enclosing if, as inside an `s_cbranch_execz`
+  scope). Anything else is a hard error: a lane taken before the divergence, another selector, or
+  a bare `s_ff1_i32_b64` (~0 for an empty mask, i.e. lane 63, never launched here). Per-lane
+  operations (lane id, v_writelane, inverse ballot, mask find) use the same lowering as larger
+  workgroups.
+  Host prerequisite: the whole workgroup runs as one subgroup when `workgroup size <=
+  subgroupSize` (Vulkan does not promise it; measured on M4 by the suite's `wave1sg` cases in
+  1D/2D/3D shapes). This is separate from
+  the lane-numbering assumption, which the reductions no longer need. The lowering checks the
+  workgroup size the shader declares (its LocalSize), which is what the dispatch uses.
 - **Graphics**: a 32-lane subgroup is a legal partially populated wave (lanes 32-63 inactive), so
   subgroup semantics are kept, except reading a lane that may be >= 32, which is a hard error.
 
