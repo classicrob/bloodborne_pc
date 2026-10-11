@@ -16,6 +16,38 @@ static uint32_t entry_trace_tcb_offset;
 static mach_port_t entry_trace_task;
 static _Atomic unsigned long long entry_trace_sequence;
 _Static_assert(ATOMIC_LLONG_LOCK_FREE==2,"entry trace signal counter must be lock-free");
+static _Atomic int entry_trace_active=1;
+_Static_assert(ATOMIC_INT_LOCK_FREE==2,"entry trace arm flag must be lock-free");
+static int entry_trace_delayed;
+static int32_t (__attribute__((sysv_abi)) *entry_trace_start_target)(void *);
+static const char *entry_trace_import_error;
+
+static const char *entry_trace_configure(const char *sites,const char *arm) {
+    if (!arm || !*arm) return NULL;
+    if (!sites || !*sites || !strcmp(sites,"0")) return "BB_GUEST_ENTRY_ARM requires BB_GUEST_ENTRY_TRACE";
+    if (strcmp(arm,"avplayer-start")) return "BB_GUEST_ENTRY_ARM must be avplayer-start";
+    entry_trace_delayed=1;
+    atomic_store_explicit(&entry_trace_active,0,memory_order_relaxed);
+    return NULL;
+}
+static __attribute__((sysv_abi,noinline)) int32_t entry_trace_avplayer_start(void *handle) {
+    int saved_errno=errno;
+    if (!atomic_exchange_explicit(&entry_trace_active,1,memory_order_relaxed)) {
+        static const char line[]="GUEST-ENTRY armed before sceAvPlayerStart\n";
+        (void)write(2,line,sizeof(line)-1);
+    }
+    errno=saved_errno;
+    return entry_trace_start_target(handle);
+}
+/* Relocation-time only, before any guest thread starts. The resolved target may
+ * itself be the HLE trace wrapper; retain it unchanged behind this typed hook. */
+static uintptr_t entry_trace_wrap_import(const char *name,uintptr_t target) {
+    if (!entry_trace_delayed || !target || !name || strcmp(name,"sceAvPlayerStart")) return target;
+    if (entry_trace_start_target && (uintptr_t)entry_trace_start_target!=target)
+        entry_trace_import_error="BB_GUEST_ENTRY_ARM found inconsistent sceAvPlayerStart targets";
+    entry_trace_start_target=(int32_t (__attribute__((sysv_abi)) *)(void *))target;
+    return (uintptr_t)entry_trace_avplayer_start;
+}
 
 static char *entry_text(char *out,const char *s) { while (*s) *out++=*s++; return out; }
 static char *entry_hex(char *out,uint64_t n) {
@@ -77,6 +109,10 @@ static int entry_trace_handle(int sig,const siginfo_t *info,void *context) {
     for (i=0;i<(unsigned)entry_trace_count;++i)
         if (s->__rip==entry_trace_sites[i].address+1) break;
     if (i==(unsigned)entry_trace_count) return 0;
+    if (!atomic_load_explicit(&entry_trace_active,memory_order_relaxed)) {
+        s->__rip=entry_trace_sites[i].trampoline;
+        return 1;
+    }
     int saved_errno=errno;
     uint64_t seq=atomic_fetch_add_explicit(&entry_trace_sequence,1,memory_order_relaxed)+1;
     uintptr_t tcb;
@@ -122,6 +158,9 @@ static const char *entry_trace_install(const char *setting,unsigned char *base,
                                      const Segment *segments,uint64_t count) {
     if (!setting || !*setting || !strcmp(setting,"0")) return NULL;
     if (entry_trace_count) return "BB_GUEST_ENTRY_TRACE already installed";
+    if (entry_trace_import_error) return entry_trace_import_error;
+    if (entry_trace_delayed && !entry_trace_start_target)
+        return "BB_GUEST_ENTRY_ARM requires a resolved sceAvPlayerStart import";
     EntryTraceSite sites[ENTRY_TRACE_LIMIT]; unsigned used=0;
     const char *at=setting;
     for (;;) {

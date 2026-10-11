@@ -685,12 +685,19 @@ static int probe_main(int argc, char **argv) {
         t[8] = 0x48; t[9] = 0xb8; memcpy(t + 10, &handler, 8);
         t[18] = 0xff; t[19] = 0xe0;
     }
+#ifdef __APPLE__
+    const char *entry_config_error=entry_trace_configure(getenv("BB_GUEST_ENTRY_TRACE"),getenv("BB_GUEST_ENTRY_ARM"));
+    if (entry_config_error) fail(entry_config_error);
+#endif
     for (uint64_t i = 0; i < nr; ++i) {
         uintptr_t value = relocs[i].kind == 2 ? (uintptr_t)(data_traps + page_size * relocs[i].value + relocs[i].addend)
                         : relocs[i].kind == 1 ? (uintptr_t)(traps + 32 * relocs[i].value)
                         : (uintptr_t)image + relocs[i].value;
         if (relocs[i].kind) {
             uintptr_t resolved = runtime_resolve(names[relocs[i].value], relocs[i].kind == 2);
+#ifdef __APPLE__
+            if (relocs[i].kind==1) resolved=entry_trace_wrap_import(runtime_symbol(names[relocs[i].value]),resolved);
+#endif
             if (resolved) value = resolved + relocs[i].addend;
             else if (native_libc && bindings[relocs[i].value]) {
                 uint64_t address=bindings[relocs[i].value];

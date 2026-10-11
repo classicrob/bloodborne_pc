@@ -48,6 +48,14 @@ static void check_call(void) {
     assert((result[16]&0xcd5)==0x45 && (result[23]&0xcd5)==0x45);
     for (unsigned i=32;i<96;++i) assert(result[i]==UINT64_MAX);
 }
+static unsigned start_calls;
+static __attribute__((sysv_abi)) int32_t fake_avplayer_start(void *handle) {
+    assert(handle==&start_calls && errno==EDOM);
+    assert(atomic_load(&entry_trace_active));
+    if (!start_calls++) check_call();
+    errno=ERANGE;
+    return -123;
+}
 static void name_thread(const char *name,uint64_t id) {
     char actual[64];
     assert(!pthread_setname_np(name));
@@ -68,7 +76,9 @@ static void *worker(void *arg) {
     for (unsigned i=0;i<4;++i) check_call();
     return NULL;
 }
-int main(void) {
+int main(int argc,char **argv) {
+    (void)argv;
+    int delayed=argc>1;
     alarm(30);
     assert(!pthread_key_create(&key,NULL));
     size_t page=(size_t)sysconf(_SC_PAGESIZE);
@@ -79,6 +89,15 @@ int main(void) {
     assert(!mprotect(image,page,PROT_READ|PROT_EXEC));
     check_call(); /* Prime Rosetta translation before installing. */
     Segment segment={0,page,5};
+    assert(entry_trace_configure(NULL,"avplayer-start"));
+    assert(entry_trace_configure("0x20","invalid"));
+    assert(!entry_trace_configure("0x20",delayed ? "avplayer-start" : NULL));
+    assert(entry_trace_wrap_import("other",123)==123);
+    assert(entry_trace_wrap_import(NULL,123)==123);
+    assert(!entry_trace_wrap_import("sceAvPlayerStart",0));
+    if (delayed) assert(entry_trace_install("0x20",image,&segment,1) && !entry_trace_count);
+    uintptr_t start=entry_trace_wrap_import("sceAvPlayerStart",(uintptr_t)fake_avplayer_start);
+    assert(start==(delayed ? (uintptr_t)entry_trace_avplayer_start : (uintptr_t)fake_avplayer_start));
     assert(!entry_trace_install(NULL,image,&segment,1) && !entry_trace_count);
     assert(entry_trace_install("0x1",image,&segment,1) && !entry_trace_count);
     assert(entry_trace_install("0x20,0x20",image,&segment,1) && !entry_trace_count);
@@ -104,7 +123,16 @@ int main(void) {
     mach_port_urefs_t refs_before,refs_after;
     assert(!mach_port_get_refs(mach_task_self(),own_port,MACH_PORT_RIGHT_SEND,&refs_before));
     name_thread("entry-main",0);
-    check_call(); /* Missing guest TCB is reported safely. */
+    if (delayed) {
+        for (unsigned i=0;i<32;++i) check_call();
+        assert(!atomic_load(&entry_trace_sequence));
+        errno=EDOM;
+        assert(((int32_t (__attribute__((sysv_abi)) *)(void *))start)(&start_calls)==-123);
+        assert(errno==ERANGE && start_calls==1);
+        errno=EDOM;
+        assert(((int32_t (__attribute__((sysv_abi)) *)(void *))start)(&start_calls)==-123);
+        assert(errno==ERANGE && start_calls==2);
+    } else check_call(); /* Missing guest TCB is reported safely. */
     uint64_t tcb[3]={0,0,42}; assert(!pthread_setspecific(key,tcb));
     name_thread("entry-main-renamed",42);
     check_call();
