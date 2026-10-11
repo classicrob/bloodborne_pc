@@ -533,14 +533,15 @@ int main() {
                WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT);
     }
 
-    BbFrameMarks::submitted.Note(12);
-    BbFrameMarks::submitted.Note(13);
-    BbFrameMarks::reached.Note(12);
+    BbFrameMarks::attempted.Note(12);
+    BbFrameMarks::attempted.Note(13);
+    BbFrameMarks::parsed.Note(0);
+    BbFrameMarks::prepared.Note(12);
     BbFrameMarks::published.Note(11);
-    Expect("frame marks: the stop line gives each side's flip count and newest argument",
-           BbFrameMarks::Describe().find("guest submitted 2 (arg 13), GPU command thread reached "
-                                         "1 (arg 12), published to the guest 1 (arg 11)") !=
-               std::string::npos);
+    Expect("frame marks: the stop line gives each side's flip count and latest argument",
+           BbFrameMarks::Describe().find("guest API calls 2 (latest arg 13), flip packets parsed "
+                                         "1, flip preparation entered 1 (latest arg 12), status "
+                                         "published 1 (latest arg 11)") != std::string::npos);
 
     std::fprintf(stderr, "%s: %u failures\n", failures ? "FAIL" : "PASS", failures);
     return failures ? 1 : 0;

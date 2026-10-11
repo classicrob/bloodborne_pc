@@ -38,6 +38,7 @@
 #include "bbport_cmd_data.h"
 #include "bbport_label_check.h"
 #include "bbport_label_store.h"
+#include "bbport_frame_marks.h"
 #include "bbport_parse_split.h"
 #include "video_core/amdgpu/pm4_cmds.h"
 #include "video_core/renderdoc.h"
@@ -1530,6 +1531,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
 
                 switch (nop->data_block[0]) {
                 case PM4CmdNop::PayloadType::PatchedFlip: {
+#ifdef __APPLE__
+                    BbFrameMarks::parsed.Note(0); // stop lines: the parser's flip frontier
+#endif
                     // There is no evidence that GPU CP drives flip events by parsing
                     // special NOP packets. For convenience lets assume that it does.
                     // bbport: after the writes before it (the buffer label: WriteData, which
@@ -1974,12 +1978,23 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
             case PM4ItOpcode::CopyData: {
                 const auto* copy_data = reinterpret_cast<const PM4CmdCopyData*>(header);
+#ifdef __APPLE__
+                // No form is implemented, and none was seen (the clinic frame has none): one
+                // that arrives stops, naming its form, rather than skipping its write.
+                UNREACHABLE_MSG("IT_COPY_DATA is not implemented: src_sel {}, dst_sel {}, "
+                                "count_sel {}, wr_confirm {}, engine_sel {}, src {:#x}, dst {:#x}",
+                                u32(copy_data->src_sel.Value()), u32(copy_data->dst_sel.Value()),
+                                copy_data->count_sel.Value(), copy_data->wr_confirm.Value(),
+                                u32(copy_data->engine_sel.Value()),
+                                copy_data->SrcAddress<u64>(), copy_data->DstAddress<u64>());
+#else
                 LOG_WARNING(Render,
                             "unhandled IT_COPY_DATA src_sel = {}, dst_sel = {}, "
                             "count_sel = {}, wr_confirm = {}, engine_sel = {}",
                             u32(copy_data->src_sel.Value()), u32(copy_data->dst_sel.Value()),
                             copy_data->count_sel.Value(), copy_data->wr_confirm.Value(),
                             u32(copy_data->engine_sel.Value()));
+#endif
                 break;
             }
             case PM4ItOpcode::MemSemaphore: {

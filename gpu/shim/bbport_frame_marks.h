@@ -1,10 +1,14 @@
 // bbport (macOS): how far each side of the flip pipeline has got, for stop lines (a parse-time
-// read of reused guest data is judged against the guest's reuse gate: docs/macos/
-// parse-time-table-reads.md). Three monotonic marks, each the count of flips and the newest
-// flip argument:
-// - submitted: the guest submitted a frame with a flip (sceGnmSubmitAndFlip..., or a CPU flip);
-// - reached: the GPU command thread reached that flip (VideoOutDriver::SubmitFlipInternal);
-// - published: the guest was told (flip status and event; at GPU retirement by default).
+// read of reused guest data is judged against the guest's reuse gate). Four marks, each a count
+// and (where known) the latest flip argument:
+// - attempted: the guest called a flip API (sceGnmSubmitAndFlip..., or a CPU flip), at entry,
+//   before validation and admission;
+// - parsed: the GPU command thread (stage A) parsed a flip packet (no argument there);
+// - prepared: flip preparation entered (SubmitFlipInternal: on the draw recording thread for EOP
+//   flips, as a host command for CPU flips);
+// - published: the flip status was applied for the guest (before its event and label effects).
+// Each field is sampled on its own and concurrent producers can reorder: approximate
+// observations, not a coherent snapshot or a monotonic argument.
 #pragma once
 #include <atomic>
 #include <cstdint>
@@ -22,19 +26,20 @@ struct Mark {
     }
 };
 
-inline Mark submitted, reached, published;
+inline Mark attempted, parsed, prepared, published;
 
-/// "; flips: guest submitted N (arg a), command thread reached M (arg b), published to the
-/// guest P (arg c)": the three marks as they stand (read one after another, not atomically).
+/// The marks as they stand, read one after another (approximate).
 inline std::string Describe() {
-    char text[224];
+    char text[320];
     std::snprintf(text, sizeof(text),
-                  "; flips at the stop: guest submitted %llu (arg %lld), GPU command thread "
-                  "reached %llu (arg %lld), published to the guest %llu (arg %lld)",
-                  static_cast<unsigned long long>(submitted.count.load()),
-                  static_cast<long long>(submitted.arg.load()),
-                  static_cast<unsigned long long>(reached.count.load()),
-                  static_cast<long long>(reached.arg.load()),
+                  "; flips at the stop (approximate): guest API calls %llu (latest arg %lld), "
+                  "flip packets parsed %llu, flip preparation entered %llu (latest arg %lld), "
+                  "status published %llu (latest arg %lld)",
+                  static_cast<unsigned long long>(attempted.count.load()),
+                  static_cast<long long>(attempted.arg.load()),
+                  static_cast<unsigned long long>(parsed.count.load()),
+                  static_cast<unsigned long long>(prepared.count.load()),
+                  static_cast<long long>(prepared.arg.load()),
                   static_cast<unsigned long long>(published.count.load()),
                   static_cast<long long>(published.arg.load()));
     return text;

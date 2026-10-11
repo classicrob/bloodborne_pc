@@ -103,11 +103,16 @@ The stop line also says:
   runtime_memory's mapping table, a query and not a guest memory read. Stop hunt #1 found every
   table read outside command memory (20261011-192653-1080p-HUNT-1), so the mapping is the
   lead.
-- **how far each side of the flip pipeline had got, always (even without `BB_CMD_DATA_CHECK`):**
-  flips the guest submitted, flips the GPU command thread reached and flips published to the
-  guest, each as a count and the newest flip argument (gpu/shim/bbport_frame_marks.h). Judged
-  against the guest's reuse gate, this shows whether the guest could already reuse the memory
-  the parser was reading.
+- **how far each side of the flip pipeline had got, always (even without `BB_CMD_DATA_CHECK`).**
+  These come from gpu/shim/bbport_frame_marks.h:
+  - guest flip API calls, counted at entry, before admission;
+  - flip packets parsed by the GPU command thread;
+  - flip preparation entered (on the draw recording thread for EOP flips);
+  - flip status published to the guest.
+
+  Each is a count, with the latest argument where known. These are approximate observations,
+  each sampled on its own. Judged against the guest's reuse gate, they show whether the guest
+  could already reuse the memory the parser was reading.
 
 **Limits:**
 - Supporting evidence only.

@@ -693,7 +693,7 @@ s32 VideoOutDriver::SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg,
     u64 generation = 0;
 #ifdef __APPLE__
     if (!is_eop) {
-        BbFrameMarks::submitted.Note(flip_arg); // a CPU flip: submitted by the guest directly
+        BbFrameMarks::attempted.Note(flip_arg); // a CPU flip: called by the guest directly
     }
     if (const s32 result = PortLifecycle::Admit(*port, index, is_eop, generation);
         result != ORBIS_OK) {
@@ -730,7 +730,7 @@ void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_
                                         u64 generation) {
     Vulkan::Frame* frame;
 #ifdef __APPLE__
-    BbFrameMarks::reached.Note(flip_arg);
+    BbFrameMarks::prepared.Note(flip_arg);
     // A Close since the flip was admitted reset (or reopened) the port: drop the flip before
     // reading its buffers. Prepare from a copy taken under port_mutex. A buffer unregistered in
     // the same lifetime is fatal, as on the other platforms: the flip is counted pending and

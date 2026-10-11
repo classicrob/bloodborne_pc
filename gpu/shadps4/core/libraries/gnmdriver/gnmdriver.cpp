@@ -2503,7 +2503,7 @@ s32 PS4_SYSV_ABI sceGnmSubmitAndFlipCommandBuffersForWorkload(
     u32* ccb_sizes_in_bytes, u32 vo_handle, u32 buf_idx, u32 flip_mode, s64 flip_arg) {
     LOG_DEBUG(Lib_GnmDriver, "called [buf = {}]", buf_idx);
 #ifdef __APPLE__
-    BbFrameMarks::submitted.Note(flip_arg); // stop lines (bbport_frame_marks.h)
+    BbFrameMarks::attempted.Note(flip_arg); // stop lines (bbport_frame_marks.h)
 #endif
 
     if (count != 0) {
