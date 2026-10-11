@@ -389,6 +389,17 @@ void Liverpool::Process(std::stop_token stoken) {
                              parse_lag.prep_build_ns_max / 1000.0);
                     std::fflush(stdout);
                     parse_lag = {};
+                    if (predication.packets) {
+                        fmt::print("SET_PREDICATION (not implemented), so far: {} packets "
+                                   "(clear {}, zpass {}, primcount {}, other {}; continue {}); "
+                                   "draws/dispatches parsed while a predicate was set: {}\n",
+                                   predication.packets, predication.by_op[0],
+                                   predication.by_op[1], predication.by_op[2],
+                                   predication.packets - predication.by_op[0] -
+                                       predication.by_op[1] - predication.by_op[2],
+                                   predication.continues, predication.draws_while_set);
+                        std::fflush(stdout);
+                    }
                 }
             }
 #endif
@@ -519,6 +530,55 @@ void Liverpool::NoteIdleSplit(u64 drain_ns, u64 recorder_ns, u64 labels_ns) {
     const u64 keep = s.labels_issued_before;
     s = {};
     s.labels_issued_before = keep;
+}
+#endif
+
+#ifdef __APPLE__
+namespace {
+bool IsDrawOrDispatch(PM4ItOpcode opcode) {
+    switch (opcode) {
+    case PM4ItOpcode::DrawIndex2:
+    case PM4ItOpcode::DrawIndexOffset2:
+    case PM4ItOpcode::DrawIndexAuto:
+    case PM4ItOpcode::DrawIndirect:
+    case PM4ItOpcode::DrawIndirectMulti:
+    case PM4ItOpcode::DrawIndexIndirect:
+    case PM4ItOpcode::DrawIndexIndirectMulti:
+    case PM4ItOpcode::DrawIndexIndirectCountMulti:
+    case PM4ItOpcode::DispatchDirect:
+    case PM4ItOpcode::DispatchIndirect:
+        return true;
+    default:
+        return false;
+    }
+}
+} // namespace
+
+/// IT_SET_PREDICATION census (it is not implemented): what the game sets, and how many draws
+/// and dispatches the parser meets while a predicate is set. DW2: START_ADDR_HI[7:0],
+/// PREDICATION_BOOLEAN[8], HINT[12], PRED_OP[18:16] (0 clear, 1 zpass, 2 primcount),
+/// CONTINUE[31].
+void Liverpool::NotePredication(const PM4Header* header) {
+    const u32* dw = reinterpret_cast<const u32*>(header);
+    const u32 count = header->type3.NumWords();
+    const u32 addr_lo = count >= 1 ? dw[1] : 0;
+    const u32 control = count >= 2 ? dw[2] : 0;
+    const u32 op = (control >> 16) & 7;
+    const u64 address = (u64(control & 0xff) << 32) | (addr_lo & ~0xfu);
+    ++predication.packets;
+    ++predication.by_op[op];
+    if (control >> 31) {
+        ++predication.continues;
+    }
+    predication.active = op != 0;
+    if (predication.packets <= 8) {
+        fmt::print("SET_PREDICATION #{}: op {} ({}), boolean {}, hint {}, continue {}, address "
+                   "{:#x}, {} dwords\n",
+                   predication.packets, op,
+                   op == 0 ? "clear" : op == 1 ? "zpass" : op == 2 ? "primcount" : "other",
+                   (control >> 8) & 1, (control >> 12) & 1, control >> 31, address, count);
+        std::fflush(stdout);
+    }
 }
 #endif
 
@@ -1268,6 +1328,11 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
         case 3:
             const u32 count = header->type3.NumWords();
             const PM4ItOpcode opcode = header->type3.opcode;
+#ifdef __APPLE__
+            if (predication.active && IsDrawOrDispatch(opcode)) {
+                ++predication.draws_while_set; // executed here; the PS4 may have skipped it
+            }
+#endif
             ApplyGraphicsRegisterPacket(regs, header, gfx_reg_checksum, &pipe_dirty);
             // DmaData to 0x3022C does nothing here (skipped below): no need to wait.
             if (rasterizer && !PipelinedOpcode(opcode) &&
@@ -1425,6 +1490,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
             case PM4ItOpcode::SetPredication: {
                 LOG_WARNING(Render, "Unimplemented IT_SET_PREDICATION");
+#ifdef __APPLE__
+                NotePredication(header);
+#endif
                 break;
             }
             case PM4ItOpcode::IndexType: {
