@@ -4814,9 +4814,22 @@ int CensusSgpr(int argc, char** argv, int first) {
                     const bool mask_reader = (insts[k].name.rfind("S_", 0) == 0 && is_mask_writer(insts[k].name)) ||
                                              insts[k].name.find("CNDMASK") != std::string::npos;
                     (mask ? mask_hit : mask_reader ? reuse_hit : value_hit) = true;
-                    std::printf("%s: %s execz @%#x..%#x: %s written by %s, read @%#x by %s\n", base.c_str(),
+                    // Whether the register holds a value before the scope (else the recompiler's
+                    // phi is (undefined, scope value) and every lane may see the scope value).
+                    std::string prior = " (no prior write)";
+                    for (size_t b = i; b-- > 0;) {
+                        std::vector<u32> ws;
+                        dsts(insts[b].inst, insts[b].name, ws);
+                        if (std::ranges::contains(ws, r)) {
+                            char buf[96];
+                            std::snprintf(buf, sizeof(buf), " (prior write @%#x by %s)", insts[b].pc * 4, insts[b].name.c_str());
+                            prior = buf;
+                            break;
+                        }
+                    }
+                    std::printf("%s: %s execz @%#x..%#x: %s written by %s, read @%#x by %s%s\n", base.c_str(),
                                 mask ? "mask->any  " : mask_reader ? "value->mask" : "value->value", insts[i].pc * 4, target * 4, reg_name(r).c_str(),
-                                it->second.c_str(), insts[k].pc * 4, insts[k].name.c_str());
+                                it->second.c_str(), insts[k].pc * 4, insts[k].name.c_str(), prior.c_str());
                     written.erase(it);
                 }
                 dsts(insts[k].inst, insts[k].name, writes);
