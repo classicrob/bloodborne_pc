@@ -838,6 +838,13 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
         const auto* header = reinterpret_cast<const PM4Header*>(dcb.data());
         const u32 type = header->type;
 
+#ifdef __APPLE__
+        if (type == 0 || type == 1) {
+            // Lost packet alignment: which builder calls wrote around here (guest address).
+            BuilderTrace::Report(region ? region->guest + (region->size_dw - dcb.size())
+                                        : dcb.data());
+        }
+#endif
         switch (type) {
         default:
             UNREACHABLE_MSG("Wrong PM4 type {}", type);

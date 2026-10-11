@@ -230,6 +230,22 @@ int main() {
                WIFEXITED(status) && WEXITSTATUS(status) == 23);
     }
 
+    // Builder calls are traced: the ones overlapping a window, plus the latest, oldest first.
+    {
+        static u32 stream[256];
+        BuilderTrace::Note("sceGnmSetCsShader", stream + 100, 25);
+        BuilderTrace::Note("sceGnmDrawIndexAuto", stream + 10, 7);
+        std::thread([] { BuilderTrace::Note("sceGnmSetVsShader", stream + 140, 29); }).join();
+        const auto near = BuilderTrace::Around(stream + 120, stream + 130, 0);
+        Expect("trace: call overlapping the window found, other excluded",
+               near.size() == 1 && near[0].cmdbuf == stream + 100 && near[0].size == 25);
+        const auto latest = BuilderTrace::Around(stream, stream, 2);
+        Expect("trace: latest calls kept in order, threads told apart",
+               latest.size() == 2 && latest[0].cmdbuf == stream + 10 &&
+                   latest[1].cmdbuf == stream + 140 && latest[0].thread != latest[1].thread);
+        BuilderTrace::Report(stream + 106);
+    }
+
     std::fprintf(stderr, "%s: %u failures\n", failures ? "FAIL" : "PASS", failures);
     return failures ? 1 : 0;
 }

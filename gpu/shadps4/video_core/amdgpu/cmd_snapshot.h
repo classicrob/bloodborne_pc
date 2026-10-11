@@ -82,4 +82,23 @@ public:
     static u32 WaitLanded(VAddr address, u64 size);
 };
 
+/// The latest calls of the sceGnm* command builders (which guest thread wrote which dwords), so a
+/// malformed packet can be traced to the writes around it.
+class BuilderTrace {
+public:
+    struct Call {
+        const char* builder;
+        const u32* cmdbuf;
+        u32 size;   ///< dwords the guest reserved
+        u32 thread; ///< small per-thread number, in order of first call
+        u64 seq;
+    };
+    /// Guest thread, on entry to a builder.
+    static void Note(const char* builder, const u32* cmdbuf, u32 size);
+    /// Recorded calls (oldest first) whose dwords overlap [begin, end), plus the `last` latest.
+    [[nodiscard]] static std::vector<Call> Around(const u32* begin, const u32* end, u32 last);
+    /// Logs Around() for a malformed packet at `at`.
+    static void Report(const u32* at);
+};
+
 } // namespace AmdGpu
