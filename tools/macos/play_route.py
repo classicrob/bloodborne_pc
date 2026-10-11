@@ -421,8 +421,19 @@ def launch(args):
     lock = (BASE / 'launch.lock').open('w')
     fcntl.flock(lock, fcntl.LOCK_EX)
     # A detached supervisor owns the game, so its exit status is recorded however the run ends.
-    subprocess.Popen([sys.executable, __file__, '_supervise', str(run)], start_new_session=True,
-                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
+    supervisor = subprocess.Popen([sys.executable, __file__, '_supervise', str(run)], start_new_session=True,
+                                  stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                  stderr=subprocess.DEVNULL, env=env)
+
+    def give_up(message):
+        # The supervisor leads its own process group (heavy.sh, then the game): end all of it, so a
+        # launch that gave up cannot start later with nobody driving it (BISECT-P15 started 730 s
+        # after its route had gone, idled at the title into the attract movie and crashed).
+        try:
+            os.killpg(supervisor.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        die(message)
     # Waiting for a heavy-job slot or the GPU (heavy.sh) is not startup: the 60 s start when
     # heavy.sh says the game is running (BB_HEAVY_ANNOUNCE). The wait is reported, not failed.
     deadline, waited_since, reported = None, time.time(), time.time()
@@ -441,12 +452,12 @@ def launch(args):
                       f'{heavy_lines[-1] if heavy_lines else "(no report yet)"}', file=sys.stderr)
                 reported = time.time()
         if (run / 'exit.json').exists():
-            die(f'game exited during startup: {(run / "exit.json").read_text().strip()}; log {run / "game.log"}')
+            give_up(f'game exited during startup: {(run / "exit.json").read_text().strip()}; log {run / "game.log"}')
         if info.get('pid') and any(l.startswith('Runtime:') for l in log_lines(run)):
             fcntl.flock(lock, fcntl.LOCK_UN)
             print(json.dumps({'run': str(run), 'pid': info['pid'], 'log': str(run / 'game.log')}))
             return run
-    die(f'no runtime output within 60 s (Rosetta rule: report, do not retry); run {run}')
+    give_up(f'no runtime output within 60 s (Rosetta rule: report, do not retry); run {run}')
 
 
 def supervise(run):
