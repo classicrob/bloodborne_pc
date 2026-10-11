@@ -1,4 +1,24 @@
-# Movie step handoff to GXRenderThread (`BB_MOVIE_HANDOFF=1`, experiment)
+# Movie step handoff to GXRenderThread (`BB_MOVIE_HANDOFF`): falsified and removed
+
+> **Falsified, 2026-10-11; removed from the code.** This note is kept as the record. The
+> movie/title race itself is parked: the game is playable without the attract video.
+>
+> **H1** (Playtest, title idle at `--fps 30`, FPS++ 30 preset, 17d,
+> `out/macos_route/20261011-182501-1080p-TI30-17d-H1`):
+> - The kick mode byte was 1, and the movie step ran on main.
+> - The handoff did not remove the race: there were still 16 `CMD-INTERLEAVE`. In #1, two lines
+>   after the first movie step, GXRenderThread is *starting a frame*
+>   (`sceGnmDrawInitDefaultHardwareState200`) before main writes.
+> - Meanwhile the first 600 movie steps found GX's done event already set, so 0 waited. In mode
+>   1, done does not bracket GX's frames.
+> - Later 6 steps waited (mean 57 ms, max 132 ms). Then done never came within 5 s (event state
+>   0x5: initialized, a waiter, not signaled). The handoff's own stop ended the run. It could
+>   hang the game.
+>
+> **H0**, the same at `--fps 30` without the handoff: (pending; added when it is in).
+>
+> What is still unknown, and not being pursued: the mode-1 kick path (whether it resets done),
+> and what else starts GX's frames.
 
 Title-screen idle crashes once the attract video (`sprj_advertise.mp4`) starts. So do some movie
 crashes. The builder trace reports `CMD-INTERLEAVE`: the main thread and GXRenderThread
