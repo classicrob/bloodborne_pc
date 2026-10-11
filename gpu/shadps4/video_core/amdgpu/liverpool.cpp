@@ -387,7 +387,7 @@ bool PipelinedOpcode(PM4ItOpcode opcode) {
 
 namespace {
 #ifdef __APPLE__
-/// BB_LABELS_AT_GPU_COMPLETE: labels are written on the label writer thread. A faulting store
+/// Labels at GPU completion (the default): labels are written on the label writer thread. A faulting store
 /// there could enter the write-fault handler (DrainDrawPipe, cache locks) while a recording thread
 /// waits for this very label, so labels are stored only through the memory's backing, which
 /// cannot fault; a label without a backing stops.

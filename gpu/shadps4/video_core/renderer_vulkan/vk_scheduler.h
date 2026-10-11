@@ -852,7 +852,7 @@ public:
     void SignalAfterHostCopies(std::function<void()> signal);
 
 #ifdef __APPLE__
-    /// bbport (Apple, BB_LABELS_AT_GPU_COMPLETE=1, under A/B): like SignalAfterHostCopies, but
+    /// bbport (Apple, labels at GPU completion, the default): like SignalAfterHostCopies, but
     /// `signal` runs only once the GPU has completed the command buffer holding everything
     /// recorded before it. That buffer is submitted at once, so the GPU reaches it without
     /// waiting for the frame's end (a guest or WAIT_REG_MEM waiting on the label would never
@@ -873,8 +873,9 @@ public:
     }
     static constexpr auto LabelBatchAge = std::chrono::microseconds(500);
 
-    /// Whether labels are written at GPU completion now: BB_LABELS_AT_GPU_COMPLETE=1 for the
-    /// whole run, or toggle bit 59 (switchable live). Read when a label is issued.
+    /// Whether labels are written at GPU completion now: the default, unless toggle bit 59
+    /// (LabelsAtSubmit, live) or BB_LABELS_AT_GPU_COMPLETE=0/1 for the whole run says otherwise
+    /// (bbport_label_mode.h). Read when a label is issued.
     static bool LabelsAtGpuComplete();
 #endif
 

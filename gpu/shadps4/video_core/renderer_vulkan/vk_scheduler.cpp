@@ -12,6 +12,7 @@
 #include <functional>
 
 #include "bbport_copy.h"
+#include "bbport_label_mode.h"
 #include "video_core/renderer_vulkan/vk_gpu_profiler.h"
 #include "bbport_toggles.h"
 #include "common/assert.h"
@@ -199,18 +200,18 @@ void Scheduler::SignalAfterHostCopies(std::function<void()> signal) {
 
 #ifdef __APPLE__
 bool Scheduler::LabelsAtGpuComplete() {
-    static const bool whole_run = [] {
-        const char* env = std::getenv("BB_LABELS_AT_GPU_COMPLETE");
-        const bool on = env && env[0] == '1';
-        if (on) {
-            std::fprintf(stderr, "BB_LABELS_AT_GPU_COMPLETE=1: EOP/EOS/RELEASE_MEM labels are "
-                                 "written once the GPU completed the work before them (one "
-                                 "submission per label)\n");
-        }
-        return on;
+    static const BbLabels::RunMode run = [] {
+        const auto mode = BbLabels::ParseRunMode(std::getenv("BB_LABELS_AT_GPU_COMPLETE"));
+        std::fprintf(stderr, "Labels (EOP/EOS/RELEASE_MEM): %s\n",
+                     mode == BbLabels::RunMode::AtGpuComplete
+                         ? "at GPU completion for the whole run (BB_LABELS_AT_GPU_COMPLETE=1)"
+                     : mode == BbLabels::RunMode::AtSubmit
+                         ? "at submit for the whole run (BB_LABELS_AT_GPU_COMPLETE=0, diagnosis)"
+                         : "at GPU completion (default; toggle bit 59 writes them at submit)");
+        return mode;
     }();
     // Toggle bit 59 (BB_TOGGLE_FILE) switches it live; Liverpool keeps the order at a switch.
-    return whole_run || BbToggle::Disabled(BbToggle::LabelsAtGpuComplete);
+    return BbLabels::AtGpuComplete(run, BbToggle::Disabled(BbToggle::LabelsAtSubmit));
 }
 
 void Scheduler::FlushLabels(bool idle) {
