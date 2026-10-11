@@ -98,6 +98,16 @@ struct Liverpool {
         u64 snapshot_bytes{}, snapshot_ns{}, snapshot_ns_max{}, snapshot_writes_waited{};
         u64 prep_build_ns{}, prep_build_ns_max{}; ///< draw preparation copy, on the guest thread
     } parse_lag;
+    /// GpuIdle's wait split (docs/macos/throttle-relaxation.md, R0), per frame end that raised
+    /// GpuIdle: from the guest's sceGnmSubmitDone to GpuIdle, and its parts (GPU thread only).
+    struct IdleSplitStats {
+        u64 frames{}, total_ns{}, total_ns_max{}, drain_ns{}, recorder_ns{}, labels_ns{};
+        u64 tail_frames{}, tail_ticks{}, unlabeled_frames{}, unpaired{};
+        u64 labels_issued_before{};
+    } idle_split;
+    std::chrono::steady_clock::time_point submit_done_at{}; ///< under submit_mutex
+    std::chrono::steady_clock::time_point idle_split_frame_submit_done{}; ///< GPU thread
+    void NoteIdleSplit(u64 drain_ns, u64 recorder_ns, u64 labels_ns);
     /// bbport (macOS): graphics submissions whose command memory is a submit-time copy and not
     /// fully parsed yet (cmd_snapshot.h), in submission order.
     std::mutex snapshots_mutex;
@@ -127,6 +137,9 @@ public:
 
     void SubmitDone() noexcept {
         std::scoped_lock lk{submit_mutex};
+#ifdef __APPLE__
+        submit_done_at = std::chrono::steady_clock::now(); // GpuIdle's wait split (R0)
+#endif
         mapped_queues[GfxQueueId].ccb_buffer_offset = 0;
         mapped_queues[GfxQueueId].dcb_buffer_offset = 0;
         submit_done = true;

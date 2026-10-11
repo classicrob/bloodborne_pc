@@ -12,6 +12,7 @@
 #include <functional>
 
 #include "bbport_copy.h"
+#include "bbport_label_mode.h"
 #include "video_core/renderer_vulkan/vk_gpu_profiler.h"
 #include "bbport_toggles.h"
 #include "common/assert.h"
@@ -188,29 +189,42 @@ void Scheduler::SignalAfterHostCopies(std::function<void()> signal) {
     }
     BbCopy::FlushBatch();
     deferred_signals_issued.fetch_add(1, std::memory_order_relaxed);
+#ifdef __APPLE__
+    recorder_signals.Issue();
+    Record([signal = std::move(signal), done = deferred_signals_done,
+            recorder_done = recorder_signals.done](vk::CommandBuffer) mutable {
+        BbCopy::AfterCopies([signal = std::move(signal), done = std::move(done),
+                             recorder_done = std::move(recorder_done)] {
+            signal();
+            recorder_done->fetch_add(1, std::memory_order_release);
+            done->fetch_add(1, std::memory_order_release);
+        });
+    });
+#else
     Record([signal = std::move(signal), done = deferred_signals_done](vk::CommandBuffer) mutable {
         BbCopy::AfterCopies([signal = std::move(signal), done = std::move(done)] {
             signal();
             done->fetch_add(1, std::memory_order_release);
         });
     });
+#endif
     KickRecording(true);
 }
 
 #ifdef __APPLE__
 bool Scheduler::LabelsAtGpuComplete() {
-    static const bool whole_run = [] {
-        const char* env = std::getenv("BB_LABELS_AT_GPU_COMPLETE");
-        const bool on = env && env[0] == '1';
-        if (on) {
-            std::fprintf(stderr, "BB_LABELS_AT_GPU_COMPLETE=1: EOP/EOS/RELEASE_MEM labels are "
-                                 "written once the GPU completed the work before them (one "
-                                 "submission per label)\n");
-        }
-        return on;
+    static const BbLabels::RunMode run = [] {
+        const auto mode = BbLabels::ParseRunMode(std::getenv("BB_LABELS_AT_GPU_COMPLETE"));
+        std::fprintf(stderr, "Labels (EOP/EOS/RELEASE_MEM): %s\n",
+                     mode == BbLabels::RunMode::AtGpuComplete
+                         ? "at GPU completion for the whole run (BB_LABELS_AT_GPU_COMPLETE=1)"
+                     : mode == BbLabels::RunMode::AtSubmit
+                         ? "at submit for the whole run (BB_LABELS_AT_GPU_COMPLETE=0, diagnosis)"
+                         : "at GPU completion (default; toggle bit 59 writes them at submit)");
+        return mode;
     }();
     // Toggle bit 59 (BB_TOGGLE_FILE) switches it live; Liverpool keeps the order at a switch.
-    return whole_run || BbToggle::Disabled(BbToggle::LabelsAtGpuComplete);
+    return BbLabels::AtGpuComplete(run, BbToggle::Disabled(BbToggle::LabelsAtSubmit));
 }
 
 void Scheduler::FlushLabels(bool idle) {
@@ -228,6 +242,8 @@ void Scheduler::SignalAtGpuCompletion(std::function<void()> signal, bool batch) 
     // Issued now, in stream order; the writer takes labels only in this order, whichever
     // becomes ready first (deferred ones after the copy threads, direct ones at once).
     const u64 sequence = labels.Issue();
+    completion_labels.Issue();
+    last_label_tick.store(tick, std::memory_order_relaxed);
     deferred_signals_issued.fetch_add(1, std::memory_order_relaxed);
     std::call_once(label_thread_once, [this] {
         label_thread = std::jthread([this](std::stop_token stoken) { LabelThread(stoken); });
@@ -302,12 +318,14 @@ void Scheduler::LabelThread(std::stop_token stoken) {
             break;
         }
         label->write();
+        completion_labels.Complete();
         deferred_signals_done->fetch_add(1, std::memory_order_release);
     }
     // Stopping (exit): labels not written are dropped, and counted as done so that nothing is
     // left waiting for them (WaitDeferredSignals).
     dropped += labels.Outstanding();
     if (dropped) {
+        completion_labels.Complete(dropped);
         deferred_signals_done->fetch_add(dropped, std::memory_order_release);
         std::fprintf(stderr, "Labels at GPU completion: %llu labels not written at shutdown\n",
                      static_cast<unsigned long long>(dropped));
@@ -355,6 +373,22 @@ void Scheduler::WaitDeferredSignals() {
         std::this_thread::yield();
     }
 }
+
+#ifdef __APPLE__
+void Scheduler::WaitRecorderSignals() {
+    // Its own counts (bbport_deferred_counts.h), not a difference of the total and the labels.
+    const u64 issued = recorder_signals.Issued();
+    if (recorder_signals.CompleteThrough(issued) ||
+        BbToggle::Disabled(BbToggle::OrderedGuestWrites)) {
+        return;
+    }
+    KickRecording(true);
+    while (!recorder_signals.CompleteThrough(issued)) {
+        BbCopy::WaitAsync();
+        std::this_thread::yield();
+    }
+}
+#endif
 
 void Scheduler::WaitHostCopies() {
     if (host_copies_done.load(std::memory_order_acquire) < host_copies_issued) {

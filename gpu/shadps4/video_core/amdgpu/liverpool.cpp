@@ -354,9 +354,20 @@ void Liverpool::Process(std::stop_token stoken) {
         }
 
 #ifdef __APPLE__
-        const bool frame_ended = submit_done;
-#endif
+        // The frame-end flag and its sceGnmSubmitDone time, sampled together (a later
+        // SubmitDone may overwrite submit_done_at before GpuIdle); this iteration's frame-end
+        // body and the GpuIdle split use this same flag. (The body's submit_done reset is
+        // unchanged: a SubmitDone during OnSubmit/Flush can still be cleared by it.)
+        bool frame_ended;
+        {
+            std::scoped_lock lk{submit_mutex};
+            frame_ended = submit_done;
+            idle_split_frame_submit_done = submit_done_at;
+        }
+        if (frame_ended) {
+#else
         if (submit_done) {
+#endif
 #ifdef __APPLE__
             {
                 std::scoped_lock lk{submit_mutex};
@@ -396,10 +407,29 @@ void Liverpool::Process(std::stop_token stoken) {
         // heap free list after minutes of play).
         // The same holds when sceGnmSubmitDone finds the GPU idle and does not block at all:
         // decoded (num_submits 0) is not done until then (work_retired).
+#ifdef __APPLE__
+        // GpuIdle's wait split (R0): the drain, the recorder-side writes, then the completion
+        // labels, timed separately; the waits are the same as without it.
+        u64 drain_ns = 0, recorder_ns = 0, labels_ns = 0;
+        if (rasterizer) {
+            const auto t0 = std::chrono::steady_clock::now();
+            rasterizer->DrainDrawPipe(Vulkan::DrawPipe::ReasonSubmissionEnd);
+            const auto t1 = std::chrono::steady_clock::now();
+            rasterizer->WaitRecorderSignals();
+            const auto t2 = std::chrono::steady_clock::now();
+            rasterizer->WaitDeferredSignals();
+            const auto t3 = std::chrono::steady_clock::now();
+            using std::chrono::duration_cast, std::chrono::nanoseconds;
+            drain_ns = duration_cast<nanoseconds>(t1 - t0).count();
+            recorder_ns = duration_cast<nanoseconds>(t2 - t1).count();
+            labels_ns = duration_cast<nanoseconds>(t3 - t2).count();
+        }
+#else
         if (rasterizer) {
             rasterizer->DrainDrawPipe(Vulkan::DrawPipe::ReasonSubmissionEnd);
             rasterizer->WaitDeferredSignals();
         }
+#endif
 #ifdef __APPLE__
         // GpuIdle releases the guest's sceGnmSubmitDone throttle (submission_lock), after which
         // it rebuilds command buffers it double-buffers. The drain above can take long while the
@@ -413,6 +443,9 @@ void Liverpool::Process(std::stop_token stoken) {
                 work_retired = true;
                 retired_frame = frame_ended;
                 Platform::IrqC::Instance()->Signal(Platform::InterruptId::GpuIdle);
+                if (frame_ended) {
+                    NoteIdleSplit(drain_ns, recorder_ns, labels_ns);
+                }
             } else if (++parse_lag.idle_held_back <= 8) {
                 LOG_INFO(Render, "GpuIdle held back: {} submissions arrived while retiring",
                          num_submits.load());
@@ -439,6 +472,55 @@ void Liverpool::Process(std::stop_token stoken) {
 #endif
     }
 }
+
+#ifdef __APPLE__
+void Liverpool::NoteIdleSplit(u64 drain_ns, u64 recorder_ns, u64 labels_ns) {
+    // Under submit_mutex, with GpuIdle just raised for a frame end.
+    auto& s = idle_split;
+    const u64 total_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             std::chrono::steady_clock::now() - idle_split_frame_submit_done)
+                             .count();
+    if (total_ns < drain_ns + recorder_ns + labels_ns) {
+        ++s.unpaired; // the parts were not all after this SubmitDone: not a frame-end sample
+        return;
+    }
+    s.total_ns += total_ns;
+    s.total_ns_max = std::max(s.total_ns_max, total_ns);
+    s.drain_ns += drain_ns;
+    s.recorder_ns += recorder_ns;
+    s.labels_ns += labels_ns;
+    if (rasterizer) {
+        const auto progress = rasterizer->GetLabelProgress();
+        if (progress.issued == s.labels_issued_before) {
+            ++s.unlabeled_frames;
+        } else if (progress.last_submitted_tick > progress.last_label_tick) {
+            ++s.tail_frames;
+            s.tail_ticks += progress.last_submitted_tick - progress.last_label_tick;
+        }
+        s.labels_issued_before = progress.issued;
+    }
+    if (++s.frames < 600) {
+        return;
+    }
+    const double n = double(s.frames);
+    const u64 parts = s.drain_ns + s.recorder_ns + s.labels_ns; // each sample's total >= its parts
+    // Printed like the Stall lines: Info-level logging is filtered in perf runs.
+    fmt::print("GpuIdle split, last 600 frame ends: sceGnmSubmitDone to GpuIdle {:.2f} ms mean "
+               "({:.2f} max) = parse and queue {:.2f} + stage-B drain {:.2f} + recorder writes "
+               "{:.2f} + completion labels {:.2f} ms; of the GpuIdles with a completion label "
+               "issued since the previous reported one, those whose last GPU submission follows "
+               "that last label {} (mean {:.1f} ticks); without one {}; samples excluded as "
+               "unpaired {}\n",
+               s.total_ns / n / 1e6, s.total_ns_max / 1e6, (s.total_ns - parts) / n / 1e6,
+               s.drain_ns / n / 1e6, s.recorder_ns / n / 1e6, s.labels_ns / n / 1e6,
+               s.tail_frames, s.tail_frames ? double(s.tail_ticks) / s.tail_frames : 0.0,
+               s.unlabeled_frames, s.unpaired);
+    std::fflush(stdout);
+    const u64 keep = s.labels_issued_before;
+    s = {};
+    s.labels_issued_before = keep;
+}
+#endif
 
 namespace {
 /// bbport: packets the GPU command thread handles while the draw recording thread may still
@@ -488,7 +570,7 @@ bool PipelinedOpcode(PM4ItOpcode opcode) {
 
 namespace {
 #ifdef __APPLE__
-/// BB_LABELS_AT_GPU_COMPLETE: labels are written on the label writer thread. A faulting store
+/// Labels at GPU completion (the default): labels are written on the label writer thread. A faulting store
 /// there could enter the write-fault handler (DrainDrawPipe, cache locks) while a recording thread
 /// waits for this very label, so labels are stored only through the memory's backing, which
 /// cannot fault; a label without a backing stops.
@@ -525,6 +607,32 @@ bool LabelsAtGpuCompleteForIssue(Vulkan::Rasterizer& rasterizer) {
                      now ? "ON" : "OFF", stamp, static_cast<long long>(ms));
     }
     return now;
+}
+#endif
+
+#ifdef __APPLE__
+/// BB_LABEL_CHECK covers RELEASE_MEM labels with 32/64-bit data too: the guest's compute-queue
+/// chunk release (0x26d3cb0) zeroes a chunk's status word that way (docs/macos/gpu-idle.md).
+bool LabelCheckedReleaseMem(const PM4CmdReleaseMem& packet) {
+    return BbLabelCheck::Enabled() && (packet.data_sel.Value() == DataSelect::Data32Low ||
+                                       packet.data_sel.Value() == DataSelect::Data64);
+}
+/// A RELEASE_MEM label store: through the backing on the label writer (at GPU completion),
+/// otherwise one store at the guest address, as the packet's default write does; checked
+/// around the store as EOP labels are.
+void WriteReleaseMemLabel(void* address, u64 data, u32 num_bytes, bool backing_only,
+                          bool checked) {
+    if (checked) {
+        BbLabelCheck::BeforeWrite(reinterpret_cast<u64>(address), num_bytes);
+    }
+    if (backing_only) {
+        WriteLabelBacking(address, data, num_bytes);
+    } else {
+        BbLabelStore::StoreOnce(address, data, num_bytes);
+    }
+    if (checked) {
+        BbLabelCheck::AfterWrite(reinterpret_cast<u64>(address), data, num_bytes);
+    }
 }
 #endif
 
@@ -2145,6 +2253,14 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 rasterizer->WaitDeferredSignals();
             }
             const auto* release_mem = reinterpret_cast<const PM4CmdReleaseMem*>(header);
+#ifdef __APPLE__
+            const bool label_checked = LabelCheckedReleaseMem(*release_mem);
+            if (label_checked) {
+                BbLabelCheck::NoteParsed(
+                    release_mem->Address<u64>(),
+                    release_mem->data_sel.Value() == DataSelect::Data32Low ? 4 : 8);
+            }
+#endif
             if (rasterizer) {
                 rasterizer->ProcessDownloadImages();
 #ifdef __APPLE__
@@ -2159,9 +2275,13 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                     };
                     if (release_mem->data_sel.Value() != DataSelect::GdsMemStore) {
                         const PM4CmdReleaseMem packet = *release_mem;
-                        rasterizer->SignalAtGpuCompletion([packet, irq] {
-                            packet.SignalFence(WriteLabelBacking, irq,
-                                               [](VAddr, u16, u16) { UNREACHABLE(); });
+                        rasterizer->SignalAtGpuCompletion([packet, irq, label_checked] {
+                            packet.SignalFence(
+                                [label_checked](void* address, u64 data, u32 num_bytes) {
+                                    WriteReleaseMemLabel(address, data, num_bytes, true,
+                                                         label_checked);
+                                },
+                                irq, [](VAddr, u16, u16) { UNREACHABLE(); });
                         });
                         break;
                     }
@@ -2183,6 +2303,18 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 }
 #endif
             }
+#ifdef __APPLE__
+            release_mem->SignalFence(
+                [label_checked](void* address, u64 data, u32 num_bytes) {
+                    WriteReleaseMemLabel(address, data, num_bytes, false, label_checked);
+                },
+                [pipe_id = queue.pipe_id] {
+                    Platform::IrqC::Instance()->Signal(static_cast<Platform::InterruptId>(pipe_id));
+                },
+                [this](VAddr dst, u16 gds_index, u16 num_dwords) {
+                    rasterizer->CopyBuffer(dst, gds_index, num_dwords * sizeof(u32), false, true);
+                });
+#else
             release_mem->SignalFence(
                 [pipe_id = queue.pipe_id] {
                     Platform::IrqC::Instance()->Signal(static_cast<Platform::InterruptId>(pipe_id));
@@ -2190,6 +2322,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 [this](VAddr dst, u16 gds_index, u16 num_dwords) {
                     rasterizer->CopyBuffer(dst, gds_index, num_dwords * sizeof(u32), false, true);
                 });
+#endif
             break;
         }
         case PM4ItOpcode::EventWrite: {

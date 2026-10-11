@@ -18,6 +18,7 @@
 #include <vector>
 #include <mutex>
 #ifdef __APPLE__
+#include "bbport_deferred_counts.h"
 #include "bbport_label_sequencer.h"
 #endif
 #include <thread>
@@ -852,7 +853,7 @@ public:
     void SignalAfterHostCopies(std::function<void()> signal);
 
 #ifdef __APPLE__
-    /// bbport (Apple, BB_LABELS_AT_GPU_COMPLETE=1, under A/B): like SignalAfterHostCopies, but
+    /// bbport (Apple, labels at GPU completion, the default): like SignalAfterHostCopies, but
     /// `signal` runs only once the GPU has completed the command buffer holding everything
     /// recorded before it. That buffer is submitted at once, so the GPU reaches it without
     /// waiting for the frame's end (a guest or WAIT_REG_MEM waiting on the label would never
@@ -873,9 +874,22 @@ public:
     }
     static constexpr auto LabelBatchAge = std::chrono::microseconds(500);
 
-    /// Whether labels are written at GPU completion now: BB_LABELS_AT_GPU_COMPLETE=1 for the
-    /// whole run, or toggle bit 59 (switchable live). Read when a label is issued.
+    /// Whether labels are written at GPU completion now: the default, unless toggle bit 59
+    /// (LabelsAtSubmit, live) or BB_LABELS_AT_GPU_COMPLETE=0/1 for the whole run says otherwise
+    /// (bbport_label_mode.h). Read when a label is issued.
     static bool LabelsAtGpuComplete();
+
+    /// GpuIdle's wait split (docs/macos/throttle-relaxation.md, R0): waits only for the
+    /// recorder-side deferred writes (host copies, RecorderFences), not the completion labels.
+    /// Called by the thread recording (stage A), after the draw pipe drained.
+    void WaitRecorderSignals();
+    /// Completion labels issued so far, and the timeline tick the last one waits for.
+    [[nodiscard]] u64 LabelsIssued() const noexcept {
+        return completion_labels.Issued();
+    }
+    [[nodiscard]] u64 LastLabelTick() const noexcept {
+        return last_label_tick.load(std::memory_order_relaxed);
+    }
 #endif
 
     /// bbport: before a guest-visible write that is not deferred (WriteData, end-of-shader
@@ -1046,6 +1060,11 @@ private:
     /// and when the oldest was recorded. Set by the recording thread, cleared by a submission.
     std::atomic<bool> labels_unflushed{false};
     u64 unflushed_tick = 0;
+    /// Of deferred_signals_issued/done, by kind (bbport_deferred_counts.h): the recorder-side
+    /// writes and the completion labels, each counted on its own.
+    BbDeferred::Count recorder_signals;
+    BbDeferred::Count completion_labels;
+    std::atomic<u64> last_label_tick{0};
     std::chrono::steady_clock::time_point unflushed_since{};
     std::once_flag label_thread_once;
     std::jthread label_thread;
