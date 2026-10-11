@@ -196,7 +196,7 @@ and announced at the first submission. With `BB_LABEL_CHECK=1` it shows whether 
 start to change before their writes once the guest is not held, and how soon after the parse they
 are checked. It may corrupt the guest heap, so it is not for play.
 
-## Labels at GPU completion (`BB_LABELS_AT_GPU_COMPLETE=1`, the fix under A/B)
+## Labels at GPU completion (the default on Apple)
 
 End-of-pipe labels (EOP, EOS, compute RELEASE_MEM) were written once the recording side had passed
 the work before them and its guest-memory copies were done. That is before Metal executes the
@@ -205,7 +205,8 @@ reclaimer frees nodes once their label reads 4, even mid-frame, and those nodes 
 such as index buffers (node+8 is passed to INDEX_BASE; Astra-2, 50b01dc). So the guest could
 overwrite memory that recorded but not yet executed draws still read.
 
-With `BB_LABELS_AT_GPU_COMPLETE=1`:
+Labels are therefore written at GPU completion. This is the default since labels at completion
+removed the corrupted frames (lighting floods, frame-to-frame alternation) on PREVIEW-17:
 - EOP, EOS and RELEASE_MEM labels, and their interrupts, are written only once the GPU has
   completed the command buffer holding everything recorded before them.
 - Labels issued on the draw recording thread (stage B) are batched rather than submitted one by
@@ -235,11 +236,17 @@ With `BB_LABELS_AT_GPU_COMPLETE=1`:
 - WRITE_DATA and DMA_DATA are unchanged. The command processor executes them in stream order
   without waiting for earlier draws, so the guest cannot take them as "GPU done".
 
-This is the exact fix candidate, kept toggleable for an A/B on corruption and FPS, and the
-precondition for dropping the submit throttle.
+It remains switchable for diagnosis (`gpu/shim/bbport_label_mode.h`):
+- Bit 59 of `BB_TOGGLE_FILE` (`LabelsAtSubmit`, live) writes labels as soon as the work before
+  them is recorded, the old behaviour.
+- `BB_LABELS_AT_GPU_COMPLETE=0` does the same for the whole run, and `=1` keeps labels at GPU
+  completion for the whole run. Either ignores bit 59. Any other value stops.
+- The startup line `Labels (EOP/EOS/RELEASE_MEM): ...` names the mode.
 
-It can be switched live with bit 59 of `BB_TOGGLE_FILE` (`BB_LABELS_AT_GPU_COMPLETE=1` keeps it on
-for the whole run). The mode is read when each label is issued and fixed for that label. At a
+Note the inversion: before this became the default, bit 59 set meant labels at GPU
+completion. Masks from those A/Bs now mean the opposite.
+
+The mode is read when each label is issued and fixed for that label. At a
 switch, the first label in the new mode waits until every label issued before it was written, so
 the two modes never reorder labels. The switch is logged as
 `Labels at GPU completion: ON|OFF at <UTC time> (switched; ...)`. One run can therefore alternate
