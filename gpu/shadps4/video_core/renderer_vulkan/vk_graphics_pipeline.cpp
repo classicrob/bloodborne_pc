@@ -229,6 +229,22 @@ GraphicsPipeline::GraphicsPipeline(
         });
     } else if (is_rect_list || is_quad_list) {
         const auto type = is_quad_list ? AuxShaderType::QuadListTCS : AuxShaderType::RectListTCS;
+#ifdef __APPLE__
+        // The auxiliary stages rotate the corners and tessellate, and with tessellation Vulkan
+        // leaves the provoking vertex of the generated triangles to the implementation: a flat
+        // input would take any corner's value, not the guest's provoking vertex (unproven for
+        // RectList).
+        if (const auto* fs = infos[u32(Shader::SwStage::Fragment)]) {
+            const u32 flat = Shader::Backend::SPIRV::AuxiliaryFlatInputs(
+                *fs, runtime_infos[u32(Shader::SwStage::Fragment)].hw.fs);
+            ASSERT_MSG(flat == 0,
+                       "macOS: {} pipeline {}: fragment shader {:#x} reads parameters {:#010x} "
+                       "flat, and the RectList/QuadList emulation does not keep the provoking "
+                       "vertex",
+                       is_quad_list ? "QuadList" : "RectList", GetDebugString(), fs->pgm_hash,
+                       flat);
+        }
+#endif
         if (!preloading) {
             const auto& fs_info = runtime_infos[u32(Shader::SwStage::Fragment)].hw.fs;
             const auto* vs = infos[u32(Shader::SwStage::Vertex)];
