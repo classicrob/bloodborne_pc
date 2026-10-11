@@ -9,6 +9,7 @@
 // GsEmulationUnsupported check first, as RefreshGraphicsStages does.
 //
 //   shader-sweep JOBS FIRST END [HULL_JOB]    (JOBS from extract.py; sweep.py runs this)
+//   shader-sweep --disasm CODE.bin DWORDS     (GCN disassembly with the production decoder)
 //
 // stderr carries the production log; "@@JOB <index> <hash> <kind>" precedes a job and
 // "@@DONE <index>" follows it. A stop (assertion, exit 23) or a crash ends the process inside a
@@ -588,7 +589,66 @@ struct Sweep {
 
 } // namespace
 
+/// GCN disassembly with the production decoder (no host disassembler handles GFX7): one line
+/// per instruction, dword offset, raw words, opcode, then destinations and sources as
+/// field:code (s/v registers, constants, literals).
+int Disassemble(const char* path, u32 dwords) {
+    std::ifstream f(path, std::ios::binary);
+    std::vector<char> bytes((std::istreambuf_iterator<char>(f)), {});
+    if (bytes.size() < dwords * 4) {
+        std::fprintf(stderr, "shader-sweep --disasm: %s is shorter than %u dwords\n", path, dwords);
+        return 2;
+    }
+    std::vector<u32> code(dwords);
+    std::memcpy(code.data(), bytes.data(), dwords * 4);
+    Shader::Gcn::GcnCodeSlice slice(code.data(), code.data() + code.size());
+    Shader::Gcn::GcnDecodeContext decoder;
+    const auto operand = [](const Shader::Gcn::InstOperand& op) {
+        using F = Shader::Gcn::OperandField;
+        switch (op.field) {
+        case F::ScalarGPR:
+            return "s" + std::to_string(op.code);
+        case F::VectorGPR:
+            return "v" + std::to_string(op.code);
+        case F::LiteralConst: {
+            char text[16];
+            std::snprintf(text, sizeof(text), "%#x", op.code);
+            return std::string(text);
+        }
+        default:
+            return std::string(magic_enum::enum_name(op.field)) + ":" + std::to_string(op.code);
+        }
+    };
+    while (!slice.atEnd()) {
+        const u32 at = u32(slice.position() - code.data());
+        const auto inst = decoder.decodeInstruction(slice);
+        std::string line;
+        for (u32 i = 0; i < inst.dst_count; ++i) {
+            line += (i ? ", " : " ") + operand(inst.dst[i]);
+        }
+        line += inst.dst_count ? " <-" : "";
+        for (u32 i = 0; i < inst.src_count; ++i) {
+            line += (i ? ", " : " ") + operand(inst.src[i]);
+        }
+        std::printf("%5u  %08x%s  %-28s%s\n", at, code[at],
+                    inst.length > 4 ? (" " + [&] {
+                        char t[16];
+                        std::snprintf(t, sizeof(t), "%08x", code[at + 1]);
+                        return std::string(t);
+                    }()).c_str()
+                                    : "         ",
+                    std::string(magic_enum::enum_name(inst.opcode)).c_str(), line.c_str());
+        if (inst.opcode == Shader::Gcn::Opcode::S_ENDPGM) {
+            break;
+        }
+    }
+    return 0;
+}
+
 int main(int argc, char** argv) {
+    if (argc == 4 && std::string(argv[1]) == "--disasm") {
+        return Disassemble(argv[2], u32(std::strtoul(argv[3], nullptr, 0)));
+    }
     if (argc != 4 && argc != 5) {
         std::fprintf(stderr, "usage: shader-sweep JOBS FIRST END [HULL_JOB]\n");
         return 2;
