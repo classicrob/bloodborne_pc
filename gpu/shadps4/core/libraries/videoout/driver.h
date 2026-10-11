@@ -8,6 +8,10 @@
 #endif
 
 #include <deque>
+#include <memory>
+#ifdef __APPLE__
+#include "bbport_flip_publish.h"
+#endif
 #include <functional>
 
 #include "common/debug.h"
@@ -113,6 +117,10 @@ private:
         s64 flip_arg;
         s32 index;
         bool eop;
+        /// bbport: the frame copy's draw-scheduler timeline value, taken while the frame was
+        /// exclusively ours (right after PrepareFrame), and the port generation at SubmitFlip.
+        u64 ready_tick = 0;
+        u64 generation = 0;
 
         operator bool() const noexcept {
             return frame != nullptr;
@@ -121,10 +129,11 @@ private:
 
     void Flip(const Request& req);
     /// The flip's guest-visible effects: status and count, flip events, previous buffer label.
-    void PublishFlip(const Request& req, u64 generation);
+    void PublishFlip(const Request& req);
     void DrawBlankFrame(); // Video port out not open
     void DrawLastFrame();  // Used when there is no flip request
-    void SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_arg, bool is_eop = false);
+    void SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_arg, bool is_eop,
+                            u64 generation);
     void PresentThread(std::stop_token token);
     /// bbport: runs presenter work (acquire, blit, vkQueuePresent) off the vblank thread, in
     /// order. Acquire and present block while the GPU is the bottleneck (much longer on NVIDIA);
@@ -144,19 +153,11 @@ private:
     std::condition_variable request_cv; ///< bbport: a flip was queued (immediate flips)
     VideoOutPort main_port{};
 #ifdef __APPLE__
-    /// bbport: flips published at GPU retirement of their frame copy, in flip order
-    /// (FlipAtGpuRetire). After main_port, before present_thread: stops after the present
-    /// thread that queues to it, before the port it publishes to.
-    struct PendingFlip {
-        Request request;
-        u64 tick; ///< the frame copy's draw-scheduler timeline value; 0: nothing to wait for
-        u64 generation;
-    };
-    void PublishThread(std::stop_token token);
-    std::mutex publish_mutex;
-    std::condition_variable_any publish_cv;
-    std::deque<PendingFlip> publish_queue;
-    std::jthread publish_thread;
+    /// bbport: serializes a flip's publication (generation check and all its effects) against
+    /// Close's whole reset of the port.
+    std::mutex lifecycle_mutex;
+    /// Flips published at GPU retirement of their frame copy, in flip order (FlipAtGpuRetire).
+    std::unique_ptr<BbFlip::Publisher<Request>> publisher;
 #endif
     std::jthread present_thread;
     std::queue<Request> requests;

@@ -258,12 +258,15 @@ not guest memory. So that copy's GPU retirement is the exact point. The moment t
 actually on screen matters only for pacing, which vblank events model, and MoltenVK does not
 report it reliably.
 
-With bit 60 of `BB_TOGGLE_FILE` (or `BB_FLIP_AT_GPU_RETIRE=1` for the whole run):
-- VideoOutDriver::Flip queues the publication with the frame's ready_tick.
-- A FlipPublish thread waits for each tick in flip order, then publishes. Blank frames read no
-  guest memory and wait for nothing.
+With bit 60 of `BB_TOGGLE_FILE` (or `BB_FLIP_AT_GPU_RETIRE=1` for the whole run), flips are
+published by `BbFlip::Publisher` (`gpu/shim/bbport_flip_publish.h`, test `flip-publish-test`):
+- Each flip carries its frame copy's ready_tick, read in SubmitFlipInternal while the frame is
+  still exclusively ours. A blank frame carries its own copy submission's tick.
+- It also carries the port generation, taken in SubmitFlip together with the pending count.
+- The publisher's thread waits for each tick in flip order, then publishes.
 - With the bit cleared, flips publish at once, unless publications are still queued. Then they
   queue behind them, so order holds across a live switch.
-- Close bumps the port's generation, so a late publication for a closed port is dropped and
-  reported rather than applied to the reopened one.
+- Close bumps the port's generation and holds the port lifecycle lock for its whole reset. A
+  publication holds the same lock for its generation check and all three effects. A flip
+  submitted before a Close is dropped and reported, rather than applied to the reopened port.
 - Flips still queued at shutdown are reported.

@@ -79,6 +79,13 @@ VideoOutDriver::VideoOutDriver(u32 width, u32 height) {
     if (separate_swap) {
         swap_thread = std::jthread([&](std::stop_token token) { SwapThread(token); });
     }
+#ifdef __APPLE__
+    publisher = std::make_unique<BbFlip::Publisher<Request>>(
+        [this](u64 tick, const std::stop_token& stop) {
+            return presenter->GetDrawScheduler().WaitRetired(tick, stop);
+        },
+        [this](const Request& req) { PublishFlip(req); });
+#endif
     present_thread = std::jthread([&](std::stop_token token) { PresentThread(token); });
 }
 
@@ -115,7 +122,22 @@ void VideoOutDriver::SwapThread(std::stop_token token) {
     }
 }
 
-VideoOutDriver::~VideoOutDriver() = default;
+VideoOutDriver::~VideoOutDriver() {
+    // Stop the threads while everything they use is alive (members go in reverse declaration
+    // order: `requests` would go before present_thread is joined).
+    present_thread.request_stop();
+    request_cv.notify_all();
+    if (present_thread.joinable()) {
+        present_thread.join();
+    }
+#ifdef __APPLE__
+    if (publisher) {
+        if (const std::size_t left = publisher->Stop()) {
+            std::fprintf(stderr, "Flip publication: %zu flips not published at shutdown\n", left);
+        }
+    }
+#endif
+}
 
 int VideoOutDriver::Open(const ServiceThreadParams* params) {
     if (main_port.is_open) {
@@ -128,12 +150,16 @@ int VideoOutDriver::Open(const ServiceThreadParams* params) {
 
 void VideoOutDriver::Close(s32 handle) {
     std::scoped_lock lock{mutex};
+#ifdef __APPLE__
+    // The whole reset, against a flip being published (PublishFlip holds it throughout).
+    std::scoped_lock lifecycle{lifecycle_mutex};
+#endif
 
     // Mark as closed
     main_port.is_open = false;
     {
         std::scoped_lock port_lock{main_port.port_mutex};
-        ++main_port.generation; // flips still queued for publication are dropped
+        ++main_port.generation; // flips submitted before this are dropped when published
     }
     main_port.flip_rate = 0;
     main_port.prev_index = -1;
@@ -556,81 +582,39 @@ void VideoOutDriver::Flip(const Request& req) {
 
 #ifdef __APPLE__
     // A flip tells the guest it may reuse the previous buffer. The presenter's last read of the
-    // guest framebuffer is the frame copy PrepareFrame submitted (ready_tick); with
-    // FlipAtGpuRetire the flip is published once the GPU retired it. Publications keep flip
-    // order: one queued before is published first, whatever the mode now.
+    // guest framebuffer is the frame copy PrepareFrame submitted (req.ready_tick; a blank frame's
+    // own submission). With FlipAtGpuRetire the flip is published once the GPU retired it; flips
+    // are published in order either way (BbFlip::Publisher).
     static const bool whole_run = [] {
         const char* env = std::getenv("BB_FLIP_AT_GPU_RETIRE");
         return env && env[0] == '1';
     }();
     const bool at_retire = whole_run || BbToggle::Disabled(BbToggle::FlipAtGpuRetire);
-    u64 generation;
-    {
-        std::unique_lock lock{req.port->port_mutex};
-        generation = req.port->generation;
+    if (at_retire) {
+        static std::once_flag announced;
+        std::call_once(announced, [] {
+            std::fprintf(stderr,
+                         "Flips are published once the GPU retired their frame copy\n");
+        });
     }
-    {
-        std::unique_lock lock{publish_mutex};
-        if (at_retire || !publish_queue.empty()) {
-            static std::once_flag announced;
-            std::call_once(announced, [] {
-                std::fprintf(stderr, "Flips are published once the GPU retired their frame "
-                                     "copy (FlipAtGpuRetire)\n");
-            });
-            if (!publish_thread.joinable()) {
-                publish_thread =
-                    std::jthread([this](std::stop_token token) { PublishThread(token); });
-            }
-            publish_queue.push_back(
-                {req, at_retire && req.index >= 0 ? req.frame->ready_tick : 0, generation});
-            lock.unlock();
-            publish_cv.notify_one();
-            return;
-        }
-    }
-    PublishFlip(req, generation);
+    publisher->Submit(req, req.ready_tick, at_retire);
 }
 
-void VideoOutDriver::PublishThread(std::stop_token token) {
-    Common::SetCurrentThreadName("shadPS4:FlipPublish");
-    auto& scheduler = presenter->GetDrawScheduler();
-    while (!token.stop_requested()) {
-        PendingFlip pending;
-        {
-            std::unique_lock lock{publish_mutex};
-            publish_cv.wait(lock, token, [this] { return !publish_queue.empty(); });
-            if (token.stop_requested()) {
-                break;
-            }
-            pending = publish_queue.front();
-        }
-        if (pending.tick && !scheduler.WaitRetired(pending.tick, token)) {
-            break;
-        }
-        PublishFlip(pending.request, pending.generation);
-        std::unique_lock lock{publish_mutex};
-        publish_queue.pop_front(); // after publishing: a flip queued meanwhile stays behind it
-    }
-    std::unique_lock lock{publish_mutex};
-    if (!publish_queue.empty()) {
-        std::fprintf(stderr, "Flip publication: %zu flips not published at shutdown\n",
-                     publish_queue.size());
-    }
-}
-
-void VideoOutDriver::PublishFlip(const Request& req, u64 generation) {
+void VideoOutDriver::PublishFlip(const Request& req) {
+    std::scoped_lock lifecycle{lifecycle_mutex}; // against Close, for all the effects below
 #else
-    PublishFlip(req, 0);
+    PublishFlip(req);
 }
 
-void VideoOutDriver::PublishFlip(const Request& req, [[maybe_unused]] u64 generation) {
+void VideoOutDriver::PublishFlip(const Request& req) {
 #endif
     // Update flip status.
     auto* port = req.port;
+    int previous;
     {
         std::unique_lock lock{port->port_mutex};
 #ifdef __APPLE__
-        if (port->generation != generation) {
+        if (port->generation != req.generation) {
             static std::atomic<u64> dropped{0};
             std::fprintf(stderr, "Flip publication: a flip of a closed port dropped (%llu)\n",
                          static_cast<unsigned long long>(++dropped));
@@ -647,6 +631,9 @@ void VideoOutDriver::PublishFlip(const Request& req, [[maybe_unused]] u64 genera
             --flip_status.gc_queue_num;
         }
         --flip_status.flip_pending_num;
+        // Under the lock with the generation check: a Close cannot come between.
+        previous = port->prev_index;
+        port->prev_index = req.index;
     }
 
     // Trigger flip events for the port.
@@ -662,12 +649,10 @@ void VideoOutDriver::PublishFlip(const Request& req, [[maybe_unused]] u64 genera
     }
 
     // Reset prev flip label
-    if (port->prev_index != -1) {
-        port->buffer_labels[port->prev_index] = 0;
+    if (previous != -1) {
+        port->buffer_labels[previous] = 0;
         port->SignalVoLabel();
     }
-    // save to prev buf index
-    port->prev_index = req.index;
 }
 
 void VideoOutDriver::DrawBlankFrame() {
@@ -688,6 +673,7 @@ void VideoOutDriver::DrawLastFrame() {
 
 bool VideoOutDriver::SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg,
                                 bool is_eop /*= false*/) {
+    u64 generation;
     {
         std::unique_lock lock{port->port_mutex};
         if (index != -1 && port->flip_status.flip_pending_num > 16) {
@@ -700,19 +686,22 @@ bool VideoOutDriver::SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg,
         }
         ++port->flip_status.flip_pending_num; // integral GPU and CPU pending flips counter
         port->flip_status.submit_tsc = Libraries::Kernel::sceKernelReadTsc();
+        generation = port->generation; // with the pending count: Close resets both
     }
 
     if (!is_eop) {
         // Non EOP flips can arrive from any thread so ask GPU thread to perform them
-        liverpool->SendCommand([=, this]() { SubmitFlipInternal(port, index, flip_arg, is_eop); });
+        liverpool->SendCommand(
+            [=, this]() { SubmitFlipInternal(port, index, flip_arg, is_eop, generation); });
     } else {
-        SubmitFlipInternal(port, index, flip_arg, is_eop);
+        SubmitFlipInternal(port, index, flip_arg, is_eop, generation);
     }
 
     return true;
 }
 
-void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_arg, bool is_eop) {
+void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_arg, bool is_eop,
+                                        u64 generation) {
     Vulkan::Frame* frame;
     if (index == -1) {
         frame = presenter->PrepareBlankFrame(false);
@@ -731,6 +720,8 @@ void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_
             .flip_arg = flip_arg,
             .index = index,
             .eop = is_eop,
+            .ready_tick = frame->ready_tick, // ours until queued: read it now
+            .generation = generation,
         });
     }
     request_cv.notify_one();
