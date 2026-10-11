@@ -4224,6 +4224,8 @@ namespace {
 //   skip 120-340        skip the frame's draws 120 to 340 (inclusive; "skip 7" is one draw)
 //   skip vs 0x1234abcd  skip every draw whose vertex shader has this hash ("ps": pixel shader)
 //   skip rt 0x...       skip every draw whose first color target is at this guest address
+//   skip vb 0xLO-0xHI   skip every draw whose index range or a fetched vertex buffer overlaps
+//                       the guest range LO..HI (inclusive)
 //   dump vs 0x1234abcd  for the next frame's draws with this vertex shader, print its user data
 //                       s0-s15 and, per fetch attribute, where its V# is read and its raw words
 //   list 7              a new value lists every draw of the frame that starts at the next flip
@@ -4237,6 +4239,7 @@ struct DrawBisect {
     std::vector<Range> ranges;
     std::vector<u64> vs_hashes, ps_hashes, dump_vs;
     std::vector<VAddr> targets;
+    std::vector<std::pair<VAddr, VAddr>> vb_ranges; ///< inclusive
     std::string list_value;
     bool listing = false; ///< this frame's draws are printed
     bool dumping = false; ///< this frame's dump_vs draws are dumped
@@ -4247,7 +4250,8 @@ struct DrawBisect {
     off_t size = -1;
 
     bool Active() const {
-        return !ranges.empty() || !vs_hashes.empty() || !ps_hashes.empty() || !targets.empty();
+        return !ranges.empty() || !vs_hashes.empty() || !ps_hashes.empty() || !targets.empty() ||
+               !vb_ranges.empty();
     }
 };
 
@@ -4291,6 +4295,7 @@ bool ReadDrawBisect(DrawBisect& b) {
         b.vs_hashes.clear();
         b.ps_hashes.clear();
         b.targets.clear();
+        b.vb_ranges.clear();
         b.dump_vs.clear();
     };
     DrawBisect next;
@@ -4334,6 +4339,15 @@ bool ReadDrawBisect(DrawBisect& b) {
             if (ok) {
                 next.dump_vs.push_back(hash);
             }
+        } else if (ok && verb == "skip" && what == "vb" && !value.empty()) {
+            const auto dash = value.find('-');
+            u64 low = 0, high = 0;
+            ok = dash != std::string::npos &&
+                 ParseBisectNumber(std::string_view{value}.substr(0, dash), low) &&
+                 ParseBisectNumber(std::string_view{value}.substr(dash + 1), high) && low <= high;
+            if (ok) {
+                next.vb_ranges.emplace_back(low, high);
+            }
         } else if (ok && verb == "skip" && (what == "vs" || what == "ps" || what == "rt") &&
                    !value.empty()) {
             u64 number_value = 0;
@@ -4365,6 +4379,7 @@ bool ReadDrawBisect(DrawBisect& b) {
     b.vs_hashes = std::move(next.vs_hashes);
     b.ps_hashes = std::move(next.ps_hashes);
     b.targets = std::move(next.targets);
+    b.vb_ranges = std::move(next.vb_ranges);
     b.dump_vs = std::move(next.dump_vs);
     b.dumping = !b.dump_vs.empty();
     b.list_value = next.list_value;
@@ -4381,6 +4396,9 @@ bool ReadDrawBisect(DrawBisect& b) {
     }
     for (const VAddr target : b.targets) {
         rules += fmt::format(" rt {:#x}", target);
+    }
+    for (const auto& [low, high] : b.vb_ranges) {
+        rules += fmt::format(" vb {:#x}-{:#x}", low, high);
     }
     for (const u64 hash : b.dump_vs) {
         rules += fmt::format("; dumping vs {:#x}", hash);
@@ -4430,11 +4448,37 @@ bool Rasterizer::DrawBisectSkip(const GraphicsPipeline* pipeline, bool is_indexe
     const auto contains = [](const auto& values, u64 value) {
         return std::ranges::find(values, value) != values.end();
     };
+    // Whether the draw's index range or a fetched vertex buffer overlaps a "skip vb" range.
+    const auto reads_vb_range = [&] {
+        const auto overlaps = [&](VAddr address, u64 size) {
+            return size && std::ranges::any_of(b.vb_ranges, [&](const auto& range) {
+                       return address <= range.second && range.first <= address + size - 1;
+                   });
+        };
+        if (is_indexed && !indirect) {
+            const u32 index_size =
+                regs.index_buffer_type.index_type == AmdGpu::IndexType::Index16 ? 2u : 4u;
+            if (overlaps(regs.index_base_address.Address<VAddr>() + u64(index_offset) * index_size,
+                         u64(regs.num_indices) * index_size)) {
+                return true;
+            }
+        }
+        // The copy shader of an emulated geometry stage has no fetch of its own here.
+        if (const auto& fetch = pipeline->GetFetchShader(); fetch && !pipeline->GsEmulation()) {
+            for (const auto& attribute : fetch->attributes) {
+                const auto sharp = attribute.GetSharp(vs);
+                if (overlaps(sharp.base_address, sharp.GetSize())) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    };
     const bool skip =
         std::ranges::any_of(b.ranges,
                             [&](const auto& r) { return r.first <= index && index <= r.last; }) ||
         contains(b.vs_hashes, vs.pgm_hash) || (ps && contains(b.ps_hashes, ps_hash)) ||
-        (target && contains(b.targets, target));
+        (target && contains(b.targets, target)) || (!b.vb_ranges.empty() && reads_vb_range());
     if (b.listing) {
         const VAddr depth =
             regs.depth_buffer.DepthValid() ? regs.depth_buffer.DepthAddress() : VAddr{0};
