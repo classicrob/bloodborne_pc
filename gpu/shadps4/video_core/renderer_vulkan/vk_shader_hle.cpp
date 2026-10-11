@@ -1,6 +1,10 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
+#include <mutex>
+#include <string>
+#include <unordered_set>
 #include "shader_recompiler/info.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
@@ -234,8 +238,78 @@ static bool ExecuteCopyShaderHLE(const Shader::Info& info, const AmdGpu::Compute
     return true;
 }
 
+#ifdef __APPLE__
+// bbport (BB_RT_KERNEL_CENSUS=1, diagnostic): the SDK fill (0x8b355b5a) and copy (0x3d5ebf4e)
+// compute kernels write render-target memory through storage buffers, which costs a full
+// buffer<->image round trip per frame for every image they touch. Logs each distinct call shape
+// (the kernel's buffer V#s, the dispatch size and the images overlapping each buffer) once, as
+// the input for exact image-level replacements. Changes nothing.
+static constexpr u64 SDK_FILL_HASH = 0x8b355b5a;
+static constexpr u64 SDK_COPY_HASH = 0x3d5ebf4e;
+
+static void CensusRenderTargetKernel(const Shader::Info& info,
+                                     const AmdGpu::ComputeProgram& cs_program,
+                                     Rasterizer& rasterizer) {
+    static const bool enabled = [] {
+        const char* env = std::getenv("BB_RT_KERNEL_CENSUS");
+        return env && env[0] == '1';
+    }();
+    if (!enabled) {
+        return;
+    }
+    static std::mutex mutex;
+    static std::unordered_set<u64> seen;
+    std::string text = fmt::format("{} kernel {:#x}: dispatch {}x{}x{}",
+                                   info.pgm_hash == SDK_FILL_HASH ? "FILL" : "COPY",
+                                   info.pgm_hash, cs_program.dim_x, cs_program.dim_y,
+                                   cs_program.dim_z);
+    u64 signature = info.pgm_hash ^ (u64(cs_program.dim_x) << 32);
+    const auto ud = info.UserData();
+    if (ud.size() > 10) {
+        text += fmt::format(", s10={}", ud[10]);
+    }
+    auto& texture_cache = rasterizer.GetTextureCache();
+    for (u32 i = 0; i < info.buffers.size(); ++i) {
+        const auto& desc = info.buffers[i];
+        if (desc.IsSpecial()) {
+            continue;
+        }
+        const auto sharp = desc.GetSharp(info);
+        signature = signature * 0x100000001b3ull ^ sharp.base_address ^ (u64(sharp.GetSize()) << 40) ^
+                    (u64(sharp.GetDataFmt()) << 56) ^ desc.is_written;
+        text += fmt::format("; buffer {} {} base {:#x} size {} stride {} fmt {}/{}", i,
+                            desc.is_written ? "W" : "R", sharp.base_address, sharp.GetSize(),
+                            sharp.GetStride(), u32(sharp.GetDataFmt()), u32(sharp.GetNumberFmt()));
+        if (sharp.base_address && sharp.GetSize()) {
+            texture_cache.ForEachImageInRegion(
+                sharp.base_address, sharp.GetSize(), [&](VideoCore::ImageId, VideoCore::Image& image) {
+                    text += fmt::format(" [image {:#x} size {} {}x{} {} tile {} layers {} mips {}{}]",
+                                        image.info.guest_address, image.info.guest_size,
+                                        image.info.size.width, image.info.size.height,
+                                        vk::to_string(image.info.pixel_format),
+                                        u32(image.info.tile_mode), image.info.resources.layers,
+                                        image.info.resources.levels,
+                                        image.info.guest_address == sharp.base_address &&
+                                                image.info.guest_size == sharp.GetSize()
+                                            ? " exact"
+                                            : "");
+                });
+        }
+    }
+    std::scoped_lock lk{mutex};
+    if (seen.size() < 256 && seen.insert(signature).second) {
+        LOG_INFO(Render_Vulkan, "RT kernel census: {}", text);
+    }
+}
+#endif
+
 bool ExecuteShaderHLE(const Shader::Info& info, const AmdGpu::Regs& regs,
                       const AmdGpu::ComputeProgram& cs_program, Rasterizer& rasterizer) {
+#ifdef __APPLE__
+    if (info.pgm_hash == SDK_FILL_HASH || info.pgm_hash == SDK_COPY_HASH) {
+        CensusRenderTargetKernel(info, cs_program, rasterizer);
+    }
+#endif
     switch (info.pgm_hash) {
     case COPY_SHADER_HASH:
         return ExecuteCopyShaderHLE(info, cs_program, rasterizer);
