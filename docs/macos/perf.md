@@ -142,6 +142,7 @@ then covers only the windows completed during the hold, so loading on the way is
 `--segments` runs timed segments at the last stage and summarizes each one separately. `still`
 leaves the pad neutral. `walk` holds the left stick forward and turns the camera with the right
 stick, alternating direction every 3 s, so the scene keeps changing without leaving the area.
+`turn` only turns the camera, alternating every 3 s.
 A segment's summary starts 6 s after the segment does, so no 5 s window spans two segments.
 `segments.txt` in the run directory records each segment's perf.jsonl line range.
 

@@ -8,7 +8,8 @@
 # only the windows completed during the hold (the stage itself, not loading on the way).
 # --segments still:60,walk:60 runs the segments in order at the last stage, each with its own
 # summary: still leaves the pad neutral; walk holds the left stick forward while the right stick
-# turns the camera one way, then the other, every 3 s (BB_PAD_FILE). A segment's summary covers
+# turns the camera one way, then the other, every 3 s; turn only turns the camera that way
+# (BB_PAD_FILE). A segment's summary covers
 # the windows written from 6 s after its start (a 5 s window never straddles two segments) to
 # its end. --fixture, --warm-cache and --diag-env (repeatable) pass to play_route.py.
 set -euo pipefail
@@ -71,8 +72,8 @@ if [[ -n $segments ]]; then
     ((hold == 0)) || fail "--hold and --segments exclude each other"
     IFS=, read -r -a plan <<< "$segments"
     for segment in "${plan[@]}"; do
-        [[ $segment =~ ^(still|walk):([0-9]+)$ ]] && ((BASH_REMATCH[2] >= 16)) ||
-            fail "segment '$segment': expected still:SECONDS or walk:SECONDS, at least 16 s"
+        [[ $segment =~ ^(still|walk|turn):([0-9]+)$ ]] && ((BASH_REMATCH[2] >= 16)) ||
+            fail "segment '$segment': expected still:, walk: or turn:SECONDS, at least 16 s"
     done
     hold=1 # keep the game for the segments
 fi
@@ -110,6 +111,8 @@ if ((${#plan[@]} && status == 0)); then
             if [[ -z $first ]] && ((SECONDS - start >= 6)); then first=$(lines); fi
             if [[ $kind == walk ]]; then
                 if (((SECONDS - start) / 3 % 2)); then pad 'ly=0 rx=170'; else pad 'ly=0 rx=86'; fi
+            elif [[ $kind == turn ]]; then
+                if (((SECONDS - start) / 3 % 2)); then pad 'rx=200'; else pad 'rx=56'; fi
             fi
             sleep 1
         done
