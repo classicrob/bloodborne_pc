@@ -1445,8 +1445,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 const auto* wait_reg_mem = reinterpret_cast<const PM4CmdWaitRegMem*>(header);
                 // ASSERT(wait_reg_mem->engine.Value() == PM4CmdWaitRegMem::Engine::Me);
 #ifdef __APPLE__
-                if (wait_reg_mem->mem_space.Value() == PM4CmdWaitRegMem::MemSpace::Register) {
-                    wait_reg_mem->AssertRegisterWaitMet(regs.reg_array);
+                wait_reg_mem->AssertRegisterInRange(regs.reg_array.size());
+                if (wait_reg_mem->IsStreamOutFlushWait()) {
+                    wait_reg_mem->AssertStreamOutFlushWaitMet(regs.reg_array);
                     break;
                 }
 #endif

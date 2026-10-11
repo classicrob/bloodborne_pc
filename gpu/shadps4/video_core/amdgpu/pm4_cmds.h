@@ -744,16 +744,22 @@ struct PM4CmdWaitRegMem {
                    "macOS: WAIT_REG_MEM on register {:#x}, outside the register file", Reg());
     }
 
-    /// bbport: on the graphics queue a register wait reads registers only that queue's packets
-    /// set. Compute queues write SH registers of their own pipelines. The one register the
-    /// hardware sets, CP_STRMOUT_CNTL.OFFSET_UPDATE_DONE, is set when its EVENT_WRITE
-    /// (SO_VGTSTREAMOUT_FLUSH) is parsed. So a wait unmet when reached is never met: stop instead
-    /// of spinning.
-    void AssertRegisterWaitMet(std::span<const u32> regs) const {
+    /// CP_STRMOUT_CNTL (uconfig 0x3F): its OFFSET_UPDATE_DONE is set only by the graphics
+    /// queue's own SO_VGTSTREAMOUT_FLUSH, when parsed, so a graphics wait on it that is unmet when
+    /// reached is never met. Other registers can change while it waits: a compute queue's
+    /// SET_SH_REG writes the shared register file. Those waits yield as before.
+    static constexpr u32 CpStrmoutCntl = 0xC03F;
+    bool IsStreamOutFlushWait() const {
+        return mem_space.Value() == MemSpace::Register && Reg() == CpStrmoutCntl;
+    }
+
+    /// bbport: stops on a stream-out flush wait the flush event did not meet, instead of spinning.
+    void AssertStreamOutFlushWaitMet(std::span<const u32> regs) const {
         AssertRegisterInRange(regs.size());
-        ASSERT_MSG(mem_space.Value() != MemSpace::Register || Test(regs),
-                   "macOS: WAIT_REG_MEM on register {:#x} can never be met on the graphics queue: "
-                   "value {:#x}, mask {:#x}, function {}, reference {:#x}",
+        ASSERT_MSG(!IsStreamOutFlushWait() || Test(regs),
+                   "macOS: WAIT_REG_MEM on CP_STRMOUT_CNTL ({:#x}) can never be met on the graphics "
+                   "queue (no SO_VGTSTREAMOUT_FLUSH before it): value {:#x}, mask {:#x}, function "
+                   "{}, reference {:#x}",
                    Reg(), regs[Reg()], mask, static_cast<u32>(function.Value()), ref);
     }
 #endif

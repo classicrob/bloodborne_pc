@@ -3,9 +3,11 @@
 // - Bloodborne's Gnm stream-out setup (eboot 0x1077d80, called before each stream-out draw) emits
 //   {0xC0043400, buffer << 8, 0, 0, offset, 0}: the buffer's offset from the packet, no
 //   filled-size store. That form decodes; every other form stops (exit 23).
-// - A register wait on the graphics queue reads registers only that queue's packets set, so one
-//   unmet when reached is never met: it stops instead of spinning. CP_STRMOUT_CNTL's
-//   OFFSET_UPDATE_DONE, set when SO_VGTSTREAMOUT_FLUSH is parsed, meets the Gnm flush wait.
+// - CP_STRMOUT_CNTL's OFFSET_UPDATE_DONE is set only by the graphics queue's own
+//   SO_VGTSTREAMOUT_FLUSH, when parsed: it meets the Gnm flush wait, and a flush wait it did not
+//   meet stops instead of spinning. Waits on other registers are not stopped: a compute queue's
+//   SET_SH_REG can meet them (control: USER_DATA_VS_0). Register indices are bounds-checked.
+// Scope: these exercise the pm4_cmds.h helpers Liverpool calls, not ProcessGraphics' dispatch.
 #include <array>
 #include <cerrno>
 #include <cstdio>
@@ -126,17 +128,25 @@ int main() {
     regs.cp_strmout_cntl.offset_update_done = 1;
     Expect("flush wait on CP_STRMOUT_CNTL after the flush event passes", InChild([] {
                const auto words = WaitReg(CpStrmoutCntl, 3 /*Equal*/, 1, 1);
-               reinterpret_cast<const PM4CmdWaitRegMem*>(words.data())
-                   ->AssertRegisterWaitMet(regs.reg_array);
+               const auto& wait = *reinterpret_cast<const PM4CmdWaitRegMem*>(words.data());
+               if (!wait.IsStreamOutFlushWait()) std::_Exit(1);
+               wait.AssertStreamOutFlushWaitMet(regs.reg_array);
            }).status == 0);
-    Expect("a register wait unmet when reached stops instead of spinning",
+    Expect("a flush wait the flush event did not meet stops instead of spinning",
            StoppedWith(InChild([] {
                            regs.cp_strmout_cntl.offset_update_done = 0;
                            const auto words = WaitReg(CpStrmoutCntl, 3, 1, 1);
                            reinterpret_cast<const PM4CmdWaitRegMem*>(words.data())
-                               ->AssertRegisterWaitMet(regs.reg_array);
+                               ->AssertStreamOutFlushWaitMet(regs.reg_array);
                        }),
-                       "WAIT_REG_MEM on register 0xc03f can never be met"));
+                       "WAIT_REG_MEM on CP_STRMOUT_CNTL (0xc03f) can never be met"));
+    // Control: USER_DATA_VS_0 (SH 0x2C4C) unmet is a wait another queue's SET_SH_REG can meet.
+    Expect("an unmet wait on another register is left to yield (not stopped)", InChild([] {
+               const auto words = WaitReg(0x2C4C, 3, 1, 0xFFFFFFFF);
+               const auto& wait = *reinterpret_cast<const PM4CmdWaitRegMem*>(words.data());
+               if (wait.IsStreamOutFlushWait() || wait.Test(regs.reg_array)) std::_Exit(1);
+               wait.AssertStreamOutFlushWaitMet(regs.reg_array);
+           }).status == 0);
     Expect("a register index outside the register file stops", StoppedWith(InChild([] {
                const auto words = WaitReg(0xE000, 3, 1, 1);
                reinterpret_cast<const PM4CmdWaitRegMem*>(words.data())
