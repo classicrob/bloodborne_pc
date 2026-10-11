@@ -278,6 +278,8 @@ if [[ ${1:-} == --test ]]; then
         BB_DEPS_PREFIX="$deps" bash tests/macos_metalfx/run.sh --module
         BB_DEPS_PREFIX="$deps" bash tests/macos_metalfx/jitter.sh
         BB_GPU_BUILD="$PWD/out/gpu" sh tests/macos_metalfx/library.sh
+        # Scaled presets: tonemapped RGBA8 content in larger aligned textures, both output formats.
+        BB_DEPS_PREFIX="$deps" bash tests/macos_metalfx/run.sh --ldr-padded
         # Every tests/test_*.py (a skipped test fails).
         bash tests/run_python_tests.sh
         # BB_PERF's GPU numbers rely on per-submission timestamps; qualify them on this device.
