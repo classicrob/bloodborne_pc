@@ -390,13 +390,18 @@ void SignalEop(const PM4CmdEventWriteEop& eop) {
             auto* memory = Core::Memory::Instance();
 #ifdef __APPLE__
             if (BbLabelCheck::Enabled()) {
-                BbLabelCheck::BeforeWrite(reinterpret_cast<u64>(address), data, num_bytes);
+                BbLabelCheck::BeforeWrite(reinterpret_cast<u64>(address), num_bytes);
             }
 #endif
             BbWriteLog::Note(reinterpret_cast<u64>(address), &data, num_bytes, BbWriteLog::Fence);
             if (!memory->TryWriteBacking(address, &data, num_bytes)) {
                 memcpy(address, &data, num_bytes);
             }
+#ifdef __APPLE__
+            if (BbLabelCheck::Enabled()) {
+                BbLabelCheck::AfterWrite(reinterpret_cast<u64>(address), data, num_bytes);
+            }
+#endif
         },
         [] { Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxEop); });
 }

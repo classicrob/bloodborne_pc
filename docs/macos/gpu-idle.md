@@ -158,19 +158,27 @@ For a targeted follow-up, framed entry probes can cover `0x26d6e50` (RDI identif
 range's end through its neighbor; those need separately bounded safe reads. Avoid a global
 node-pool allocation probe unless the specific allocator is filtered: that pool helper is shared.
 
-## Checking when the guest acts on "done" (`BB_LABEL_CHECK=1`)
+## Label content check (`BB_LABEL_CHECK=1`, diagnostic)
 
 The guest frees per-frame objects holding end-of-pipe labels (48-byte heap blocks, label at
 offset 0) once the submitDone throttle releases it. A label written after that corrupts its heap
 (guest fault 0x263b8e7, `docs/history/SESSION_2026-09-30.md`). With `BB_LABEL_CHECK=1`, each EOP
-label's value is read when the EOP is parsed and again just before it is written. If the guest
-changed it in between (the allocator's free-list link, a reset), `LABEL-CHECK` is logged with the
-values, the 48 bytes around it, and how long the write was pending. With several EOPs on one label
-in flight, a later one finding the earlier one's value is not a report. Any change to when the
-guest is released must keep the count at zero. Test: `label-check-test`.
+label is sampled when the EOP is parsed and again just before it is written. A change in between
+that is not one of our own completed writes is logged as `LABEL-CHECK`, with the values, the 16-byte
+aligned 48 bytes around the label, and the time since the parse sample. Every 4096 checks a summary
+gives the checked, changed, unreadable, unmatched and mixed-width counts.
 
-`BB_SUBMIT_THROTTLE=none` (UNSAFE diagnostic) never holds the guest for GPU idle. Together with
-`BB_LABEL_CHECK=1` it measures whether the guest depends on the throttle, and how far behind its
-early frees run: the `pending` time of each report. That decides whether the guest may run a frame
-ahead of the GPU thread (the P0b throughput lever). It may corrupt the guest heap, so it is not
-for play.
+This is supporting evidence, not proof:
+- A change need not be a guest free; another writer may have changed the memory.
+- No change does not prove the lifetime is right. A free that leaves the value equal, ABA, or a
+  change after the second sample are invisible.
+- Guest memory is only read with non-faulting Mach reads; unreadable samples are counted and not
+  compared.
+- Slots where a 32-bit and a 64-bit EOP meet are counted as mixed and not compared.
+
+Test: `label-check-test`.
+
+`BB_SUBMIT_THROTTLE=none` (UNSAFE diagnostic) never holds the guest for GPU idle. It is validated
+and announced at the first submission. With `BB_LABEL_CHECK=1` it shows whether label contents
+start to change before their writes once the guest is not held, and how soon after the parse they
+are checked. It may corrupt the guest heap, so it is not for play.

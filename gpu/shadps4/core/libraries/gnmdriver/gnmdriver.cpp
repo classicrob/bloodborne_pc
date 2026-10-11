@@ -114,8 +114,9 @@ static PacingStats pacing; ///< under m_submit_lock
 
 #ifdef __APPLE__
 /// BB_SUBMIT_THROTTLE=none (UNSAFE diagnostic, Apple): submissions and sceGnmSubmitDone never wait
-/// for GPU idle; sceGnmAreSubmitsAllowed still reports the throttle. With BB_LABEL_CHECK=1 this
-/// shows whether, and how soon, the guest acts on a frame as done before its labels are written
+/// for GPU idle; sceGnmAreSubmitsAllowed still reports the throttle. Validated and announced at
+/// the first submission. With BB_LABEL_CHECK=1 it gives supporting evidence on whether the content
+/// at end-of-pipe labels changes before they are written once the guest is not held
 /// (docs/macos/gpu-idle.md). It can corrupt the guest heap: for that measurement only.
 static bool ThrottleOff() {
     static const bool off = [] {
@@ -140,7 +141,8 @@ static u64 WaitGpuIdle() {
     HLE_TRACE;
     std::unique_lock lock{m_wait_idle};
 #ifdef __APPLE__
-    if (submission_lock == 0 || ThrottleOff()) {
+    // Evaluated first, so the mode is validated and announced at the first submission.
+    if (ThrottleOff() || submission_lock == 0) {
         return 0;
     }
     const auto start = std::chrono::steady_clock::now();
