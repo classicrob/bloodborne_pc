@@ -1387,12 +1387,14 @@ void PipelineCache::VerifyReusedPipeline(const GraphicsPipeline& pipeline, u64 p
         ++verify_pipeline_mismatches; // before the summary, which may print for this reuse
     }
     if ((verify_pipelines & 4095) == 0) {
-        LOG_INFO(Render_Vulkan,
-                 "PIPELINE-VERIFY summary: {} pipeline reuses checked, {} differ; {} preloaded "
-                 "modules checked, {} differ; {} preloaded tessellation-stage runtime infos not "
-                 "compared; {} prepared selections bypassed for the check",
-                 verify_pipelines, verify_pipeline_mismatches, verify_modules,
-                 verify_module_mismatches, verify_tess_unchecked, verify_prepared_bypassed);
+        // stdout: the GPU log hides Info unless BB_GPU_LOG=info.
+        const std::string summary = fmt::format(
+            "PIPELINE-VERIFY summary: {} pipeline reuses checked, {} differ; {} preloaded modules "
+            "checked, {} differ; {} preloaded tessellation-stage runtime infos not compared; {} "
+            "prepared selections bypassed for the check",
+            verify_pipelines, verify_pipeline_mismatches, verify_modules, verify_module_mismatches,
+            verify_tess_unchecked, verify_prepared_bypassed);
+        std::printf("%s\n", summary.c_str());
     }
     if (differences.empty()) {
         return;
