@@ -228,6 +228,8 @@ bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
     for (int stage_idx = 0; stage_idx < MaxShaderStages; ++stage_idx) {
         const auto& hash = sel.graphics_key.stage_hashes[stage_idx];
         if (!hash) {
+            // No stale runtime info from the previous record (LoadPipelineStage sets the rest).
+            sel.runtime_infos[stage_idx] = Shader::RuntimeInfo{};
             continue;
         }
 
@@ -306,6 +308,10 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
             module = CompileSPV(spv, instance.GetDevice());
         }
     }
+    // bbport: the stage's runtime info as it was compiled (its specialization keeps it). Pipeline
+    // construction reads it even when preloading: the depth-bounds set of an Apple fragment
+    // shader, the pre-raster/fragment interface checks.
+    sel.runtime_infos[stage] = spec.runtime_info;
     it_pgm.value()->InsertPermut(module, std::move(spec), std::move(info), perm_idx);
 
     sel.infos[stage] = it_pgm.value()->modules[perm_idx].info.get();

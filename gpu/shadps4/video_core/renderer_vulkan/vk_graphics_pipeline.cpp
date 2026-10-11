@@ -543,7 +543,9 @@ GraphicsPipeline::GraphicsPipeline(
 
     auto [pipeline_result, pipe] =
         device.createGraphicsPipelineUnique(pipeline_cache, pipeline_info);
-    ASSERT_MSG(pipeline_result == vk::Result::eSuccess, "Failed to create graphics pipeline: {}",
+    ASSERT_MSG(pipeline_result == vk::Result::eSuccess,
+               "Failed to create graphics pipeline {} ({}): {}", debug_str,
+               preloading ? "preloaded from the pipeline cache" : "new",
                vk::to_string(pipeline_result));
     pipeline = std::move(pipe);
     SetObjectName(device, *pipeline, "Graphics Pipeline {}", debug_str);
