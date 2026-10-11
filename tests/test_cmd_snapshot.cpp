@@ -260,6 +260,9 @@ int main() {
         Expect("overlap: first submission of the range clean", submit(0, 16, 1000) == 0);
         Expect("overlap: same buffer called again not reported", submit(0, 16, 1001) == 0);
         Expect("overlap: same start, other length not reported", submit(0, 7, 1001) == 0);
+        u32 cross = 0;
+        std::thread([&] { cross = submit(0, 7, 1001); }).join();
+        Expect("overlap: same start from another thread reported", cross == 3);
         Expect("overlap: partial overlap reported", submit(10, 16, 1002) == 2);
         Expect("overlap: adjacent buffer clean", submit(26, 8, 1003) == 0);
         Expect("overlap: older than 64 submissions forgotten", submit(4, 8, 1100) == 0);

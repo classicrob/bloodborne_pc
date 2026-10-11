@@ -148,9 +148,11 @@ u32 CmdSnapshot::ReportRecentOverlaps() {
         const u32* end = region.guest + region.size_dw;
         for (const auto& old : recent_regions) {
             const u32* old_end = old.guest + old.size_dw;
-            // The same start is one buffer submitted again (called again, or a per-frame buffer
-            // at a fixed address with a different length): not two writers.
-            if (old.guest == region.guest || !(region.guest < old_end && old.guest < end)) {
+            // The same start from the same thread is one buffer submitted again (called again, or
+            // a per-frame buffer at a fixed address with a different length): not two writers.
+            // From two threads it can be two claims of one chunk, which both start there.
+            if ((old.guest == region.guest && old.thread == thread) ||
+                !(region.guest < old_end && old.guest < end)) {
                 continue;
             }
             ++overlaps;
