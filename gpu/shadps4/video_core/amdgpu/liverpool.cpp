@@ -427,6 +427,32 @@ bool LabelsAtGpuCompleteForIssue(Vulkan::Rasterizer& rasterizer) {
 }
 #endif
 
+#ifdef __APPLE__
+/// BB_LABEL_CHECK covers RELEASE_MEM labels with 32/64-bit data too: the guest's compute-queue
+/// chunk release (0x26d3cb0) zeroes a chunk's status word that way (docs/macos/gpu-idle.md).
+bool LabelCheckedReleaseMem(const PM4CmdReleaseMem& packet) {
+    return BbLabelCheck::Enabled() && (packet.data_sel.Value() == DataSelect::Data32Low ||
+                                       packet.data_sel.Value() == DataSelect::Data64);
+}
+/// A RELEASE_MEM label store: through the backing on the label writer (at GPU completion),
+/// otherwise one store at the guest address, as the packet's default write does; checked
+/// around the store as EOP labels are.
+void WriteReleaseMemLabel(void* address, u64 data, u32 num_bytes, bool backing_only,
+                          bool checked) {
+    if (checked) {
+        BbLabelCheck::BeforeWrite(reinterpret_cast<u64>(address), num_bytes);
+    }
+    if (backing_only) {
+        WriteLabelBacking(address, data, num_bytes);
+    } else {
+        BbLabelStore::StoreOnce(address, data, num_bytes);
+    }
+    if (checked) {
+        BbLabelCheck::AfterWrite(reinterpret_cast<u64>(address), data, num_bytes);
+    }
+}
+#endif
+
 /// `backing_only`: the label was issued at GPU completion (written on the label writer).
 void SignalEop(const PM4CmdEventWriteEop& eop, bool backing_only = false) {
     eop.SignalFence(
@@ -2044,6 +2070,14 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 rasterizer->WaitDeferredSignals();
             }
             const auto* release_mem = reinterpret_cast<const PM4CmdReleaseMem*>(header);
+#ifdef __APPLE__
+            const bool label_checked = LabelCheckedReleaseMem(*release_mem);
+            if (label_checked) {
+                BbLabelCheck::NoteParsed(
+                    release_mem->Address<u64>(),
+                    release_mem->data_sel.Value() == DataSelect::Data32Low ? 4 : 8);
+            }
+#endif
             if (rasterizer) {
                 rasterizer->ProcessDownloadImages();
 #ifdef __APPLE__
@@ -2058,9 +2092,13 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                     };
                     if (release_mem->data_sel.Value() != DataSelect::GdsMemStore) {
                         const PM4CmdReleaseMem packet = *release_mem;
-                        rasterizer->SignalAtGpuCompletion([packet, irq] {
-                            packet.SignalFence(WriteLabelBacking, irq,
-                                               [](VAddr, u16, u16) { UNREACHABLE(); });
+                        rasterizer->SignalAtGpuCompletion([packet, irq, label_checked] {
+                            packet.SignalFence(
+                                [label_checked](void* address, u64 data, u32 num_bytes) {
+                                    WriteReleaseMemLabel(address, data, num_bytes, true,
+                                                         label_checked);
+                                },
+                                irq, [](VAddr, u16, u16) { UNREACHABLE(); });
                         });
                         break;
                     }
@@ -2082,6 +2120,18 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 }
 #endif
             }
+#ifdef __APPLE__
+            release_mem->SignalFence(
+                [label_checked](void* address, u64 data, u32 num_bytes) {
+                    WriteReleaseMemLabel(address, data, num_bytes, false, label_checked);
+                },
+                [pipe_id = queue.pipe_id] {
+                    Platform::IrqC::Instance()->Signal(static_cast<Platform::InterruptId>(pipe_id));
+                },
+                [this](VAddr dst, u16 gds_index, u16 num_dwords) {
+                    rasterizer->CopyBuffer(dst, gds_index, num_dwords * sizeof(u32), false, true);
+                });
+#else
             release_mem->SignalFence(
                 [pipe_id = queue.pipe_id] {
                     Platform::IrqC::Instance()->Signal(static_cast<Platform::InterruptId>(pipe_id));
@@ -2089,6 +2139,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 [this](VAddr dst, u16 gds_index, u16 num_dwords) {
                     rasterizer->CopyBuffer(dst, gds_index, num_dwords * sizeof(u32), false, true);
                 });
+#endif
             break;
         }
         case PM4ItOpcode::EventWrite: {
