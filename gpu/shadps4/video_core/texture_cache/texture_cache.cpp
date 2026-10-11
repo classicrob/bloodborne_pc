@@ -1,6 +1,11 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <array>
+#include <chrono>
+#include <unordered_map>
+#include <vector>
 #include <xxhash.h>
 
 #include "bbport_toggles.h"
@@ -21,6 +26,116 @@
 #include "video_core/texture_cache/tile_manager.h"
 
 namespace VideoCore {
+
+#ifdef __APPLE__
+namespace {
+/// bbport (BB_PERF): which images RefreshImage re-reads from guest memory each frame, why they
+/// were dirty, and how many bytes it hashed and copied; logged every 10 s.
+enum DirtySource : u8 { DirtyInitial, DirtyCpuWrite, DirtyCpuMaybe, DirtyGpuStorage, DirtyGpuCopy };
+constexpr const char* DirtySourceNames[] = {"initial/other", "CPU write", "CPU write near",
+                                            "GPU storage write", "GPU copy/DMA"};
+
+struct RefreshCensus {
+    struct Entry {
+        u64 refreshes = 0, entered = 0, hashed = 0, copied = 0, unchanged = 0;
+        u32 flags_seen = 0;
+        u64 size = 0;
+        u32 width = 0, height = 0;
+        vk::Format format{};
+        u32 usage = 0;
+        u8 source = 0;
+        u64 detail = 0;
+        std::array<u64, 5> by_source{};
+    };
+    std::mutex mutex;
+    std::unordered_map<VAddr, Entry> entries;
+    u64 refreshes = 0, entered = 0, hashed = 0, copied = 0;
+    std::chrono::steady_clock::time_point since = std::chrono::steady_clock::now();
+};
+RefreshCensus refresh_census;
+
+void NoteDirty(Image& image, DirtySource source, u64 detail) {
+    image.dirty_source = source;
+    image.dirty_detail = detail;
+}
+
+/// One RefreshImage call: `entry_flags` as it found the image; bytes hashed and copied.
+void NoteRefresh(const Image& image, ImageFlagBits entry_flags, u64 hashed, u64 copied) {
+    if (!BbStats::enabled) {
+        return;
+    }
+    auto& census = refresh_census;
+    std::unique_lock lk{census.mutex};
+    auto& entry = census.entries[image.info.guest_address];
+    ++entry.refreshes;
+    entry.entered += image.info.guest_size;
+    entry.hashed += hashed;
+    entry.copied += copied;
+    entry.unchanged += copied == 0;
+    entry.flags_seen |= static_cast<u32>(entry_flags);
+    entry.size = image.info.guest_size;
+    entry.width = image.info.size.width;
+    entry.height = image.info.size.height;
+    entry.format = image.info.pixel_format;
+    entry.usage = image.usage.texture | image.usage.storage << 1 | image.usage.render_target << 2 |
+                  image.usage.depth_target << 3 | image.usage.vo_surface << 4;
+    entry.source = image.dirty_source;
+    entry.detail = image.dirty_detail;
+    ++entry.by_source[std::min<u32>(image.dirty_source, entry.by_source.size() - 1)];
+    ++census.refreshes;
+    census.entered += image.info.guest_size;
+    census.hashed += hashed;
+    census.copied += copied;
+    const auto now = std::chrono::steady_clock::now();
+    if (now - census.since < std::chrono::seconds(10)) {
+        return;
+    }
+    const double seconds = std::chrono::duration<double>(now - census.since).count();
+    std::vector<std::pair<VAddr, RefreshCensus::Entry>> top(census.entries.begin(),
+                                                           census.entries.end());
+    std::ranges::sort(top, [](const auto& a, const auto& b) {
+        return a.second.entered > b.second.entered;
+    });
+    const u64 total_refreshes = census.refreshes, total_entered = census.entered,
+              total_hashed = census.hashed, total_copied = census.copied;
+    census.entries.clear();
+    census.refreshes = census.entered = census.hashed = census.copied = 0;
+    census.since = now;
+    lk.unlock();
+    constexpr double MB = 1024.0 * 1024.0;
+    LOG_INFO(Render, "Image refresh census ({:.1f} s): {} refreshes of {} images, {:.0f} MB "
+                     "entered, {:.0f} MB hashed, {:.0f} MB copied (per second: {:.0f} / {:.0f} / "
+                     "{:.0f} MB)",
+             seconds, total_refreshes, top.size(), total_entered / MB, total_hashed / MB,
+             total_copied / MB, total_entered / MB / seconds, total_hashed / MB / seconds,
+             total_copied / MB / seconds);
+    for (size_t i = 0; i < std::min<size_t>(top.size(), 12); ++i) {
+        const auto& [address, e] = top[i];
+        std::string sources;
+        for (size_t s = 0; s < e.by_source.size(); ++s) {
+            if (e.by_source[s]) {
+                sources += fmt::format("{}{} {}", sources.empty() ? "" : ", ", DirtySourceNames[s],
+                                       e.by_source[s]);
+            }
+        }
+        LOG_INFO(Render,
+                 "  {:#x} {:.1f} MB {}x{} {} usage{}{}{}{}{}: {} refreshes ({} unchanged), "
+                 "{:.0f} MB entered, {:.0f} hashed, {:.0f} copied; flags seen{}{}{}{}; dirty by "
+                 "{}; last {} {:#x}",
+                 address, e.size / MB, e.width, e.height, vk::to_string(e.format),
+                 e.usage & 1 ? " texture" : "", e.usage & 2 ? " storage" : "",
+                 e.usage & 4 ? " render-target" : "", e.usage & 8 ? " depth" : "",
+                 e.usage & 16 ? " video-out" : "", e.refreshes, e.unchanged, e.entered / MB,
+                 e.hashed / MB, e.copied / MB,
+                 e.flags_seen & u32(ImageFlagBits::CpuDirty) ? " CpuDirty" : "",
+                 e.flags_seen & u32(ImageFlagBits::GpuDirty) ? " GpuDirty" : "",
+                 e.flags_seen & u32(ImageFlagBits::MaybeCpuDirty) ? " MaybeCpuDirty" : "",
+                 e.flags_seen & u32(ImageFlagBits::GpuModified) ? " GpuModified" : "", sources,
+                 DirtySourceNames[std::min<u32>(e.source, 4)], e.detail);
+    }
+}
+} // namespace
+#endif
 
 static constexpr u64 PageShift = 12;
 static constexpr u64 NumFramesBeforeRemoval = 32;
@@ -120,6 +235,9 @@ void TextureCache::MarkAsMaybeDirty(ImageId image_id, Image& image) {
         image.hash = XXH3_64bits(addr, image.info.guest_size);
     }
     image.flags |= ImageFlagBits::MaybeCpuDirty;
+#ifdef __APPLE__
+    NoteDirty(image, DirtyCpuMaybe, 0);
+#endif
     UntrackImage(image_id);
 }
 
@@ -134,6 +252,9 @@ void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
             // Modified region overlaps image, so the image was definitely accessed by this fault.
             // Untrack the image, so that the range is unprotected and the guest can write freely.
             image.flags |= ImageFlagBits::CpuDirty;
+#ifdef __APPLE__
+            NoteDirty(image, DirtyCpuWrite, addr);
+#endif
             UntrackImage(image_id);
         } else if (pages_end < image_end) {
             // This page access may or may not modify the image.
@@ -154,7 +275,8 @@ void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
     });
 }
 
-void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size) {
+void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size,
+                                           [[maybe_unused]] u64 shader) {
     std::scoped_lock lock{mutex};
     ForEachImageInRegion(address, max_size, [&](ImageId image_id, Image& image) {
         // Only consider images that match base address.
@@ -164,6 +286,9 @@ void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size) {
         }
         // Ensure image is reuploaded when accessed again.
         image.flags |= ImageFlagBits::GpuDirty;
+#ifdef __APPLE__
+        NoteDirty(image, shader ? DirtyGpuStorage : DirtyGpuCopy, shader);
+#endif
     });
 }
 
@@ -765,6 +890,13 @@ void TextureCache::RefreshImage(Image& image) {
         return;
     }
     BbStats::Timer timer{BbStats::t_refresh};
+#ifdef __APPLE__
+    const ImageFlagBits entry_flags = image.flags;
+    u64 hashed_bytes = 0, copied_bytes = 0;
+    SCOPE_EXIT {
+        NoteRefresh(image, entry_flags, hashed_bytes, copied_bytes);
+    };
+#endif
 
     RENDERER_TRACE;
     TRACE_HINT(fmt::format("{:x}:{:x}", image.info.guest_address, image.info.guest_size));
@@ -782,6 +914,9 @@ void TextureCache::RefreshImage(Image& image) {
         const u32 s_h = image.info.props.is_block ? Common::DivCeil(h, 4u) : h;
         const u32 size = s_w * s_h * (image.info.num_bits / 8);
         const u64 hash = XXH3_64bits(addr, size);
+#ifdef __APPLE__
+        hashed_bytes += size;
+#endif
         if (image.hash == hash) {
             image.flags &= ~ImageFlagBits::MaybeCpuDirty;
             return;
@@ -807,6 +942,9 @@ void TextureCache::RefreshImage(Image& image) {
         if (is_gpu_modified && !is_gpu_dirty) {
             const u8* addr = std::bit_cast<u8*>(image.info.guest_address);
             const u64 hash = XXH3_64bits(addr + mip_offset, mip_size);
+#ifdef __APPLE__
+            hashed_bytes += mip_size;
+#endif
             if (image.mip_hashes[m] == hash) {
                 continue;
             }
@@ -815,6 +953,9 @@ void TextureCache::RefreshImage(Image& image) {
 
         const u32 extent_width = mip_pitch ? std::min(mip_pitch, width) : width;
         const u32 extent_height = mip_height ? std::min(mip_height, height) : height;
+#ifdef __APPLE__
+        copied_bytes += mip_size;
+#endif
         image_copies.push_back({
             .bufferOffset = mip_offset,
             .bufferRowLength = mip_pitch,
