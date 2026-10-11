@@ -920,6 +920,17 @@ public:
         return &work_semaphore;
     }
 
+#ifdef __APPLE__
+    /// bbport (frame capture): deferred operations not yet run, and labels issued and not yet
+    /// written (BB_LABELS_AT_GPU_COMPLETE).
+    [[nodiscard]] u32 NumPendingOperations() const noexcept {
+        return num_pending_ops.load(std::memory_order_acquire);
+    }
+    [[nodiscard]] u64 OutstandingLabels() {
+        return labels.Outstanding();
+    }
+#endif
+
     /// Defers an operation until the gpu has reached the current cpu tick.
     /// Will be run when submitting or calling PopPendingOperations.
     void DeferOperation(Common::UniqueFunction<void>&& func) {

@@ -21,6 +21,7 @@
 #include "video_core/multi_level_page_table.h"
 #include "video_core/texture_cache/blit_helper.h"
 #include "video_core/texture_cache/image.h"
+#include "video_core/texture_cache/capture_records.h"
 #include "video_core/texture_cache/image_view.h"
 #include "video_core/texture_cache/sampler.h"
 #include "video_core/texture_cache/tile_manager.h"
@@ -113,6 +114,13 @@ public:
 
     /// Evicts any images that overlap the unmapped range.
     void UnmapMemory(VAddr cpu_addr, size_t size);
+
+#ifdef __APPLE__
+    /// bbport (frame capture, docs/macos/capture-replay.md): one record per GPU-modified image,
+    /// read-only (nothing is written back). Call at a quiescent point
+    /// (Rasterizer::QuiesceForCapture). Not const: the slot vector's const iteration is unusable.
+    void ReportGpuModifiedForCapture(std::vector<CaptureImageRecord>& out);
+#endif
 
     /// Schedules a copy of pending images for download back to CPU memory.
     void ProcessDownloadImages();

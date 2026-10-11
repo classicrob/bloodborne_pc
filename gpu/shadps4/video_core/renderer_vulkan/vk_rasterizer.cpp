@@ -4749,6 +4749,56 @@ Rasterizer::~Rasterizer() {
 #endif
 }
 
+#ifdef __APPLE__
+bool Rasterizer::QuiesceForCapture(std::string& why) {
+    if (!OnStageA()) {
+        why = "not on the GPU command thread";
+        return false;
+    }
+    DrainDrawPipe();
+    if (draw_pipe && !draw_pipe->Idle()) {
+        why = "draw pipe not idle after its drain";
+        return false;
+    }
+    JoinBindHelper(this);
+    WaitDeferredSignals();
+    scheduler.Finish();
+    scheduler.PopPendingOperations();
+    std::string outstanding;
+    if (const u32 ops = scheduler.NumPendingOperations()) {
+        outstanding += fmt::format("{} deferred operations; ", ops);
+    }
+    if (const u64 labels = scheduler.OutstandingLabels()) {
+        outstanding += fmt::format("{} labels not written; ", labels);
+    }
+    if (!outstanding.empty()) {
+        why = outstanding.substr(0, outstanding.size() - 2);
+        return false;
+    }
+    return true;
+}
+
+std::string Rasterizer::CaptureSettingsRefusal() const {
+    std::string on;
+    const auto add = [&](const char* name) {
+        on += on.empty() ? name : fmt::format(", {}", name);
+    };
+    if (upscaler && upscaler->Enabled()) {
+        add("upscaler (incl. TAA and DisplayOverride)");
+    }
+    if (scene_targets && scene_targets->Reduced()) {
+        add("reduced scene (live resolution)");
+    }
+    if (camera_motion && camera_motion->Enabled()) {
+        add("camera motion vectors");
+    }
+    if (object_motion && object_motion->Enabled()) {
+        add("object motion vectors");
+    }
+    return on;
+}
+#endif
+
 void Rasterizer::NoteFrameStart() {
     if (auto* profiler = GpuProfiler::Get()) {
         profiler->BeginFrame();
