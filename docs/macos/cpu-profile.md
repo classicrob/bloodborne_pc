@@ -128,11 +128,14 @@ SA_RESTART restarts the pipe read; sleep wrappers explicitly retry EINTR; semaph
 condition waits retain their predicate/timeout semantics. This is not a blanket
 claim that every third-party blocking API is EINTR-safe.
 
-Six alternating fixed-work baseline/profile pairs at 1 kHz on macOS 27.2 under
-Rosetta measured process CPU ratios 1.0685, 1.0700, 1.0704, 1.0561, 1.0583, 1.0624:
-median **1.0654 (6.5% CPU overhead)**. Baseline process CPU was 0.670–0.677 s;
-profiled 0.713–0.720 s, with 485–522 samples and zero drops per run. This includes
-handler and collector CPU in that workload. The host was heavily contended:
-wall-time ratios ranged 0.951–1.486, so those are not an FPS or latency estimate.
-A quiet gameplay measurement must establish the cost for its actual thread mix
-and stack depths. Raw local evidence: `out/cpu-profile/bench-1791695015495094000/`.
+Six alternating fixed-work baseline/profile pairs on the final mask/stop code at
+1 kHz on macOS 27.2 under Rosetta measured process CPU ratios 1.0889, 1.0717,
+1.0649, 1.0457, 1.0559, 1.0513: median **1.0604 (6.0% CPU overhead)**. Baseline
+process CPU was 0.671–0.683 s; profiled 0.714–0.732 s, with 491–553 samples and
+zero drops per run. This includes handler and collector CPU in that workload.
+The host was heavily contended: wall-time ratios ranged 0.977–2.089, so those
+are not an FPS or latency estimate. A quiet gameplay measurement must establish
+the cost for its actual thread mix and stack depths. Raw local evidence:
+`out/cpu-profile/bench-1791695879668525000/`. The fixture's `bench-off` and `bench`
+modes run the same fixed work and print wall/process-CPU seconds; `bench` needs a
+fresh `BB_CPU_PROFILE` filename. Alternate their order for paired trials.
