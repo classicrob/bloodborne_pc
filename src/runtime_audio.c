@@ -169,8 +169,9 @@ static ABI int32_t audio_open(int32_t user, int32_t type, int32_t index, uint32_
             int device_frames=0;
             SDL_AudioDeviceID device=SDL_GetAudioStreamDevice(p->stream);
             if (!SDL_GetAudioDeviceFormat(device,&device_spec,&device_frames)) audio_fail("device format",SDL_GetError());
+            const char *device_name=SDL_GetAudioDeviceName(device);
             printf("Runtime: audio device '%s': %d Hz, %d channels, format 0x%x, quantum %d frames (%.3f ms); input 48000 Hz/%d channels\n",
-                   SDL_GetAudioDeviceName(device),device_spec.freq,device_spec.channels,(unsigned)device_spec.format,
+                   device_name ? device_name : "<unavailable>",device_spec.freq,device_spec.channels,(unsigned)device_spec.format,
                    device_frames,1000.0*device_frames/device_spec.freq,p->channels);
             if (!SDL_ResumeAudioStreamDevice(p->stream)) audio_fail("device resume",SDL_GetError());
 #else
