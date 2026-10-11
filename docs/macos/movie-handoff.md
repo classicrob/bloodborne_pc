@@ -15,7 +15,9 @@
 >   0x5: initialized, a waiter, not signaled). The handoff's own stop ended the run. It could
 >   hang the game.
 >
-> **H0**, the same at `--fps 30` without the handoff: (pending; added when it is in).
+> The H0 control at `--fps 30` (without the handoff) was not run: the race is parked, so this
+> rests on H1 alone. The A, B and C title-idle arms without the handoff (earlier, uncapped) had
+> the same 16 `CMD-INTERLEAVE`.
 >
 > What is still unknown, and not being pursued: the mode-1 kick path (whether it resets done),
 > and what else starts GX's frames.
