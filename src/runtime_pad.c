@@ -109,7 +109,14 @@ static SDL_Gamepad *current_gamepad(void) {
 #ifdef __APPLE__
                 const char *motion_mode=getenv("BB_PAD_MOTION");
                 if (motion_mode && !strcmp(motion_mode,"diagnostic")) motion_connect(gamepad);
-                else { motion_disconnect(); puts("Runtime: controller motion not qualified; BB_PAD_MOTION=diagnostic opts into SDL sensor qualification"); }
+                else {
+                    motion_disconnect();
+                    const SDL_SensorType sensors[2]={SDL_SENSOR_ACCEL,SDL_SENSOR_GYRO};
+                    for (int i=0;i<2;++i)
+                        if (SDL_GamepadHasSensor(gamepad,sensors[i]) && SDL_GamepadSensorEnabled(gamepad,sensors[i]) &&
+                            !SDL_SetGamepadSensorEnabled(gamepad,sensors[i],false)) pad_failure("SDL diagnostic sensor disable");
+                    puts("Runtime: controller motion not qualified; BB_PAD_MOTION=diagnostic opts into SDL sensor qualification");
+                }
 #endif
                 ++connected_count;
                 const char *name=SDL_GetGamepadName(gamepad);
