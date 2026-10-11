@@ -7,32 +7,42 @@ threads with signals: write faults, the CPU profiler and entry probes. Guest cod
 without rechecking its predicate then goes on early. The engine's event wait 0x207e8f0 does
 exactly that (docs/macos/movie-handoff.md).
 
-With `BB_COND_WAKE_CHECK=1` (macOS), each cond counts signal and broadcast attempts. The count
-goes up before the native wake, so a waiter woken by it never finds it unchanged. A wait that
-returns success with its cond's count unchanged since it began is an **unnotified wake
-candidate**.
+With `BB_COND_WAKE_CHECK=1` (macOS), each cond counts notifications (signal and broadcast).
+Each is counted **started** before its native wake and **completed** after it. A wait takes both
+counts before it waits (completed first) and classifies a successful return:
+- **notified**: a notification started while it waited. This is no proof that this waiter was
+  the one woken, since one signal can overlap several waiters, so it undercounts candidates.
+- **ambiguous**: none started while it waited, but one was in progress when it began (started
+  but not completed). That notification may be the one that woke it.
+- **unnotified wake candidate**: neither. No notification could have woken it, because one that
+  woke it would have been started before its native wake, either while it waited or in
+  progress when it began. The paused-signaler control checks exactly this.
 
-A changed count does not prove that this waiter was the one woken. One signal can overlap
-several waiters, so the check undercounts. It never names a notified wake as a candidate.
+The counts live in a per-cond record that is never freed. POSIX lets a thread destroy a cond once
+its waiters are awake, while they are still reacquiring the mutex, so a returning waiter reads the
+record it took before waiting, never the cond. Each record has a unique id; a cond's address can
+be reused.
 
-Waits behave the same with the check on or off. The check:
+Waits behave the same with the check on or off. Off, no record is made. The check:
 - enrolls nothing per waiter, so a cancelled wait leaves nothing behind;
 - holds no diagnostic lock across a wait;
-- never takes the guest mutex in signal or broadcast.
+- never takes the guest mutex in signal or broadcast;
+- keeps errno and the guest errno around its own work.
 
-Native signal and broadcast failures are counted separately, since a failed attempt notifies no
-one.
+Native signal and broadcast failures are counted separately.
 
 ## Output
 
 The output goes to stdout.
-- `COND-UNNOTIFIED candidate #n: thread "<name>" caller <guest return address> cond #<id> ...`
-  is printed for the first 32 candidates.
+- `COND-UNNOTIFIED candidate #n: thread "<name>" (pthread <id>) caller <guest return address>
+  cond #<id> ...` is printed for the first 32 candidates.
   - The caller is the guest's return address from the sync import. It comes from the HLE
     trace's record when `BB_HLE_TRACE` or its summary replaced the return slot.
   - The cond id is unique per cond created, unlike its recyclable address.
-- `COND-UNNOTIFIED summary` gives the count per thread, caller and cond. It is printed at the
-  first candidate, then at most every 10 s, and in the runtime report at exit.
+- `COND-UNNOTIFIED summary` gives the counts of candidates and ambiguous wakes, and the count
+  per site: thread (pthread identity and name), caller and cond. 64 sites are tracked; the
+  candidates at further sites are counted and reported as such. It is printed at the first
+  candidate, then at most every 10 s, and in the runtime report at exit.
 
 Any other value of the variable stops. On other platforms, setting it stops.
 
@@ -54,6 +64,14 @@ on, and traced. It checks that none of these is a candidate:
 - a signal to one of two waiters;
 - a timed expiry.
 
-A native wake that bypasses the guest signal (what a host spurious wake looks like) is exactly
-one candidate. It names the waiter's guest caller and cond, including through the trace's
-record. A cancelled wait leaves later waits counted as before.
+It also checks:
+- A native wake that bypasses the guest signal (what a host spurious wake looks like) is exactly
+  one candidate. It names the waiter's pthread, guest caller (including through the trace's
+  record) and cond.
+- A cancelled wait leaves later waits counted as before.
+- A paused signaler is ambiguous, not a candidate: its notification is counted before the wait
+  begins, and its native wake happens after.
+- Broadcast, then destroy and recreate the cond before the woken waiter reacquires the mutex:
+  the waiter checks its own record.
+- errno and the guest errno are kept although the report clobbers them.
+- More than 64 sites: the rest are counted.

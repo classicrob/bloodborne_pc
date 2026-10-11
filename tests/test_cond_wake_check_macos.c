@@ -6,7 +6,13 @@
  * - on: real signal, broadcast to two waiters, signal to one of two, timed expiry: no candidate;
  *   a native wake that bypasses the guest signal (what a host spurious wake looks like): one
  *   candidate, named with the waiter's guest caller (through the trace's record when traced);
- *   a cancelled wait leaves nothing behind (later waits are counted and reported as before). */
+ *   a cancelled wait leaves nothing behind (later waits are counted and reported as before);
+ * - a notification counted before the waiter began but woken natively after: ambiguous, not a
+ *   candidate (a paused signaler);
+ * - broadcast, then destroy and recreate the cond (address reuse) before the woken waiter
+ *   reacquires the mutex: the waiter's check uses its own cond's stats, not the new cond's;
+ * - errno and the guest errno are kept even if the report clobbers them;
+ * - more than 64 sites: the rest are counted as untracked and reported. */
 #define _GNU_SOURCE
 #define BB_HLE_TRACE_TEST
 #include "../src/runtime_hle_trace.c"
@@ -56,6 +62,34 @@ static void waiters_blocked(int count) {
 static void reset(void) { atomic_store(&waiting,0); atomic_store(&woken,0); }
 
 static void cancel_cleanup(void *unused) { (void)unused; assert(!unlock(&mutex)); }
+
+/* The paused signaler: counted started, its native wake held until released. */
+static atomic_int pause_reached, pause_release;
+static void pause_notification(void) {
+    atomic_store(&pause_reached,1);
+    while (!atomic_load(&pause_release)) usleep(1000);
+}
+static void *paused_signaler(void *unused) { (void)unused; assert(!signal_one(&cond)); return NULL; }
+static void clobber_errno(void) { errno=99; *runtime_errno()=77; }
+static atomic_int errno_kept;
+static void *errno_waiter(void *unused) {
+    (void)unused;
+    assert(!lock(&mutex));
+    atomic_fetch_add(&waiting,1);
+    errno=17; *runtime_errno()=23;
+    assert(!wait_cond(&cond,&mutex));
+    atomic_store(&errno_kept,errno==17 && *runtime_errno()==23);
+    assert(!unlock(&mutex));
+    return NULL;
+}
+static void native_wake_of_new_waiter(void *(*body)(void *)) {
+    pthread_t t;
+    reset();
+    assert(!pthread_create(&t,NULL,body,NULL));
+    waiters_blocked(1);
+    assert(!pthread_cond_signal(&((GuestCond *)cond)->native));
+    assert(!pthread_join(t,NULL));
+}
 static void *cancelled_waiter(void *unused) {
     (void)unused;
     assert(!lock(&mutex));
@@ -126,7 +160,8 @@ int main(int argc, char **argv) {
         assert(atomic_load(&unnotified)==1);
         const uintptr_t caller=unnotified_sites[0].caller;
         assert(caller>=(uintptr_t)waiter && caller<(uintptr_t)waiter+512);
-        assert(unnotified_sites[0].cond==((GuestCond *)cond)->id && unnotified_sites[0].count==1);
+        assert(unnotified_sites[0].cond==((GuestCond *)cond)->stats->id && unnotified_sites[0].count==1);
+        assert(pthread_equal(unnotified_sites[0].thread,a));
         printf("PASS: %s: a wake without a guest signal is one candidate, named with the waiter's "
                "guest caller and cond\n",mode);
     } else {
@@ -148,5 +183,68 @@ int main(int argc, char **argv) {
     assert(!pthread_join(a,NULL));
     assert(atomic_load(&unnotified)==(mode_on ? 2u : 0u));
     printf("PASS: %s: a cancelled wait leaves nothing behind\n",mode);
+    if (!mode_on) return 0;
+
+    /* A notification in progress when the wait began. */
+    notify_pause_for_test=pause_notification;
+    pthread_t signaler;
+    assert(!pthread_create(&signaler,NULL,paused_signaler,NULL));
+    while (!atomic_load(&pause_reached)) usleep(1000);
+    notify_pause_for_test=NULL;
+    reset();
+    assert(!pthread_create(&a,NULL,waiter,NULL));
+    waiters_blocked(1);
+    atomic_store(&pause_release,1);
+    assert(!pthread_join(signaler,NULL) && !pthread_join(a,NULL));
+    assert(atomic_load(&unnotified)==2 && atomic_load(&ambiguous)==1);
+    printf("PASS: %s: a notification counted before the wait began and woken after: ambiguous, "
+           "not a candidate\n",mode);
+
+    /* Broadcast, then destroy and recreate the cond before the woken waiter reacquires. */
+    Op cond_destroy_op=(Op)runtime_mutex_resolve("g+PZd2hiacg#p#J");
+    reset();
+    assert(!pthread_create(&a,NULL,waiter,NULL));
+    waiters_blocked(1);
+    const CondStats *old_stats=((GuestCond *)cond)->stats;
+    const uint64_t checked=atomic_load(&checked_waits);
+    assert(!lock(&mutex));
+    assert(!broadcast_all(&cond));
+    usleep(20000); /* the waiter is woken, now waiting for the mutex */
+    const int32_t destroyed=cond_destroy_op(&cond);
+    if (!destroyed) {
+        assert(!cond_create(&cond,NULL,"wake-check-2"));
+        assert(((GuestCond *)cond)->stats!=old_stats);
+    }
+    assert(!unlock(&mutex));
+    assert(!pthread_join(a,NULL));
+    assert(atomic_load(&checked_waits)==checked+1 && atomic_load(&unnotified)==2);
+    if (!destroyed) {
+        assert(!atomic_load(&((GuestCond *)cond)->stats->started));
+        printf("PASS: %s: cond destroyed and recreated before the woken waiter reacquired: its "
+               "check used its own cond's stats\n",mode);
+    } else {
+        printf("PASS: %s: (Darwin refused destroying the cond before the woken waiter "
+               "reacquired: %#x; the waiter's check used its own stats)\n",mode,(unsigned)destroyed);
+        if (destroyed) assert(!cond_create(&cond,NULL,"wake-check-2"));
+    }
+
+    /* errno and the guest errno kept although the report clobbers them. */
+    report_hook_for_test=clobber_errno;
+    native_wake_of_new_waiter(errno_waiter);
+    report_hook_for_test=NULL;
+    assert(atomic_load(&errno_kept) && atomic_load(&unnotified)==3);
+    printf("PASS: %s: errno and the guest errno kept around the report\n",mode);
+
+    /* More than 64 sites: a new cond each (a joined thread's pthread_t can be reused). */
+    for (int i=0;i<66;++i) {
+        assert(!cond_create(&cond,NULL,"wake-check-site"));
+        native_wake_of_new_waiter(waiter);
+    }
+    assert(atomic_load(&unnotified)==69 && atomic_load(&untracked)>=1);
+    pthread_mutex_lock(&unnotified_lock);
+    report_unnotified_sites_locked();
+    pthread_mutex_unlock(&unnotified_lock);
+    printf("PASS: %s: candidates at sites beyond the 64 tracked are counted (%llu)\n",mode,
+           (unsigned long long)atomic_load(&untracked));
     return 0;
 }
