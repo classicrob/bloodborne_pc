@@ -296,9 +296,12 @@ __attribute__((used,noinline)) uintptr_t runtime_hle_trace_leave(Saved *s,uintpt
     *guest_errno=guest_saved;errno=host_errno;return c.ret;
 }
 uintptr_t runtime_hle_trace_original_return(const uintptr_t *slot) {
+    /* Only a slot holding the bridge was replaced: a stale record (after a nonlocal exit) can
+     * name the same stack slot as a later untraced call. */
+    if(*slot!=(uintptr_t)runtime_hle_trace_return_bridge)return *slot;
     for(unsigned i=depth;i>0;i--) if(calls[i-1].slot==(uintptr_t)slot) return calls[i-1].ret;
-    if(*slot==(uintptr_t)runtime_hle_trace_return_bridge)die("a return bridge without its call record");
-    return *slot;
+    die("a return bridge without its call record");
+    return 0;
 }
 uintptr_t runtime_hle_trace_unwrap(uintptr_t pointer) {
     pthread_mutex_lock(&import_lock);
