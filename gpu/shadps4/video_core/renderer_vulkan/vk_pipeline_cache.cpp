@@ -876,15 +876,17 @@ bool PipelineCache::RefreshGraphicsStages(PipelineSelection& sel) {
             const auto bind_compute = [&](HwStage stage_in, SwStage stage_out,
                                           PipelineSelection::GsEmulationProgram& out) {
                 const auto* pgm = regs.ProgramForStage(static_cast<u32>(stage_in));
-                if (!pgm || !pgm->Address<u32*>()) {
-                    return false;
-                }
+                ASSERT_MSG(pgm && pgm->Address<u32*>(),
+                           "macOS geometry emulation: ES/GS draw without a{} program",
+                           stage_in == HwStage::Export ? "n ES" : " GS");
                 // Each compute pipeline has its own layout: bindings start at 0.
                 Shader::Backend::Bindings compute_binding{};
                 const auto program =
                     GetProgram(sel, stage_in, stage_out, AmdGpu::GetParams(*pgm), compute_binding);
                 out = {std::get<0>(program), std::get<1>(program), std::get<3>(program)};
-                return out.info != nullptr;
+                ASSERT_MSG(out.info, "macOS geometry emulation: no {} program selected",
+                           stage_in == HwStage::Export ? "ES" : "GS");
+                return true;
             };
             if (!bind_compute(HwStage::Export, SwStage::Vertex, sel.gs_es) ||
                 !bind_compute(HwStage::Geometry, SwStage::Geometry, sel.gs_gs)) {
