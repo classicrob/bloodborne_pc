@@ -151,7 +151,17 @@ bool ComputePipeline::SerializationSupport::Deserialize(Serialization::Archive& 
     return true;
 }
 
+void PipelineCache::ResetPreloadSelection() {
+    sel.infos.fill(nullptr);
+    sel.modules.fill(nullptr);
+    sel.fetch_shader.reset();
+    for (auto& runtime_info : sel.runtime_infos) {
+        runtime_info = Shader::RuntimeInfo{};
+    }
+}
+
 bool PipelineCache::LoadComputePipeline(Serialization::Archive& ar) {
+    ResetPreloadSelection();
     compute_key.Deserialize(ar);
 
     ComputePipeline::SerializationSupport sdata{};
@@ -220,6 +230,10 @@ bool GraphicsPipeline::SerializationSupport::Deserialize(Serialization::Archive&
 }
 
 bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
+    // bbport: a record starts from an empty selection. A record that failed part-way (missing
+    // stage metadata) leaves stages behind, and a later record without those stages would be
+    // built with them.
+    ResetPreloadSelection();
     sel.graphics_key.Deserialize(ar);
 
     GraphicsPipeline::SerializationSupport sdata{};
@@ -228,8 +242,6 @@ bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
     for (int stage_idx = 0; stage_idx < MaxShaderStages; ++stage_idx) {
         const auto& hash = sel.graphics_key.stage_hashes[stage_idx];
         if (!hash) {
-            // No stale runtime info from the previous record (LoadPipelineStage sets the rest).
-            sel.runtime_infos[stage_idx] = Shader::RuntimeInfo{};
             continue;
         }
 
@@ -401,6 +413,7 @@ void PipelineCache::WarmUp() {
                     num_total_pipelines - num_pipelines);
     }
 
+    ResetPreloadSelection();
     Storage::DataBase::Instance().FinishPreload();
 }
 
