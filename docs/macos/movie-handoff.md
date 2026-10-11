@@ -76,8 +76,8 @@ Output (stdout):
   - R or G is null;
   - the done event is not initialized, or its wait method is not 0x207e8f0;
   - locking or unlocking the event's mutex fails;
-  - GX's frame is not done within 5 s, whether the waits time out, wake without done, or see
-    done only after the deadline.
+  - GX's frame is not done within 5 s, including done seen only after the deadline (a check
+    blocked on the mutex past it).
 
 ### Not established (why it is opt-in)
 
@@ -99,11 +99,10 @@ no parser stop while the attract video plays.
 - a fake image with `mov edi, 20000; call <stub>` at the movie step's offset;
 - the sleep and mutex stubs, `jmp [slot]`;
 - import slots holding a usleep built like the runtime's, not runtime_kernel.c itself;
-- a scripted wait method and the engine objects the hook reads.
+- the engine objects the hook reads, and a wait method that aborts if called.
 
 It runs untraced, traced (`BB_HLE_TRACE`) and summary-only (`BB_HLE_TRACE_SUMMARY`). It checks:
-- waiting through timeouts, and through wakes with done still clear, until done is seen under
-  the mutex;
+- polling until done is seen under the mutex;
 - no wait when GX is already done;
 - no wait for a sleep from another call site;
 - errno and guest errno kept;

@@ -170,7 +170,26 @@ static void expect_stop(const char *what, const char *message, void (*body)(void
     printf("PASS: stops: %s\n",what);
 }
 static void stop_past_limit(void) { run(-1,1); }
-static void stop_done_late(void) { run(400,1); } /* past the test's 300 ms limit */
+/* GX holds the event's mutex past the 300 ms limit, sets done, then releases: the hook's check
+ * blocks on the mutex and then sees done, but only after the deadline. */
+static atomic_int gx_holding;
+static void *gx_holds_then_done(void *unused) {
+    (void)unused;
+    pthread_mutex_lock(&event_mutex);
+    atomic_store(&gx_holding,1);
+    usleep(400000);
+    uint32_t state; memcpy(&state,gx+GxDoneEvent+EventState,4);
+    state|=2; memcpy(gx+GxDoneEvent+EventState,&state,4);
+    pthread_mutex_unlock(&event_mutex);
+    return NULL;
+}
+static void stop_done_late(void) {
+    set_state(1);
+    pthread_t holder;
+    assert(!pthread_create(&holder,NULL,gx_holds_then_done,NULL));
+    while (!atomic_load(&gx_holding)) usleep(1000);
+    movie_step();
+}
 static void stop_failed_lock(void) { lock_fails=1; run(-1,1); }
 static void stop_uninitialized(void) { run(-1,0); }
 static void stop_null_renderer(void) { put_pointer(image_base+RendererGlobal,0); run(-1,1); }
