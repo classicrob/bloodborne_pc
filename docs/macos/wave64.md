@@ -51,12 +51,25 @@ range.
 The ISA is ambiguous about out-of-range scalar dwords: they are left unwritten (the literal
 reading) or written as 0 (reading SMEM_ZERO, which `tests/gcn_buffer_conformance/SPEC.md` accepts
 too). When **every** workgroup-divergent cross-lane value of a shader is used only as that old
-destination value (through phis and 32/64-bit packing), the pass takes the SMEM_ZERO reading for
+destination value (through phis, 32/64-bit packing and pure bitwise ops such as an
+`s_and_saveexec` mask combined with exec), the pass takes the SMEM_ZERO reading for
 **all** scalar buffer loads of that shader, then removes the dead masks. A warning names each
 such shader (once per compiled module or permutation): `reads out-of-range scalar buffer dwords
 as 0 (SMEM_ZERO reading)`. This is a choice
 between two accepted readings of the ISA text, not a statement about physical GCN2 behaviour.
 
-Any other use of a divergent mask (a store, an address, a branch condition, an export) keeps the
-shader a hard error. Suite: group `wave64`, cases "divergent VOP3 compare into s[30:31],
+Compute shader 0x40229f02 has ten divergent saved-exec masks that reach `s_buffer_load`
+destinations only through `s_and_b64`/`s_not_b64`-style ops. Any other use of a divergent mask (a
+store, an address, a branch condition, an export) keeps the shader a hard error.
+
+## Considered, unused by this game: taking a divergent ballot at a uniform point
+
+A ballot in a workgroup-divergent block B reached from a workgroup-uniform block U only through ifs
+(no loop, break, return or unreachable in between) equals `Ballot(x && c1 && ... && cn)` taken at
+the end of U, the ci being the conditions of the ifs open at B: B's invocations are exactly U's
+invocations with c1..cn, and the barrier exchange is safe in U. x and every ci must already exist at
+the end of U (nothing moved or recomputed). Implemented and tested (branch
+`bb/verifier-old-hoist`, commit 7203277), then dropped: across the whole shader corpus it applied to
+no shader. The suite keeps the shape ("s_cbranch_execz scope: v_mbcnt(exec) rank + s_bcnt1(exec)",
+approved loud) and four controls that must stay loud if it is revived. Suite: group `wave64`, cases "divergent VOP3 compare into s[30:31],
 s_buffer_load s30/s40" (in range, out of range, and the two must-be-loud controls).

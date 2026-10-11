@@ -380,7 +380,8 @@ bool IsFirstActiveLane(const IR::Inst& read_lane, bool block_uniform,
            (pred.TryInst() && std::ranges::contains(enclosing_conditions, pred.TryInst()));
 }
 
-// Whether every consumer of `inst` (through phis and 32/64-bit packing) is the old-destination
+// Whether every consumer of `inst` (through phis, 32/64-bit packing and pure bitwise ops, e.g. an
+// s_and_saveexec mask combined with another) is the old-destination
 // operand of a scalar buffer load (ReadConstBuffer arg 2: the SDST value kept for out-of-range
 // dwords). Collects the pass-through instructions in `chain`.
 bool OnlyFeedsScalarLoadFallback(const IR::Inst& inst, std::vector<IR::Inst*>& chain) {
@@ -396,7 +397,9 @@ bool OnlyFeedsScalarLoadFallback(const IR::Inst& inst, std::vector<IR::Inst*>& c
             const std::string_view name = IR::NameOf(op);
             const bool pass = op == IR::Opcode::Phi || name.starts_with("CompositeExtract") ||
                               name.starts_with("CompositeConstruct") || op == IR::Opcode::UnpackUint2x32 ||
-                              op == IR::Opcode::PackUint2x32;
+                              op == IR::Opcode::PackUint2x32 || name.starts_with("BitwiseAnd") ||
+                              name.starts_with("BitwiseOr") || name.starts_with("BitwiseXor") ||
+                              name.starts_with("BitwiseNot");
             if (!pass) return false;
             if (seen.insert(user).second) {
                 chain.push_back(user);

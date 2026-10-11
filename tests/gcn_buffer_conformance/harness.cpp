@@ -16,6 +16,7 @@
 #include <fcntl.h>
 #include <filesystem>
 #include <map>
+#include <unordered_map>
 #include <memory>
 #include <optional>
 #include <set>
@@ -89,7 +90,8 @@ enum class SoffSrc { Inline, Sgpr };
 enum class SmemSrc { None, Imm, Sgpr };
 // Wave64 lane-semantics programs (no buffer access under test).
 enum class Wave { None, Lane, MbcntMask, Readlane, Exec1, Exec2, LoopReadFirstLane, Lds, CtrlPhi, CtrlBreak, Pkrtz, Pkrtz3, SmemFallback, Exec3, Exec3Out, WriteLane,
-                  RlBeforeDiv, RlCselect, RlBareFf1, RlEmptyExec };
+                  RlBeforeDiv, RlCselect, RlBareFf1, RlEmptyExec,
+                  DivRank, DivLoop, DivVopc, DivInnerExec, DivExit };
 
 struct Template {
     std::string name;
@@ -140,7 +142,7 @@ struct Template {
     u32 workgroups = 1;              // compute dispatch width (spilled LDS: one region per workgroup)
     u32 pushud_mask = 0;             // pushud: user-data SGPRs the stage reads (s[0:3] = its V#)
     bool fs_count = false;           // pushud-style FS: buffer_atomic_add 1 at its V# (side-effect count)
-    u32 smemfb = 0;                  // SmemFallback: 0 in range, 1 mask also stored, 2 mask also a branch, 3 OOB too,
+    u32 smemfb = 0;                  // SmemFallback: 0 in range, 1 mask also stored, 2 mask also a branch, 3 OOB too, 5 OOB through bitwise ops,
                                      // 4 in range with the mask carried around a uniform loop (phi cycle)
     u32 Threads() const { return wg[0] * wg[1] * wg[2]; }
     std::vector<u32> code;
@@ -245,6 +247,10 @@ void AssembleSmemFallback(GcnAsm::Code& c, u32 variant) {
     c.SAndSaveexecB64(22, VCC_LO);
     c.words.push_back(0xD0000000u | (197u << 17) | 30u); // v_cmp_ne_u32 s[30:31], 0, v3 (VOP3)
     c.words.push_back(Inline(0) | (Vgpr(3) << 9));
+    if (variant == 5) { // the mask through pure 64-bit bitwise ops, still only the load destination
+        c.Sop2(15, 30, 30, EXEC_LO); // s_and_b64 s[30:31], s[30:31], exec
+        c.Sop1(8, 30, 30);           // s_not_b64 s[30:31], s[30:31]
+    }
     if (variant == 1) c.VMov(12, 30);
     if (variant == 2) {
         c.words.push_back(0xBF000000u | (6u << 16) | (Inline(0) << 8) | 30u); // s_cmp_eq_u32 s30, 0
@@ -257,7 +263,7 @@ void AssembleSmemFallback(GcnAsm::Code& c, u32 variant) {
         c.SCmpLtU32Literal(20, 2);
         c.SCbranchScc1To(loop);
     }
-    c.SBufferLoad(1, 30, 0, true, variant == 3 ? 100 : 2); // s30 <- dword 2 (in range) or 100
+    c.SBufferLoad(1, 30, 0, true, variant == 3 || variant == 5 ? 100 : 2); // s30 <- dword 2 (in range) or 100
     c.SBufferLoad(1, 40, 0, true, 100);                    // s40 <- dword 100: out of range
     c.SWaitcntAll();
     c.VMov(10, 30);
@@ -390,6 +396,59 @@ void AssembleWave(GcnAsm::Code& c, Wave w) {
         c.VReadfirstlane(21, 3); // after it: exec may be empty, and lane 0 may be outside the scope
         c.SMovB64(EXEC_LO, 24);
         c.VMov(10, 21);
+        c.words[br] |= u32(int32_t(c.words.size()) - int32_t(br + 1)) & 0xFFFF;
+        c.SMovB64(EXEC_LO, 22);
+        break;
+    }
+    // Ballots of exec inside an s_cbranch_execz scope of a multi-wave workgroup (workgroup-divergent
+    // flow): DivRank could be exact by taking the ballot where the scope's condition is computed;
+    // the others could not (a loop inside the scope, a ballot of a compare made inside the scope,
+    // an inner exec change, an s_endpgm path inside the scope).
+    case Wave::DivRank:
+    case Wave::DivLoop:
+    case Wave::DivVopc:
+    case Wave::DivInnerExec:
+    case Wave::DivExit: {
+        c.VMov(9, Inline(0));
+        c.VCmpNeU32(Inline(0), 2);
+        c.SAndSaveexecB64(22, VCC_LO);
+        const size_t br = c.words.size();
+        c.Sopp(8, 0); // s_cbranch_execz END
+        if (w == Wave::DivRank) { // rank among the scope's lanes, and their count
+            c.VMbcnt(false, 10, EXEC_LO, 9);
+            c.VMbcnt(true, 10, EXEC_LO + 1, 10);
+            c.SBcnt1B64(24, EXEC_LO);
+            c.VMov(11, 24);
+        } else if (w == Wave::DivLoop) {
+            c.Sop1(3, 20, Inline(0));
+            const size_t loop = c.words.size();
+            c.SBcnt1B64(24, EXEC_LO);
+            c.VMov(11, 24);
+            c.SAddU32(20, 20, Inline(1));
+            c.SCmpLtU32Literal(20, 2);
+            c.SCbranchScc1To(loop);
+        } else if (w == Wave::DivVopc) {
+            c.VCmpNeU32(Inline(0), 5);
+            c.SBcnt1B64(24, VCC_LO);
+            c.VMov(11, 24);
+        } else if (w == Wave::DivInnerExec) {
+            c.VCmpNeU32(Inline(0), 5);
+            c.SAndSaveexecB64(26, VCC_LO);
+            c.VMov(13, Vgpr(3));
+            c.SBcnt1B64(24, EXEC_LO);
+            c.SMovB64(EXEC_LO, 26);
+            c.VMov(11, 24);
+        } else { // DivExit
+            c.VCmpNeU32(Inline(0), 5);
+            c.SAndSaveexecB64(26, VCC_LO);
+            const size_t br2 = c.words.size();
+            c.Sopp(8, 0);
+            c.SEndpgm();
+            c.words[br2] |= u32(int32_t(c.words.size()) - int32_t(br2 + 1)) & 0xFFFF;
+            c.SMovB64(EXEC_LO, 26);
+            c.SBcnt1B64(24, EXEC_LO);
+            c.VMov(11, 24);
+        }
         c.words[br] |= u32(int32_t(c.words.size()) - int32_t(br + 1)) & 0xFFFF;
         c.SMovB64(EXEC_LO, 22);
         break;
@@ -1822,10 +1881,11 @@ void AddWaveCases() {
     // only matters if the load is out of range, so production reads out-of-range scalar dwords as
     // 0 for the whole shader (SMEM_ZERO reading); any other use of the mask stays loud.
     for (u32 x : {64u, 128u}) {
-        for (u32 variant : {0u, 3u, 4u, 1u, 2u}) {
+        for (u32 variant : {0u, 3u, 4u, 5u, 1u, 2u}) {
             Template t;
             static const char* vn[] = {"s30 in range", "mask also stored (must be loud)", "mask also a branch (must be loud)",
-                                       "s30 out of range", "s30 in range, mask loop-carried"};
+                                       "s30 out of range", "s30 in range, mask loop-carried",
+                                       "s30 out of range, mask through s_and_b64 + s_not_b64"};
             t.name = std::string("wave: divergent VOP3 compare into s[30:31], s_buffer_load s30/s40: ") + vn[variant] + " [" +
                      std::to_string(x) + "x1]";
             t.op.kind = GCN_LOAD;
@@ -1874,6 +1934,51 @@ void AddWaveCases() {
         t.compile_only = true;
         t.compute_compile = true;
         t.wg = {16, 1, 1};
+        t.expect_loud = true;
+        const u32 tt = AddTemplate(t);
+        NewJob("wave64", tt, RawV(64), 0);
+    }
+#endif
+    // Ballots of exec in an s_cbranch_execz scope of multi-wave workgroups: a ballot in
+    // workgroup-divergent flow, rejected loudly (taking it at the uniform point that computes the
+    // scope's condition is exact, see docs/macos/wave64.md, but no shader of this game needs it).
+    // Exec masks differ per wave (rotated by 7 per wave); "lanes0+37" puts one lane in each
+    // half-wave. The compile-only controls must stay loud even if that hoisting is revived.
+    for (const std::array<u32, 3>& wg : {std::array<u32, 3>{128, 1, 1}, std::array<u32, 3>{64, 2, 1},
+                                         std::array<u32, 3>{32, 4, 1}}) {
+        const u32 threads = wg[0] * wg[1] * wg[2];
+        const std::string shape = " [" + std::to_string(wg[0]) + "x" + std::to_string(wg[1]) + "]";
+        Template t;
+        t.name = "wave: s_cbranch_execz scope: v_mbcnt(exec) rank + s_bcnt1(exec)" + shape;
+        t.op.kind = GCN_LOAD;
+        t.wave = Wave::DivRank;
+        t.wg = wg;
+        t.wave_divergent = true;
+        const u32 tt = AddTemplate(t);
+        for (const M& m : masks) {
+            const std::string mn = m.name;
+            if (mn != "all" && mn != "none" && mn != "even" && mn != "lanes0+37" && mn != "lanes5+40") continue;
+            Job& j = NewJob("wave64", tt, RawV(64), 0);
+            j.label += " exec=" + mn;
+            for (u32 l = 0; l < threads; ++l) {
+                const u64 wm = (l / 64) ? (m.mask << 7 | m.mask >> 57) : m.mask;
+                SetLane(j, l, value(l), 0);
+                j.lanes[l].active = u32(wm >> (l % 64) & 1);
+            }
+        }
+    }
+#ifdef BB_MIRROR_PROFILE_WAVE64
+    for (auto [name, w] : {std::pair{"s_bcnt1(exec) in a loop inside the scope", Wave::DivLoop},
+                           std::pair{"s_bcnt1 of a compare made inside the scope", Wave::DivVopc},
+                           std::pair{"s_bcnt1(exec) after an inner exec change", Wave::DivInnerExec},
+                           std::pair{"s_bcnt1(exec) after an inner scope with s_endpgm", Wave::DivExit}}) {
+        Template t;
+        t.name = std::string("wave: s_cbranch_execz scope: ") + name + " [128x1] (compile)";
+        t.op.kind = GCN_LOAD;
+        t.wave = w;
+        t.compile_only = true;
+        t.compute_compile = true;
+        t.wg = {128, 1, 1};
         t.expect_loud = true;
         const u32 tt = AddTemplate(t);
         NewJob("wave64", tt, RawV(64), 0);
@@ -3367,6 +3472,12 @@ std::vector<u32> WaveExpected(const Job& j) {
             r[0] = exec ? value(gcn_first_lane(exec)) : 0xDEAD0000u;
             r[1] = exec ? gcn_popcount64(ballot & exec) : 0xDEAD0001u;
             break;
+        case Wave::DivRank:
+            if (exec >> lane & 1) {
+                r[0] = gcn_popcount64(exec & ((1ull << lane) - 1));
+                r[1] = gcn_popcount64(exec);
+            }
+            break;
         case Wave::Exec3:
             if (exec >> lane & 1) {
                 r[0] = value(gcn_first_lane(exec));
@@ -4304,7 +4415,7 @@ JobResult EvaluateSmemFallback(Gpu& g, const Job& j, const u32* res) {
     const Template& t = g_templates[j.tmpl];
     u32 in_range;
     std::memcpy(&in_range, g.pristine.data() + (ActualV(j).base + 8 - GuestVa), 4);
-    const u32 want0 = t.smemfb == 3 ? 0u : in_range;
+    const u32 want0 = t.smemfb == 3 || t.smemfb == 5 ? 0u : in_range;
     u32 bad = 0;
     std::string d;
     for (u32 l = 0; l < t.Threads(); ++l) {
@@ -4650,9 +4761,10 @@ int Bench(const Options& opt) {
 // (results depend on the 64-lane wave; see the wave64 group).
 // --census-sgpr FILE...: static scan for SGPRs (and VCC/M0) written inside an s_cbranch_execz
 // scope (between a forward execz branch and its target) and read at or after the target before
-// being rewritten. The recompiler builds such a scope as a per-lane if, so lanes that skipped it
-// read the old value where GCN gives every lane the new one (SGPRs are wave-wide). A linear scan:
-// candidates, not proof (no loops, no SCC, implicit M0/VCC reads not seen). Writers are tagged
+// being rewritten on some path of the CFG. The recompiler builds such a scope as a per-lane if,
+// so lanes that skipped it read the old value where GCN gives every lane the new one (SGPRs are
+// wave-wide). Candidates, not proof (SCC and implicit M0 reads are not seen; the writes inside
+// the scope are collected linearly). Writers are tagged
 // "value" (smem, v_readlane/v_readfirstlane, 32-bit and arithmetic s_* ops: one number per wave)
 // or "mask" (v_cmp, carry-outs, s_*saveexec and 64-bit bitwise s_* ops, which the recompiler
 // keeps as one bit per lane; there only lanes whose bit GCN would change can differ). Readers are
@@ -4734,9 +4846,11 @@ int CensusSgpr(int argc, char** argv, int first) {
     std::map<std::string, std::array<u32, 4>> by_stage; // stage -> scanned, value->value, value->mask, mask
     std::vector<std::string> value_hashes, reuse_hashes, mask_hashes;
     // Controls, scanned first: the Exec3Out shape (s_readfirstlane and s_bcnt1 results written in
-    // the scope, read after it) must be value->value; Exec3 (copied inside the scope) must be clean.
+    // the scope, read after it) must be value->value; Exec3 (copied inside the scope) and Exec3Out
+    // with an s_branch over the reads must be clean.
     std::vector<std::pair<std::string, std::vector<u32>>> inputs;
-    for (bool out : {true, false}) {
+    for (int variant : {0, 1, 2}) {
+        const bool out = variant != 1;
         using GcnAsm::Inline, GcnAsm::VCC_LO, GcnAsm::EXEC_LO;
         GcnAsm::Code c;
         c.SMovLiteral(21, 0xDEAD0000u);
@@ -4751,9 +4865,12 @@ int CensusSgpr(int argc, char** argv, int first) {
         if (!out) { c.VMov(10, 21); c.VMov(11, 24); }
         c.words[br] |= u32(int32_t(c.words.size()) - int32_t(br + 1)) & 0xFFFF;
         c.SMovB64(EXEC_LO, 22);
+        if (variant == 2) c.Sopp(2, 2); // s_branch over the two reads
         if (out) { c.VMov(10, 21); c.VMov(11, 24); }
         c.SEndpgm();
-        inputs.emplace_back(out ? "control_read-after-scope" : "control_copied-in-scope", c.words);
+        inputs.emplace_back(variant == 0 ? "control_read-after-scope"
+                                         : variant == 1 ? "control_copied-in-scope" : "control_branched-over",
+                            c.words);
     }
     for (int a = first; a < argc; ++a) {
         FILE* f = std::fopen(argv[a], "rb");
@@ -4792,6 +4909,8 @@ int CensusSgpr(int argc, char** argv, int first) {
             }
         }
         bool value_hit = false, mask_hit = false, reuse_hit = false;
+        std::unordered_map<u32, size_t> at_pc; // dword pc -> instruction index
+        for (size_t x = 0; x < insts.size(); ++x) at_pc[insts[x].pc] = x;
         for (size_t i = 0; i < insts.size(); ++i) {
             if (insts[i].inst.opcode != Opcode::S_CBRANCH_EXECZ || insts[i].inst.control.sopp.simm <= 0) continue;
             const u32 target = insts[i].pc + 1 + u32(insts[i].inst.control.sopp.simm);
@@ -4802,14 +4921,34 @@ int CensusSgpr(int argc, char** argv, int first) {
                 dsts(insts[j].inst, insts[j].name, rs);
                 for (u32 r : rs) written[r] = insts[j].name;
             }
-            // Scan on from the target; follow each loop back-edge once (the loop head may read it).
-            std::set<size_t> followed;
-            for (size_t k = j; k < insts.size() && !written.empty(); ++k) {
+            // Walk the CFG from the target: s_branch is followed, s_endpgm ends a path, conditional
+            // branches take both arms. A may-analysis of which scope-written registers can still
+            // hold the scope's value; each read of one is reported once.
+            std::vector<std::set<u32>> in(insts.size());
+            std::vector<bool> visited(insts.size());
+            std::vector<size_t> work;
+            std::set<std::pair<u32, size_t>> reported;
+            const auto flow = [&](size_t to, const std::set<u32>& live) {
+                if (to >= insts.size()) return;
+                const size_t before = in[to].size();
+                in[to].insert(live.begin(), live.end());
+                if (!visited[to] || in[to].size() != before) {
+                    visited[to] = true;
+                    work.push_back(to);
+                }
+            };
+            std::set<u32> start;
+            for (const auto& [r, w] : written) start.insert(r);
+            if (j < insts.size() && insts[j].pc == target) flow(j, start);
+            while (!work.empty()) {
+                const size_t k = work.back();
+                work.pop_back();
+                std::set<u32> live = in[k];
                 std::vector<u32> reads, writes;
                 srcs(insts[k].inst, insts[k].name, reads);
                 for (u32 r : reads) {
+                    if (!live.count(r) || !reported.insert({r, k}).second) continue;
                     const auto it = written.find(r);
-                    if (it == written.end()) continue;
                     const bool mask = is_mask_writer(it->second);
                     const bool mask_reader = (insts[k].name.rfind("S_", 0) == 0 && is_mask_writer(insts[k].name)) ||
                                              insts[k].name.find("CNDMASK") != std::string::npos;
@@ -4830,17 +4969,19 @@ int CensusSgpr(int argc, char** argv, int first) {
                     std::printf("%s: %s execz @%#x..%#x: %s written by %s, read @%#x by %s%s\n", base.c_str(),
                                 mask ? "mask->any  " : mask_reader ? "value->mask" : "value->value", insts[i].pc * 4, target * 4, reg_name(r).c_str(),
                                 it->second.c_str(), insts[k].pc * 4, insts[k].name.c_str(), prior.c_str());
-                    written.erase(it);
                 }
                 dsts(insts[k].inst, insts[k].name, writes);
-                for (u32 r : writes) written.erase(r);
-                const auto& in = insts[k].inst;
-                if (in.encoding == InstEncoding::SOPP && insts[k].name.find("BRANCH") != std::string::npos &&
-                    in.control.sopp.simm < 0 && followed.insert(k).second) {
-                    const u32 head = insts[k].pc + 1 + in.control.sopp.simm;
-                    for (size_t h = 0; h < insts.size(); ++h)
-                        if (insts[h].pc == head) { k = h - 1; break; }
-                }
+                for (u32 r : writes) live.erase(r);
+                const auto& in_k = insts[k].inst;
+                const std::string& nm = insts[k].name;
+                const auto branch_to = [&] {
+                    const auto t = at_pc.find(insts[k].pc + 1 + in_k.control.sopp.simm);
+                    if (t != at_pc.end()) flow(t->second, live);
+                };
+                if (nm == "S_ENDPGM" || nm.rfind("S_SETPC", 0) == 0 || nm.rfind("S_SWAPPC", 0) == 0) continue;
+                if (nm == "S_BRANCH") { branch_to(); continue; }
+                if (nm.rfind("S_CBRANCH", 0) == 0) branch_to();
+                flow(k + 1, live);
             }
         }
         if (control) {
