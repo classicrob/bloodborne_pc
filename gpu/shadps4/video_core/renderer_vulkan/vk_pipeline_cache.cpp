@@ -393,14 +393,29 @@ PipelineCache::~PipelineCache() = default;
 // bbport: shader/pipeline compile time on the GPU thread, reported by BB_FRAME_STATS.
 std::atomic<u64> g_bb_compile_ns;
 std::atomic<u32> g_bb_compiles;
+/// The part of the above that translated guest shaders to SPIR-V; the rest created pipelines
+/// (on Apple: MoltenVK's SPIR-V to MSL conversion and the Metal compile).
+std::atomic<u64> g_bb_translate_ns;
+std::atomic<u32> g_bb_translations;
 namespace {
 struct CompileTimer {
+    const char* what;
+    u64 hash;
+    bool translation = false;
     std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
     ~CompileTimer() {
-        g_bb_compile_ns += u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                   std::chrono::steady_clock::now() - start)
-                                   .count());
+        const u64 ns = u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                               std::chrono::steady_clock::now() - start)
+                               .count());
+        g_bb_compile_ns += ns;
         ++g_bb_compiles;
+        if (translation) {
+            g_bb_translate_ns += ns;
+            ++g_bb_translations;
+        }
+        if (ns >= 50'000'000) {
+            LOG_INFO(Render_Vulkan, "Slow compile: {} {:#x} took {:.1f} ms", what, hash, ns / 1e6);
+        }
     }
 };
 } // namespace
@@ -478,7 +493,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
     if (is_new) {
         const auto pipeline_hash = std::hash<GraphicsPipelineKey>{}(sel.graphics_key);
         LOG_INFO(Render_Vulkan, "Compiling graphics pipeline {:#x}", pipeline_hash);
-        CompileTimer timer;
+        CompileTimer timer{"graphics pipeline", pipeline_hash};
 
         GraphicsPipeline::SerializationSupport sdata{};
         it.value() = std::make_unique<GraphicsPipeline>(
@@ -533,7 +548,7 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
     if (is_new) {
         const auto pipeline_hash = std::hash<ComputePipelineKey>{}(compute_key);
         LOG_INFO(Render_Vulkan, "Compiling compute pipeline {:#x}", pipeline_hash);
-        CompileTimer timer;
+        CompileTimer timer{"compute pipeline", pipeline_hash};
 
         ComputePipeline::SerializationSupport sdata{};
         it.value() = std::make_unique<ComputePipeline>(instance, scheduler, desc_heap, profile,
@@ -1011,7 +1026,7 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
     LOG_INFO(Render_Vulkan, "Compiling {} shader {:#x} {}", info.hw_stage, info.pgm_hash,
              perm_idx != 0 ? "(permutation)" : "");
     DumpShader(code, info.pgm_hash, info.hw_stage, perm_idx, "bin");
-    CompileTimer timer;
+    CompileTimer timer{"shader translation", info.pgm_hash, true};
 
     const auto ir_program = Shader::TranslateProgram(code, pools, info, runtime_info, profile);
     auto spv = Shader::Backend::SPIRV::EmitSPIRV(profile, runtime_info, ir_program, binding);

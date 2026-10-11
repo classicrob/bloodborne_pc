@@ -34,6 +34,8 @@ extern std::unique_ptr<AmdGpu::Liverpool> liverpool;
 namespace Vulkan {
 extern std::atomic<u64> g_bb_compile_ns;
 extern std::atomic<u32> g_bb_compiles;
+extern std::atomic<u64> g_bb_translate_ns;
+extern std::atomic<u32> g_bb_translations;
 } // namespace Vulkan
 
 namespace Libraries::VideoOut {
@@ -440,6 +442,8 @@ void VideoOutDriver::Flip(const Request& req) {
         if (window >= 5.0) {
             const u32 compiles = Vulkan::g_bb_compiles.exchange(0);
             const u64 compile_ns = Vulkan::g_bb_compile_ns.exchange(0);
+            const u32 translations = Vulkan::g_bb_translations.exchange(0);
+            const u64 translate_ns = Vulkan::g_bb_translate_ns.exchange(0);
             const u64 direct = Vulkan::Scheduler::direct_recordings.exchange(0);
             const u64 faults = BbStats::tracker_faults.exchange(0);
             // GPU command thread CPU time per draw: comparable between builds even when the scene
@@ -480,6 +484,12 @@ void VideoOutDriver::Flip(const Request& req) {
                         wait_delta(BbStats::tick_wait_ns, 6) / (window * 1e7),
                         frames ? double(BbStats::reduced_draws.exchange(0)) / frames : 0.0,
                         frames ? double(BbStats::scene_draws.exchange(0)) / frames : 0.0);
+            if (compiles) {
+                std::printf("Compiles: %u shader translations %.1f ms, %u pipeline creations %.1f ms "
+                            "(slow ones: \"Slow compile\" lines)\n",
+                            translations, translate_ns / 1e6, compiles - translations,
+                            (compile_ns - translate_ns) / 1e6);
+            }
             // Frame pacing: spread of the guest flip intervals (judder that the mean hides).
             if (intervals.size() > 2) {
                 std::vector<double> sorted = intervals;
