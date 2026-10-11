@@ -50,7 +50,7 @@ q2=$!
 until_held quick0 Q2
 start=$(date +%s)
 "$heavy" --pool quick Q3 -- true
-(( $(date +%s) - start < 2 )) || fail "second quick slot not available"
+(( $(date +%s) - start < 10 )) || fail "second quick slot not available"  # the holder sleeps 30 s
 marker=bbheavytest$$
 set +e
 BB_HEAVY_QUICK_WARN=1 BB_HEAVY_QUICK_LIMIT=2 "$heavy" --pool quick Q4 -- \
@@ -71,7 +71,7 @@ holder=$!
 until_held build0 C
 start=$(date +%s)
 "$heavy" --priority P -- true
-(( $(date +%s) - start < 2 )) || fail "priority job waited for the ordinary slot"
+(( $(date +%s) - start < 10 )) || fail "priority job waited for the ordinary slot"  # the holder sleeps 30 s
 # Ordinary jobs never take the priority slot.
 "$heavy" status | grep -q '^build-priority: free' || fail "priority slot not free after P"
 
@@ -126,6 +126,36 @@ err=$(BB_HEAVY_ANNOUNCE=1 "$heavy" --pool quick --gpu exclusive T4 -- "$heavy" -
 err=$("$heavy" --pool playtest G11 -- true 2>&1 >/dev/null)
 [[ $err != *running* ]] || fail "announced without BB_HEAVY_ANNOUNCE ('$err')"
 
+# Scheduling: builds/tests (build, quick) as background QoS (scheduler priority 4) with compile
+# parallelism capped at 8, correctness games (playtest) at nice +5 with a utility clamp (priority
+# 20), exclusive-GPU jobs unchanged; applied once; BB_HEAVY_POLITE=0 turns it off. Niceness is
+# relative to this shell's. The QoS checks need a normal-priority shell: under build.sh --test
+# this test itself runs as background QoS, and they are reported as not checked.
+base=$(ps -o nice= -p $$ | tr -d ' ') base_pri=$(ps -o pri= -p $$ | tr -d ' ')
+want() { local n=$((base + $1)); ((n > 20)) && n=20; echo "$n"; }
+probe() { "$heavy" "$@" -- sh -c 'echo "$(ps -o pri= -p $$) $(ps -o nice= -p $$) $BB_BUILD_JOBS"' 2>/dev/null; }
+read -r pri nic jobs <<< "$(probe N1)"
+(( jobs == 8 )) || fail "build job parallelism not capped at 8 ('$jobs')"
+read -r _ _ jobs <<< "$(BB_BUILD_JOBS=4 probe --pool quick N2)"
+(( jobs == 4 )) || fail "a lower parallelism hint was raised ('$jobs')"
+read -r gpri gnic _ <<< "$(probe --pool playtest N3)"
+[[ $gnic == $(want 5) ]] || fail "game not at nice +5"
+read -r xpri xnic _ <<< "$(probe --pool playtest --gpu exclusive N4)"
+[[ $xnic == "$base" ]] || fail "exclusive-GPU job was deprioritized"
+[[ $("$heavy" --pool playtest N5 -- "$heavy" --pool playtest N6 -- sh -c 'ps -o nice= -p $$' 2>/dev/null | tr -d ' ') == $(want 5) ]] ||
+    fail "nested call added to the niceness"
+read -r ppri pnic _ <<< "$(BB_HEAVY_POLITE=0 probe --pool playtest N7)"
+[[ $pnic == "$base" ]] || fail "BB_HEAVY_POLITE=0 did not turn it off"
+if (( base_pri >= 20 )); then
+    (( pri == 4 )) || fail "build job not background QoS (priority $pri)"
+    (( gpri == 20 )) || fail "game not utility QoS (priority $gpri)"
+    (( xpri == base_pri )) || fail "exclusive-GPU job QoS changed (priority $xpri)"
+    qos=checked
+else
+    qos="not checked: this test runs at scheduler priority $base_pri"
+fi
+echo "heavy.sh scheduling: niceness and parallelism checked; QoS $qos"
+
 # Bad usage is an error, not a silent no-op.
 if "$heavy" G true 2>/dev/null; then fail "missing -- accepted"; fi
 if BB_HEAVY_BUILD_SLOTS=0 "$heavy" H -- true 2>/dev/null; then fail "zero slots accepted"; fi
@@ -142,4 +172,4 @@ assert any(l['label'] == 'B' and l['waited_s'] >= 1 for l in starts), 'B waited'
 assert all({'pool', 'slot', 'waited_s', 'load', 'held'} <= set(l) for l in starts)
 assert any(l['label'] == 'Q4' and l['status'] == 124 for l in ends), 'Q4 killed'
 PY
-echo "heavy.sh: history log, build/playtest/quick pools, quick hints and time limit, waiting, priority slot, GPU shared/exclusive lock with gate, start announcement, release on SIGKILL, nesting, exit status, usage errors PASS"
+echo "heavy.sh: history log, build/playtest/quick pools, quick hints and time limit, waiting, priority slot, GPU shared/exclusive lock with gate, start announcement, polite scheduling, release on SIGKILL, nesting, exit status, usage errors PASS"

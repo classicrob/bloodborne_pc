@@ -8,7 +8,7 @@
 Pools of slots, each slot an flock on a file in BB_HEAVY_DIR (default ~/bbport-deps/locks):
   build     BB_HEAVY_BUILD_SLOTS (1) for builds, test suites, benchmarks and probes, plus one
             slot that only --priority jobs (shared builds, the critical lane) may take;
-  playtest  BB_HEAVY_PLAYTEST_SLOTS (3) for game runs (play_route.py), parallel correctness runs;
+  playtest  BB_HEAVY_PLAYTEST_SLOTS (2) for game runs (play_route.py), parallel correctness runs;
   quick     BB_HEAVY_QUICK_SLOTS (2) for jobs that are short by declaration: one-TU compile
             checks, a single test link or run, a driver-only build. A quick job is told to use
             4 jobs (BB_BUILD_JOBS, MAKEFLAGS, CMAKE_BUILD_PARALLEL_LEVEL), warned on stderr after
@@ -52,7 +52,7 @@ def lock_dir():
     return path
 
 
-POOLS = {'build': ('BB_HEAVY_BUILD_SLOTS', 1), 'playtest': ('BB_HEAVY_PLAYTEST_SLOTS', 3),
+POOLS = {'build': ('BB_HEAVY_BUILD_SLOTS', 1), 'playtest': ('BB_HEAVY_PLAYTEST_SLOTS', 2),
          'quick': ('BB_HEAVY_QUICK_SLOTS', 2)}
 QUICK_JOBS = '4'
 
@@ -186,6 +186,30 @@ def status():
             print(f'{name}: held by {describe(holder(name))}')
 
 
+def polite(pool, gpu, command):
+    """The user shares this Mac and their apps were being starved: heavy jobs yield. Builds, tests
+    and sweeps (build and quick pools) run as background QoS (taskpolicy -b: low CPU priority,
+    efficiency cores, throttled I/O; slower, by the user's choice); correctness games (playtest
+    pool) at nice 5 with a utility QoS clamp. Exclusive-GPU jobs (perf_run, timing) are exempt.
+    Applied once, when the slot is taken, so nested calls inherit it. BB_HEAVY_POLITE=0 turns it
+    off."""
+    if os.environ.get('BB_HEAVY_POLITE', '1') == '0' or gpu == 'exclusive':
+        return command, 'normal'
+    if pool == 'playtest':
+        os.nice(5)
+        return ['taskpolicy', '-c', 'utility', *command], 'nice 5, utility QoS'
+    # Compile parallelism: at most BB_HEAVY_BUILD_JOBS (8) jobs, lowering (never raising) a hint
+    # the job already has. Plain `ninja` ignores these; build.sh and CMake/make honour them.
+    cap = os.environ.get('BB_HEAVY_BUILD_JOBS', '8')
+    if not cap.isdigit() or int(cap) < 1:
+        fail('BB_HEAVY_BUILD_JOBS must be a positive whole number')
+    for name in ('BB_BUILD_JOBS', 'CMAKE_BUILD_PARALLEL_LEVEL'):
+        current = os.environ.get(name, '')
+        os.environ[name] = str(min(int(current), int(cap))) if current.isdigit() else cap
+    os.environ['MAKEFLAGS'] = f'-j{os.environ["BB_BUILD_JOBS"]}'
+    return ['taskpolicy', '-b', *command], f'background QoS, {os.environ["BB_BUILD_JOBS"]} jobs'
+
+
 def announce(label):
     """With BB_HEAVY_ANNOUNCE set (play_route.py sets it), says on stderr that the command starts
     now: everything before was waiting for a slot or the GPU, not the command's own startup."""
@@ -213,9 +237,10 @@ def run(pool, priority, gpu, label, command):
             os.pwrite(fd, json.dumps(info).encode(), 0)
             os.fsync(fd)
             waited = time.monotonic() - started
+            command, policy = polite(pool, gpu, command)
             record({'event': 'start', 'label': label, 'pool': pool, 'slot': name, 'priority': priority,
                     'waited_s': round(waited, 1), 'load': [round(x, 2) for x in os.getloadavg()],
-                    'held': busy_slots(), 'pid': os.getpid()})
+                    'held': busy_slots(), 'pid': os.getpid(), 'policy': policy})
             if waited >= 1:
                 print(f'heavy: {label}: got {name} after {waited:.0f} s', file=sys.stderr, flush=True)
             os.set_inheritable(fd, True)
