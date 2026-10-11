@@ -91,3 +91,46 @@ R32 depth-copy, HDR, and final preview at their sampling points. Valid G-buffer
 coverage followed by empty HDR localizes the problem differently from an empty
 G-buffer/depth pair; a populated final image requires examining UI sampling and
 blending instead. No new game or GPU test was launched for this audit.
+
+## Update: user's 20:35 screenshots, 4K-specific strips
+
+The two `CleanShot-2026-10-10-at-20.35.*` PNGs supplied to the orchestrator show
+large diagonal grey strips in the lower-right preview panel, one with repeated
+parallel bands. No recognizable character is visible. This is nonzero preview
+content, but does not identify it as correct floor/background geometry: malformed
+character triangles, bad projection or depth artifacts remain possible.
+
+Playtest identified their provenance as
+`out/macos_route/20261010-203323-4k-4k-efce883/`: pinned **efce883**, 3840x2160
+output, FSR 3.1 Quality, startup-patched 2560x1440 scene, movie skipped. Its
+`shots/06-character-creation.jpg` shows the same symptom. The same build's native
+1080p run, `20261010-200550-1080p-ACCEPT4-1-efce883/`, has an empty panel in
+`shots/07-character-creation.jpg`. These are separate runs, not a controlled
+same-frame toggle, but they establish that the user's screenshots are **not**
+evidence that a newer shader fix partially restored the preview. Playtest also
+reports a missing Level icon at 4K, with other stat icons present.
+
+In the older captured graph, the geometry producer feeding the visible UI preview
+is pass 3, followed by lighting/filtering and pass 19 tonemap, sampled by pass 40.
+Pass 22 is a second geometry chain with the same first four recorded vertex shader
+hashes (`a7450683`, `ddbe557e`, `3deaa573`, `b10c4f55`). The graph does not separate
+background and character draw coverage. It cannot assign the visible strips to a
+particular mesh or prove that the character draws produce no pixels. The clear
+compute shader `8b355b5a` should not be mistaken for a skinning pre-pass.
+
+The next paired capture should include the original guest viewport/control and
+scissor registers **and** the effective Vulkan viewport/scissor and attachment
+extent for geometry and UI composition. In `vk_rasterizer.cpp`, viewport and scissor
+are multiplied by `target_scale`; target redirection and the reduced-scene path can
+change that scale. Record `target_scale`, `draw_jitter`, the reduced/redirection
+flags and actual bound image extent. The frame graph's original guest image size
+alone does not describe a redirected target. No erroneous scale is established by
+the current evidence.
+
+Compare G-buffer color and sampled depth, HDR and final preview on the two output
+configurations first. Strips already in the G-buffer/depth localize the fault before
+lighting/composition; correct character coverage there moves the investigation
+later. If the G-buffer is malformed, inspect per-draw clip-space outputs and fetch
+formats/strides, bone indices/weights and matrix ranges for the candidate vertex
+shaders. Per-pass shader lists and short CPU-side buffer prefixes cannot replace
+that evidence. No renderer edit or game launch was made for this update.
