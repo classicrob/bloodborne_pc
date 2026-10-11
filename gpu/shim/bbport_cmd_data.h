@@ -485,8 +485,16 @@ inline void ForgetLastRead() {
     last.kind = nullptr;
 }
 
+/// The guest mapping holding an address: [start, end), whether it is mapped (false: a gap
+/// [start, end) between mappings), and how many other guest mappings view the same backing
+/// byte (-1: not tracked). Set by the owner (Liverpool, runtime_memory_region and
+/// runtime_memory_alias_snapshot); mapping-table queries, not guest memory reads.
+using RegionFn = bool (*)(std::uint64_t address, std::uint64_t& start, std::uint64_t& end,
+                          bool& mapped, long long& aliases);
+inline std::atomic<RegionFn> region_lookup{nullptr};
+
 /// For a stop: this thread's latest instrumented read for the current descriptor, as observed
-/// then. Empty when off.
+/// then, and the guest mapping holding it now. Empty when off.
 inline std::string LastRead() {
     if (!Enabled()) {
         return {};
@@ -502,7 +510,23 @@ inline std::string LastRead() {
                   last.kind, static_cast<unsigned long long>(last.shader),
                   static_cast<unsigned long long>(last.address),
                   static_cast<unsigned long long>(last.size));
-    return text + Describe(last.result);
+    std::string out = text + Describe(last.result);
+    std::uint64_t start = 0, end = 0;
+    bool mapped = false;
+    long long aliases = -1;
+    if (const RegionFn fn = region_lookup.load(std::memory_order_acquire);
+        fn && fn(last.address, start, end, mapped, aliases)) {
+        char region[192];
+        std::snprintf(region, sizeof(region),
+                      "; at the stop it lies in %s [%#llx, %#llx) (%llu KiB), %s%lld other guest "
+                      "mapping(s) of the same backing",
+                      mapped ? "guest mapping" : "the unmapped gap",
+                      static_cast<unsigned long long>(start), static_cast<unsigned long long>(end),
+                      static_cast<unsigned long long>((end - start) >> 10),
+                      aliases < 0 ? "untracked: " : "", aliases < 0 ? 0 : aliases);
+        out += region;
+    }
+    return out;
 }
 
 } // namespace BbCmdData

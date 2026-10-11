@@ -97,6 +97,18 @@ that stopped, **as observed then** (it never re-reads guest memory). The latest 
 before each descriptor is read, so when that descriptor came from direct user data or the
 uninstrumented flat buffer, the stop says so instead of naming an earlier read.
 
+The stop line also says:
+- **where the read lies at the stop:** the guest mapping holding it, `[start, end)` and size, or
+  the unmapped gap, and how many other guest mappings view the same backing. These come from
+  runtime_memory's mapping table, a query and not a guest memory read. Stop hunt #1 found every
+  table read outside command memory (20261011-192653-1080p-HUNT-1), so the mapping is the
+  lead.
+- **how far each side of the flip pipeline had got, always (even without `BB_CMD_DATA_CHECK`):**
+  flips the guest submitted, flips the GPU command thread reached and flips published to the
+  guest, each as a count and the newest flip argument (gpu/shim/bbport_frame_marks.h). Judged
+  against the guest's reuse gate, this shows whether the guest could already reuse the memory
+  the parser was reading.
+
 **Limits:**
 - Supporting evidence only.
 - Reads made by generated code (the SRT walker) are not instrumented.

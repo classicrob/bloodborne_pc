@@ -22,6 +22,7 @@
 #include "bbport_label_mode.h"
 #include "bbport_label_store.h"
 #include "bbport_parse_split.h"
+#include "bbport_frame_marks.h"
 #include "bbport_label_sequencer.h"
 
 namespace {
@@ -382,6 +383,20 @@ int main() {
         Expect("  ... the stop's latest-read text comes from the observation, not a re-read",
                text.find("latest instrumented read: ud table") != std::string::npos &&
                    text.find("DIFFERS") != std::string::npos);
+        // The stop names the guest mapping holding the read (a mapping-table query, faked here).
+        region_lookup.store([](std::uint64_t, std::uint64_t& lo, std::uint64_t& hi, bool& mapped,
+                               long long& aliases) {
+            lo = 0x7043000000;
+            hi = 0x704b000000;
+            mapped = true;
+            aliases = 1;
+            return true;
+        });
+        const std::string named = LastRead();
+        region_lookup.store(nullptr);
+        Expect("  ... the stop names the guest mapping holding the read and its other views",
+               named.find("guest mapping [0x7043000000, 0x704b000000) (131072 KiB), 1 other") !=
+                   std::string::npos);
         ForgetLastRead();
         Expect("  ... after a new descriptor starts, a stop names no earlier read",
                LastRead().find("no instrumented read for this descriptor") != std::string::npos);
@@ -517,6 +532,15 @@ int main() {
         Expect("  ... a scope open across a yield stops",
                WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT);
     }
+
+    BbFrameMarks::submitted.Note(12);
+    BbFrameMarks::submitted.Note(13);
+    BbFrameMarks::reached.Note(12);
+    BbFrameMarks::published.Note(11);
+    Expect("frame marks: the stop line gives each side's flip count and newest argument",
+           BbFrameMarks::Describe().find("guest submitted 2 (arg 13), GPU command thread reached "
+                                         "1 (arg 12), published to the guest 1 (arg 11)") !=
+               std::string::npos);
 
     std::fprintf(stderr, "%s: %u failures\n", failures ? "FAIL" : "PASS", failures);
     return failures ? 1 : 0;

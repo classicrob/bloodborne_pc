@@ -231,6 +231,23 @@ Liverpool::Liverpool() : guest_markers_enabled{EmulatorSettings.IsVkGuestMarkers
     SetAssertStopHook(&ReportParserStop);
     if (BbCmdData::Enabled()) {
         BbCmdData::Register(&Liverpool::LookupCommandData, this);
+        BbCmdData::region_lookup.store(
+            [](u64 address, u64& start, u64& end, bool& mapped, long long& aliases) {
+                uintptr_t lo = 0, hi = 0;
+                int is_mapped = 0;
+                if (!runtime_memory_region(address, &lo, &hi, &is_mapped)) {
+                    return false;
+                }
+                start = lo;
+                end = hi;
+                mapped = is_mapped != 0;
+                RuntimeMemoryAliasSnapshot alias{};
+                aliases = runtime_memory_alias_snapshot(address, nullptr, 0, &alias) == 1
+                              ? static_cast<long long>(alias.total)
+                              : -1;
+                return true;
+            },
+            std::memory_order_release);
     }
 #endif
     num_counter_pairs = Libraries::Kernel::sceKernelIsNeoMode() ? 16 : 8;
