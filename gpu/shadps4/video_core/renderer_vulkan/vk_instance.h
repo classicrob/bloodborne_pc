@@ -402,6 +402,11 @@ public:
         return vk11_props.subgroupSize;
     }
 
+    /// Returns true if subgroup operations are supported in vertex shaders.
+    bool IsVertexSubgroupSupported() const {
+        return static_cast<bool>(vk11_props.subgroupSupportedStages & vk::ShaderStageFlagBits::eVertex);
+    }
+
     /// Returns the maximum size of compute shared memory.
     u32 MaxComputeSharedMemorySize() const {
         return properties.limits.maxComputeSharedMemorySize;

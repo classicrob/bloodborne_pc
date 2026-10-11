@@ -333,7 +333,216 @@ bool IsCrossLane(IR::Opcode op) {
            op == Opcode::QuadBroadcast;
 }
 
-void LowerWave64Graphics(IR::Program& program) {
+// Vertex shaders where the device has no subgroup operations (Apple: Metal vertex functions).
+// A VS wave's lanes are vertices, and the recompiler keeps exec and VOPC/VOP3 compare masks as one
+// bit per lane; a ballot of such a predicate is only ever read back by InverseBallot (this lane's
+// bit). Ballot(x) becomes the lane's own bit in every position (x ? ~0 : 0), which pure bitwise
+// ops, 32-bit halves and phis preserve, and InverseBallot(m) becomes m != 0. That is exact at a
+// read when every value that reaches it is ballot-derived, with both halves mirrored. A phi arm
+// that is not (an SGPR the guest reuses for other data on a path that skips the compare) is
+// allowed only when it is the skip edge of an if whose condition also encloses the read: every
+// lane that executes the read went through the ballot. Anything else (another reader of a mask,
+// a mask as data, any other subgroup operation) stops compilation naming the shader.
+void LowerWave64VertexWithoutSubgroups(IR::Program& program) {
+    using Type = IR::AbstractSyntaxNode::Type;
+    const auto strip = [](const IR::Inst* c) {
+        if (c && c->GetOpcode() == IR::Opcode::ConditionRef) c = c->Arg(0).TryInst();
+        while (c && c->GetOpcode() == IR::Opcode::LogicalNot && c->Arg(0).TryInst() &&
+               c->Arg(0).TryInst()->GetOpcode() == IR::Opcode::LogicalNot) {
+            c = c->Arg(0).TryInst()->Arg(0).TryInst();
+        }
+        return c;
+    };
+    // Enclosing if conditions of each block, and for each if merge block: its header and condition.
+    std::unordered_map<const IR::Block*, std::vector<const IR::Inst*>> enclosing;
+    struct IfInfo {
+        const IR::Block* header;
+        const IR::Inst* cond;
+    };
+    std::unordered_map<const IR::Block*, IfInfo> if_by_merge;
+    {
+        std::vector<const IR::Inst*> conds;
+        for (const IR::AbstractSyntaxNode& node : program.syntax_list) {
+            if (node.type == Type::If) {
+                const IR::Inst* ref = node.data.if_node.cond.TryInst();
+                conds.push_back(strip(ref));
+                if_by_merge[node.data.if_node.merge] = {ref ? ref->GetParent() : nullptr, strip(ref)};
+            } else if (node.type == Type::EndIf) {
+                conds.pop_back();
+            } else if (node.type == Type::Block) {
+                enclosing[node.data.block] = conds;
+            }
+        }
+    }
+    const auto is_imm = [](const IR::Value& v, u64 x) {
+        if (!v.IsImmediate()) return false;
+        if (v.Type() == IR::Type::U64) return v.U64() == x;
+        if (v.Type() == IR::Type::U32) return v.U32() == u32(x);
+        return false;
+    };
+    // Whether condition `c` being true implies `d` is true: the same value, d = p || q with p or q
+    // implied, or c = p && q with p or q implying d (double negations looked through).
+    std::function<bool(const IR::Inst*, const IR::Inst*, int)> implies;
+    implies = [&](const IR::Inst* c, const IR::Inst* d, int depth) -> bool {
+        c = strip(c);
+        d = strip(d);
+        if (!c || !d || depth > 16) return false;
+        if (c == d) return true;
+        if (d->GetOpcode() == IR::Opcode::LogicalOr &&
+            (implies(c, d->Arg(0).TryInst(), depth + 1) || implies(c, d->Arg(1).TryInst(), depth + 1))) {
+            return true;
+        }
+        return c->GetOpcode() == IR::Opcode::LogicalAnd &&
+               (implies(c->Arg(0).TryInst(), d, depth + 1) || implies(c->Arg(1).TryInst(), d, depth + 1));
+    };
+    // Whether the phi arm from `pred` into a phi of `merge` cannot be taken by a lane that executes
+    // a block enclosed by `conds`: it is the skip edge of if (c) with c implied by one of `conds`.
+    const auto arm_dead = [&](const IR::Block* merge, const IR::Block* pred,
+                              const std::vector<const IR::Inst*>& conds) {
+        const auto it = if_by_merge.find(merge);
+        if (it == if_by_merge.end() || it->second.header != pred || !it->second.cond) return false;
+        return std::ranges::any_of(conds, [&](const IR::Inst* c) { return implies(c, it->second.cond, 0); });
+    };
+    // valid64: the value is ~0 or 0 in every lane that executes a block enclosed by `conds`.
+    std::function<bool(const IR::Value&, const std::vector<const IR::Inst*>&, int)> valid64;
+    std::function<bool(const IR::Value&, const IR::Value&, const std::vector<const IR::Inst*>&, int)> mirror;
+    valid64 = [&](const IR::Value& v, const std::vector<const IR::Inst*>& conds, int depth) -> bool {
+        if (depth > 64) return false;
+        if (is_imm(v, 0) || is_imm(v, ~0ull)) return true;
+        const IR::Inst* inst = v.TryInst();
+        if (!inst) return false;
+        switch (inst->GetOpcode()) {
+        case IR::Opcode::Ballot:
+            return true;
+        case IR::Opcode::PackUint2x32: {
+            const IR::Inst* pair = inst->Arg(0).TryInst();
+            return pair && pair->GetOpcode() == IR::Opcode::CompositeConstructU32x2 &&
+                   mirror(pair->Arg(0), pair->Arg(1), conds, depth + 1);
+        }
+        case IR::Opcode::BitwiseAnd64:
+        case IR::Opcode::BitwiseOr64:
+        case IR::Opcode::BitwiseXor64:
+            return valid64(inst->Arg(0), conds, depth + 1) && valid64(inst->Arg(1), conds, depth + 1);
+        case IR::Opcode::BitwiseNot64:
+            return valid64(inst->Arg(0), conds, depth + 1);
+        case IR::Opcode::Phi:
+            for (size_t i = 0; i < inst->NumArgs(); ++i) {
+                if (arm_dead(inst->GetParent(), inst->PhiBlock(i), conds)) continue;
+                if (!valid64(inst->Arg(i), conds, depth + 1)) return false;
+            }
+            return true;
+        default:
+            return false;
+        }
+    };
+    // mirror: the two 32-bit halves are equal and ~0 or 0 in every such lane.
+    mirror = [&](const IR::Value& lo, const IR::Value& hi, const std::vector<const IR::Inst*>& conds,
+                 int depth) -> bool {
+        if (depth > 64) return false;
+        if ((is_imm(lo, 0) && is_imm(hi, 0)) || (is_imm(lo, ~0u) && is_imm(hi, ~0u))) return true;
+        const IR::Inst* a = lo.TryInst();
+        const IR::Inst* b = hi.TryInst();
+        if (!a || !b || a->GetOpcode() != b->GetOpcode()) return false;
+        if (a->GetOpcode() == IR::Opcode::CompositeExtractU32x2) {
+            const IR::Inst* ua = a->Arg(0).TryInst();
+            return ua && ua == b->Arg(0).TryInst() && ua->GetOpcode() == IR::Opcode::UnpackUint2x32 &&
+                   is_imm(a->Arg(1), 0) && is_imm(b->Arg(1), 1) && valid64(ua->Arg(0), conds, depth + 1);
+        }
+        if (a->GetOpcode() == IR::Opcode::Phi && a->GetParent() == b->GetParent() &&
+            a->NumArgs() == b->NumArgs()) {
+            for (size_t i = 0; i < a->NumArgs(); ++i) {
+                if (a->PhiBlock(i) != b->PhiBlock(i)) return false;
+                if (arm_dead(a->GetParent(), a->PhiBlock(i), conds)) continue;
+                if (!mirror(a->Arg(i), b->Arg(i), conds, depth + 1)) return false;
+            }
+            return true;
+        }
+        return false;
+    };
+
+    std::vector<IR::Inst*> reads;
+    std::vector<IR::Inst*> ballots;
+    for (IR::Block* block : program.blocks) {
+        for (IR::Inst& inst : block->Instructions()) {
+            const auto op = inst.GetOpcode();
+            if (op == IR::Opcode::InverseBallot) {
+                ASSERT_MSG(valid64(inst.Arg(0), enclosing[block], 0),
+                           "Apple wave64: vertex shader {:#x} reads a lane bit of a value that is not "
+                           "provably this lane's own ballot bit (vertex functions have no subgroup "
+                           "operations)",
+                           program.info.pgm_hash);
+                reads.push_back(&inst);
+            } else if (op == IR::Opcode::Ballot) {
+                ballots.push_back(&inst);
+            } else if (IsCrossLane(op) || op == IR::Opcode::LaneId || op == IR::Opcode::BallotFindLsb ||
+                       op == IR::Opcode::WriteLane || op == IR::Opcode::WarpId ||
+                       (op == IR::Opcode::GetAttributeU32 &&
+                        inst.Arg(0).Attribute() == IR::Attribute::SubgroupLtMask)) {
+                UNREACHABLE_MSG("Apple wave64: vertex shader {:#x} uses {}, which needs subgroup "
+                                "operations; vertex functions have none on this device",
+                                program.info.pgm_hash, op);
+            }
+        }
+    }
+    // Every ballot must be consumed only on the validated paths: through the mask plumbing above
+    // into InverseBallot reads (its own-bit form is visible to nothing else), or as the
+    // old-destination operand of a scalar buffer load (an SGPR pair the guest reuses as an
+    // s_buffer_load destination), which the shader then reads as 0 for out-of-range dwords: the
+    // SMEM_ZERO reading, as for compute (docs/macos/wave64.md).
+    bool smem_zero = false;
+    for (IR::Inst* ballot : ballots) {
+        std::vector<const IR::Inst*> work{ballot};
+        std::unordered_set<const IR::Inst*> seen{ballot};
+        while (!work.empty()) {
+            const IR::Inst* x = work.back();
+            work.pop_back();
+            for (const IR::Use& use : x->Uses()) {
+                const auto op = use.user->GetOpcode();
+                const bool plumbing =
+                    op == IR::Opcode::Phi || op == IR::Opcode::UnpackUint2x32 ||
+                    op == IR::Opcode::CompositeExtractU32x2 || op == IR::Opcode::CompositeConstructU32x2 ||
+                    op == IR::Opcode::PackUint2x32 || op == IR::Opcode::BitwiseAnd64 ||
+                    op == IR::Opcode::BitwiseOr64 || op == IR::Opcode::BitwiseXor64 ||
+                    op == IR::Opcode::BitwiseNot64;
+                if (op == IR::Opcode::ReadConstBuffer && use.operand == 2) {
+                    smem_zero = true;
+                    continue;
+                }
+                ASSERT_MSG(plumbing || op == IR::Opcode::InverseBallot,
+                           "Apple wave64: vertex shader {:#x} uses a ballot mask as data ({}); vertex "
+                           "functions have no subgroup operations",
+                           program.info.pgm_hash, op);
+                if (plumbing && seen.insert(use.user).second) work.push_back(use.user);
+            }
+        }
+    }
+    if (smem_zero) {
+        LOG_WARNING(Render_Recompiler,
+                    "Apple wave64: vertex shader {:#x} reads out-of-range scalar buffer dwords as 0 "
+                    "(SMEM_ZERO reading): a compare mask is also an s_buffer_load destination",
+                    program.info.pgm_hash);
+        for (IR::Block* block : program.blocks) {
+            for (IR::Inst& inst : block->Instructions()) {
+                if (inst.GetOpcode() == IR::Opcode::ReadConstBuffer) inst.SetArg(2, IR::Value{0u});
+            }
+        }
+    }
+    for (IR::Inst* ballot : ballots) {
+        IR::IREmitter ir{*ballot->GetParent(), IR::Block::InstructionList::s_iterator_to(*ballot)};
+        ballot->ReplaceUsesWithAndRemove(
+            ir.Select(IR::U1{ballot->Arg(0)}, ir.Imm64(~0ull), ir.Imm64(u64{0})));
+    }
+    for (IR::Inst* read : reads) {
+        IR::IREmitter ir{*read->GetParent(), IR::Block::InstructionList::s_iterator_to(*read)};
+        read->ReplaceUsesWithAndRemove(ir.LogicalNot(ir.IEqual(IR::U64{read->Arg(0)}, ir.Imm64(u64{0}))));
+    }
+}
+
+void LowerWave64Graphics(IR::Program& program, const Profile& profile) {
+    if (program.info.hw_stage == HwStage::Vertex && !profile.supports_vertex_subgroup_ops) {
+        LowerWave64VertexWithoutSubgroups(program);
+        return;
+    }
     for (IR::Block* block : program.blocks) {
         for (IR::Inst& inst : block->Instructions()) {
             if (inst.GetOpcode() != IR::Opcode::ReadLane) continue;
@@ -754,7 +963,7 @@ void LowerWave64BallotPass(IR::Program& program, const RuntimeInfo& runtime_info
         if (program.info.hw_stage == HwStage::Compute) {
             LowerWave64Compute(program, runtime_info, profile);
         } else {
-            LowerWave64Graphics(program);
+            LowerWave64Graphics(program, profile);
         }
         return;
     }

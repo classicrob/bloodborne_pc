@@ -13,6 +13,8 @@ struct Profile {
     u32 max_shared_memory_size{};
     u32 supported_spirv{0x00010000};
     u32 subgroup_size{};
+    /// Subgroup operations are available in vertex shaders (Apple/MoltenVK: no).
+    bool supports_vertex_subgroup_ops{true};
     u32 sparse_page_shift{};
     bool support_int8{};
     bool support_int16{};
