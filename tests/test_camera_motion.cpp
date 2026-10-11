@@ -137,6 +137,10 @@ int main() {
             return (v&0x8000 ? -1.f : 1.f)*(e==0 ? std::ldexp(float(v&1023),-24) :
                 std::ldexp(1.f+float(v&1023)/1024.f,e-15));
         };
+        // Before the asserts, so a failing case shows what it measured (stdout and stderr).
+        std::printf("Camera motion: %s measured (%.5f, %.5f), expected (%.5f, %.5f)\n",label,
+                    half(result[0]),half(result[1]),expected,expected_y);
+        std::fflush(stdout);
         assert(std::abs(half(result[0])-expected)<0.002f);
         assert(std::abs(half(result[1])-expected_y)<std::max(0.002f,std::abs(expected_y)*0.002f));
         std::printf("Camera motion: %s PASS (%.5f, %.5f)\n",label,half(result[0]),
