@@ -189,9 +189,6 @@ Liverpool::~Liverpool() {
 }
 
 u32 Liverpool::ProcessCommands(bool* stopped_at_cpu_flip) {
-    if (num_commands && rasterizer) {
-        rasterizer->DrainDrawPipe(Vulkan::DrawPipe::ReasonCommands); // bbport: commands touch the caches
-    }
     // Process incoming commands with high priority
     u32 ran = 0;
     const bool stop_at_cpu_flip = stopped_at_cpu_flip || replay_held_left;
@@ -208,6 +205,11 @@ u32 Liverpool::ProcessCommands(bool* stopped_at_cpu_flip) {
             callback = std::move(command_queue.front().func);
             command_queue.pop();
             --num_commands;
+        }
+        // Before the first command that runs (a CPU flip left waiting drains nothing: this is
+        // called per packet while held work parses).
+        if (ran == 0 && rasterizer) {
+            rasterizer->DrainDrawPipe(Vulkan::DrawPipe::ReasonCommands); // bbport: commands touch the caches
         }
         callback();
         ++ran;
