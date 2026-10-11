@@ -34,6 +34,9 @@ EXCLUDED = {
                                       'is macos_float_modes/production.sh',
     'tests/macos_float_modes/variants.py': 'variant generator of the float-mode research probe '
                                            '(macos_float_modes/run.sh)',
+    'tools/macos/shader_sweep/': 'offline sweep of the game\'s shader corpus through the production '
+                                 'pipeline cache (docs/macos/shader-sweep.md): needs the game data '
+                                 'and minutes of compile time, so it is run on demand, not by --test',
 }
 
 

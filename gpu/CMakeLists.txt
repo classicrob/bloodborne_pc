@@ -313,6 +313,13 @@ if (APPLE)
     target_compile_definitions(host-import-arena-test PRIVATE VK_USE_PLATFORM_METAL_EXT)
     # gcn_buffer_conformance/gcn_asm.h assembles the test's GCN fetch shaders.
     target_include_directories(shader-permutation-info-test PRIVATE ../tests)
+    # Offline sweep of the game's shader corpus through the production pipeline cache
+    # (tools/macos/shader_sweep, run by sweep.py; not a --test target).
+    add_executable(shader-sweep EXCLUDE_FROM_ALL ../tools/macos/shader_sweep/sweep.cpp
+        ../tests/test_gpu_runtime_stubs.cpp)
+    target_include_directories(shader-sweep PRIVATE shim shadps4 third_party/gcn/include)
+    target_compile_options(shader-sweep PRIVATE -UNDEBUG -fPIC)
+    target_link_libraries(shader-sweep PRIVATE bbgpu)
     target_include_directories(depth-bounds-shader-test PRIVATE third_party/sirit/externals/SPIRV-Headers/include)
     # Unit tests of the GPU library's Apple paths (build.sh --test runs each).
     add_executable(cmd-snapshot-test EXCLUDE_FROM_ALL ../tests/test_cmd_snapshot.cpp ../tests/test_gpu_runtime_stubs.cpp)
@@ -345,7 +352,7 @@ if (APPLE)
     target_compile_definitions(overlay-concurrency-test PRIVATE
         BB_FONT_PATH="${CMAKE_CURRENT_SOURCE_DIR}/third_party/fonts/DejaVuSans.ttf")
     find_package(Python3 REQUIRED COMPONENTS Interpreter)
-    foreach(test_target motion-shader-test scene-resolution-test taa-shader-test camera-motion-test null-descriptor-test buffer-bounds-test buffer-bounds-benchmark buffer-dead-resources-test host-import-arena-test vertex-pulling-pipeline-test shader-permutation-info-test gpu-user-dir-test push-userdata-test macos-perf-test depth-bounds-shader-test ${apple_unit_test_targets})
+    foreach(test_target motion-shader-test scene-resolution-test taa-shader-test camera-motion-test null-descriptor-test buffer-bounds-test buffer-bounds-benchmark buffer-dead-resources-test host-import-arena-test vertex-pulling-pipeline-test shader-permutation-info-test gpu-user-dir-test push-userdata-test macos-perf-test depth-bounds-shader-test shader-sweep ${apple_unit_test_targets})
         add_custom_command(TARGET ${test_target} POST_BUILD
             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../packaging/macos/check-exports.py
                 $<TARGET_FILE:bbgpu> $<TARGET_FILE:${test_target}> VERBATIM)
