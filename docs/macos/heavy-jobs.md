@@ -5,7 +5,7 @@ GPU build took 8 to 11 minutes and no timing meant anything. `tools/macos/heavy.
 work machine-wide.
 
 ```sh
-tools/macos/heavy.sh [--pool build|playtest|quick] [--priority] LABEL -- COMMAND [ARG...]
+tools/macos/heavy.sh [--pool build|playtest|quick] [--priority] [--gpu shared|exclusive] LABEL -- COMMAND [ARG...]
 tools/macos/heavy.sh status
 ```
 
@@ -22,8 +22,27 @@ on stderr, and it exits 124. A job that can take that long belongs in the build 
 pool exists so one-minute jobs don't wait behind fifteen-minute builds.
 
 That is at most 4 translated (Rosetta) processes from game runs and one build-pool test, which is
-the team limit. Perf runs stay alone, in quiet windows. Parallel runs are for correctness only;
-their FPS numbers mean nothing.
+the team limit. Parallel runs are for correctness only; their FPS numbers mean nothing.
+
+## The GPU lock
+
+GPU timings taken while a game runs measure the game too (a contended `--test` once failed the
+timestamp gate). So the GPU is its own lock, separate from the pools:
+
+- Games hold it **shared**: a playtest-pool job takes it shared by default.
+- A GPU-timing job asks for it **exclusive** (`--gpu exclusive`) and waits until no game runs.
+  `tools/macos/perf_run.sh` does this for the whole run (its game runs under the hold), and
+  `build.sh --test` does it around the timestamp gate. Short timing jobs need no hand-called quiet
+  window.
+- While an exclusive request waits it holds `gpu-gate`, which every shared request passes first,
+  so games started meanwhile wait behind it instead of starving it.
+- `--gpu` works inside a slot too. Under an exclusive hold (`BB_HEAVY_GPU=exclusive`), nested
+  calls run directly; asking for exclusive inside a shared hold is an error (it would wait for
+  itself).
+- `heavy.sh status` prints `gpu: free|shared|exclusive`; each GPU acquisition is in the history.
+
+A long perf session (several runs, a profile) still needs a quiet window: the lock keeps games
+off the GPU, not builds off the CPU.
 
 - Slots are flocks under `~/bbport-deps/locks` (`BB_HEAVY_DIR`). A job waits for a free slot of
   its pool and prints who holds them every 30 s.
@@ -38,5 +57,7 @@ Automatic: on macOS `build.sh` (the GPU build and `--test`) takes a build slot, 
 with `BB_HEAVY_PRIORITY=1`. `play_route.py` runs each game in a playtest slot, and time spent
 waiting for it does not count against the 60 s startup limit. Everything else heavy must be
 started through heavy.sh. `tests/test_heavy.sh` covers the pools, the quick hints and time
-limit (group kill, exit 124), waiting, the priority slot, release on SIGKILL, nesting, exit
-status and usage errors.
+limit (group kill, exit 124), waiting, the priority slot, the GPU lock (shared games, an
+exclusive job waiting for them, a game started meanwhile waiting behind it, nesting under
+exclusive, exclusive-in-shared refused), release on SIGKILL, nesting, exit status and usage
+errors.

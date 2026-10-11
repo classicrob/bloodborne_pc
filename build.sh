@@ -189,46 +189,67 @@ if [[ $(uname -s) == Darwin ]]; then
 fi
 "$CC" "${platform_flags[@]}" -std=c11 -O2 -Wall -Wextra -Werror tools/gpu_capabilities.c "${includes[@]}" "${libraries[@]}" "${caps_link[@]}" -o out/bb-gpu-capabilities
 sign_darwin out/bb-gpu-capabilities
-if [[ ${1:-} == --test ]]; then
+if [[ ${1:-} == --test || ${1:-} == --test-dry ]]; then
+    # --test-dry builds, links and signs everything --test would run, and runs the static checks
+    # (export gate, test wiring), but executes no test: t checks each test binary exists and is
+    # signed, and each test script exists. Run it before merging a change to build.sh or a test
+    # target. Tests that compile inside their own scripts are only checked to exist.
+    dry=''
+    if [[ $1 == --test-dry ]]; then dry=1; fi
+    t() {
+        if [[ -z $dry ]]; then "$@"; return; fi
+        local program=$1
+        case $program in
+        sh|bash|python3) program=$2 ;;
+        spirv-val) return 0 ;;
+        esac
+        if [[ $program == */* ]]; then
+            [[ -e $program ]] || { echo "test-dry: $program does not exist" >&2; exit 1; }
+            if [[ $program == *out/* && $(uname -s) == Darwin ]]; then
+                codesign -v "$program" 2>/dev/null || { echo "test-dry: $program is not signed" >&2; exit 1; }
+            fi
+        fi
+        echo "test-dry: would run $*"
+    }
     if [[ $(uname -s) == Darwin ]]; then
         # The GPU library has no default user directory on macOS: fixtures get a scratch one.
         export BB_GPU_USER_DIR="$PWD/out/gpu-test-user"
         ninja -C out/gpu "${ninja_jobs[@]}" null-descriptor-test upscaler-support-test buffer-bounds-test buffer-dead-resources-test host-import-arena-test vertex-pulling-pipeline-test shader-permutation-info-test gpu-user-dir-test push-userdata-test macos-perf-test depth-bounds-shader-test shader-inputs-test flatten-base-shape-test
         sign_darwin out/gpu/null-descriptor-test out/gpu/upscaler-support-test out/gpu/buffer-bounds-test out/gpu/buffer-dead-resources-test out/gpu/host-import-arena-test out/gpu/vertex-pulling-pipeline-test out/gpu/shader-permutation-info-test out/gpu/gpu-user-dir-test out/gpu/push-userdata-test out/gpu/macos-perf-test out/gpu/depth-bounds-shader-test out/gpu/shader-inputs-test out/gpu/flatten-base-shape-test
-        out/gpu/gpu-user-dir-test
-        out/gpu/null-descriptor-test
-        out/gpu/upscaler-support-test
+        t out/gpu/gpu-user-dir-test
+        t out/gpu/null-descriptor-test
+        t out/gpu/upscaler-support-test
         mkdir -p out/macos-buffer-bounds
-        out/gpu/buffer-bounds-test out/macos-buffer-bounds
+        t out/gpu/buffer-bounds-test out/macos-buffer-bounds
         mkdir -p out/mac-inventory
-        out/gpu/buffer-dead-resources-test
-        out/gpu/host-import-arena-test
-        out/gpu/vertex-pulling-pipeline-test
-        out/gpu/shader-permutation-info-test
-        out/gpu/push-userdata-test out/push-userdata.spv
-        spirv-val --target-env vulkan1.3 out/push-userdata.spv
+        t out/gpu/buffer-dead-resources-test
+        t out/gpu/host-import-arena-test
+        t out/gpu/vertex-pulling-pipeline-test
+        t out/gpu/shader-permutation-info-test
+        t out/gpu/push-userdata-test out/push-userdata.spv
+        t spirv-val --target-env vulkan1.3 out/push-userdata.spv
         # Depth-bounds emulation shaders: 8 permutations + 2 entry-phi cases, each validated.
         rm -rf out/depth-bounds-shader && mkdir -p out/depth-bounds-shader
-        out/gpu/depth-bounds-shader-test out/depth-bounds-shader
+        t out/gpu/depth-bounds-shader-test out/depth-bounds-shader
         depth_spv=(out/depth-bounds-shader/*.spv)
-        [[ ${#depth_spv[@]} == 10 ]] || { echo "depth-bounds-shader-test wrote ${#depth_spv[@]} SPIR-V files, expected 10" >&2; exit 1; }
-        for spv in "${depth_spv[@]}"; do spirv-val --target-env vulkan1.3 "$spv"; done
+        [[ -n $dry ]] || [[ ${#depth_spv[@]} == 10 ]] || { echo "depth-bounds-shader-test wrote ${#depth_spv[@]} SPIR-V files, expected 10" >&2; exit 1; }
+        for spv in "${depth_spv[@]}"; do t spirv-val --target-env vulkan1.3 "$spv"; done
         rm -rf out/shader-inputs-modules && mkdir -p out/shader-inputs-modules
-        out/gpu/shader-inputs-test out/shader-inputs-modules
+        t out/gpu/shader-inputs-test out/shader-inputs-modules
         input_spv=(out/shader-inputs-modules/*.spv)
-        [[ ${#input_spv[@]} == 12 ]] || { echo "shader-inputs-test wrote ${#input_spv[@]} SPIR-V files, expected 12" >&2; exit 1; }
-        for spv in "${input_spv[@]}"; do spirv-val --target-env vulkan1.3 "$spv"; done
-        out/gpu/flatten-base-shape-test
+        [[ -n $dry ]] || [[ ${#input_spv[@]} == 12 ]] || { echo "shader-inputs-test wrote ${#input_spv[@]} SPIR-V files, expected 12" >&2; exit 1; }
+        for spv in "${input_spv[@]}"; do t spirv-val --target-env vulkan1.3 "$spv"; done
+        t out/gpu/flatten-base-shape-test
         # Default allocated descriptor sets only; --push reproduces a MoltenVK bug and exits 2.
-        BB_DEPS_PREFIX="$deps" bash tests/macos_descriptor_sizes/run.sh
-        BB_DEPS_PREFIX="$deps" bash tests/test_fp64_policy.sh
-        BB_DEPS_PREFIX="$deps" BB_GPU_BUILD="$PWD/out/gpu" sh tests/test_buffer_atomic_wrap.sh
-        BB_DEPS_PREFIX="$deps" BB_GPU_BUILD="$PWD/out/gpu" sh tests/test_lds_subword.sh
-        BB_DEPS_PREFIX="$deps" sh tests/test_geometry_runtime_info.sh
-        BB_DEPS_PREFIX="$deps" BB_GPU_BUILD="$PWD/out/gpu" bash tests/macos_fp16/run.sh
-        BB_DEPS_PREFIX="$deps" BB_GPU_BUILD="$PWD/out/gpu" sh tests/macos_pkrtz/run.sh
+        BB_DEPS_PREFIX="$deps" t bash tests/macos_descriptor_sizes/run.sh
+        BB_DEPS_PREFIX="$deps" t bash tests/test_fp64_policy.sh
+        BB_DEPS_PREFIX="$deps" BB_GPU_BUILD="$PWD/out/gpu" t sh tests/test_buffer_atomic_wrap.sh
+        BB_DEPS_PREFIX="$deps" BB_GPU_BUILD="$PWD/out/gpu" t sh tests/test_lds_subword.sh
+        BB_DEPS_PREFIX="$deps" t sh tests/test_geometry_runtime_info.sh
+        BB_DEPS_PREFIX="$deps" BB_GPU_BUILD="$PWD/out/gpu" t bash tests/macos_fp16/run.sh
+        BB_DEPS_PREFIX="$deps" BB_GPU_BUILD="$PWD/out/gpu" t sh tests/macos_pkrtz/run.sh
         BB_DEPS_PREFIX="$deps" BB_GPU_BUILD="$PWD/out/gpu" BB_GPU_THIRD_PARTY="$PWD/gpu/third_party" \
-            bash tests/macos_gs/run.sh
+            t bash tests/macos_gs/run.sh
         # GPU library unit tests: Apple paths (PM4 parsing, feature checks, views, scheduler,
         # vertex fetch, null buffers, rect interface, overlay) and the renderer's cross-platform
         # tests (motion, UI composition, scene resolution, TAA, camera motion).
@@ -239,80 +260,83 @@ if [[ ${1:-} == --test ]]; then
             ui-composition-test scene-resolution-test taa-shader-test camera-motion-test)
         ninja -C out/gpu "${ninja_jobs[@]}" "${unit_tests[@]}"
         for unit_test in "${unit_tests[@]}"; do sign_darwin "out/gpu/$unit_test"; done
-        out/gpu/cmd-snapshot-test
-        out/gpu/cond-exec-test
-        out/gpu/strmout-update-test
-        out/gpu/equeue-concurrency-test
-        out/gpu/feature-checks-test
-        out/gpu/image-view-storage-test
-        out/gpu/submit-info-bounds-test
-        out/gpu/vertex-fetch-translation-test
-        out/gpu/fence-address-test
-        out/gpu/overlay-concurrency-test
-        out/gpu/rect-interface-test
-        out/gpu/depth-bounds-probe-test
+        t out/gpu/cmd-snapshot-test
+        t out/gpu/cond-exec-test
+        t out/gpu/strmout-update-test
+        t out/gpu/equeue-concurrency-test
+        t out/gpu/feature-checks-test
+        t out/gpu/image-view-storage-test
+        t out/gpu/submit-info-bounds-test
+        t out/gpu/vertex-fetch-translation-test
+        t out/gpu/fence-address-test
+        t out/gpu/overlay-concurrency-test
+        t out/gpu/rect-interface-test
+        t out/gpu/depth-bounds-probe-test
         rm -rf out/buffer-null && mkdir -p out/buffer-null
-        out/gpu/buffer-null-test out/buffer-null
-        spirv-val --target-env vulkan1.3 out/buffer-null/null-buffer.spv
-        spirv-val --target-env vulkan1.3 out/buffer-null/valid-buffer.spv
-        out/gpu/motion-history-test
+        t out/gpu/buffer-null-test out/buffer-null
+        t spirv-val --target-env vulkan1.3 out/buffer-null/null-buffer.spv
+        t spirv-val --target-env vulkan1.3 out/buffer-null/valid-buffer.spv
+        t out/gpu/motion-history-test
         rm -rf out/motion-shaders && mkdir -p out/motion-shaders
-        out/gpu/motion-shader-test out/motion-shaders
-        for spv in out/motion-shaders/*.spv; do spirv-val --target-env vulkan1.3 "$spv"; done
-        out/gpu/ui-composition-test
-        out/gpu/scene-resolution-test
-        out/gpu/taa-shader-test
-        out/gpu/camera-motion-test
+        t out/gpu/motion-shader-test out/motion-shaders
+        for spv in out/motion-shaders/*.spv; do t spirv-val --target-env vulkan1.3 "$spv"; done
+        t out/gpu/ui-composition-test
+        t out/gpu/scene-resolution-test
+        t out/gpu/taa-shader-test
+        t out/gpu/camera-motion-test
         # GCN2 buffer conformance (Opus verification's suite) against this tree's GPU library:
         # exit 0 only (FAIL, INVALID-SPIRV, CRASH and harness errors exit non-zero).
         BB_GPU_BUILD="$PWD/out/gpu" BB_GPU_THIRD_PARTY="$PWD/gpu/third_party" \
             bash tests/gcn_buffer_conformance/build.sh --out "$PWD/out/gcnconf"
-        BB_GPU_USER_DIR="$PWD/out/gcnconf/user" "$PWD/out/gcnconf/gcn-conformance-dylib" \
+        BB_GPU_USER_DIR="$PWD/out/gcnconf/user" t "$PWD/out/gcnconf/gcn-conformance-dylib" \
             --out "$PWD/out/gcnconf" --label shared
         # Standalone qualification probes and runtime pieces.
-        sh tests/test_guest_alloc_macos.sh
-        sh tests/test_memory_clamp.sh
-        sh tests/test_memory_cpu_alias_macos.sh
-        sh tests/test_audio_macos.sh
-        sh tests/test_guest_heap_lock_macos.sh
-        sh tests/test_low_map_trace_macos.sh
-        sh tests/test_perf_summary.sh
-        sh tests/test_guest_entry_macos.sh
-        sh tests/test_cpu_profile_macos.sh
-        sh tests/test_hle_trace_macos.sh
-        BB_DEPS_PREFIX="$deps" bash tests/macos_external_host/run.sh
-        BB_DEPS_PREFIX="$deps" bash tests/macos_metalfx/signature.sh
-        BB_DEPS_PREFIX="$deps" bash tests/macos_metalfx/run.sh
+        t sh tests/test_guest_alloc_macos.sh
+        t sh tests/test_memory_clamp.sh
+        t sh tests/test_memory_cpu_alias_macos.sh
+        t sh tests/test_audio_macos.sh
+        t sh tests/test_guest_heap_lock_macos.sh
+        t sh tests/test_low_map_trace_macos.sh
+        t sh tests/test_perf_summary.sh
+        t sh tests/test_guest_entry_macos.sh
+        t sh tests/test_cpu_profile_macos.sh
+        t sh tests/test_hle_trace_macos.sh
+        BB_DEPS_PREFIX="$deps" t bash tests/macos_external_host/run.sh
+        BB_DEPS_PREFIX="$deps" t bash tests/macos_metalfx/signature.sh
+        BB_DEPS_PREFIX="$deps" t bash tests/macos_metalfx/run.sh
         # The production module (gpu/shim/macos_metalfx.mm) as the provider, incl. off-thread teardown.
-        BB_DEPS_PREFIX="$deps" bash tests/macos_metalfx/run.sh --module
-        BB_DEPS_PREFIX="$deps" bash tests/macos_metalfx/jitter.sh
-        BB_GPU_BUILD="$PWD/out/gpu" sh tests/macos_metalfx/library.sh
+        BB_DEPS_PREFIX="$deps" t bash tests/macos_metalfx/run.sh --module
+        BB_DEPS_PREFIX="$deps" t bash tests/macos_metalfx/jitter.sh
+        BB_GPU_BUILD="$PWD/out/gpu" t sh tests/macos_metalfx/library.sh
         # Scaled presets: tonemapped RGBA8 content in larger aligned textures, both output formats.
-        BB_DEPS_PREFIX="$deps" bash tests/macos_metalfx/run.sh --ldr-padded
+        BB_DEPS_PREFIX="$deps" t bash tests/macos_metalfx/run.sh --ldr-padded
         # Every tests/test_*.py (a skipped test fails).
-        bash tests/run_python_tests.sh
+        t bash tests/run_python_tests.sh
         # BB_PERF's GPU numbers rely on per-submission timestamps; qualify them on this device.
-        BB_DEPS_PREFIX="$deps" bash tests/macos_perf/timestamps.sh
-        out/gpu/macos-perf-test
-        BB_GPU_BUILD="$PWD/out/gpu" sh tests/macos_float_modes/production.sh
+        # It takes the GPU exclusively (heavy.sh): it waits for running games instead of measuring
+        # a shared GPU.
+        BB_DEPS_PREFIX="$deps" t tools/macos/heavy.sh --gpu exclusive "timestamp gate" -- \
+            bash tests/macos_perf/timestamps.sh
+        t out/gpu/macos-perf-test
+        BB_GPU_BUILD="$PWD/out/gpu" t sh tests/macos_float_modes/production.sh
         "$CC" "${platform_flags[@]}" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread -Isrc \
             tests/test_compat_mac.c src/compat_mac.c -o out/compat-mac-test
         sign_darwin out/compat-mac-test
-        out/compat-mac-test
+        t out/compat-mac-test
         "$CC" "${platform_flags[@]}" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread -Isrc \
             tests/test_macos_ui.c src/macos_ui.c -o out/macos-ui-test
         sign_darwin out/macos-ui-test
-        out/macos-ui-test
+        t out/macos-ui-test
         "$CC" "${platform_flags[@]}" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread \
             "${includes[@]}" -I. -Isrc tests/test_fault_mac.c src/runtime_cpu_profile.c "${compat[@]}" \
             -Wl,-dead_strip -o out/fault-mac-test
         sign_darwin out/fault-mac-test
-        out/fault-mac-test
+        t out/fault-mac-test
         read -r -a media_flags <<< "$(pkg-config --cflags --libs libavformat libavcodec libavutil)"
         "${CXX:-clang++}" "${platform_flags[@]}" -std=c++23 -O2 -g -Wall -Wextra -Werror \
             -I. tests/test_media_mac.cpp "${media_flags[@]}" "${caps_link[@]}" -o out/media-mac-test
         sign_darwin out/media-mac-test
-        out/media-mac-test
+        t out/media-mac-test
         read -r -a surface_flags <<< "$(pkg-config --cflags --libs vulkan sdl3 fmt)"
         "$CC" "${platform_flags[@]}" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread -Isrc \
             -c src/macos_ui.c -o out/macos-ui-surface.o
@@ -323,38 +347,38 @@ if [[ ${1:-} == --test ]]; then
             gpu/shim/common/assert.cpp gpu/shadps4/common/path_util.cpp out/macos-ui-surface.o \
             "${surface_flags[@]}" "${caps_link[@]}" -o out/macos-surface-test
         sign_darwin out/macos-surface-test
-        out/macos-surface-test
-        sh tests/test_memory_macos.sh
-        sh tests/test_memory_lifetime_macos.sh
-        sh tests/test_avplayer_lifecycle_macos.sh
-        sh tests/macos_spike/test_tls_runtime.sh
-        sh tests/macos_spike/test_hle_stack.sh
-        bash tests/test_savedata_macos.sh
-        bash tests/test_heavy.sh
-        sh tests/test_sync_diagnostics_macos.sh
-        python3 tests/test_restart_macos.py
+        t out/macos-surface-test
+        t sh tests/test_memory_macos.sh
+        t sh tests/test_memory_lifetime_macos.sh
+        t sh tests/test_avplayer_lifecycle_macos.sh
+        t sh tests/macos_spike/test_tls_runtime.sh
+        t sh tests/macos_spike/test_hle_stack.sh
+        t bash tests/test_savedata_macos.sh
+        t bash tests/test_heavy.sh
+        t sh tests/test_sync_diagnostics_macos.sh
+        t python3 tests/test_restart_macos.py
         # Last: every test file under tests/ is run above or excluded with a reason.
         python3 tools/macos/check_test_wiring.py
     fi
     "$CC" "${platform_flags[@]}" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread "${includes[@]}" -I. -Isrc tests/test_pad.c "${libraries[@]}" "${caps_link[@]}" -o out/pad-test
     sign_darwin out/pad-test
-    out/pad-test
+    t out/pad-test
     "$CC" "${platform_flags[@]}" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread "${includes[@]}" -I. -Isrc tests/test_runtime.c "${runtime[@]}" out/libatrac9.a -lm "${gpu[@]}" "${libraries[@]}" -o out/runtime-test
     sign_darwin out/runtime-test
     if [[ $(uname -s) == Darwin ]]; then
         python3 packaging/macos/check-exports.py out/gpu/libbbgpu.dylib out/runtime-test
     fi
-    out/runtime-test
+    t out/runtime-test
     "$CC" "${platform_flags[@]}" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread -Isrc tests/test_file_mods.c -o out/file-mods-test
     sign_darwin out/file-mods-test
-    out/file-mods-test
+    t out/file-mods-test
     "$CC" "${platform_flags[@]}" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread "${includes[@]}" -I. -Isrc tests/test_sema.c "${runtime[@]}" out/libatrac9.a -lm "${gpu[@]}" "${libraries[@]}" -o out/sema-test
     sign_darwin out/sema-test
     if [[ $(uname -s) == Darwin ]]; then
         python3 packaging/macos/check-exports.py out/gpu/libbbgpu.dylib out/sema-test
     fi
-    out/sema-test
+    t out/sema-test
     "$CC" "${platform_flags[@]}" -std=c11 -D_GNU_SOURCE -O2 -g -Wall -Wextra -Werror -I. -Isrc tests/test_content.c src/runtime_content.c -o out/content-test
     sign_darwin out/content-test
-    out/content-test
+    t out/content-test
 fi

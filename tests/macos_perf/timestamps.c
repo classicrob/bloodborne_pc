@@ -323,6 +323,8 @@ int main(int argc, char **argv) {
     check("  in-buffer fill", ms, measure(run_in_buffer, 64u << 20, 1, ms), 0, 0, 0);
     if (!ok) {
         fprintf(stderr, "MoltenVK timestamps do not measure GPU work; BB_PERF results would be invalid\n");
+        fprintf(stderr, "(if another GPU user ran during this test, the measurement is inconclusive: rerun "
+                        "with the GPU to itself, as build.sh --test does through heavy.sh --gpu exclusive)\n");
         return 1;
     }
     puts("MoltenVK per-submission timestamps: scaling, empty, repeat, ring reuse, wall-time bound PASS");

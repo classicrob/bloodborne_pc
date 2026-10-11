@@ -13,6 +13,11 @@
 # its end. --fixture, --warm-cache and --diag-env (repeatable) pass to play_route.py.
 set -euo pipefail
 cd -- "$(dirname -- "$0")/../.."
+# The run takes the GPU exclusively (tools/macos/heavy.sh): it waits until running games end, and
+# games started meanwhile wait for it. The game itself runs under this hold.
+if [[ ${BB_HEAVY_GPU:-} != exclusive ]]; then
+    exec tools/macos/heavy.sh --pool playtest --gpu exclusive "perf_run $*" -- bash "$PWD/tools/macos/perf_run.sh" "$@"
+fi
 probe='' output=4k phases=0 label=perf until=() hold=0 segments='' seeds=()
 while (($#)); do
     case $1 in
