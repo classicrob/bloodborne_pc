@@ -160,6 +160,18 @@ and ownership-transfer limits in
 [throttle-guest-lifetimes.md](throttle-guest-lifetimes.md) remain relevant;
 this audit has not proved them unreachable for the bad block.
 
+One publication-order edge remains unqualified: `0x26aa5a0` links N into
+the pending list with CAS at `0x26aa5d1`, **before** storing N[0]=2 at
+`0x26aa5db`. It takes no allocator mutex itself. If a reclaimer on another
+thread can run in that interval, it can observe the old used-byte count.
+A count of 4 would look completed; an odd count would look like a tagged
+external label pointer. The allocation path can therefore CPU-write 4
+before retirement; the statement that only a GPU can ever write 4 into
+N[0] would be false. This is a conditional guest publication hazard,
+not evidence of the observed failure: concurrent retirement/reclamation,
+the relevant node contents, and caller exclusion remain to be established.
+No host policy change is justified by this static interleaving alone.
+
 ## Consequence and next discrimination
 
 For the now-identified arena, a large frame simply wrapping into an
