@@ -45,3 +45,37 @@ Test: `tests/test_cmd_snapshot.cpp` (nested and constant IBs, an IB called twice
 target, later guest writes, unparsed ranges, truncated streams, pending stream writes into a called
 chunk and into the submitted buffer, a pending write elsewhere, a GPU-side DMA into submitted
 command memory).
+
+## Guest data read from command memory (`BB_CMD_DATA_CHECK=1`, diagnostic)
+
+Gnm can allocate descriptor tables and constants inside a command buffer's chunk. The engine
+allocates them downward from the chunk's end (0x26b07f0, Astra-2), so they lie **outside** the
+submitted `[begin, cmdptr)` range that the snapshot copies. The guest may reuse a chunk once it
+believes the GPU is done with it. If we then read such data at parse time, we read bytes the
+guest has already replaced: for example, the GXFfxLightShaft vertex-buffer table read as floats.
+
+`BB_CMD_DATA_CHECK=1` (`gpu/shim/bbport_cmd_data.h`) classifies these parse-time guest reads
+against the snapshots still held:
+- `Info::ReadUdReg`: a descriptor table read through a user-data pointer, including the fetch
+  shader's vertex-buffer table;
+- `Info::ReadTessConstantBuffer`.
+
+Each read falls into one of these:
+- **Inside a submitted region:** the bytes just read are compared with the submitted bytes.
+- **Straddling a region boundary.**
+- **In a submitted region's chunk tail:** past the region's end, in the same command chunk. The
+  chunk's status word (end − 8: 0 free, 1 claimed, 2 released) is reported as read now. The tail
+  is not copied at submit, so it cannot be compared.
+  - `BB_CMD_DATA_CHUNK`: the chunk size, default 262144.
+  - `BB_CMD_DATA_CHUNK_OFFSET`: where chunks start, modulo that size. The default 0x20 comes from
+    Astra-2's pool base, 0x703b400020.
+- **Outside command memory.**
+
+**Output** goes to stdout:
+- `CMD-DATA #n` lines for the first 16 reads that are changed inside a region, or in a chunk
+  tail;
+- a summary every 65536 reads, per read kind and shader hash.
+
+The `CheckNumberConversion` stop appends where this thread's latest instrumented read came from.
+
+**Not instrumented:** reads made by generated code (the SRT walker).

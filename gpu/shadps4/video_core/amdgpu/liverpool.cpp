@@ -35,6 +35,7 @@
 #include "core/platform.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "bbport_write_log.h"
+#include "bbport_cmd_data.h"
 #include "bbport_label_check.h"
 #include "bbport_label_store.h"
 #include "video_core/amdgpu/pm4_cmds.h"
@@ -175,9 +176,73 @@ static std::span<const u32> NextPacket(std::span<const u32> span, size_t offset)
     return span.subspan(offset);
 }
 
+#ifdef __APPLE__
+namespace {
+Liverpool* command_data_owner = nullptr; ///< BB_CMD_DATA_CHECK's snapshots (one GPU)
+} // namespace
+
+BbCmdData::Found Liverpool::LookupCommandData(u64 address, u64 size) {
+    BbCmdData::Found found;
+    Liverpool* self = command_data_owner;
+    if (!self || !size) {
+        return found;
+    }
+    std::scoped_lock lk{self->snapshots_mutex};
+    for (const auto& snapshot : self->gfx_snapshots) {
+        for (const auto& region : snapshot->Regions()) {
+            const u64 start = reinterpret_cast<u64>(region.guest);
+            const u64 bytes = u64(region.size_dw) * sizeof(u32);
+            if (address >= start && size <= bytes && address - start <= bytes - size) {
+                found.where = BbCmdData::Where::Inside;
+                found.submission = snapshot->submit_number;
+                found.region_start = start;
+                found.region_bytes = bytes;
+                if (size <= BbCmdData::MaxCompared) {
+                    const auto words = snapshot->Words(region);
+                    std::memcpy(found.submitted,
+                                reinterpret_cast<const u8*>(words.data()) + (address - start),
+                                size);
+                    found.copied = true;
+                }
+                return found; // the newest snapshot holding it is not needed: any copy is the
+                              // bytes as submitted, and the oldest live one comes first
+            }
+            if (address < start + bytes && start < address + size) {
+                found.where = BbCmdData::Where::Straddles;
+                found.submission = snapshot->submit_number;
+                found.region_start = start;
+                found.region_bytes = bytes;
+            } else if (found.where == BbCmdData::Where::Outside ||
+                       found.where == BbCmdData::Where::ChunkTail) {
+                // Past this region's end, in the same command chunk: the engine's downward
+                // allocations (Astra-2). The nearest region below the address names it.
+                const u64 chunk = BbCmdData::ChunkBytes();
+                const u64 block = BbCmdData::ChunkStart(address);
+                const bool tail = start >= block && start + bytes <= address &&
+                                  address + size <= block + chunk;
+                if (tail && (found.where == BbCmdData::Where::Outside ||
+                             start > found.region_start)) {
+                    found.where = BbCmdData::Where::ChunkTail;
+                    found.submission = snapshot->submit_number;
+                    found.region_start = start;
+                    found.region_bytes = bytes;
+                    std::memcpy(&found.chunk_status,
+                                reinterpret_cast<const void*>(block + chunk - 8), 8);
+                }
+            }
+        }
+    }
+    return found;
+}
+#endif
+
 Liverpool::Liverpool() : guest_markers_enabled{EmulatorSettings.IsVkGuestMarkersEnabled()} {
 #ifdef __APPLE__
     SetAssertStopHook(&ReportParserStop);
+    if (BbCmdData::Enabled()) {
+        command_data_owner = this;
+        BbCmdData::lookup.store(&Liverpool::LookupCommandData, std::memory_order_release);
+    }
 #endif
     num_counter_pairs = Libraries::Kernel::sceKernelIsNeoMode() ? 16 : 8;
     process_thread = std::jthread{std::bind_front(&Liverpool::Process, this)};

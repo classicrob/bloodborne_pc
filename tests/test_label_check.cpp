@@ -16,6 +16,7 @@
 #include <mutex>
 #include <thread>
 #include <vector>
+#include "bbport_cmd_data.h"
 #include "bbport_deferred_counts.h"
 #include "bbport_label_check.h"
 #include "bbport_label_mode.h"
@@ -256,6 +257,45 @@ int main() {
         int status = 0;
         waitpid(child, &status, 0);
         Expect("  ... any other value stops", WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT);
+    }
+
+    // BB_CMD_DATA_CHECK (bbport_cmd_data.h) with a fake snapshot lookup: one submitted region
+    // whose bytes are {1,2,3,4}; a read inside that matches, one that does not, one in the
+    // region's chunk tail, and the chunk arithmetic (256 KiB chunks from offset 0x20).
+    {
+        static const std::uint32_t submitted[4] = {1, 2, 3, 4};
+        static const std::uint64_t region = 0x703b400020 + 0x1000;
+        BbCmdData::lookup.store(+[](std::uint64_t address, std::uint64_t size) {
+            BbCmdData::Found found;
+            if (address >= region && address + size <= region + sizeof(submitted)) {
+                found.where = BbCmdData::Where::Inside;
+                found.copied = true;
+                std::memcpy(found.submitted,
+                            reinterpret_cast<const std::uint8_t*>(submitted) + (address - region),
+                            size);
+            } else if (address > region && address < BbCmdData::ChunkStart(region) + 0x40000) {
+                found.where = BbCmdData::Where::ChunkTail;
+                found.chunk_status = 2;
+            }
+            found.submission = 7;
+            found.region_start = region;
+            found.region_bytes = sizeof(submitted);
+            return found;
+        });
+        const std::uint32_t same[2] = {2, 3}, changed[2] = {2, 9};
+        BbCmdData::NoteRead("ud table", 0xabc, reinterpret_cast<const void*>(region + 4), 8, same);
+        BbCmdData::NoteRead("ud table", 0xabc, reinterpret_cast<const void*>(region + 4), 8,
+                            changed);
+        BbCmdData::NoteRead("ud table", 0xabc, reinterpret_cast<const void*>(region + 0x3e000), 16,
+                            same);
+        const auto& t = BbCmdData::detail::tallies[{"ud table", 0xabc}];
+        Expect("cmd data: inside reads compared with the submitted bytes, chunk tail counted",
+               t.inside == 2 && t.differs == 1 && t.chunk_tail == 1 && t.outside == 0);
+        Expect("  ... chunks of 256 KiB start at the 0x20 offset",
+               BbCmdData::ChunkStart(0x703b400020 + 0x40000 + 5) == 0x703b400020 + 0x40000 &&
+                   BbCmdData::ChunkStart(0x703b400020 + 0x3ffff) == 0x703b400020 &&
+                   BbCmdData::ChunkStart(0x703b40001f) == 0x703b400020 - 0x40000);
+        BbCmdData::lookup.store(nullptr);
     }
 
     std::fprintf(stderr, "%s: %u failures\n", failures ? "FAIL" : "PASS", failures);

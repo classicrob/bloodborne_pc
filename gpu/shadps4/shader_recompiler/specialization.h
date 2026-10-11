@@ -115,9 +115,17 @@ struct StageSpecialization {
             std::memcpy(&dword, static_cast<const u8*>(sharp) + i * sizeof(u32), sizeof(dword));
             dwords += fmt::format("{}{:08x}", i ? " " : "", dword);
         }
+#ifdef __APPLE__
+        // BB_CMD_DATA_CHECK: where the descriptor's table read came from (submitted command
+        // memory, its chunk tail, or elsewhere).
+        const std::string source = BbCmdData::LastRead();
+#else
+        const std::string source;
+#endif
         UNREACHABLE_MSG("{} shader {:#x}: {} {} (Info index) has data format {} with number format {}, "
-                        "which this backend cannot convert; descriptor {}",
-                        info->hw_stage, info->pgm_hash, kind, index, u32(data_fmt), u32(num_fmt), dwords);
+                        "which this backend cannot convert; descriptor {}{}",
+                        info->hw_stage, info->pgm_hash, kind, index, u32(data_fmt), u32(num_fmt), dwords,
+                        source);
     }
 
     StageSpecialization() = default;
