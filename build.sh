@@ -206,7 +206,7 @@ if [[ ${1:-} == --test ]]; then
         # GPU library unit tests: Apple paths (PM4 parsing, feature checks, views, scheduler,
         # vertex fetch, null buffers, rect interface, overlay) and the renderer's cross-platform
         # tests (motion, UI composition, scene resolution, TAA, camera motion).
-        unit_tests=(cmd-snapshot-test cond-exec-test feature-checks-test image-view-storage-test
+        unit_tests=(cmd-snapshot-test cond-exec-test equeue-concurrency-test feature-checks-test image-view-storage-test
             submit-info-bounds-test vertex-fetch-translation-test buffer-null-test rect-interface-test
             fence-address-test overlay-concurrency-test depth-bounds-probe-test motion-history-test
             motion-shader-test
@@ -215,6 +215,7 @@ if [[ ${1:-} == --test ]]; then
         for unit_test in "${unit_tests[@]}"; do sign_darwin "out/gpu/$unit_test"; done
         out/gpu/cmd-snapshot-test
         out/gpu/cond-exec-test
+        out/gpu/equeue-concurrency-test
         out/gpu/feature-checks-test
         out/gpu/image-view-storage-test
         out/gpu/submit-info-bounds-test

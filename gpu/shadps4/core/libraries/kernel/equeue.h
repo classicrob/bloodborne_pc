@@ -141,6 +141,7 @@ private:
 };
 
 class EqueueInternal {
+    friend struct EqueueConcurrencyTest;
     struct SmallTimer {
         OrbisKernelEvent event;
         std::chrono::steady_clock::time_point added;
@@ -161,7 +162,6 @@ public:
     bool RemoveEvent(u64 id, s16 filter);
     int WaitForEvents(OrbisKernelEvent* ev, int num, const OrbisKernelUseconds* timo);
     bool TriggerEvent(u64 ident, s16 filter, void* trigger_data);
-    int GetTriggeredEvents(OrbisKernelEvent* ev, int num);
 
     bool AddSmallTimer(EqueueEvent& event);
     bool HasSmallTimer() {
@@ -181,6 +181,8 @@ public:
     bool EventExists(u64 id, s16 filter);
 
 private:
+    // All inspection, clearing and removal of triggered events requires m_mutex.
+    int GetTriggeredEventsLocked(OrbisKernelEvent* ev, int num);
     OrbisKernelEqueue m_handle;
     std::string m_name;
     std::mutex m_mutex;

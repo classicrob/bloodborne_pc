@@ -176,7 +176,8 @@ int EqueueInternal::WaitForEvents(OrbisKernelEvent* ev, int num, const OrbisKern
     if (timo != nullptr && *timo == 0) {
         // Effectively acts as a poll; only events that have already
         // arrived at the time of this function call can be received
-        return GetTriggeredEvents(ev, num);
+        std::scoped_lock lock{m_mutex};
+        return GetTriggeredEventsLocked(ev, num);
     }
     const auto micros = timo ? *timo : 0u;
 
@@ -188,7 +189,7 @@ int EqueueInternal::WaitForEvents(OrbisKernelEvent* ev, int num, const OrbisKern
     int count = 0;
 
     const auto predicate = [&] {
-        count = GetTriggeredEvents(ev, num);
+        count = GetTriggeredEventsLocked(ev, num);
         return count > 0;
     };
 
@@ -229,7 +230,7 @@ bool EqueueInternal::TriggerEvent(u64 ident, s16 filter, void* trigger_data) {
     return has_found;
 }
 
-int EqueueInternal::GetTriggeredEvents(OrbisKernelEvent* ev, int num) {
+int EqueueInternal::GetTriggeredEventsLocked(OrbisKernelEvent* ev, int num) {
     int count = 0;
     for (auto it = m_events.begin(); it != m_events.end();) {
         if (it->IsTriggered()) {
