@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
 #include "gnm_error.h"
 #include "gnmdriver.h"
 
@@ -64,7 +65,9 @@ static constexpr std::array indirect_sgpr_offsets{0u, 0u, 0x4cu, 0u, 0xccu, 0u, 
 static constexpr bool UseNeoCompatSequences = false;
 
 // In case if `submitDone` is issued we need to block submissions until GPU idle
-static u32 submission_lock{};
+// bbport: atomic, as sceGnmAreSubmitsAllowed reads it without a lock and sceGnmSubmitDone sets it
+// without m_wait_idle.
+static std::atomic<u32> submission_lock{};
 std::condition_variable cv_lock{};
 std::mutex m_wait_idle{};
 std::mutex m_submit_lock{};
@@ -84,10 +87,52 @@ static void ResetSubmissionLock(Platform::InterruptId irq) {
     cv_lock.notify_all();
 }
 
-static void WaitGpuIdle() {
+#ifdef __APPLE__
+/// How long guest threads wait for the submitDone throttle, in sceGnmSubmitDone and in
+/// submissions, and the frame interval (between sceGnmSubmitDone calls); logged every 600 frames.
+struct PacingStats {
+    struct Waits {
+        u64 count = 0;
+        u64 total_us = 0;
+        u64 max_us = 0;
+        void Add(u64 us) {
+            ++count;
+            total_us += us;
+            max_us = std::max(max_us, us);
+        }
+        double MeanMs() const {
+            return count ? total_us / 1000.0 / count : 0.0;
+        }
+    };
+    Waits in_submit_done, in_submits, frame_interval;
+    std::chrono::steady_clock::time_point last_frame{};
+    u64 frames = 0;
+};
+static PacingStats pacing; ///< under m_submit_lock
+#endif
+
+/// Returns the microseconds it blocked (0 if the throttle was not set).
+static u64 WaitGpuIdle() {
     HLE_TRACE;
     std::unique_lock lock{m_wait_idle};
+    if (submission_lock == 0) {
+        return 0;
+    }
+    const auto start = std::chrono::steady_clock::now();
     cv_lock.wait(lock, [] { return submission_lock == 0; });
+    return std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() -
+                                                                 start)
+        .count();
+}
+
+/// A submission's wait for the submitDone throttle (counted on Apple).
+static void WaitGpuIdleToSubmit() {
+    [[maybe_unused]] const u64 waited = WaitGpuIdle();
+#ifdef __APPLE__
+    if (waited) {
+        pacing.in_submits.Add(waited);
+    }
+#endif
 }
 
 // Write a special ending NOP packet with N DWs data block
@@ -317,7 +362,7 @@ void PS4_SYSV_ABI sceGnmDingDong(u32 gnm_vqid, u32 next_offs_dw) {
     }
 
     std::scoped_lock lk{m_submit_lock};
-    WaitGpuIdle();
+    WaitGpuIdleToSubmit();
 
     if (DebugState.ShouldPauseInSubmit()) {
         DebugState.PauseGuestThreads();
@@ -2462,7 +2507,7 @@ s32 PS4_SYSV_ABI sceGnmSubmitAndFlipCommandBuffersForWorkload(
     const auto size_dw = dcb_sizes_in_bytes[count - 1] / 4;
 
     std::scoped_lock lk{m_submit_lock};
-    WaitGpuIdle();
+    WaitGpuIdleToSubmit();
 
     const s32 patch_result =
         PatchFlipRequest(cmdbuf, size_dw, vo_handle, buf_idx, flip_mode, flip_arg, nullptr /*unk*/);
@@ -2505,7 +2550,7 @@ s32 PS4_SYSV_ABI sceGnmSubmitCommandBuffersForWorkload(u32 workload, u32 count,
     }
 
     std::scoped_lock lk{m_submit_lock};
-    WaitGpuIdle();
+    WaitGpuIdleToSubmit();
 
     return PerformSubmit(count, const_cast<const u32**>(dcb_gpu_addrs), dcb_sizes_in_bytes,
                          const_cast<const u32**>(ccb_gpu_addrs), ccb_sizes_in_bytes);
@@ -2518,11 +2563,43 @@ s32 PS4_SYSV_ABI sceGnmSubmitCommandBuffers(u32 count, const u32* dcb_gpu_addrs[
                                                  ccb_gpu_addrs, ccb_sizes_in_bytes);
 }
 
+#ifdef __APPLE__
+/// Frame interval and the summary every 600 frames. Under m_submit_lock.
+static void NoteFramePacing() {
+    const auto now = std::chrono::steady_clock::now();
+    if (pacing.last_frame != std::chrono::steady_clock::time_point{}) {
+        pacing.frame_interval.Add(
+            std::chrono::duration_cast<std::chrono::microseconds>(now - pacing.last_frame).count());
+    }
+    pacing.last_frame = now;
+    if (++pacing.frames < 600) {
+        return;
+    }
+    LOG_INFO(Lib_GnmDriver,
+             "Frame pacing ({} frames): frame {:.1f} ms mean, {:.1f} ms "
+             "max; waits in sceGnmSubmitDone {} ({:.1f} ms mean, {:.1f} ms max), in submissions "
+             "{} ({:.1f} ms mean, {:.1f} ms max)",
+             pacing.frames,
+             pacing.frame_interval.MeanMs(), pacing.frame_interval.max_us / 1000.0,
+             pacing.in_submit_done.count, pacing.in_submit_done.MeanMs(),
+             pacing.in_submit_done.max_us / 1000.0, pacing.in_submits.count,
+             pacing.in_submits.MeanMs(), pacing.in_submits.max_us / 1000.0);
+    const auto last_frame = pacing.last_frame;
+    pacing = {};
+    pacing.last_frame = last_frame;
+}
+#endif
+
 s32 PS4_SYSV_ABI sceGnmSubmitDone() {
     HLE_TRACE;
     LOG_DEBUG(Lib_GnmDriver, "called");
     std::scoped_lock lk{m_submit_lock};
-    WaitGpuIdle();
+    [[maybe_unused]] const u64 waited = WaitGpuIdle(); // the previous submitDone's throttle
+#ifdef __APPLE__
+    if (waited) {
+        pacing.in_submit_done.Add(waited);
+    }
+#endif
     if (!liverpool->IsGpuIdle()) {
         submission_lock = true;
     }
@@ -2530,6 +2607,9 @@ s32 PS4_SYSV_ABI sceGnmSubmitDone() {
     send_init_packet = true;
     ++frames_submitted;
     DebugState.IncGnmFrameNum();
+#ifdef __APPLE__
+    NoteFramePacing();
+#endif
     return ORBIS_OK;
 }
 
