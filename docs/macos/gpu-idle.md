@@ -184,22 +184,28 @@ and announced at the first submission. With `BB_LABEL_CHECK=1` it shows whether 
 start to change before their writes once the guest is not held, and how soon after the parse they
 are checked. It may corrupt the guest heap, so it is not for play.
 
-## Labels at GPU completion (`BB_LABELS_AT_GPU_COMPLETE=1`, diagnostic)
+## Labels at GPU completion (`BB_LABELS_AT_GPU_COMPLETE=1`, the fix under A/B)
 
-End-of-pipe labels (EOP, EOS, compute RELEASE_MEM) are normally written when the recording side
-has passed the work before them and its guest-memory copies are done. That is before Metal
-executes the work. Guest buffers bound zero-copy are read by the GPU at execution. So a guest that
-reuses memory when a label says done (its label-governed reclaimer frees nodes whose label is 4,
-and those nodes own GPU data such as index buffers) can overwrite memory that recorded but not yet
-executed work will still read.
+End-of-pipe labels (EOP, EOS, compute RELEASE_MEM) were written once the recording side had passed
+the work before them and its guest-memory copies were done. That is before Metal executes the
+work. Guest buffers bound zero-copy are read by the GPU at execution. The guest's label-governed
+reclaimer frees nodes once their label reads 4, even mid-frame, and those nodes own GPU-read data
+such as index buffers (node+8 is passed to INDEX_BASE; Astra-2, 50b01dc). So the guest could
+overwrite memory that recorded but not yet executed draws still read.
 
 With `BB_LABELS_AT_GPU_COMPLETE=1`:
-- EOP and EOS labels, with their interrupts, are written only once the GPU has completed the
-  command buffer holding everything recorded before them. That buffer is submitted at once
-  (one submission per label), in order.
+- EOP, EOS and RELEASE_MEM labels, and their interrupts, are written only once the GPU has
+  completed the command buffer holding everything recorded before them.
+- That command buffer is submitted at once, one submission per label, so a guest or a
+  WAIT_REG_MEM waiting on the label is never left waiting for a submission that only comes at the
+  frame's end.
+- The scheduler's priority runner waits for each submission's timeline tick in FIFO order, so
+  labels keep stream order across the graphics and compute queues.
 - WaitDeferredSignals, and with it GpuIdle, waits for them.
-- A compute RELEASE_MEM first waits for the GPU (Rasterizer::Finish).
+- A RELEASE_MEM GDS store needs a GPU copy, so it waits for the GPU synchronously
+  (Rasterizer::Finish).
+- WRITE_DATA and DMA_DATA are unchanged. The command processor executes them in stream order
+  without waiting for earlier draws, so the guest cannot take them as "GPU done".
 
-It costs a submission and a GPU round trip per label. If intermittent corruption disappears with
-it, the exact fix is to write GPU-visible labels at GPU completion, in order. That is also the
+This is the exact fix candidate, kept toggleable for an A/B on corruption and FPS, and the
 precondition for dropping the submit throttle.

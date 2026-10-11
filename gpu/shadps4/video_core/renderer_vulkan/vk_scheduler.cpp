@@ -204,8 +204,8 @@ bool Scheduler::LabelsAtGpuComplete() {
         const bool on = env && env[0] == '1';
         if (on) {
             std::fprintf(stderr, "BB_LABELS_AT_GPU_COMPLETE=1: EOP/EOS/RELEASE_MEM labels are "
-                                 "written once the GPU completed the work before them (diagnostic; "
-                                 "one submission per label)\n");
+                                 "written once the GPU completed the work before them (one "
+                                 "submission per label)\n");
         }
         return on;
     }();

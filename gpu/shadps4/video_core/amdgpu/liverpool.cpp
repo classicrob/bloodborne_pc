@@ -1967,8 +1967,22 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             if (rasterizer) {
                 rasterizer->ProcessDownloadImages();
 #ifdef __APPLE__
-                // Compute end-of-pipe label: after the GPU completed the dispatches before it.
+                // Compute end-of-pipe label: after the GPU completed the work before it, in
+                // order with the graphics labels. A GDS store needs a GPU copy: it waits here.
                 if (Vulkan::Scheduler::LabelsAtGpuComplete()) {
+                    if (release_mem->data_sel.Value() != DataSelect::GdsMemStore) {
+                        const PM4CmdReleaseMem packet = *release_mem;
+                        const u32 pipe_id = queue.pipe_id;
+                        rasterizer->SignalAtGpuCompletion([packet, pipe_id] {
+                            packet.SignalFence(
+                                [pipe_id] {
+                                    Platform::IrqC::Instance()->Signal(
+                                        static_cast<Platform::InterruptId>(pipe_id));
+                                },
+                                [](VAddr, u16, u16) { UNREACHABLE(); });
+                        });
+                        break;
+                    }
                     rasterizer->Finish();
                 }
 #endif
