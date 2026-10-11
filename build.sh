@@ -1,6 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 cd -- "$(dirname -- "$0")"
+# macOS: the whole build (and --test) runs in a machine-wide heavy-job slot (tools/macos/heavy.sh;
+# BB_HEAVY_PRIORITY=1 is the critical lane: shared builds).
+if [[ $(uname -s) == Darwin && -z ${BB_HEAVY_HELD:-} ]]; then
+    case ${BB_HEAVY_PRIORITY:-0} in
+    1) heavy_priority=(--priority) ;;
+    0) heavy_priority=() ;;
+    *) echo 'BB_HEAVY_PRIORITY must be 0 or 1.' >&2; exit 1 ;;
+    esac
+    exec tools/macos/heavy.sh ${heavy_priority[@]+"${heavy_priority[@]}"} "build.sh $* in $(basename "$(dirname "$PWD")")/$(basename "$PWD")" \
+        -- bash "$PWD/build.sh" "$@"
+fi
 mkdir -p out
 platform_flags=()
 probe_link_flags=(-no-pie)
@@ -215,6 +226,7 @@ if [[ ${1:-} == --test ]]; then
         sh tests/macos_spike/test_tls_runtime.sh
         sh tests/macos_spike/test_hle_stack.sh
         bash tests/test_savedata_macos.sh
+        bash tests/test_heavy.sh
         sh tests/test_sync_diagnostics_macos.sh
         python3 tests/test_restart_macos.py
     fi

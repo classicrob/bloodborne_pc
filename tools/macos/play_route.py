@@ -290,6 +290,9 @@ def launch(args):
     removed = sorted(k for k in os.environ if k.startswith('BB_') and k not in ALLOWED_ENV)
     if removed:
         print('play_route: not passed to the game: ' + ', '.join(removed), file=sys.stderr)
+    # The game runs in a slot of the machine-wide playtest pool (tools/macos/heavy.sh: three
+    # games at once). The pool settings are read here; they never reach the game.
+    heavy = {k: os.environ[k] for k in ('BB_HEAVY_DIR', 'BB_HEAVY_PLAYTEST_SLOTS') if k in os.environ}
     running = translated_games()
     if len(running) >= 4:
         die(f'{len(running)} bb-probe processes are already running ({running}); the Rosetta limit is four')
@@ -376,7 +379,8 @@ def launch(args):
               'shader_cache': {'warm': args.warm_cache, 'from': warm} if args.warm_cache
                               else 'empty (fresh user directory)',
               'saves': {'fixture': args.fixture, 'from': fixture} if args.fixture else 'none (fresh user directory)',
-              'host': {'load_average': os.getloadavg(), 'other_bb_probe': running}}
+              'host': {'load_average': os.getloadavg(), 'other_bb_probe': running},
+              'heavy': heavy}
     (run / 'manifest.json').write_text(json.dumps(record, indent=2) + '\n')
     current = BASE / 'current'
     if current.is_symlink() or current.exists():
@@ -388,10 +392,16 @@ def launch(args):
     # A detached supervisor owns the game, so its exit status is recorded however the run ends.
     subprocess.Popen([sys.executable, __file__, '_supervise', str(run)], start_new_session=True,
                      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
-    deadline = time.time() + 60
+    deadline, slot_taken = time.time() + 60, False
     while time.time() < deadline:
         time.sleep(1)
-        info = manifest(run)
+        info = manifest(run)  # the supervisor writes it (pid); only read here
+        # Waiting for a heavy-job slot is not startup: the 60 s start when the slot is taken.
+        heavy_lines = [l for l in log_lines(run) if l.startswith('heavy: ')]
+        if heavy_lines and 'waiting for a slot' in heavy_lines[-1]:
+            deadline = time.time() + 60
+        elif heavy_lines and ' got ' in heavy_lines[-1] and not slot_taken:
+            slot_taken, deadline = True, time.time() + 60
         if (run / 'exit.json').exists():
             die(f'game exited during startup: {(run / "exit.json").read_text().strip()}; log {run / "game.log"}')
         if info.get('pid') and any(l.startswith('Runtime:') for l in log_lines(run)):
@@ -403,10 +413,14 @@ def launch(args):
 
 def supervise(run):
     with (run / 'game.log').open('wb') as log:
-        p = subprocess.Popen(['/bin/bash', str(ROOT / 'run.sh')], cwd=ROOT, stdout=log, stderr=subprocess.STDOUT,
-                             stdin=subprocess.DEVNULL)
         info = manifest(run)
-        info['pid'] = p.pid  # run.sh execs bb-probe, so this is the game's pid
+        heavy = info['heavy']
+        env = dict(os.environ, **{k: v for k, v in heavy.items() if k.startswith('BB_HEAVY_')})
+        command = [str(ROOT / 'tools/macos/heavy.sh'), '--pool', 'playtest', f'game {run.name}', '--',
+                   '/bin/bash', str(ROOT / 'run.sh')]
+        p = subprocess.Popen(command, cwd=ROOT, stdout=log, stderr=subprocess.STDOUT,
+                             stdin=subprocess.DEVNULL, env=env)
+        info['pid'] = p.pid  # heavy.sh and run.sh exec into bb-probe, so this is the game's pid
         (run / 'manifest.json').write_text(json.dumps(info, indent=2) + '\n')
         code = p.wait()
     (run / 'exit.json').write_text(json.dumps({'time': now(), 'returncode': code}) + '\n')
