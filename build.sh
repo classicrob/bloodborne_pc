@@ -44,6 +44,15 @@ Darwin)
                     -DCMAKE_C_COMPILER="${CC:-/usr/bin/clang}" -DCMAKE_CXX_COMPILER="${CXX:-/usr/bin/clang++}")
     default_lto=OFF
     ninja_jobs=(-j "${BB_BUILD_JOBS:-8}")
+    # No compiler cache: one cached object differed from a clean compile and clean builds are not
+    # yet bit-reproducible, so a cache cannot be shown equivalent to clean. The launchers are
+    # cleared on every configure, so a CMake cache from an experiment cannot keep one.
+    if [[ ${BB_CCACHE:-0} != 0 ]]; then
+        echo 'BB_CCACHE: compiler caching is disabled until builds are shown bit-reproducible.' >&2
+        exit 1
+    fi
+    cmake_platform+=(-DCMAKE_C_COMPILER_LAUNCHER= -DCMAKE_CXX_COMPILER_LAUNCHER=
+                     -DCMAKE_OBJC_COMPILER_LAUNCHER= -DCMAKE_OBJCXX_COMPILER_LAUNCHER=)
     ;;
 esac
 # Windows: MSYS2 CLANG64 (packages in packaging/windows/README.md). The GPU library is static
@@ -120,6 +129,13 @@ done
 cmake -S gpu -B out/gpu -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DBB_PGO="$pgo" \
     -DBB_LTO="${BB_LTO:-$default_lto}" -DBB_PGO_DIR="$PWD/pgo" "${cmake_platform[@]}" >/dev/null
 echo "GPU library: PGO $pgo, LTO ${BB_LTO:-$default_lto}"
+if [[ $(uname -s) == Darwin ]]; then
+    if ninja -C out/gpu -t commands bbgpu | grep -q ccache; then
+        echo 'STOP: out/gpu compiles through ccache; configure did not clear the launcher.' >&2
+        exit 1
+    fi
+    echo 'GPU library: ccache=off'
+fi
 # A failed GPU build must stop here: an older libbbgpu.so would otherwise be used silently.
 if ! ninja -C out/gpu "${ninja_jobs[@]}" bbgpu > out/gpu-build.log 2>&1; then
     grep -v '^\[' out/gpu-build.log | tail -40 >&2
