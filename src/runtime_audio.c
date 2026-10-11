@@ -14,6 +14,7 @@
 #include <pthread.h>
 #include <time.h>
 #include <errno.h>
+#include <stdatomic.h>
 #include <SDL3/SDL.h>
 
 #define PORTS 25
@@ -40,6 +41,10 @@ typedef struct {
     pthread_mutex_t lock;
     FILE *dump;                     /* BB_AUDIO_DUMP: raw converted PCM per port */
     int stats;
+#ifdef __APPLE__
+    uint64_t health_start_ns;
+    int health_started, health_warned;
+#endif
     uint64_t stat_start_ns, stat_last_ns, stat_max_gap_ns; /* BB_AUDIO_STATS */
     unsigned stat_starved, stat_buffers; int stat_min_queued;
 } Port;
@@ -49,10 +54,27 @@ _Static_assert(sizeof(PortState)==32,"AudioOut port state layout");
 static pthread_mutex_t table_lock=PTHREAD_MUTEX_INITIALIZER;
 static Port ports[PORTS];
 static int initialized, sdl_ready=-1;
-static size_t buffers_out, ports_opened;
+static _Atomic size_t buffers_out, ports_opened;
+#ifdef __APPLE__
+static _Atomic uint64_t input_starvation, inserted_silence_frames;
+static _Atomic uint64_t warmup_starvation, warmup_silence_frames, backend_errors;
+#define AUDIO_WARMUP_NS UINT64_C(5000000000)
+static void record_queue_health(Port *p,uint64_t now,int queued,uint64_t silence_frames) {
+    if (!p->health_started) { p->health_started=1; p->health_start_ns=now; }
+    int warmup=now-p->health_start_ns<AUDIO_WARMUP_NS;
+    if (queued==0) atomic_fetch_add_explicit(warmup ? &warmup_starvation : &input_starvation,1,memory_order_relaxed);
+    if (silence_frames) atomic_fetch_add_explicit(warmup ? &warmup_silence_frames : &inserted_silence_frames,silence_frames,memory_order_relaxed);
+    if (!warmup && (queued==0 || silence_frames) && !p->health_warned) {
+        p->health_warned=1;
+        fprintf(stderr,"AUDIO HEALTH FAILURE: port %d after 5s warmup: input queued=%d bytes, inserted silence=%llu frames; not a hardware-underrun measurement\n",
+                (int)(p-ports),queued,(unsigned long long)silence_frames);
+    }
+}
+#endif
 
 #ifdef __APPLE__
 static void audio_fail(const char *operation, const char *detail) {
+    atomic_fetch_add_explicit(&backend_errors,1,memory_order_relaxed);
     fprintf(stderr,"STOP: macOS audio %s failed: %s\n",operation,detail);
     abort();
 }
@@ -143,6 +165,13 @@ static ABI int32_t audio_open(int32_t user, int32_t type, int32_t index, uint32_
         p->stream=SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK,&spec,NULL,NULL);
         if (p->stream) {
 #ifdef __APPLE__
+            SDL_AudioSpec device_spec;
+            int device_frames=0;
+            SDL_AudioDeviceID device=SDL_GetAudioStreamDevice(p->stream);
+            if (!SDL_GetAudioDeviceFormat(device,&device_spec,&device_frames)) audio_fail("device format",SDL_GetError());
+            printf("Runtime: audio device '%s': %d Hz, %d channels, format 0x%x, quantum %d frames (%.3f ms); input 48000 Hz/%d channels\n",
+                   SDL_GetAudioDeviceName(device),device_spec.freq,device_spec.channels,(unsigned)device_spec.format,
+                   device_frames,1000.0*device_frames/device_spec.freq,p->channels);
             if (!SDL_ResumeAudioStreamDevice(p->stream)) audio_fail("device resume",SDL_GetError());
 #else
             SDL_ResumeAudioStreamDevice(p->stream);
@@ -161,7 +190,7 @@ static ABI int32_t audio_open(int32_t user, int32_t type, int32_t index, uint32_
         snprintf(path,sizeof(path),"%s.port%d.%dch.%s",dump,id,p->channels,p->is_float ? "f32" : "s16");
         p->dump=fopen(path,"wb");
     }
-    ++ports_opened;
+    atomic_fetch_add_explicit(&ports_opened,1,memory_order_relaxed);
     pthread_mutex_unlock(&table_lock);
     printf("Runtime: audio port %d opened (type %d, %d ch, %s, %u frames)\n",id,type,p->channels,p->is_float ? "float" : "s16",length);
     return (type<<16) | id | 0x20000000;
@@ -236,16 +265,24 @@ static int32_t output_port(int32_t handle, const void *data, int pace) {
 #ifdef __APPLE__
             if (queued<0) audio_fail("queue query",SDL_GetError());
 #endif
+#ifdef __APPLE__
+            int input_queued=queued;
+            uint64_t silence_frames=0;
+#endif
             if (queued<(int)bytes) {
                 static const unsigned char silence[2048*8*4];
                 bool queued_silence=SDL_PutAudioStreamData(p->stream,silence,low-queued<(int)bytes ? low-queued : (int)bytes);
 #ifdef __APPLE__
                 if (!queued_silence) audio_fail("silence submission",SDL_GetError());
+                silence_frames=(uint64_t)(low-queued<(int)bytes ? low-queued : (int)bytes)/(p->channels*p->sample_bytes);
 #else
                 (void)queued_silence;
 #endif
                 queued=low;
             }
+#ifdef __APPLE__
+            record_queue_health(p,now_ns(),input_queued,silence_frames);
+#endif
             if (!p->window_count || queued<p->window_min) p->window_min=queued;
             if (++p->window_count==32) {
                 p->adjust_ns=p->window_min>low+2*(int)bytes ? (int64_t)(period/32) : p->window_min<low ? -(int64_t)(period/32) : 0;
@@ -259,7 +296,7 @@ static int32_t output_port(int32_t handle, const void *data, int pace) {
             (void)queued_data;
 #endif
         }
-        ++buffers_out;
+        atomic_fetch_add_explicit(&buffers_out,1,memory_order_relaxed);
     }
     p->last_output_us=now_ns()/1000;
     pthread_mutex_unlock(&p->lock);
@@ -323,4 +360,17 @@ static const RuntimeExport exports[]={
     {"sceAudioOutGetLastOutputTime",audio_last_time},
 };
 uintptr_t runtime_audio_resolve(const char *name) { return RUNTIME_LOOKUP(exports,name); }
-void runtime_audio_report(void) { printf("Runtime: audio ports opened=%zu, buffers output=%zu\n",ports_opened,buffers_out); }
+void runtime_audio_report(void) {
+    printf("Runtime: audio ports opened=%zu, buffers output=%zu\n",
+           atomic_load_explicit(&ports_opened,memory_order_relaxed),atomic_load_explicit(&buffers_out,memory_order_relaxed));
+#ifdef __APPLE__
+    uint64_t starved=atomic_load_explicit(&input_starvation,memory_order_relaxed);
+    uint64_t silence=atomic_load_explicit(&inserted_silence_frames,memory_order_relaxed);
+    printf("Runtime: audio health: post-warmup input-starvation observations=%llu, inserted-silence frames=%llu; warmup observations=%llu, silence frames=%llu; backend errors=%llu; %s\n",
+           (unsigned long long)starved,(unsigned long long)silence,
+           (unsigned long long)atomic_load_explicit(&warmup_starvation,memory_order_relaxed),
+           (unsigned long long)atomic_load_explicit(&warmup_silence_frames,memory_order_relaxed),
+           (unsigned long long)atomic_load_explicit(&backend_errors,memory_order_relaxed),
+           starved || silence ? "AUDIO HEALTH FAILURE" : "no observed input starvation after warmup");
+#endif
+}

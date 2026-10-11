@@ -6,6 +6,7 @@ mkdir -p out/mac-playability
 clang -arch x86_64 -std=c11 -Wall -Wextra -Werror -I. -Isrc -I"$prefix/include" \
     tests/test_audio_macos.c src/compat_mac.c -L"$prefix/lib" -Wl,-rpath,"$prefix/lib" \
     -lSDL3 -lm -o out/mac-playability/test-audio
+python3 packaging/macos/sign.py out/mac-playability/test-audio
 arch -x86_64 out/mac-playability/test-audio --timer
 # Real CoreAudio output plays a short 440 Hz tone on the default device: opt-in, so build.sh
 # --test does not sound on the user's speakers.

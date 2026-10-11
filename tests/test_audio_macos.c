@@ -76,6 +76,21 @@ int main(int argc,char **argv) {
     }
     printf("PASS: %s audio, 96 paced buffers, volume, timestamps, EINTR and port reopen\n",timer ? "explicit timer" : "real CoreAudio");
     runtime_audio_report();
+    if (timer) {
+        Port *health=&ports[0];
+        memset(health,0,sizeof(*health));
+        record_queue_health(health,100,0,256);
+        record_queue_health(health,100+AUDIO_WARMUP_NS-1,0,128);
+        assert(atomic_load(&warmup_starvation)==2 && atomic_load(&warmup_silence_frames)==384);
+        record_queue_health(health,100+AUDIO_WARMUP_NS,0,256);
+        record_queue_health(health,101+AUDIO_WARMUP_NS,512,0);
+        record_queue_health(health,102+AUDIO_WARMUP_NS,128,128);
+        assert(atomic_load(&input_starvation)==1 && atomic_load(&inserted_silence_frames)==384);
+        assert(health->health_warned);
+        runtime_audio_report();
+        assert(atomic_load(&input_starvation)==1 && atomic_load(&inserted_silence_frames)==384);
+        puts("PASS: cumulative audio health, warmup boundary, silence accounting, report does not reset");
+    }
     SDL_QuitSubSystem(SDL_INIT_AUDIO);
     return 0;
 }
