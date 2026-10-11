@@ -71,6 +71,18 @@ static void pause_notification(void) {
 }
 static void *paused_signaler(void *unused) { (void)unused; assert(!signal_one(&cond)); return NULL; }
 static void clobber_errno(void) { errno=99; *runtime_errno()=77; }
+/* Cancels the reporting thread while it reports (the cancel is pending until re-enabled). */
+static void cancel_reporter(void) { pthread_cancel(pthread_self()); pthread_testcancel(); }
+static void *cancelled_reporter(void *unused) {
+    (void)unused;
+    assert(!lock(&mutex));
+    atomic_fetch_add(&waiting,1);
+    pthread_cleanup_push(cancel_cleanup,NULL);
+    assert(!wait_cond(&cond,&mutex));
+    pthread_testcancel(); /* the cancel arranged during the report acts here */
+    pthread_cleanup_pop(1);
+    abort(); /* not reached */
+}
 static atomic_int errno_kept;
 static void *errno_waiter(void *unused) {
     (void)unused;
@@ -223,9 +235,9 @@ int main(int argc, char **argv) {
         printf("PASS: %s: cond destroyed and recreated before the woken waiter reacquired: its "
                "check used its own cond's stats\n",mode);
     } else {
-        printf("PASS: %s: (Darwin refused destroying the cond before the woken waiter "
-               "reacquired: %#x; the waiter's check used its own stats)\n",mode,(unsigned)destroyed);
-        if (destroyed) assert(!cond_create(&cond,NULL,"wake-check-2"));
+        printf("UNEXERCISED: %s: Darwin refused destroying the cond before the woken waiter "
+               "reacquired (%#x)\n",mode,(unsigned)destroyed);
+        assert(!cond_create(&cond,NULL,"wake-check-2"));
     }
 
     /* errno and the guest errno kept although the report clobbers them. */
@@ -235,12 +247,29 @@ int main(int argc, char **argv) {
     assert(atomic_load(&errno_kept) && atomic_load(&unnotified)==3);
     printf("PASS: %s: errno and the guest errno kept around the report\n",mode);
 
+    /* A reporter cancelled while it reports: its cleanup releases the guest mutex, and the
+     * diagnostic's lock is free (another candidate is reported, the summary completes). */
+    report_hook_for_test=cancel_reporter;
+    reset();
+    assert(!pthread_create(&a,NULL,cancelled_reporter,NULL));
+    waiters_blocked(1);
+    assert(!pthread_cond_signal(&((GuestCond *)cond)->native));
+    void *cancelled;
+    assert(!pthread_join(a,&cancelled) && cancelled==PTHREAD_CANCELED);
+    report_hook_for_test=NULL;
+    assert(atomic_load(&unnotified)==4);
+    native_wake_of_new_waiter(waiter);
+    assert(atomic_load(&unnotified)==5);
+    runtime_mutex_report();
+    printf("PASS: %s: a reporter cancelled during its report leaves the diagnostic and the guest "
+           "mutex free\n",mode);
+
     /* More than 64 sites: a new cond each (a joined thread's pthread_t can be reused). */
     for (int i=0;i<66;++i) {
         assert(!cond_create(&cond,NULL,"wake-check-site"));
         native_wake_of_new_waiter(waiter);
     }
-    assert(atomic_load(&unnotified)==69 && atomic_load(&untracked)>=1);
+    assert(atomic_load(&unnotified)==71 && atomic_load(&untracked)>=1);
     pthread_mutex_lock(&unnotified_lock);
     report_unnotified_sites_locked();
     pthread_mutex_unlock(&unnotified_lock);

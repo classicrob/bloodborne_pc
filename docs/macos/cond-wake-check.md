@@ -27,7 +27,13 @@ Waits behave the same with the check on or off. Off, no record is made. The chec
 - enrolls nothing per waiter, so a cancelled wait leaves nothing behind;
 - holds no diagnostic lock across a wait;
 - never takes the guest mutex in signal or broadcast;
-- keeps errno and the guest errno around its own work.
+- keeps errno and the guest errno around its own work;
+- disables cancellation while it holds its own lock to report, so a cancelled reporter cannot
+  leave that lock held.
+
+The records are kept for the life of the process (per-cond growth while the check is on). Sites
+are keyed by pthread identity; a pthread_t reused after a thread exits merges the two histories
+when the caller and cond also match.
 
 Native signal and broadcast failures are counted separately.
 
@@ -74,4 +80,7 @@ It also checks:
 - Broadcast, then destroy and recreate the cond before the woken waiter reacquires the mutex:
   the waiter checks its own record.
 - errno and the guest errno are kept although the report clobbers them.
+- A reporter cancelled during its report: the guest mutex is released by its cleanup, and
+  another candidate is reported and the summary completes.
 - More than 64 sites: the rest are counted.
+- If Darwin refuses the destroy, that control prints UNEXERCISED instead of PASS.

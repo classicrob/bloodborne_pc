@@ -192,6 +192,10 @@ static void note_wake(const CondStats *s, uint64_t started_before, uint64_t comp
     const int saved_errno=errno;
     int32_t *guest_errno=runtime_errno();
     const int32_t guest_saved=*guest_errno;
+    /* The report's output can reach cancellation points: a cancelled reporter must not leave
+     * unnotified_lock held. Restored after unlocking. */
+    int cancel_state;
+    pthread_setcancelstate(PTHREAD_CANCEL_DISABLE,&cancel_state);
     const uint64_t n=atomic_fetch_add(&unnotified,1)+1;
     const uintptr_t caller=sync_return_slot ? runtime_hle_trace_original_return(sync_return_slot) : 0;
     const pthread_t self=pthread_self();
@@ -224,6 +228,7 @@ static void note_wake(const CondStats *s, uint64_t started_before, uint64_t comp
     pthread_mutex_unlock(&unnotified_lock);
     *guest_errno=guest_saved;
     errno=saved_errno;
+    pthread_setcancelstate(cancel_state,NULL);
 }
 #else
 static void note_wake(const CondStats *s, uint64_t started_before, uint64_t completed_before) {
@@ -420,7 +425,12 @@ void runtime_mutex_report(void) {
     printf("Runtime: condition variables created=%zu, waits=%zu, wakeups=%zu\n", atomic_load_explicit(&conds,memory_order_relaxed),
            atomic_load_explicit(&waits,memory_order_relaxed), atomic_load_explicit(&wakeups,memory_order_relaxed));
 #ifdef __APPLE__
-    if (wake_check) { pthread_mutex_lock(&unnotified_lock); report_unnotified_sites_locked(); pthread_mutex_unlock(&unnotified_lock); }
+    if (wake_check) {
+        int cancel_state; /* the summary's output can reach cancellation points */
+        pthread_setcancelstate(PTHREAD_CANCEL_DISABLE,&cancel_state);
+        pthread_mutex_lock(&unnotified_lock); report_unnotified_sites_locked(); pthread_mutex_unlock(&unnotified_lock);
+        pthread_setcancelstate(cancel_state,NULL);
+    }
 #endif
 }
 
