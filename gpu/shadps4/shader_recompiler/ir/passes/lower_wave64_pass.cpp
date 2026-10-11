@@ -346,6 +346,20 @@ void LowerWave64Graphics(IR::Program& program) {
     }
 }
 
+// Whether `lane` is the frontend's first-active-lane selector (V_READFIRSTLANE_B32 in compute):
+// BallotFindLsb(Ballot(x)), optionally behind Select(mask == 0, 0, ...). The lane it names
+// executes this instruction (a ballot only has bits of executing invocations).
+bool IsFirstActiveLane(const IR::Value& lane) {
+    const IR::Inst* inst = lane.TryInst();
+    if (inst && inst->GetOpcode() == IR::Opcode::SelectU32 && inst->Arg(1).IsImmediate() &&
+        inst->Arg(1).U32() == 0) {
+        inst = inst->Arg(2).TryInst();
+    }
+    if (!inst || inst->GetOpcode() != IR::Opcode::BallotFindLsb) return false;
+    const IR::Inst* mask = inst->Arg(0).TryInst();
+    return mask && mask->GetOpcode() == IR::Opcode::Ballot;
+}
+
 // Whether every consumer of `inst` (through phis and 32/64-bit packing) is the old-destination
 // operand of a scalar buffer load (ReadConstBuffer arg 2: the SDST value kept for out-of-range
 // dwords). Collects the pass-through instructions in `chain`.
@@ -378,6 +392,20 @@ void LowerWave64Compute(IR::Program& program, const RuntimeInfo& runtime_info, c
     const auto [size_x, size_y, size_z] = runtime_info.hw.cs.workgroup_size;
     const u32 num_threads = size_x * size_y * size_z;
     const u32 num_waves = (num_threads + 63) / 64;
+    // A workgroup of at most one subgroup is one GCN wave (lanes beyond the workgroup absent) that
+    // runs as one subgroup. Its wave operations are built from LocalInvocationIndex and subgroup
+    // reductions over the executing invocations (exact in any control flow, and independent of the
+    // order the driver numbers subgroup invocations in); no shared memory or barrier.
+    // Lane-index exchanges (shuffles) would need the invocation order: such shaders keep the
+    // shared-memory exchange (exact in workgroup-uniform flow, loud elsewhere).
+    bool lane_exchange = false;
+    for (const IR::Block* block : program.blocks) {
+        for (const IR::Inst& inst : block->Instructions()) {
+            const auto op = inst.GetOpcode();
+            lane_exchange |= op == IR::Opcode::Shuffle || op == IR::Opcode::ShuffleXor || op == IR::Opcode::QuadBroadcast;
+        }
+    }
+    const bool single_subgroup = num_threads <= profile.subgroup_size && !lane_exchange;
     const WorkgroupUniformity uniformity{program, num_waves <= 1};
     const auto uniform_blocks = FindWorkgroupUniformBlocks(program, uniformity);
 
@@ -389,7 +417,7 @@ void LowerWave64Compute(IR::Program& program, const RuntimeInfo& runtime_info, c
     // divergent cross-lane value, the shader takes the other accepted reading of §7.4 for all of
     // its scalar buffer loads (out-of-range dwords read 0; tests/gcn_buffer_conformance/SPEC.md
     // SMEM_ZERO) and the masks become dead. Any other divergent use stays a hard error.
-    {
+    if (!single_subgroup) {
         std::vector<IR::Inst*> divergent_cross_lane, chain;
         bool all_fallback = true;
         for (IR::Block* block : program.blocks) {
@@ -426,7 +454,26 @@ void LowerWave64Compute(IR::Program& program, const RuntimeInfo& runtime_info, c
         const bool block_uniform = std::ranges::contains(uniform_blocks, block);
         for (IR::Inst& inst : block->Instructions()) {
             const auto op = inst.GetOpcode();
-            if (IsCrossLane(op)) {
+            if (IsCrossLane(op) && single_subgroup) {
+                if (op == IR::Opcode::ReadLane) {
+                    const IR::Value lane = inst.Arg(1);
+                    if (lane.IsImmediate()) {
+                        // v_readlane reads the lane whatever exec says: only exact when it executes here
+                        ASSERT_MSG(lane.U32() < num_threads && block_uniform,
+                                   "Apple wave64: v_readlane of lane {} in a {}-invocation workgroup "
+                                   "({}): shader={:#x}",
+                                   lane.U32(), num_threads,
+                                   lane.U32() < num_threads ? "workgroup-divergent flow" : "never launched",
+                                   info.pgm_hash);
+                    } else {
+                        ASSERT_MSG(IsFirstActiveLane(lane),
+                                   "Apple wave64: v_readlane with a dynamic lane in a {}-invocation "
+                                   "workgroup (only the first active lane is known to execute): shader={:#x}",
+                                   num_threads, info.pgm_hash);
+                    }
+                }
+                cross_lane.push_back(&inst);
+            } else if (IsCrossLane(op)) {
                 ASSERT_MSG(block_uniform,
                            "Apple wave64: {} in workgroup-divergent control flow cannot be "
                            "emulated on 32-wide subgroups: shader={:#x} workgroup={}x{}x{}",
@@ -455,7 +502,7 @@ void LowerWave64Compute(IR::Program& program, const RuntimeInfo& runtime_info, c
     const u32 value_base = mask_base + num_waves * 2 * 4;
     const u32 lane_base = value_base + num_waves * 4;
     const u32 end = lane_base + (needs_lane_values ? num_waves * 64 * 4 : 0);
-    if (!cross_lane.empty()) {
+    if (!cross_lane.empty() && !single_subgroup) {
         // The scratch is accessed as 32-bit words. Guest LDS of another single type would make a
         // second workgroup type, which needs VK_KHR_workgroup_memory_explicit_layout.
         bool guest_non_u32 = false;
@@ -558,7 +605,41 @@ void LowerWave64Compute(IR::Program& program, const RuntimeInfo& runtime_info, c
         }
         }
     }
+    // One subgroup: each executing lane adds its own bit (bits are disjoint, so the sum is the
+    // mask), or the target lane alone adds its value.
+    const auto subgroup_ballot = [&](IR::IREmitter& ir, const Lanes& l, const IR::U1& pred) -> IR::U64 {
+        const IR::U32 lo = ir.GroupIAdd(IR::U32{ir.Select(pred, l.bit, ir.Imm32(0))});
+        return ir.PackUint2x32(ir.CompositeConstruct(lo, ir.Imm32(0)));
+    };
+    const auto subgroup_read_lane = [&](IR::IREmitter& ir, const Lanes& l, const IR::U32& value,
+                                        const IR::U32& target) -> IR::U32 {
+        return ir.GroupIAdd(IR::U32{ir.Select(ir.IEqual(l.lane, target), value, ir.Imm32(0))});
+    };
     for (IR::Inst* inst : cross_lane) {
+        if (!single_subgroup) continue;
+        IR::IREmitter ir{*inst->GetParent(), IR::Block::InstructionList::s_iterator_to(*inst)};
+        const Lanes l = lanes(ir);
+        switch (inst->GetOpcode()) {
+        case IR::Opcode::Ballot:
+            inst->ReplaceUsesWithAndRemove(subgroup_ballot(ir, l, IR::U1{inst->Arg(0)}));
+            break;
+        case IR::Opcode::GroupAny: // already independent of the invocation order
+            break;
+        case IR::Opcode::ReadLane:
+            inst->ReplaceUsesWithAndRemove(subgroup_read_lane(ir, l, IR::U32{inst->Arg(0)}, IR::U32{inst->Arg(1)}));
+            break;
+        case IR::Opcode::ReadFirstLane: {
+            const IR::U64 exec = subgroup_ballot(ir, l, ir.Imm1(true));
+            const IR::U32 first{ir.Select(ir.IEqual(exec, ir.Imm64(u64{0})), ir.Imm32(0), find_lsb64(ir, exec))};
+            inst->ReplaceUsesWithAndRemove(subgroup_read_lane(ir, l, IR::U32{inst->Arg(0)}, first));
+            break;
+        }
+        default:
+            UNREACHABLE();
+        }
+    }
+    for (IR::Inst* inst : cross_lane) {
+        if (single_subgroup) break;
         IR::IREmitter ir{*inst->GetParent(), IR::Block::InstructionList::s_iterator_to(*inst)};
         const Lanes l = lanes(ir);
         switch (inst->GetOpcode()) {

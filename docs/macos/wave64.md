@@ -10,6 +10,19 @@ Apple in `vk_pipeline_cache.cpp`) makes `lower_wave64_pass.cpp` rebuild every wa
   workgroup at the barrier, so it is used only in workgroup-uniform control flow (a fixed-point
   uniformity analysis with control dependence: divergent ifs, loops with divergent exits,
   breaks under divergent ifs).
+- **Compute workgroups of at most one subgroup** (<= 32 invocations, e.g. 16x1x1 or 4x4x2) whose
+  shader has no lane-index exchange (shuffles): the workgroup is one GCN wave whose lanes beyond the
+  workgroup size do not exist. Its wave operations are built from LocalInvocationIndex and
+  subgroup reductions over the executing invocations (OpGroupNonUniformIAdd): a ballot is the sum
+  of each executing lane's own bit 1 << LocalInvocationIndex, a v_readlane the sum of the target
+  lane's value alone. That is exact in any control flow (inactive lanes do not contribute, as on
+  GCN) and does not depend on how the driver numbers subgroup invocations (Vulkan does not
+  promise SubgroupLocalInvocationId == LocalInvocationIndex without full subgroups). It only
+  relies on the whole workgroup being one subgroup (workgroup size <= subgroupSize, 32 on M4).
+  v_readlane must name a lane that executes the instruction: an immediate launched lane in
+  workgroup-uniform flow, or the first active lane (v_readfirstlane); anything else is a hard
+  error. Per-lane operations (lane id, v_writelane, inverse ballot, mask find) use the same
+  lowering as larger workgroups.
 - **Graphics**: a 32-lane subgroup is a legal partially populated wave (lanes 32-63 inactive), so
   subgroup semantics are kept, except reading a lane that may be >= 32, which is a hard error.
 

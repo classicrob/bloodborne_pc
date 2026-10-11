@@ -59,6 +59,10 @@ Id EmitInverseBallot(EmitContext& ctx, Id mask) {
     return ctx.OpGroupNonUniformInverseBallot(ctx.U1[1], SubgroupScope(ctx), value);
 }
 
+Id EmitGroupIAdd(EmitContext& ctx, Id value) {
+    return ctx.OpGroupNonUniformIAdd(ctx.U32[1], SubgroupScope(ctx), spv::GroupOperation::Reduce, value);
+}
+
 Id EmitGroupAny(EmitContext& ctx, Id bit) {
     return ctx.OpGroupNonUniformAny(ctx.U1[1], SubgroupScope(ctx), bit);
 }
