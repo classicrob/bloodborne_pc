@@ -35,13 +35,13 @@ With `BB_MOVIE_HANDOFF=1` (src/runtime_movie_handoff.c), only that one sleep is 
 wait for GX's done event.
 - **Done is read only under the event's mutex** (event+8, through the engine's own mutex
   imports 0x2bbfef8/0x2bbff08).
-- **While it is clear, the step waits on the event's condition** through the engine's wait
-  method (event vtable +0x18 = 0x207e8f0), in 100 ms slices.
-  - That method waits once and returns 0 for any wake, so 0 is never taken as done. Done is
-    checked again under the mutex.
+- **While it is clear, the step sleeps 250 µs and checks again.** It does not wait on the event's
+  condition: every FPS++ patch preset turns the engine's timed condition wait (helper 0x2083e80,
+  its call at 0x2083ec1) into a mid-function `ret`, so a timed wait through it would crash, and
+  an untimed one could not be bounded. Polling under the mutex reads the same synchronized state
+  and writes nothing of the guest's.
   - A 5 s deadline is checked after every check of done, so done seen only past it still
-    stops. It bounds repeated waits that return; it is not a watchdog against a lock or wait
-    that never returns.
+    stops. It bounds the polling; it is not a watchdog against a lock that never returns.
 - **If GX already finished within the 20 ms**, done is set and nothing waits.
 - **If only the main thread kicks GX** (not established, see below), no kick can come between
   the wait and the draw. The draw then follows GX's frame.
@@ -67,15 +67,15 @@ Output (stdout):
   - any code range the hook relies on differs from the analysed 01.09 image (FNV-1a per
     range, naming the range). The ranges cover the movie step, the sleep and mutex import
     stubs, GX's done set and kick wait, the kick in both modes, the kick wrapper, the event's
-    set, its wait method through unlock and return, and the condition-wait helper (0x2083e80:
-    microseconds, -1, timeout -3);
+    set, and its wait method through unlock and return (the event type check). The FPS++-patched
+    condition-wait helper 0x2083e80 is not relied on, so an FPS++ image passes;
   - the image is too small for the slots read;
   - the movie step's import slot is not the runtime's usleep, possibly wrapped by the trace;
   - `BB_MOVIE_HANDOFF` is something other than `0` or `1`.
 - At a movie step:
   - R or G is null;
   - the done event is not initialized, or its wait method is not 0x207e8f0;
-  - locking or unlocking the event's mutex fails, or a wait fails;
+  - locking or unlocking the event's mutex fails;
   - GX's frame is not done within 5 s, whether the waits time out, wake without done, or see
     done only after the deadline.
 
