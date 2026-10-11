@@ -18,6 +18,7 @@
 #include <vector>
 #include <mutex>
 #ifdef __APPLE__
+#include "bbport_deferred_counts.h"
 #include "bbport_label_sequencer.h"
 #endif
 #include <thread>
@@ -883,7 +884,7 @@ public:
     void WaitRecorderSignals();
     /// Completion labels issued so far, and the timeline tick the last one waits for.
     [[nodiscard]] u64 LabelsIssued() const noexcept {
-        return labels_issued.load(std::memory_order_relaxed);
+        return completion_labels.Issued();
     }
     [[nodiscard]] u64 LastLabelTick() const noexcept {
         return last_label_tick.load(std::memory_order_relaxed);
@@ -1026,10 +1027,10 @@ private:
     /// and when the oldest was recorded. Set by the recording thread, cleared by a submission.
     std::atomic<bool> labels_unflushed{false};
     u64 unflushed_tick = 0;
-    /// Of deferred_signals_issued/done, the completion labels (issued by the recording thread,
-    /// written by LabelThread, which counts them here before deferred_signals_done).
-    std::atomic<u64> labels_issued{0};
-    std::atomic<u64> labels_written{0};
+    /// Of deferred_signals_issued/done, by kind (bbport_deferred_counts.h): the recorder-side
+    /// writes and the completion labels, each counted on its own.
+    BbDeferred::Count recorder_signals;
+    BbDeferred::Count completion_labels;
     std::atomic<u64> last_label_tick{0};
     std::chrono::steady_clock::time_point unflushed_since{};
     std::once_flag label_thread_once;

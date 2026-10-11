@@ -274,6 +274,9 @@ void Liverpool::Process(std::stop_token stoken) {
 #ifdef __APPLE__
             {
                 std::scoped_lock lk{submit_mutex};
+                // This frame end's own sceGnmSubmitDone time, taken with the flag it set (a
+                // later SubmitDone may overwrite submit_done_at before GpuIdle).
+                idle_split_frame_submit_done = submit_done_at;
                 if (++parse_lag.frames == 600) {
                     const double samples = parse_lag.samples ? double(parse_lag.samples) : 1.0;
                     // Printed like the Stall lines: Info-level logging is filtered in perf runs.
@@ -369,8 +372,12 @@ void Liverpool::NoteIdleSplit(u64 drain_ns, u64 recorder_ns, u64 labels_ns) {
     // Under submit_mutex, with GpuIdle just raised for a frame end.
     auto& s = idle_split;
     const u64 total_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                             std::chrono::steady_clock::now() - submit_done_at)
+                             std::chrono::steady_clock::now() - idle_split_frame_submit_done)
                              .count();
+    if (total_ns < drain_ns + recorder_ns + labels_ns) {
+        ++s.unpaired; // the parts were not all after this SubmitDone: not a frame-end sample
+        return;
+    }
     s.total_ns += total_ns;
     s.total_ns_max = std::max(s.total_ns_max, total_ns);
     s.drain_ns += drain_ns;
@@ -390,17 +397,18 @@ void Liverpool::NoteIdleSplit(u64 drain_ns, u64 recorder_ns, u64 labels_ns) {
         return;
     }
     const double n = double(s.frames);
-    const u64 parts = s.drain_ns + s.recorder_ns + s.labels_ns;
+    const u64 parts = s.drain_ns + s.recorder_ns + s.labels_ns; // each sample's total >= its parts
     // Printed like the Stall lines: Info-level logging is filtered in perf runs.
     fmt::print("GpuIdle split, last 600 frame ends: sceGnmSubmitDone to GpuIdle {:.2f} ms mean "
                "({:.2f} max) = parse and queue {:.2f} + stage-B drain {:.2f} + recorder writes "
-               "{:.2f} + completion labels {:.2f} ms; of the frames with labels, those whose last GPU "
-               "submission follows the frame's last label {} (mean {:.1f} ticks); frames "
-               "without a label {}\n",
-               s.total_ns / n / 1e6, s.total_ns_max / 1e6,
-               (s.total_ns > parts ? s.total_ns - parts : 0) / n / 1e6, s.drain_ns / n / 1e6,
-               s.recorder_ns / n / 1e6, s.labels_ns / n / 1e6, s.tail_frames,
-               s.tail_frames ? double(s.tail_ticks) / s.tail_frames : 0.0, s.unlabeled_frames);
+               "{:.2f} + completion labels {:.2f} ms; of the GpuIdles with a completion label "
+               "issued since the previous reported one, those whose last GPU submission follows "
+               "that last label {} (mean {:.1f} ticks); without one {}; samples excluded as "
+               "unpaired {}\n",
+               s.total_ns / n / 1e6, s.total_ns_max / 1e6, (s.total_ns - parts) / n / 1e6,
+               s.drain_ns / n / 1e6, s.recorder_ns / n / 1e6, s.labels_ns / n / 1e6,
+               s.tail_frames, s.tail_frames ? double(s.tail_ticks) / s.tail_frames : 0.0,
+               s.unlabeled_frames, s.unpaired);
     std::fflush(stdout);
     const u64 keep = s.labels_issued_before;
     s = {};

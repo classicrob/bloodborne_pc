@@ -14,6 +14,7 @@
 #include <mutex>
 #include <thread>
 #include <vector>
+#include "bbport_deferred_counts.h"
 #include "bbport_label_check.h"
 #include "bbport_label_store.h"
 #include "bbport_label_sequencer.h"
@@ -185,6 +186,45 @@ int main() {
                    !std::memcmp(&bytes[17], &one, 4) && !std::memcmp(&bytes[22], two, 8) &&
                    !std::memcmp(three_at, three, 12) && bytes[4] == 0xEE &&
                    bytes[16] == 0xEE && bytes[21] == 0xEE && bytes[30] == 0xEE);
+    }
+
+    // The recorder-side and label counts are separate (bbport_deferred_counts.h): a recorder
+    // write still held is not complete, whichever way a concurrent label's two counters move.
+    {
+        BbDeferred::Count recorder, labels;
+        std::atomic<std::uint64_t> total_done{0};
+        const std::uint64_t held = recorder.Issue(); // its callback has not run
+        labels.Issue();
+        labels.Complete(); // label counted written, its total not yet
+        const bool written_first = !recorder.CompleteThrough(held);
+        total_done.fetch_add(1);
+        const bool both = !recorder.CompleteThrough(held);
+        Expect("a held recorder write is not complete while a label is written, then counted",
+               written_first && both);
+        labels.Issue();
+        total_done.fetch_add(1); // the other order: total first
+        labels.Complete();
+        Expect("  ... nor with the label's counters moving in the other order",
+               !recorder.CompleteThrough(held));
+        std::atomic<bool> release{false};
+        std::thread callback([&] {
+            while (!release.load()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            recorder.Complete();
+            total_done.fetch_add(1);
+        });
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        const bool blocked = !recorder.CompleteThrough(held);
+        release.store(true);
+        bool completed = false;
+        for (int i = 0; i < 1000 && !completed; ++i) {
+            completed = recorder.CompleteThrough(held);
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        callback.join();
+        Expect("  ... the recorder wait stays blocked until its callback completes, then ends",
+               blocked && completed);
     }
 
     std::fprintf(stderr, "%s: %u failures\n", failures ? "FAIL" : "PASS", failures);

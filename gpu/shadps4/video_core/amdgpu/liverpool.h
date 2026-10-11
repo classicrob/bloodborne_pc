@@ -102,10 +102,11 @@ struct Liverpool {
     /// GpuIdle: from the guest's sceGnmSubmitDone to GpuIdle, and its parts (GPU thread only).
     struct IdleSplitStats {
         u64 frames{}, total_ns{}, total_ns_max{}, drain_ns{}, recorder_ns{}, labels_ns{};
-        u64 tail_frames{}, tail_ticks{}, unlabeled_frames{};
+        u64 tail_frames{}, tail_ticks{}, unlabeled_frames{}, unpaired{};
         u64 labels_issued_before{};
     } idle_split;
     std::chrono::steady_clock::time_point submit_done_at{}; ///< under submit_mutex
+    std::chrono::steady_clock::time_point idle_split_frame_submit_done{}; ///< GPU thread
     void NoteIdleSplit(u64 drain_ns, u64 recorder_ns, u64 labels_ns);
     /// bbport (macOS): graphics submissions whose command memory is a submit-time copy and not
     /// fully parsed yet (cmd_snapshot.h), in submission order.
