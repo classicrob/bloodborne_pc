@@ -45,6 +45,9 @@ for p in "${pids[@]}"; do wait "$p" || { echo "compile failed" >&2; exit 1; }; d
 for f in flat.frag list.vert; do
     glslangValidator -V --target-env vulkan1.3 -o "$out/$f.spv" "$here/$f" >/dev/null
 done
+# The production setup kernel of indirect ES/GS draws.
+glslangValidator -V --target-env vulkan1.3 -o "$out/gs_indirect_setup.comp.spv" \
+    "$root/gpu/shadps4/video_core/host_shaders/gs_indirect_setup.comp" >/dev/null
 "${cxx[@]}" -O1 -c "$root/tests/test_gpu_runtime_stubs.cpp" -o "$obj/stubs.o"
 /usr/bin/clang++ -arch x86_64 -Wl,-export_dynamic "$obj/compile_roles.o" "$obj/stubs.o" "${objs[@]}" \
     "$gpu_build/libbbgpu.dylib" -L"$deps/lib" -lfmt \

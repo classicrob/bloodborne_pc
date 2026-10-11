@@ -217,6 +217,9 @@ private:
     u64 prepared_hits = 0, prepared_misses = 0;
     const PreparedDraw* used_prepared = nullptr;
     tsl::robin_map<ComputePipelineKey, std::unique_ptr<ComputePipeline>> compute_pipelines;
+    /// bbport (Apple): ES/GS compute pipelines of emulated geometry stages, keyed by stage
+    /// permutation and shared by the graphics pipelines using them (vk_gs_emulation.h).
+    tsl::robin_map<size_t, std::unique_ptr<ComputePipeline>> gs_compute_pipelines;
     tsl::robin_map<GraphicsPipelineKey, std::unique_ptr<GraphicsPipeline>> graphics_pipelines;
     PipelineSelection sel{}; ///< GPU thread selection state
     ComputePipelineKey compute_key{};

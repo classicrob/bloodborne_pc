@@ -505,11 +505,16 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
             // cache (its records cannot rebuild them); compiled again in each session.
             const auto& regs = *sel.regs;
             const auto compute = [&](const PipelineSelection::GsEmulationProgram& program) {
-                ComputePipeline::SerializationSupport compute_sdata{};
-                return std::make_unique<ComputePipeline>(
-                    instance, scheduler, desc_heap, profile, *pipeline_cache,
-                    ComputePipelineKey{program.hash}, *program.info, program.module, compute_sdata,
-                    false);
+                // Shared by every graphics pipeline using this ES/GS permutation.
+                auto& shared = gs_compute_pipelines[program.hash];
+                if (!shared) {
+                    ComputePipeline::SerializationSupport compute_sdata{};
+                    shared = std::make_unique<ComputePipeline>(
+                        instance, scheduler, desc_heap, profile, *pipeline_cache,
+                        ComputePipelineKey{program.hash}, *program.info, program.module,
+                        compute_sdata, false);
+                }
+                return static_cast<const ComputePipeline*>(shared.get());
             };
             auto stages = std::make_unique<GsEmulationStages>();
             stages->es = compute(sel.gs_es);

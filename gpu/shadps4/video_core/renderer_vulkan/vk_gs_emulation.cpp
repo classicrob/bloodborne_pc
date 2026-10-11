@@ -9,11 +9,13 @@
 #include "common/div_ceil.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/buffer_cache/buffer_cache.h"
+#include "video_core/host_shaders/gs_indirect_setup_comp.h"
 #include "video_core/renderer_vulkan/vk_gs_emulation.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/renderer_vulkan/vk_shader_util.h"
 
 namespace Vulkan {
 
@@ -158,52 +160,279 @@ GsEmulationDraw Rasterizer::RecordGsEmulation(const GraphicsPipeline* pipeline,
     if (prims == 0) {
         return {};
     }
+    std::optional<RenderState> ended_pass;
     if (scheduler.IsRendering()) {
-        gs_stats.splits.fetch_add(1, std::memory_order_relaxed);
+        ended_pass = scheduler.GetRenderState();
     }
 
-    const auto dispatch = [&](const ComputePipeline& compute, u32 groups_x, u32 groups_y) {
-        const bool bound = BindResources(&compute);
-        ASSERT_MSG(bound, "macOS geometry emulation: binding the {} stage failed",
-                   &compute == stages.es.get() ? "ES" : "GS");
-        if (needs_barrier) {
-            runtime.FlushBarriers();
-        }
-        scheduler.EndRendering();
-        compute.BindResources(set_writes, push_data);
-        const vk::Pipeline handle = compute.Handle();
-        scheduler.Record([=](vk::CommandBuffer cmdbuf) {
-            cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, handle);
-            cmdbuf.dispatch(groups_x, groups_y, 1);
-        });
-        ResetBindings(true);
-        gs_stats.dispatches.fetch_add(1, std::memory_order_relaxed);
-    };
-    const auto barrier = [&](vk::PipelineStageFlags2 dst_stage, vk::AccessFlags2 dst_access) {
-        scheduler.Record([=](vk::CommandBuffer cmdbuf) {
-            const vk::MemoryBarrier2 memory = {
-                .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
-                .srcAccessMask = vk::AccessFlagBits2::eShaderStorageWrite,
-                .dstStageMask = dst_stage,
-                .dstAccessMask = dst_access,
-            };
-            cmdbuf.pipelineBarrier2(vk::DependencyInfo{
-                .memoryBarrierCount = 1,
-                .pMemoryBarriers = &memory,
-            });
-        });
-    };
-
-    dispatch(*stages.es, Common::DivCeil(records, GsEmu::WorkgroupSize), instances);
-    barrier(vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderStorageRead);
-    dispatch(*stages.gs, Common::DivCeil(prims, GsEmu::WorkgroupSize),
-             instances * stages.invocations);
-    barrier(vk::PipelineStageFlagBits2::eVertexShader | vk::PipelineStageFlagBits2::eIndexInput,
-            vk::AccessFlagBits2::eShaderStorageRead | vk::AccessFlagBits2::eIndexRead);
+    RecordGsDispatch(*stages.es, Common::DivCeil(records, GsEmu::WorkgroupSize), instances);
+    RecordGsBarrier(vk::PipelineStageFlagBits2::eComputeShader,
+                    vk::AccessFlagBits2::eShaderStorageRead);
+    RecordGsDispatch(*stages.gs, Common::DivCeil(prims, GsEmu::WorkgroupSize),
+                     instances * stages.invocations);
+    RecordGsBarrier(vk::PipelineStageFlagBits2::eVertexShader |
+                        vk::PipelineStageFlagBits2::eIndexInput,
+                    vk::AccessFlagBits2::eShaderStorageRead | vk::AccessFlagBits2::eIndexRead);
 
     return {.index_buffer = stream.Handle(),
             .index_offset = scratch_offset + index_base * 4,
-            .index_count = u32(slots * stages.run_length)};
+            .index_count = u32(slots * stages.run_length),
+            .ended_pass = ended_pass};
+}
+
+void Rasterizer::RecordGsDispatch(const ComputePipeline& compute, u32 groups_x, u32 groups_y,
+                                  vk::Buffer indirect, u64 indirect_offset) {
+    const auto& stages = compute.GetStage(Shader::SwStage::Compute);
+    const bool bound = BindResources(&compute);
+    ASSERT_MSG(bound, "macOS geometry emulation: binding the {} stage failed",
+               stages.hw_stage == Shader::HwStage::Export ? "ES" : "GS");
+    if (needs_barrier) {
+        runtime.FlushBarriers();
+    }
+    scheduler.EndRendering();
+    compute.BindResources(set_writes, push_data);
+    const vk::Pipeline handle = compute.Handle();
+    scheduler.Record([=](vk::CommandBuffer cmdbuf) {
+        cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, handle);
+        if (indirect) {
+            cmdbuf.dispatchIndirect(indirect, indirect_offset);
+        } else {
+            cmdbuf.dispatch(groups_x, groups_y, 1);
+        }
+    });
+    ResetBindings(true);
+    gs_stats.dispatches.fetch_add(1, std::memory_order_relaxed);
+}
+
+void Rasterizer::RecordGsBarrier(vk::PipelineStageFlags2 dst_stage, vk::AccessFlags2 dst_access) {
+    scheduler.Record([=](vk::CommandBuffer cmdbuf) {
+        const vk::MemoryBarrier2 memory = {
+            .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+            .srcAccessMask = vk::AccessFlagBits2::eShaderStorageWrite,
+            .dstStageMask = dst_stage,
+            .dstAccessMask = dst_access,
+        };
+        cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+            .memoryBarrierCount = 1,
+            .pMemoryBarriers = &memory,
+        });
+    });
+}
+
+namespace {
+/// errors[] of gs_indirect_setup.comp: reports, largest scratch dwords asked for, index overruns,
+/// guest address (low, high) of the indirect arguments of the last draw reported.
+constexpr u32 ErrorDwords = 8;
+/// Scratch range of one indirect ES/GS draw (its counts are only known to the GPU) and the ring
+/// they come from.
+constexpr u64 IndirectScratchBytes = 32_MB;
+constexpr u64 IndirectRingBytes = 256_MB;
+
+struct SetupKernel {
+    vk::UniqueDescriptorSetLayout set_layout;
+    vk::UniquePipelineLayout layout;
+    vk::UniquePipeline pipeline;
+};
+
+struct SetupParams {
+    u32 args_skip, indexed, index_kind, index_skip, index_count;
+    u32 verts_per_prim, invocations, max_vert_out, esgs_dwords, vertex_dwords, run_length;
+    u32 capacity_dwords;
+    u32 args_address_lo, args_address_hi;
+};
+} // namespace
+
+void Rasterizer::CheckGsEmulationErrors() {
+    if (!gs_errors) {
+        return;
+    }
+    const auto* errors = reinterpret_cast<const volatile u32*>(gs_errors->mapped_data.data());
+    ASSERT_MSG(errors[0] == 0,
+               "macOS geometry emulation: {} indirect ES/GS draw(s) could not be emulated, the "
+               "last with arguments at {:#x} (largest scratch need {} dwords of {}; {} read past "
+               "the index buffer)",
+               errors[0], u64(errors[3]) | (u64(errors[4]) << 32), errors[1],
+               IndirectScratchBytes / 4, errors[2]);
+}
+
+GsEmulationDraw Rasterizer::RecordGsEmulationIndirect(const GraphicsPipeline* pipeline,
+                                                      const AmdGpu::Regs& regs, bool is_indexed,
+                                                      VAddr args, u32 stride, u32 max_count,
+                                                      VAddr count_address) {
+    ASSERT_MSG(count_address == 0 && max_count == 1,
+               "macOS geometry emulation: multi-draw indirect ES/GS draw (count at {:#x}, max {})",
+               count_address, max_count);
+    CheckGsEmulationErrors();
+    const auto& stages = *pipeline->GsEmulation();
+    const auto device = instance.GetDevice();
+    const u64 alignment = instance.StorageMinAlignment();
+    static const SetupKernel kernel = [&] {
+        SetupKernel k;
+        std::array<vk::DescriptorSetLayoutBinding, 3> bindings{};
+        for (u32 i = 0; i < bindings.size(); ++i) {
+            bindings[i] = {.binding = i,
+                           .descriptorType = vk::DescriptorType::eStorageBuffer,
+                           .descriptorCount = 1,
+                           .stageFlags = vk::ShaderStageFlagBits::eCompute};
+        }
+        auto [layout_result, set_layout] = device.createDescriptorSetLayoutUnique({
+            .flags = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR,
+            .bindingCount = static_cast<u32>(bindings.size()),
+            .pBindings = bindings.data(),
+        });
+        ASSERT(layout_result == vk::Result::eSuccess);
+        k.set_layout = std::move(set_layout);
+        const vk::PushConstantRange range{.stageFlags = vk::ShaderStageFlagBits::eCompute,
+                                          .offset = 0,
+                                          .size = sizeof(SetupParams)};
+        auto [pipeline_layout_result, pipeline_layout] = device.createPipelineLayoutUnique({
+            .setLayoutCount = 1,
+            .pSetLayouts = &*k.set_layout,
+            .pushConstantRangeCount = 1,
+            .pPushConstantRanges = &range,
+        });
+        ASSERT(pipeline_layout_result == vk::Result::eSuccess);
+        k.layout = std::move(pipeline_layout);
+        const auto module = CompileSPV(GS_INDIRECT_SETUP_COMP, device);
+        auto [pipeline_result, compute] = device.createComputePipelineUnique(
+            {}, vk::ComputePipelineCreateInfo{
+                    .stage = {.stage = vk::ShaderStageFlagBits::eCompute,
+                              .module = module,
+                              .pName = "main"},
+                    .layout = *k.layout,
+                });
+        ASSERT(pipeline_result == vk::Result::eSuccess);
+        k.pipeline = std::move(compute);
+        device.destroyShaderModule(module);
+        return k;
+    }();
+    if (!gs_indirect_scratch) {
+        gs_indirect_scratch = std::make_unique<VideoCore::StreamBuffer>(
+            instance, scheduler, VideoCore::MemoryType::Stream, IndirectRingBytes);
+        gs_errors = std::make_unique<VideoCore::Buffer>(instance, 0, ErrorDwords * 4,
+                                                        VideoCore::MemoryType::Stream,
+                                                        "GsEmulationErrors");
+        ASSERT_MSG(!gs_errors->mapped_data.empty(), "macOS geometry emulation: error words unmapped");
+        std::memset(gs_errors->mapped_data.data(), 0, ErrorDwords * 4);
+    }
+
+    // The guest's indirect command, from its storage-aligned start.
+    ASSERT(stride == (is_indexed ? sizeof(VkDrawIndexedIndirectCommand)
+                                 : sizeof(VkDrawIndirectCommand)));
+    const auto [args_buffer, args_offset] = buffer_cache.ObtainBuffer(args, stride, false);
+    needs_barrier |= runtime.IsBufferAccessed(args_buffer, args_offset, stride);
+    const u64 args_bind = Common::AlignDown(args_offset, alignment);
+    ASSERT_MSG((args_offset - args_bind) % 4 == 0,
+               "macOS geometry emulation: indirect arguments at {:#x} are not dword aligned", args);
+
+    // Scratch: the setup kernel writes header and commands; the records follow.
+    const auto scratch_offset = gs_indirect_scratch->Reserve(IndirectScratchBytes, alignment);
+    ASSERT_MSG(scratch_offset, "macOS geometry emulation: no indirect scratch");
+    gs_binding = {.scratch = gs_indirect_scratch->Handle(),
+                  .scratch_offset = *scratch_offset,
+                  .scratch_size = IndirectScratchBytes,
+                  .index = gs_indirect_scratch->Handle(),
+                  .index_offset = *scratch_offset,
+                  .index_size = IndirectScratchBytes};
+    SetupParams params{
+        .args_skip = u32((args_offset - args_bind) / 4),
+        .indexed = is_indexed ? 1u : 0u,
+        .verts_per_prim = stages.verts_per_prim,
+        .invocations = stages.invocations,
+        .max_vert_out = stages.max_vert_out,
+        .esgs_dwords = stages.esgs_dwords,
+        .vertex_dwords = stages.vertex_dwords,
+        .run_length = stages.run_length,
+        .capacity_dwords = u32(IndirectScratchBytes / 4),
+        .args_address_lo = u32(args),
+        .args_address_hi = u32(args >> 32),
+    };
+    if (is_indexed) {
+        ASSERT_MSG((regs.enable_primitive_restart & 1) == 0,
+                   "macOS geometry emulation: indexed ES/GS draw with primitive restart");
+        ASSERT_MSG(regs.index_buffer_type.swap_mode == AmdGpu::IndexSwapMode::None,
+                   "macOS geometry emulation: index swap mode {}",
+                   u32(regs.index_buffer_type.swap_mode));
+        // The whole guest index buffer (INDEX_BUFFER_SIZE indices); the kernel checks the draw's
+        // range against it.
+        const bool index16 = regs.index_buffer_type.index_type == AmdGpu::IndexType::Index16;
+        const u32 index_size = index16 ? 2 : 4;
+        const VAddr address = regs.index_base_address.Address<VAddr>();
+        const u32 index_bytes = regs.num_indices * index_size;
+        ASSERT_MSG(index_bytes != 0, "macOS geometry emulation: indirect ES/GS draw without an "
+                                     "index buffer size");
+        const auto [buffer, offset] = buffer_cache.ObtainBuffer(address, index_bytes, false);
+        needs_barrier |= runtime.IsBufferAccessed(buffer, offset, index_bytes);
+        const u64 bind_offset = Common::AlignDown(offset, alignment);
+        const u64 skip = offset - bind_offset;
+        ASSERT_MSG(skip % index_size == 0,
+                   "macOS geometry emulation: index buffer at {:#x} is not {}-byte aligned",
+                   address, index_size);
+        const u64 bind_size = Common::AlignUp(skip + index_bytes, 4);
+        ASSERT_MSG(bind_offset + bind_size <= buffer->SizeBytes(),
+                   "macOS geometry emulation: index range {:#x}+{} rounded to dwords leaves its "
+                   "cached buffer",
+                   address, index_bytes);
+        gs_binding.index = buffer->Handle();
+        gs_binding.index_offset = bind_offset;
+        gs_binding.index_size = bind_size;
+        params.index_kind = u32(index16 ? GsEmu::IndexKind::U16 : GsEmu::IndexKind::U32);
+        params.index_skip = u32(skip / index_size);
+        params.index_count = regs.num_indices;
+    }
+
+    gs_stats.draws.fetch_add(1, std::memory_order_relaxed);
+    gs_stats.scratch_bytes.fetch_add(IndirectScratchBytes, std::memory_order_relaxed);
+    std::optional<RenderState> ended_pass;
+    if (scheduler.IsRendering()) {
+        ended_pass = scheduler.GetRenderState();
+    }
+    if (needs_barrier) {
+        runtime.FlushBarriers();
+    }
+    scheduler.EndRendering();
+    const vk::Buffer scratch = gs_indirect_scratch->Handle();
+    const vk::Buffer errors = gs_errors->Handle();
+    scheduler.Record([=, args = args_buffer->Handle(),
+                      scratch_offset = *scratch_offset](vk::CommandBuffer cmdbuf) {
+        const std::array<vk::DescriptorBufferInfo, 3> infos{{
+            {args, args_bind, Common::AlignUp(args_offset - args_bind + stride, 4)},
+            {scratch, scratch_offset, IndirectScratchBytes},
+            {errors, 0, ErrorDwords * 4},
+        }};
+        std::array<vk::WriteDescriptorSet, 3> writes{};
+        for (u32 i = 0; i < writes.size(); ++i) {
+            writes[i] = {.dstBinding = i,
+                         .descriptorCount = 1,
+                         .descriptorType = vk::DescriptorType::eStorageBuffer,
+                         .pBufferInfo = &infos[i]};
+        }
+        cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, *kernel.pipeline);
+        cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *kernel.layout, 0, writes);
+        cmdbuf.pushConstants(*kernel.layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(params),
+                             &params);
+        cmdbuf.dispatch(1, 1, 1);
+    });
+    runtime.AccessBuffer(args_buffer, args_offset, stride, vk::PipelineStageFlagBits2::eComputeShader,
+                         vk::AccessFlagBits2::eShaderRead);
+    RecordGsBarrier(vk::PipelineStageFlagBits2::eDrawIndirect |
+                        vk::PipelineStageFlagBits2::eComputeShader,
+                    vk::AccessFlagBits2::eIndirectCommandRead |
+                        vk::AccessFlagBits2::eShaderStorageRead);
+    RecordGsDispatch(*stages.es, 0, 0, scratch, *scratch_offset + GsEmu::EsDispatch * 4);
+    RecordGsBarrier(vk::PipelineStageFlagBits2::eComputeShader,
+                    vk::AccessFlagBits2::eShaderStorageRead);
+    RecordGsDispatch(*stages.gs, 0, 0, scratch, *scratch_offset + GsEmu::GsDispatch * 4);
+    RecordGsBarrier(vk::PipelineStageFlagBits2::eVertexShader |
+                        vk::PipelineStageFlagBits2::eIndexInput |
+                        vk::PipelineStageFlagBits2::eDrawIndirect,
+                    vk::AccessFlagBits2::eShaderStorageRead | vk::AccessFlagBits2::eIndexRead |
+                        vk::AccessFlagBits2::eIndirectCommandRead);
+    return {.index_buffer = scratch,
+            .index_offset = *scratch_offset,
+            .indirect = true,
+            .indirect_offset = *scratch_offset + GsEmu::StripDraw * 4,
+            .ended_pass = ended_pass};
 }
 
 } // namespace Vulkan

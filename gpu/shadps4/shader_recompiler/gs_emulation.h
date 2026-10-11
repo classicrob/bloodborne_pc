@@ -86,4 +86,13 @@ enum Header : u32 {
     HeaderDwords = 16,
 };
 
+/// Indirect ES/GS draws: after the header, the setup kernel (gs_indirect_setup.comp) writes the
+/// commands the counts it read from the guest's indirect arguments call for.
+enum IndirectCommands : u32 {
+    EsDispatch = 16,  ///< VkDispatchIndirectCommand of the ES
+    GsDispatch = 19,  ///< VkDispatchIndirectCommand of the GS
+    StripDraw = 22,   ///< VkDrawIndexedIndirectCommand of the copy-shader draw (firstIndex = runs)
+    IndirectDwords = 32, ///< header + commands; the records follow
+};
+
 } // namespace Shader::GsEmulation
