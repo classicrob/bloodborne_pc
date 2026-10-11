@@ -269,6 +269,9 @@ private:
     /// returns whether the control file skips it.
     bool DrawBisectSkip(const GraphicsPipeline* pipeline, bool is_indexed, u32 index_offset,
                         const IndirectDraw* indirect);
+    /// BB_GPU_READ_CHECK (diagnostic): hashes what the draw just recorded reads, to compare at
+    /// GPU retirement.
+    void GpuReadCheck(const GraphicsPipeline* pipeline, bool is_indexed, u32 index_offset);
 #endif
     void DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_indexed,
                             const IndirectDraw& indirect);
@@ -620,6 +623,10 @@ private:
     /// Submissions (prepared draws) kept alive until stage B reaches the position.
     std::deque<std::pair<u64, std::shared_ptr<const void>>> pipe_keepalive;
     std::unique_ptr<DrawPipe> draw_pipe;
+#ifdef __APPLE__
+    /// BB_GPU_READ_CHECK: last, so its thread is stopped first.
+    std::unique_ptr<class GpuReadChecker> read_checker;
+#endif
 };
 
 } // namespace Vulkan
