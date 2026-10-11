@@ -4637,16 +4637,18 @@ bool Rasterizer::DrawBisectSkip(const GraphicsPipeline* pipeline, bool is_indexe
 
 #ifdef __APPLE__
 // bbport: BB_GPU_READ_CHECK=1|2 (diagnostic, off by default). Finds guest data that is different
-// once our GPU has retired the draws that read it in place (buffers are the guest's own memory on
-// Apple). For each draw, on the thread recording it, the guest bytes it reads are hashed: its
+// after our GPU has retired the draws that read it in place (buffers are the guest's own memory
+// on Apple). For each draw, on the thread recording it, the guest bytes it reads are hashed: its
 // read-only buffers of up to 64 KB (constants) and its index range; with 2 also its vertex buffers
-// and read-only buffers of up to 1 MB; not ranges GPU-written at that point. A checker thread
-// waits until the GPU retired the submission the draw lands in and hashes them again. What a
-// difference proves: the bytes changed between the record and that check. Not when: before the
-// GPU read them (the corruption), or after (a guest that waited correctly, but then only within
-// the moments between retirement and the check, before our labels and flips can let it). The
-// recording thread then sorts out ranges GPU-written since (later GPU work, ordered) and prints
-// the rest, with a per-binding summary every 5 s so that the buffers that change stand out.
+// and read-only buffers of up to 1 MB; not ranges marked GPU-modified at that point. A checker
+// thread waits until the GPU retired the submission the draw lands in and hashes them again. What
+// a difference proves: the bytes changed between the record and that check. Not when: before the
+// GPU read them (the corruption) or after it (a guest that waited correctly). The checker can lag
+// behind retirement, and labels and flips may let the guest write by then, so each difference is
+// printed with the time from record and from the checker seeing the retirement: small lags make
+// "before the GPU read" likely, large ones prove nothing. The recording thread then splits the
+// differences by the tracker's current state (marked GPU-modified now, most likely later GPU work,
+// or not) and prints them, with a per-binding summary every 5 s.
 namespace {
 const int gpu_read_check = [] {
     const char* env = std::getenv("BB_GPU_READ_CHECK");
@@ -4691,10 +4693,8 @@ void Rasterizer::GpuReadCheck(const GraphicsPipeline* pipeline, bool is_indexed,
         const u64 hash = XXH3_64bits(reinterpret_cast<const void*>(address), size);
         runtime_fault_recover = previous;
         batch.ranges.push_back({address, u32(size), hash, vs.pgm_hash, ps ? ps->pgm_hash : 0,
-                                frame, sequence, kind, u8(stage), u16(binding)});
-    };
-    const auto span = [](const AmdGpu::Buffer& sharp) {
-        return sharp.stride ? u64(sharp.num_records) * sharp.stride : u64(sharp.num_records);
+                                frame, sequence, kind, u8(stage), u16(binding),
+                                std::chrono::steady_clock::now()});
     };
     const auto stages = pipeline->GetStages();
     for (u32 stage = 0; stage < stages.size(); ++stage) {
@@ -4708,15 +4708,15 @@ void Rasterizer::GpuReadCheck(const GraphicsPipeline* pipeline, bool is_indexed,
                 continue;
             }
             const auto sharp = desc.GetSharp(info);
-            add(sharp.base_address, span(sharp), 'b', stage, i);
+            add(sharp.base_address, SharpSpan(sharp), 'b', stage, i);
         }
     }
     if (gpu_read_check >= 2 && !pipeline->GsEmulation()) {
         if (const auto& fetch = pipeline->GetFetchShader()) {
             for (const auto& attribute : fetch->attributes) {
-                // The draw just bound these: its vertex table was readable a moment ago.
-                const auto sharp = attribute.GetSharp(vs);
-                add(sharp.base_address, span(sharp), 'v', 0, attribute.semantic);
+                if (const auto sharp = GuardedSharp(attribute, vs)) {
+                    add(sharp->base_address, SharpSpan(*sharp), 'v', 0, attribute.semantic);
+                }
             }
         }
     }
@@ -4736,7 +4736,14 @@ void Rasterizer::GpuReadCheck(const GraphicsPipeline* pipeline, bool is_indexed,
 }
 #endif
 
-Rasterizer::~Rasterizer() = default;
+Rasterizer::~Rasterizer() {
+#ifdef __APPLE__
+    // The draw pipe's last packets record draws that use the read checker: drain and stop it while
+    // the checker (and everything else) is alive, then stop the checker.
+    draw_pipe.reset();
+    read_checker.reset();
+#endif
+}
 
 void Rasterizer::NoteFrameStart() {
     if (auto* profiler = GpuProfiler::Get()) {
