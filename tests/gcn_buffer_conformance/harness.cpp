@@ -16,6 +16,7 @@
 #include <fcntl.h>
 #include <filesystem>
 #include <map>
+#include <unordered_map>
 #include <memory>
 #include <optional>
 #include <set>
@@ -4650,9 +4651,10 @@ int Bench(const Options& opt) {
 // (results depend on the 64-lane wave; see the wave64 group).
 // --census-sgpr FILE...: static scan for SGPRs (and VCC/M0) written inside an s_cbranch_execz
 // scope (between a forward execz branch and its target) and read at or after the target before
-// being rewritten. The recompiler builds such a scope as a per-lane if, so lanes that skipped it
-// read the old value where GCN gives every lane the new one (SGPRs are wave-wide). A linear scan:
-// candidates, not proof (no loops, no SCC, implicit M0/VCC reads not seen). Writers are tagged
+// being rewritten on some path of the CFG. The recompiler builds such a scope as a per-lane if,
+// so lanes that skipped it read the old value where GCN gives every lane the new one (SGPRs are
+// wave-wide). Candidates, not proof (SCC and implicit M0 reads are not seen; the writes inside
+// the scope are collected linearly). Writers are tagged
 // "value" (smem, v_readlane/v_readfirstlane, 32-bit and arithmetic s_* ops: one number per wave)
 // or "mask" (v_cmp, carry-outs, s_*saveexec and 64-bit bitwise s_* ops, which the recompiler
 // keeps as one bit per lane; there only lanes whose bit GCN would change can differ). Readers are
@@ -4734,9 +4736,11 @@ int CensusSgpr(int argc, char** argv, int first) {
     std::map<std::string, std::array<u32, 4>> by_stage; // stage -> scanned, value->value, value->mask, mask
     std::vector<std::string> value_hashes, reuse_hashes, mask_hashes;
     // Controls, scanned first: the Exec3Out shape (s_readfirstlane and s_bcnt1 results written in
-    // the scope, read after it) must be value->value; Exec3 (copied inside the scope) must be clean.
+    // the scope, read after it) must be value->value; Exec3 (copied inside the scope) and Exec3Out
+    // with an s_branch over the reads must be clean.
     std::vector<std::pair<std::string, std::vector<u32>>> inputs;
-    for (bool out : {true, false}) {
+    for (int variant : {0, 1, 2}) {
+        const bool out = variant != 1;
         using GcnAsm::Inline, GcnAsm::VCC_LO, GcnAsm::EXEC_LO;
         GcnAsm::Code c;
         c.SMovLiteral(21, 0xDEAD0000u);
@@ -4751,9 +4755,12 @@ int CensusSgpr(int argc, char** argv, int first) {
         if (!out) { c.VMov(10, 21); c.VMov(11, 24); }
         c.words[br] |= u32(int32_t(c.words.size()) - int32_t(br + 1)) & 0xFFFF;
         c.SMovB64(EXEC_LO, 22);
+        if (variant == 2) c.Sopp(2, 2); // s_branch over the two reads
         if (out) { c.VMov(10, 21); c.VMov(11, 24); }
         c.SEndpgm();
-        inputs.emplace_back(out ? "control_read-after-scope" : "control_copied-in-scope", c.words);
+        inputs.emplace_back(variant == 0 ? "control_read-after-scope"
+                                         : variant == 1 ? "control_copied-in-scope" : "control_branched-over",
+                            c.words);
     }
     for (int a = first; a < argc; ++a) {
         FILE* f = std::fopen(argv[a], "rb");
@@ -4792,6 +4799,8 @@ int CensusSgpr(int argc, char** argv, int first) {
             }
         }
         bool value_hit = false, mask_hit = false, reuse_hit = false;
+        std::unordered_map<u32, size_t> at_pc; // dword pc -> instruction index
+        for (size_t x = 0; x < insts.size(); ++x) at_pc[insts[x].pc] = x;
         for (size_t i = 0; i < insts.size(); ++i) {
             if (insts[i].inst.opcode != Opcode::S_CBRANCH_EXECZ || insts[i].inst.control.sopp.simm <= 0) continue;
             const u32 target = insts[i].pc + 1 + u32(insts[i].inst.control.sopp.simm);
@@ -4802,14 +4811,34 @@ int CensusSgpr(int argc, char** argv, int first) {
                 dsts(insts[j].inst, insts[j].name, rs);
                 for (u32 r : rs) written[r] = insts[j].name;
             }
-            // Scan on from the target; follow each loop back-edge once (the loop head may read it).
-            std::set<size_t> followed;
-            for (size_t k = j; k < insts.size() && !written.empty(); ++k) {
+            // Walk the CFG from the target: s_branch is followed, s_endpgm ends a path, conditional
+            // branches take both arms. A may-analysis of which scope-written registers can still
+            // hold the scope's value; each read of one is reported once.
+            std::vector<std::set<u32>> in(insts.size());
+            std::vector<bool> visited(insts.size());
+            std::vector<size_t> work;
+            std::set<std::pair<u32, size_t>> reported;
+            const auto flow = [&](size_t to, const std::set<u32>& live) {
+                if (to >= insts.size()) return;
+                const size_t before = in[to].size();
+                in[to].insert(live.begin(), live.end());
+                if (!visited[to] || in[to].size() != before) {
+                    visited[to] = true;
+                    work.push_back(to);
+                }
+            };
+            std::set<u32> start;
+            for (const auto& [r, w] : written) start.insert(r);
+            if (j < insts.size() && insts[j].pc == target) flow(j, start);
+            while (!work.empty()) {
+                const size_t k = work.back();
+                work.pop_back();
+                std::set<u32> live = in[k];
                 std::vector<u32> reads, writes;
                 srcs(insts[k].inst, insts[k].name, reads);
                 for (u32 r : reads) {
+                    if (!live.count(r) || !reported.insert({r, k}).second) continue;
                     const auto it = written.find(r);
-                    if (it == written.end()) continue;
                     const bool mask = is_mask_writer(it->second);
                     const bool mask_reader = (insts[k].name.rfind("S_", 0) == 0 && is_mask_writer(insts[k].name)) ||
                                              insts[k].name.find("CNDMASK") != std::string::npos;
@@ -4830,17 +4859,19 @@ int CensusSgpr(int argc, char** argv, int first) {
                     std::printf("%s: %s execz @%#x..%#x: %s written by %s, read @%#x by %s%s\n", base.c_str(),
                                 mask ? "mask->any  " : mask_reader ? "value->mask" : "value->value", insts[i].pc * 4, target * 4, reg_name(r).c_str(),
                                 it->second.c_str(), insts[k].pc * 4, insts[k].name.c_str(), prior.c_str());
-                    written.erase(it);
                 }
                 dsts(insts[k].inst, insts[k].name, writes);
-                for (u32 r : writes) written.erase(r);
-                const auto& in = insts[k].inst;
-                if (in.encoding == InstEncoding::SOPP && insts[k].name.find("BRANCH") != std::string::npos &&
-                    in.control.sopp.simm < 0 && followed.insert(k).second) {
-                    const u32 head = insts[k].pc + 1 + in.control.sopp.simm;
-                    for (size_t h = 0; h < insts.size(); ++h)
-                        if (insts[h].pc == head) { k = h - 1; break; }
-                }
+                for (u32 r : writes) live.erase(r);
+                const auto& in_k = insts[k].inst;
+                const std::string& nm = insts[k].name;
+                const auto branch_to = [&] {
+                    const auto t = at_pc.find(insts[k].pc + 1 + in_k.control.sopp.simm);
+                    if (t != at_pc.end()) flow(t->second, live);
+                };
+                if (nm == "S_ENDPGM" || nm.rfind("S_SETPC", 0) == 0 || nm.rfind("S_SWAPPC", 0) == 0) continue;
+                if (nm == "S_BRANCH") { branch_to(); continue; }
+                if (nm.rfind("S_CBRANCH", 0) == 0) branch_to();
+                flow(k + 1, live);
             }
         }
         if (control) {
