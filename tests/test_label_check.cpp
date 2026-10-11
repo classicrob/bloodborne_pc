@@ -7,15 +7,21 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <csignal>
 #include <sys/mman.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #include <atomic>
 #include <chrono>
 #include <mutex>
 #include <thread>
 #include <vector>
+#include "bbport_cmd_data.h"
+#include "bbport_deferred_counts.h"
 #include "bbport_label_check.h"
+#include "bbport_label_mode.h"
 #include "bbport_label_store.h"
+#include "bbport_parse_split.h"
 #include "bbport_label_sequencer.h"
 
 namespace {
@@ -185,6 +191,312 @@ int main() {
                    !std::memcmp(&bytes[17], &one, 4) && !std::memcmp(&bytes[22], two, 8) &&
                    !std::memcmp(three_at, three, 12) && bytes[4] == 0xEE &&
                    bytes[16] == 0xEE && bytes[21] == 0xEE && bytes[30] == 0xEE);
+    }
+
+    // The recorder-side and label counts are separate (bbport_deferred_counts.h): a recorder
+    // write still held is not complete, whichever way a concurrent label's two counters move.
+    {
+        BbDeferred::Count recorder, labels;
+        std::atomic<std::uint64_t> total_done{0};
+        const std::uint64_t held = recorder.Issue(); // its callback has not run
+        labels.Issue();
+        labels.Complete(); // label counted written, its total not yet
+        const bool written_first = !recorder.CompleteThrough(held);
+        total_done.fetch_add(1);
+        const bool both = !recorder.CompleteThrough(held);
+        Expect("a held recorder write is not complete while a label is written, then counted",
+               written_first && both);
+        labels.Issue();
+        total_done.fetch_add(1); // the other order: total first
+        labels.Complete();
+        Expect("  ... nor with the label's counters moving in the other order",
+               !recorder.CompleteThrough(held));
+        std::atomic<bool> release{false};
+        std::thread callback([&] {
+            while (!release.load()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            recorder.Complete();
+            total_done.fetch_add(1);
+        });
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        const bool blocked = !recorder.CompleteThrough(held);
+        release.store(true);
+        bool completed = false;
+        for (int i = 0; i < 1000 && !completed; ++i) {
+            completed = recorder.CompleteThrough(held);
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        callback.join();
+        Expect("  ... the recorder wait stays blocked until its callback completes, then ends",
+               blocked && completed);
+    }
+
+    // When labels are written (bbport_label_mode.h): at GPU completion by default, toggle bit 59
+    // switches to at submit live, BB_LABELS_AT_GPU_COMPLETE=0/1 fixes the mode for the run.
+    {
+        using BbLabels::RunMode;
+        const RunMode unset = BbLabels::ParseRunMode(nullptr);
+        const RunMode empty = BbLabels::ParseRunMode("");
+        const RunMode on = BbLabels::ParseRunMode("1");
+        const RunMode off = BbLabels::ParseRunMode("0");
+        Expect("label mode: unset or empty is the default, 1 and 0 fix the run",
+               unset == RunMode::Default && empty == RunMode::Default &&
+                   on == RunMode::AtGpuComplete && off == RunMode::AtSubmit);
+        Expect("  ... default: at GPU completion, bit 59 set: at submit",
+               BbLabels::AtGpuComplete(unset, false) && !BbLabels::AtGpuComplete(unset, true));
+        Expect("  ... =1 and =0 ignore bit 59",
+               BbLabels::AtGpuComplete(on, true) && BbLabels::AtGpuComplete(on, false) &&
+                   !BbLabels::AtGpuComplete(off, false) && !BbLabels::AtGpuComplete(off, true));
+        std::fflush(stderr);
+        const pid_t child = fork();
+        if (child == 0) {
+            std::freopen("/dev/null", "w", stderr);
+            BbLabels::ParseRunMode("yes");
+            std::_Exit(0);
+        }
+        int status = 0;
+        waitpid(child, &status, 0);
+        Expect("  ... any other value stops", WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT);
+    }
+
+    // BB_CMD_DATA_CHECK (bbport_cmd_data.h): the production classifier and its inputs.
+    {
+        using namespace BbCmdData;
+        // Two pools as captured (A1 starts 0x10 past 256 KiB alignment, A2 0x20).
+        std::vector<Pool> pools;
+        const bool parsed = ParsePools("0x7039400010:128,0x703b400020:384", 0x40000, pools);
+        static const std::uint8_t copy_a[16] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
+        static std::uint8_t copy_b[16];
+        std::memcpy(copy_b, copy_a, 16);
+        copy_b[4] = 99; // a second held copy of the same range, different bytes
+        const std::uint64_t a1_chunk = 0x7039400010 + 3 * 0x40000; // A1 chunk 3
+        const std::uint64_t region = a1_chunk + 0x100;
+        const std::vector<HeldRegion> held = {
+            {region, 16, 7, copy_a},
+            {region, 16, 9, copy_b}, // resubmitted
+        };
+        const Result same = Classify(region + 4, 4, copy_a + 4, held, pools, 9);
+        const Result newest = Classify(region + 4, 4, copy_a + 4, held, pools, 0);
+        const Result reused = Classify(region + 4, 4, copy_b + 4, held, pools, 9);
+        Expect("cmd data: inside two held copies, one differs, the current one named",
+               parsed && same.where == Where::Inside && same.matches == 2 &&
+                   same.differing == 1 && same.current && same.submission == 9 &&
+                   !newest.current && newest.submission == 9);
+        Expect("  ... the selected copy differing is told apart from another copy differing",
+               same.selected_differs && // current 9 (copy_b) vs the read of copy_a
+                   Describe(same).find("DIFFERS") != std::string::npos &&
+                   !reused.selected_differs && reused.differing == 1 && // only 7 (copy_a) differs
+                   Describe(reused).find("matches the read; 1 other held copy, 1 of them differ") !=
+                       std::string::npos);
+        // A containing region is never renamed by a straddling one, in either order (Astra-2).
+        bool kept = true;
+        for (const std::uint64_t cur : {std::uint64_t{7}, std::uint64_t{0}}) {
+            const HeldRegion contain{0x1000, 0x100, 7, nullptr}, partial{0x1044, 8, 9, nullptr};
+            const std::vector<HeldRegion> orders[2] = {{contain, partial}, {partial, contain}};
+            for (const auto& order : orders) {
+                const Result x = Classify(0x1040, 8, copy_a, order, pools, cur);
+                kept = kept && x.where == Where::Inside && x.matches == 1 && x.submission == 7 &&
+                       x.region_start == 0x1000 && x.region_bytes == 0x100 &&
+                       x.current == (cur == 7);
+            }
+        }
+        const std::vector<HeldRegion> two_partial = {{0x1044, 8, 9, nullptr},
+                                                     {0x1030, 0x12, 4, nullptr}};
+        const Result only_straddle = Classify(0x1040, 8, copy_a, two_partial, pools, 0);
+        Expect("  ... a straddling region never renames the containing selection (both orders, "
+               "current and newest); straddling alone names the first",
+               kept && only_straddle.where == Where::Straddles &&
+                   only_straddle.submission == 9 && only_straddle.region_start == 0x1044);
+        const Result straddle = Classify(region + 12, 8, copy_a, held, pools, 0);
+        const Result tail = Classify(a1_chunk + 0x3ff00, 16, copy_a, held, pools, 0);
+        const Result next_chunk = Classify(a1_chunk + 0x40000 + 8, 8, copy_a, held, pools, 0);
+        const Result crossing = Classify(a1_chunk + 0x3fff8, 16, copy_a, held, pools, 0);
+        Expect("  ... straddling; a candidate tail in A1's chunk (offset 0x10); none in the next "
+               "chunk or across a chunk end",
+               straddle.where == Where::Straddles && tail.where == Where::ChunkTail &&
+                   tail.chunk_start == a1_chunk && tail.pool == 0 &&
+                   next_chunk.where == Where::Outside && crossing.where == Where::Outside &&
+                   Describe(next_chunk).find("not located") != std::string::npos &&
+                   Describe(next_chunk).find("known pools") == std::string::npos);
+        const Result overflow = Classify(UINT64_MAX - 4, 16, copy_a, held, pools, 0);
+        static std::uint8_t big[512];
+        const std::vector<HeldRegion> big_held = {{0x1000, 512, 1, big}};
+        const Result uncompared = Classify(0x1000, 300, big, big_held, pools, 0);
+        Expect("  ... an overflowing range is invalid; over 256 bytes is located, not compared",
+               !overflow.valid_range && uncompared.where == Where::Inside &&
+                   !uncompared.compared && !uncompared.differing &&
+                   Describe(uncompared).find("not compared") != std::string::npos);
+        std::uint64_t v = 0;
+        std::vector<Pool> bad;
+        std::uint64_t d = 0, z = 0;
+        Expect("  ... strict numbers: no whitespace or sign anywhere, no octal, no trailing text, "
+               "no overflow, no empty pool",
+               ParseU64("0x40000", v) && v == 0x40000 && ParseU64("10", d) && d == 10 &&
+                   ParseU64("0", z) && z == 0 && !ParseU64("010", v) && !ParseU64("0x", v) &&
+                   !ParseU64("", v) && !ParseU64("-1", v) && !ParseU64("+5", v) &&
+                   !ParseU64(" 5", v) && !ParseU64("\t-1", v) && !ParseU64("\n+5", v) &&
+                   !ParseU64("0x-1", v) && !ParseU64("0x 1", v) && !ParseU64("5 ", v) &&
+                   !ParseU64("12x", v) &&
+                   !ParseU64("0x1ffffffffffffffff", v) && !ParsePools("0x1000:0", 0x40000, bad) &&
+                   !ParsePools("0x1000", 0x40000, bad) &&
+                   !ParsePools("0xffffffffffffff00:2", 0x40000, bad));
+        // The status word read after the lookup: readable, and in an unmapped page.
+        const long page = sysconf(_SC_PAGESIZE);
+        auto* two = static_cast<std::uint8_t*>(
+            mmap(nullptr, 2 * page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0));
+        const std::uint64_t status_value = 2;
+        std::memcpy(two + page - 8, &status_value, 8);
+        Result readable;
+        readable.where = Where::ChunkTail;
+        readable.chunk_start = reinterpret_cast<std::uint64_t>(two);
+        readable.chunk_bytes = page;
+        ReadStatus(readable);
+        Result unreadable = readable;
+        unreadable.chunk_start = reinterpret_cast<std::uint64_t>(two) + page;
+        munmap(two + page, page);
+        ReadStatus(unreadable);
+        Expect("  ... the chunk status is read without faulting, unreadable when unmapped",
+               readable.status_read && readable.chunk_status == 2 && !unreadable.status_read &&
+                   Describe(unreadable).find("unreadable") != std::string::npos);
+        // The latest read is formatted as observed, without touching its (now unmapped) address.
+        setenv("BB_CMD_DATA_CHECK", "1", 1);
+        last = {"ud table", 0xabc, reinterpret_cast<std::uint64_t>(two) + page, 16, same};
+        const std::string text = LastRead();
+        Expect("  ... the stop's latest-read text comes from the observation, not a re-read",
+               text.find("latest instrumented read: ud table") != std::string::npos &&
+                   text.find("DIFFERS") != std::string::npos);
+        munmap(two, page);
+        // Owner lifetime: Unregister waits for a lookup in flight; none runs after it.
+        static std::atomic<int> entered{0}, release{0}, calls{0};
+        static int owner_object = 0;
+        const LookupFn blocking = [](void* owner, std::uint64_t, std::uint64_t,
+                                     const void*) -> Result {
+            calls.fetch_add(1);
+            entered.store(owner == &owner_object ? 1 : -1);
+            while (!release.load()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            Result r;
+            r.where = Where::Inside;
+            return r;
+        };
+        Register(blocking, &owner_object);
+        Result in_flight;
+        std::thread reader([&] { in_flight = Lookup(1, 1, copy_a); });
+        while (!entered.load()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        std::atomic<bool> unregistered{false};
+        std::thread destroyer([&] {
+            Unregister(&owner_object);
+            unregistered.store(true);
+        });
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        const bool waited = !unregistered.load();
+        release.store(1);
+        reader.join();
+        destroyer.join();
+        const Result after = Lookup(1, 1, copy_a);
+        Expect("  ... unregistering waits for a lookup in flight; no lookup runs after it",
+               entered.load() == 1 && waited && unregistered.load() &&
+                   in_flight.where == Where::Inside && after.where == Where::Outside &&
+                   calls.load() == 1);
+    }
+
+    // Parse split (bbport_parse_split.h): every transition charges the owner of the time since
+    // the previous one, so a thread's time is partitioned exactly, whatever the nesting.
+    std::thread([] {
+        using namespace BbSplit;
+        const auto spin = [] {
+            const std::uint64_t until = __rdtsc() + 20000;
+            while (__rdtsc() < until) {
+            }
+        };
+        const auto total = [] {
+            std::uint64_t sum = 0;
+            for (const auto& c : stage_a.bucket) sum += c.load();
+            for (const auto& c : stage_a.scope) sum += c.load();
+            return sum;
+        };
+        const auto in = [](K kind, std::uint32_t bucket) {
+            return stage_a.scope_in[kind * MaxBuckets + bucket].load();
+        };
+        Attach(stage_a, ALoop);
+        const std::uint64_t attached = stage_a.last;
+        spin();
+        bool scope_ok = true;
+        {
+            Scope deferred{KDeferred}; // Sol-2's case: a mark while a scope is open
+            spin();
+            Mark(ADraw);
+            spin();
+            {
+                Scope tick{KGpuTick};
+                spin();
+            }
+            spin();
+            scope_ok = Open() == ADraw;
+        }
+        spin();
+        bool section_ok = true;
+        {
+            Section active{stage_a, AHostCmds};
+            section_ok = Open() == AHostCmds;
+            spin();
+            {
+                Section other{stage_b, BBind}; // stage B's: inactive here
+                section_ok = section_ok && Open() == AHostCmds;
+                spin();
+            }
+        }
+        section_ok = section_ok && Open() == ADraw;
+        // A packet yields; the scheduler loop and a child task run; the packet resumes.
+        Mark(AWaitRegMem);
+        spin();
+        const std::uint32_t saved = Suspend();
+        Mark(ALoop);
+        spin();
+        {
+            const std::uint32_t parent = Suspend(); // RESUME of a CE child from the loop's task
+            Mark(AConstEng);
+            spin();
+            Resume(parent);
+        }
+        const bool child_ok = Open() == ALoop;
+        Resume(saved);
+        const bool resumed_ok = Open() == AWaitRegMem;
+        spin();
+        Mark(ALoop);
+        Flush();
+        Expect("parse split: buckets and scopes partition the thread's time exactly",
+               total() == stage_a.last - attached);
+        Expect("  ... a mark inside a scope moves only the bucket its time is listed under; inner "
+               "scopes take their own time",
+               scope_ok && in(KDeferred, ALoop) > 0 && in(KDeferred, ADraw) > 0 &&
+                   in(KDeferred, ALoop) + in(KDeferred, ADraw) == stage_a.scope[KDeferred].load() &&
+                   in(KGpuTick, ADraw) == stage_a.scope[KGpuTick].load() &&
+                   stage_a.scope[KGpuTick].load() > 0);
+        Expect("  ... an active section reopens the previous bucket; another thread's does nothing",
+               section_ok && stage_a.bucket[AHostCmds].load() > 0 &&
+                   stage_b.bucket[BBind].load() == 0);
+        Expect("  ... a yielded packet and a resumed child each get back their bucket",
+               child_ok && resumed_ok && stage_a.bucket[AConstEng].load() > 0 &&
+                   stage_a.bucket[AWaitRegMem].load() > 0);
+    }).join();
+    {
+        const pid_t child = fork();
+        if (child == 0) {
+            std::freopen("/dev/null", "w", stderr);
+            BbSplit::Attach(BbSplit::stage_a, BbSplit::ALoop);
+            BbSplit::Scope open{BbSplit::KDeferred};
+            BbSplit::Suspend(); // a scope across a yield
+            std::_Exit(0);
+        }
+        int status = 0;
+        waitpid(child, &status, 0);
+        Expect("  ... a scope open across a yield stops",
+               WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT);
     }
 
     std::fprintf(stderr, "%s: %u failures\n", failures ? "FAIL" : "PASS", failures);

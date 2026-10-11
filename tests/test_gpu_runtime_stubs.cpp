@@ -11,7 +11,7 @@
 extern "C" {
 extern __thread sigjmp_buf* runtime_fault_recover;
 __thread sigjmp_buf* runtime_fault_recover = nullptr;
-uint32_t runtime_disabled_optimizations = 0;
+uint64_t runtime_disabled_optimizations = 0; // as runtime_memory.c and bbport_toggles.h
 uint64_t runtime_tsc_frequency() { return 1000000000; }
 int runtime_file_translate(const char*, char*, size_t) { std::abort(); }
 uint64_t runtime_memory_clamp(uintptr_t, uint64_t) { std::abort(); }
@@ -21,6 +21,7 @@ int runtime_memory_region(uintptr_t, uintptr_t*, uintptr_t*, int*) { std::abort(
 int runtime_memory_backing_region(uintptr_t, uintptr_t*, uintptr_t*, uint64_t*) { std::abort(); }
 void runtime_memory_set_gpu_lifetime_hooks(void (*)(void), void (*)(uintptr_t, uint64_t), void (*)(void)) { std::abort(); }
 int runtime_memory_alias_snapshot(uintptr_t, RuntimeMemoryAlias*, size_t, RuntimeMemoryAliasSnapshot*) { std::abort(); }
+int runtime_memory_inventory(RuntimeMemoryInventory*) { std::abort(); }
 void runtime_hle_trace_dump(void) { std::abort(); }
 void runtime_hle_trace_frame(void) {}
 void runtime_cpu_profile_thread(const char*) {}

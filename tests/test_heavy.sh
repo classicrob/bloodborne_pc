@@ -8,7 +8,8 @@ cd "$(dirname "$0")/.."
 heavy=tools/macos/heavy.sh
 dir=$(mktemp -d)
 trap 'rm -rf "$dir"; kill $(jobs -p) 2>/dev/null || true' EXIT
-export BB_HEAVY_DIR=$dir BB_HEAVY_BUILD_SLOTS=1 BB_HEAVY_PLAYTEST_SLOTS=2 BB_HEAVY_QUICK_SLOTS=2 BB_HEAVY_SWEEP_SLOTS=1
+# The user counts as active unless a case says otherwise (the real idle time varies).
+export BB_HEAVY_DIR=$dir BB_HEAVY_BUILD_SLOTS=1 BB_HEAVY_PLAYTEST_SLOTS=2 BB_HEAVY_QUICK_SLOTS=2 BB_HEAVY_SWEEP_SLOTS=1 BB_HEAVY_IDLE_SECONDS=0
 unset BB_HEAVY_HELD
 fail() { echo "heavy test FAILED: $*" >&2; exit 1; }
 until_held() { for _ in $(seq 100); do "$heavy" status | grep -q "$1: held by $2" && return; sleep 0.1; done; fail "$1 never held by $2"; }
@@ -172,6 +173,73 @@ kill -9 "$long"; wait "$long" 2>/dev/null || true
 err=$("$heavy" B9 -- "$heavy" --pool sweep SW2 -- true 2>&1 >/dev/null)
 [[ $err == *'SW2: started inside build0'* ]] || fail "a sweep nested in a build job was not reported ('$err')"
 
+# Idle-aware admission: while the user is idle (>= BB_HEAVY_IDLE_MINUTES), a second build job
+# runs (build-idle) at nice +5 with a utility clamp and says why; while active it waits, and a
+# job runs as background QoS and says why.
+"$heavy" LONG2 -- sleep 30 &
+long=$!
+until_held build0 LONG2
+start=$(date +%s)
+out=$(BB_HEAVY_IDLE_SECONDS=4500 "$heavy" IDLE1 -- sh -c 'echo "$(ps -o pri= -p $$) $(ps -o nice= -p $$) $BB_BUILD_JOBS"' 2>"$dir/idle.err")
+(( $(date +%s) - start < 10 )) || fail "idle user: a second build job waited for build0"  # the holder sleeps 30 s
+read -r ipri inic ijobs <<< "$out"
+[[ $inic == $(want 5) && $ijobs == 8 ]] || fail "idle admission not nice +5 with 8 jobs ('$out')"
+(( base_pri < 20 || ipri == 20 )) || fail "idle admission not utility QoS (priority $ipri)"
+grep -q 'IDLE1: user idle 75 min: nice 5, utility QoS, 8 jobs' "$dir/idle.err" || fail "idle decision not logged: $(cat "$dir/idle.err")"
+( BB_HEAVY_IDLE_SECONDS=0 "$heavy" ACTIVE1 -- true 2>/dev/null; echo done > "$dir/active1" ) &
+sleep 3
+[[ ! -e $dir/active1 ]] || fail "active user: a second build job ran while build0 was held"
+kill -9 "$long"; wait "$long" 2>/dev/null || true
+for _ in $(seq 100); do [[ -e $dir/active1 ]] && break; sleep 0.1; done
+[[ -e $dir/active1 ]] || fail "active user: the waiting build job never ran"
+err=$(BB_HEAVY_IDLE_SECONDS=120 "$heavy" ACTIVE2 -- true 2>&1 >/dev/null)
+[[ $err == *'ACTIVE2: user active (idle 2 min): background QoS, 8 jobs'* ]] || fail "active decision not logged ('$err')"
+
+# --cpu-quiet (perf runs): running build/quick/sweep jobs are paused (whole tree) and resumed after,
+# a new one waits, a quick job's time limit pauses too, the pause is bounded, and the flag needs
+# --gpu exclusive outside any slot.
+ticks() { wc -l < "$1" | tr -d ' '; }
+"$heavy" B10 -- sh -c "while :; do echo t >> '$dir/b10'; sleep 0.2; done" &
+b10=$!
+BB_HEAVY_QUICK_LIMIT=4 "$heavy" --pool quick Q10 -- sh -c 'sleep 3' > /dev/null 2>&1 &
+q10=$!
+for _ in $(seq 50); do [[ -s $dir/b10 ]] && break; sleep 0.1; done
+"$heavy" --pool playtest --gpu exclusive --cpu-quiet P10 -- sh -c "sleep 0.5; a=\$(wc -l < '$dir/b10'); sleep 2.5; b=\$(wc -l < '$dir/b10'); echo \$a \$b > '$dir/p10'" 2> "$dir/p10.err" &
+p10=$!
+sleep 1
+( "$heavy" --pool sweep B11 -- sh -c 'date +%s' > "$dir/b11" 2>/dev/null ) &  # its slot is free
+b11=$!
+wait "$p10"
+p10_done=$(date +%s)
+read -r a b < "$dir/p10"
+(( a == b )) || fail "a build job kept running during a CPU-quiet perf run ($a -> $b ticks)"
+grep -q 'P10: CPU quiet: paused B10' "$dir/p10.err" || fail "pause not reported: $(cat "$dir/p10.err")"
+grep -q 'P10: CPU quiet: paused Q10' "$dir/p10.err" || fail "quick job pause not reported"
+before=$(ticks "$dir/b10"); sleep 2
+(( $(ticks "$dir/b10") > before )) || fail "a paused build job was not resumed"
+grep -q 'P10: CPU quiet over: resumed B10' "$dir/p10.err" || fail "resume not reported"
+set +e; wait "$q10"; q10_status=$?; set -e
+(( q10_status == 0 )) || fail "the quick job's time limit ran during the pause (exit $q10_status)"
+wait "$b11"
+(( $(cat "$dir/b11") >= p10_done - 1 )) || fail "a build job started during a CPU-quiet perf run"
+kill "$b10" 2>/dev/null; wait "$b10" 2>/dev/null || true; pkill -f "$dir/b10" 2>/dev/null || true
+rm -f "$dir/b10"
+"$heavy" B12 -- sh -c "while :; do echo t >> '$dir/b12'; sleep 0.2; done" &
+b12=$!
+for _ in $(seq 50); do [[ -s $dir/b12 ]] && break; sleep 0.1; done
+BB_HEAVY_QUIET_MAX=2 "$heavy" --pool playtest --gpu exclusive --cpu-quiet P11 -- sleep 5 2> "$dir/p11.err" &
+p11=$!
+sleep 3.5
+before=$(ticks "$dir/b12"); sleep 1
+(( $(ticks "$dir/b12") > before )) || fail "the CPU-quiet bound did not resume the build job"
+grep -q 'CPU QUIET BOUND REACHED' "$dir/p11.err" || fail "bound not reported loudly"
+wait "$p11"
+kill "$b12" 2>/dev/null; wait "$b12" 2>/dev/null || true; pkill -f "$dir/b12" 2>/dev/null || true
+if "$heavy" --cpu-quiet K1 -- true 2>/dev/null; then fail "--cpu-quiet without --gpu exclusive accepted"; fi
+if "$heavy" K2 -- "$heavy" --pool playtest --gpu exclusive --cpu-quiet K3 -- true 2>/dev/null; then
+    fail "--cpu-quiet inside a slot accepted"
+fi
+
 # Bad usage is an error, not a silent no-op.
 if "$heavy" G true 2>/dev/null; then fail "missing -- accepted"; fi
 if BB_HEAVY_BUILD_SLOTS=0 "$heavy" H -- true 2>/dev/null; then fail "zero slots accepted"; fi
@@ -188,4 +256,4 @@ assert any(l['label'] == 'B' and l['waited_s'] >= 1 for l in starts), 'B waited'
 assert all({'pool', 'slot', 'waited_s', 'load', 'held'} <= set(l) for l in starts)
 assert any(l['label'] == 'Q4' and l['status'] == 124 for l in ends), 'Q4 killed'
 PY
-echo "heavy.sh: history log, build/playtest/quick pools, quick hints and time limit, waiting, priority slot, GPU shared/exclusive lock with gate, start announcement, polite scheduling, sweep lane, release on SIGKILL, nesting, exit status, usage errors PASS"
+echo "heavy.sh: history log, build/playtest/quick pools, quick hints and time limit, waiting, priority slot, GPU shared/exclusive lock with gate, start announcement, polite scheduling, idle-aware admission, CPU-quiet pause, sweep lane, release on SIGKILL, nesting, exit status, usage errors PASS"

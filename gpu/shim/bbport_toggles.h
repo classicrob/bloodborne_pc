@@ -72,11 +72,13 @@ enum : std::uint64_t {
     // Apple: bit set builds new graphics pipelines on the GPU thread at selection, as before the
     // build workers (docs/macos/pipeline-compile.md); a diagnostic A/B, read per new pipeline.
     PipelineWorkers = 1ull << 58,
-    // Apple: bit set writes end-of-pipe labels once the GPU completed the work before them
-    // (BB_LABELS_AT_GPU_COMPLETE=1 sets it for the whole run). Switchable live: the first label
-    // after a switch waits for every label issued before it, and the switch is logged with the
-    // time (docs/macos/gpu-idle.md), so one run can alternate the modes for an A/B.
-    LabelsAtGpuComplete = 1ull << 59,
+    // Apple, diagnosis: bit set writes end-of-pipe labels as soon as the work before them is
+    // recorded (the old behaviour) instead of at GPU completion (the default;
+    // gpu/shim/bbport_label_mode.h). BB_LABELS_AT_GPU_COMPLETE=0 or =1 fixes the mode for the
+    // whole run, whatever this bit says. Switchable live: the first label after a switch waits
+    // for every label issued before it, and the switch is logged with the time
+    // (docs/macos/gpu-idle.md), so one run can alternate the modes for an A/B.
+    LabelsAtSubmit = 1ull << 59,
     // Apple: bit set publishes a flip (status and count, flip event, previous buffer released)
     // once the GPU retired the presenter's copy of the guest framebuffer, its last read of it
     // (BB_FLIP_AT_GPU_RETIRE=1 sets it for the whole run). Publications stay in flip order across
@@ -87,6 +89,9 @@ enum : std::uint64_t {
     // (the device-loss bug), so it is only for load A/Bs. BB_STAGING_RELEASE_AT_REQUEST=1 sets
     // it for the whole run; read at each request.
     StagingReleaseAtRequest = 1ull << 61,
+    // Apple: bit set always runs the SDK fill kernel 0x8b355b5a, instead of clearing the render
+    // target it exactly covers (vk_shader_hle.cpp FillAsImageClear); for before/after A/Bs.
+    RtFillKernel = 1ull << 62,
     // Bits 20-29 are used as raw debug toggles by the camera/object motion and the upscaler.
 };
 inline bool Disabled(std::uint64_t bit) {

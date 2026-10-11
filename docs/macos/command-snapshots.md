@@ -45,3 +45,62 @@ Test: `tests/test_cmd_snapshot.cpp` (nested and constant IBs, an IB called twice
 target, later guest writes, unparsed ranges, truncated streams, pending stream writes into a called
 chunk and into the submitted buffer, a pending write elsewhere, a GPU-side DMA into submitted
 command memory).
+
+## Guest data read from command memory (`BB_CMD_DATA_CHECK=1`, diagnostic)
+
+Gnm can allocate descriptor tables and constants inside a command buffer's chunk. The engine
+allocates them downward from the chunk's end (0x26b07f0, Astra-2), so they lie **outside** the
+submitted `[begin, cmdptr)` range that the snapshot copies. The guest may reuse a chunk once it
+believes the GPU is done with it. If we then read such data at parse time, we read bytes the
+guest has already replaced: for example, the GXFfxLightShaft vertex-buffer table read as floats.
+
+`BB_CMD_DATA_CHECK=1` (`gpu/shim/bbport_cmd_data.h`) locates these parse-time guest reads
+relative to the snapshots the GPU thread still holds:
+- `Info::ReadUdReg`: a descriptor table read through a user-data pointer, including the fetch
+  shader's vertex-buffer table;
+- `Info::ReadTessConstantBuffer`.
+
+The classifier (`BbCmdData::Classify`) is pure. It runs under the snapshot lock against the
+snapshots' own copies and reads no guest memory. Each read falls into one of these:
+- **Inside:** every held region containing the range is compared with the bytes just read.
+  - The result says how many held copies contain it and how many differ. It also says whether
+    one of them is the parser's current submission (recorded per packet on the GPU thread; reads
+    on the draw thread have none).
+  - The selected region is the current submission's, else the newest. The line says first
+    whether the **selected** copy matches the read, then how many other held copies differ. This
+    is a byte comparison, not an order: it does not say which copy was written last.
+  - A resubmitted chunk shows up as several copies. A difference shows that a held copy differs
+    from the read, not by itself which submission's bytes the PS4 would have used.
+- **Straddling** a held region's boundary, when no held region contains the range (a containing
+  region always wins).
+- **A candidate chunk tail:** outside every held region, but in the same chunk of a known pool
+  as a held region that ends below it. The newest such submission is named.
+  - Pools come from `BB_CMD_DATA_POOLS` (`base:chunks,...`). The default is Astra-2's captured A1
+    at 0x7039400010 (128 chunks) and A2 at 0x703b400020 (384 chunks).
+  - `BB_CMD_DATA_CHUNK` is the chunk size, default 256 KiB.
+  - The geometry is assumed, and ownership of the address is not established.
+  - After the lock is released, the chunk's status word (its last 8 bytes: 0 free, 1 claimed,
+    2 released) is read without faulting (Mach). If that fails it is reported as unreadable.
+- **Not located:** none of the above. The address may still be in a known pool (a chunk with no
+  held region below it, or a range crossing a chunk end). Parsed snapshots are released, so this
+  never means outside command memory.
+
+**Output** goes to stdout:
+- `CMD-DATA #n` lines for the first 16 notable reads: the selected copy differs, straddling, or
+  a candidate tail;
+- a summary every 65536 reads across all kinds, with counts per read kind and shader hash.
+
+The `CheckNumberConversion` stop appends this thread's latest instrumented read, **as observed
+then** (it never re-reads guest memory). That read is not necessarily the descriptor that stopped:
+it may have come from the uninstrumented flat buffer.
+
+**Limits:**
+- Supporting evidence only.
+- Reads made by generated code (the SRT walker) are not instrumented.
+- Each lookup takes the snapshot lock and scans the held regions. That serialises against
+  submissions and can change the timing of the race it observes.
+- Numeric settings are parsed strictly (decimal without a leading zero, or 0x hex; no
+  whitespace or sign); a malformed value stops.
+- Lifetime: each lookup holds a registry lock (shared) while it uses the Liverpool owner.
+  `~Liverpool` unregisters first, holding none of its own locks, so it waits out any lookup in
+  flight on any thread; later reads are not located.

@@ -121,6 +121,30 @@ public:
     /// in stream order with the draws (SignalFlip).
     void DrawBisectOnFlip();
 #endif
+#ifdef __APPLE__
+    /// bbport (frame capture, docs/macos/capture-replay.md): on the GPU command thread at the
+    /// capture hold point. Drains the draw pipe, joins the binding helper and waits for every
+    /// submission (these block, unbounded), runs deferred operations, then polls until a 2 s
+    /// deadline
+    /// (Scheduler::WaitQuiescentForCapture) until every priority operation and deferred signal
+    /// issued has run to the end; false and `why` if anything is still outstanding (the caller
+    /// rejects the cut).
+    bool QuiesceForCapture(std::string& why);
+    /// Empty if a capture may be armed, else the host features available (the menu switches them
+    /// live; BB_UPSCALER=none removes the upscaler and camera motion for the run) that make a frame
+    /// depend on host-side history or redirect it (upscaler incl. TAA, reduced scene / live
+    /// resolution, camera or object motion vectors).
+    [[nodiscard]] std::string CaptureSettingsRefusal() const;
+    /// Perf replay (capture_images.h): every GPU-modified image, streamed to `sink`, and the
+    /// metadata surfaces. GPU command thread, after QuiesceForCapture succeeded. False with
+    /// `why` on an image it cannot capture exactly.
+    bool CaptureImages(const std::function<void(VideoCore::CapturedImage&&)>& sink,
+                       VideoCore::CapturedMetadata& metadata, std::string& why);
+    /// Perf replay: recreates the captured images in a fresh cache, before the first replayed
+    /// packet (GPU command thread, guest memory and registers already restored).
+    bool RestoreImages(const std::function<bool(VideoCore::CapturedImage&)>& next,
+                       const VideoCore::CapturedMetadata& metadata, std::string& why);
+#endif
     bool RunInOrder(OrderedTask task, const void* data, u32 size,
                     u64 toggle = BbToggle::PipelinedTasks);
     /// Stage A: the draw pipe position after the last handed-over packet, and whether the
@@ -146,6 +170,21 @@ public:
     /// written the range, recorded work completes.
     void SyncParserRead(VAddr address, u64 size);
     /// Before a guest-visible write: fences deferred earlier are written first.
+#ifdef __APPLE__
+    /// GpuIdle's wait split (R0, docs/macos/throttle-relaxation.md): the recorder-side deferred
+    /// writes only, and the completion labels' progress.
+    void WaitRecorderSignals() {
+        scheduler.WaitRecorderSignals();
+    }
+    struct LabelProgress {
+        u64 issued;              ///< completion labels issued so far
+        u64 last_label_tick;     ///< the timeline tick the last one waits for
+        u64 last_submitted_tick; ///< the last tick submitted to the GPU
+    };
+    LabelProgress GetLabelProgress() {
+        return {scheduler.LabelsIssued(), scheduler.LastLabelTick(), scheduler.CurrentTick() - 1};
+    }
+#endif
     void WaitDeferredSignals() {
 #ifdef __APPLE__
         // Labels this stage B batched are not submitted yet: submit them before waiting for

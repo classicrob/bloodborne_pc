@@ -12,6 +12,7 @@
 #include <magic_enum/magic_enum.hpp>
 #include "bbport_copy.h"
 #include "bbport_toggles.h"
+#include "bbport_parse_split.h"
 #include "common/alignment.h"
 #include "core/memory.h"
 #include "video_core/amdgpu/liverpool.h"
@@ -821,6 +822,7 @@ const Buffer* BufferCache::UploadCopies(const Buffer* arena, std::span<vk::Buffe
 }
 
 bool BufferCache::SynchronizeMemoryFromImage(const Buffer* arena, VAddr device_addr, u32 size) {
+    BB_SPLIT_SCOPE(KTexelSync);
     if (auto type = texture_cache.IsMeta(device_addr)) {
         if (*type == TextureCache::MetaType::HTile) {
             static constexpr u32 ZmaskUncompressed = 0xf;

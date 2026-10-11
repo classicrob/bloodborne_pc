@@ -1231,6 +1231,52 @@ int runtime_memory_alias_snapshot(uintptr_t address,RuntimeMemoryAlias *aliases,
     read_unlock();
     return found;
 }
+typedef struct { uint64_t start, end; } PhysSpan;
+static int phys_span_cmp(const void *a,const void *b) {
+    const PhysSpan *x=a,*y=b;
+    return x->start<y->start ? -1 : x->start>y->start;
+}
+int runtime_memory_inventory(RuntimeMemoryInventory *out) {
+    if (!out) return -1;
+    *out=(RuntimeMemoryInventory){0};
+    PhysSpan *spans=NULL;
+    size_t capacity=0, count=0;
+    for (;;) {
+        read_lock();
+        if (vma_count<=capacity) break;
+        size_t need=vma_count+16;
+        read_unlock();
+        PhysSpan *grown=realloc(spans,need*sizeof *spans);
+        if (!grown) { free(spans); return -1; }
+        spans=grown; capacity=need;
+    }
+    out->generation=__atomic_load_n(&table_generation,__ATOMIC_ACQUIRE);
+    for (size_t i=0;i<vma_count;++i) {
+        const Vma *v=&vmas[i];
+        const uint64_t size=v->end-v->start;
+        if (v->kind==KIND_RESERVED) { ++out->reserved_vmas; continue; }
+        if (v->kind==KIND_DIRECT) { ++out->direct_vmas; out->direct_view_bytes+=size; }
+        else { ++out->flexible_vmas; out->flexible_view_bytes+=size; }
+        spans[count++]=(PhysSpan){v->phys,v->phys+size};
+    }
+    out->live_direct_bytes=live_bytes;
+    out->flexible_in_use_bytes=flexible_bytes;
+    read_unlock();
+    qsort(spans,count,sizeof *spans,phys_span_cmp);
+    /* Sorted by start: a view overlaps an earlier one iff it starts before their furthest end,
+     * and a later one iff the next view starts before its own end. */
+    uint64_t end=0;
+    for (size_t i=0;i<count;++i) {
+        const int shares_earlier=i && spans[i].start<end;
+        const int shares_later=i+1<count && spans[i+1].start<spans[i].end;
+        out->shared_backing_views+=shares_earlier || shares_later;
+        if (!shares_earlier) out->unique_backing_bytes+=spans[i].end-spans[i].start;
+        else if (spans[i].end>end) out->unique_backing_bytes+=spans[i].end-end;
+        if (spans[i].end>end) end=spans[i].end;
+    }
+    free(spans);
+    return 0;
+}
 #endif
 /* GPU page tracking: restrict host access, never beyond the guest's own protection. */
 void runtime_memory_gpu_protect(uintptr_t address, uint64_t size, int read, int write) {

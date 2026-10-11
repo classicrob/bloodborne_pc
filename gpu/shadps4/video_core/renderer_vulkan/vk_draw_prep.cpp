@@ -9,6 +9,7 @@
 
 #include "bbport_threads.h"
 #include "bbport_toggles.h"
+#include "common/assert.h"
 #include "common/thread.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/amdgpu/pm4_cmds.h"
@@ -283,6 +284,35 @@ void DrawPreparation::BeginSubmission(u64 seq, const AmdGpu::Regs& regs, u64 reg
     }
 }
 
+void DrawPreparation::ResetBaseline(u64 seq, const AmdGpu::Regs& regs, u64 reg_checksum) {
+    current_draw = 0;
+    current.reset();
+    if (!Enabled()) {
+        return;
+    }
+    {
+        std::scoped_lock lk{mutex};
+        for (const auto& submission : submissions) {
+            ASSERT_MSG(submission->seq < seq,
+                       "Draw preparation reset at submission {} after submission {} was queued",
+                       seq, submission->seq);
+        }
+        submissions.clear();
+        if (!initial_regs) {
+            initial_regs = std::make_unique<AmdGpu::Regs>(regs);
+            tail_regs = std::make_unique<AmdGpu::Regs>(regs);
+        } else {
+            *initial_regs = regs;
+            *tail_regs = regs;
+        }
+        initial_checksum = tail_checksum = reg_checksum;
+        baseline_seq = tail_seq = seq;
+        baseline_ready = true;
+        ++generation;
+    }
+    cv.notify_all();
+}
+
 void DrawPreparation::EndSubmission() {
     if (current) {
         current->gpu_done.store(true, std::memory_order_release);
@@ -330,6 +360,7 @@ void DrawPreparation::ScannerLoop(std::stop_token stop) {
     std::unique_ptr<AmdGpu::Regs> regs;
     u64 checksum = 0;
     u64 next_seq = 0;
+    u64 seen_generation = 0;
     {
         std::unique_lock lk{mutex};
         cv.wait(lk, stop, [&] { return baseline_ready; });
@@ -339,6 +370,7 @@ void DrawPreparation::ScannerLoop(std::stop_token stop) {
         regs = std::make_unique<AmdGpu::Regs>(*initial_regs);
         checksum = initial_checksum;
         next_seq = baseline_seq;
+        seen_generation = generation;
     }
     AmdGpu::RegDirty dirty;
     while (!stop.stop_requested()) {
@@ -346,17 +378,18 @@ void DrawPreparation::ScannerLoop(std::stop_token stop) {
         {
             std::unique_lock lk{mutex};
             cv.wait(lk, stop, [&] {
-                return next_seq < tail_seq ||
+                return next_seq < tail_seq || seen_generation != generation ||
                        (!submissions.empty() && submissions.back()->seq >= next_seq);
             });
             if (stop.stop_requested()) {
                 return;
             }
-            if (next_seq < tail_seq) {
-                // Rebased by the GPU thread: continue from its state.
+            if (next_seq < tail_seq || seen_generation != generation) {
+                // Rebased or reset by the GPU thread: continue from its state.
                 *regs = *tail_regs;
                 checksum = tail_checksum;
                 next_seq = tail_seq;
+                seen_generation = generation;
                 continue;
             }
             // Unscanned buffers are only collected by a rebase, so `next_seq` is still queued.
@@ -384,6 +417,7 @@ void DrawPreparation::WorkerLoop(std::stop_token stop, u32 index) {
     auto regs = std::make_unique<AmdGpu::Regs>();
     constexpr u64 NoPosition = ~0ull;
     u64 position = NoPosition; ///< `regs` holds the state at the start of this buffer
+    u64 seen_generation = 0;
     PipelineSelection sel{};
     sel.regs = regs.get();
     PrepWorker prep_worker{};
@@ -419,9 +453,11 @@ void DrawPreparation::WorkerLoop(std::stop_token stop, u32 index) {
             target->claimed.store(true, std::memory_order_relaxed);
             // Buffers between this worker's state and the target: their deltas. A position
             // already collected (or past the target) restarts from the queue's tail state.
-            if (position == NoPosition || position < tail_seq || position > target->seq) {
+            if (position == NoPosition || position < tail_seq || position > target->seq ||
+                seen_generation != generation) {
                 *regs = *tail_regs;
                 position = tail_seq;
+                seen_generation = generation;
             }
             const u64 front = submissions.front()->seq;
             path.clear();

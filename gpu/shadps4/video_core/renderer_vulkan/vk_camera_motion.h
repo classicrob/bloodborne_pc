@@ -42,6 +42,17 @@ public:
         jitter = value;
     }
 
+    /// What the last RecordMotion used, for dump provenance (tools/macos/motion_agree.py).
+    struct MotionRecord {
+        float proj_z = 0;          ///< current projection z scale (the shader's depth threshold)
+        u32 mode = 0;              ///< 1: object vectors merged in; 0: camera vectors only
+        bool camera_only = false;  ///< BB_MOTION_CAMERA_ONLY
+        bool object_valid = false; ///< an object motion image was available
+    };
+    [[nodiscard]] MotionRecord LastRecord() const noexcept {
+        return last_record;
+    }
+
     [[nodiscard]] bool Enabled() const noexcept {
         return debug_overlay || for_upscaler;
     }
@@ -94,6 +105,8 @@ private:
     VideoCore::TextureCache& texture_cache;
     Runtime& runtime;
     bool debug_overlay = false;
+    bool camera_only = false; ///< BB_MOTION_CAMERA_ONLY (diagnostic)
+    MotionRecord last_record;
     bool for_upscaler = false;
     vk::UniqueDescriptorSetLayout motion_desc_layout;
     vk::UniquePipelineLayout motion_pipeline_layout;

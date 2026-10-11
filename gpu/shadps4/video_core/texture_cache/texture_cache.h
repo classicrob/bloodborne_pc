@@ -8,6 +8,7 @@
 #include "bbport_toggles.h"
 
 #include <condition_variable>
+#include <functional>
 #include <mutex>
 #include <thread>
 #include <unordered_set>
@@ -21,6 +22,8 @@
 #include "video_core/multi_level_page_table.h"
 #include "video_core/texture_cache/blit_helper.h"
 #include "video_core/texture_cache/image.h"
+#include "video_core/texture_cache/capture_images.h"
+#include "video_core/texture_cache/capture_records.h"
 #include "video_core/texture_cache/image_view.h"
 #include "video_core/texture_cache/sampler.h"
 #include "video_core/texture_cache/tile_manager.h"
@@ -113,6 +116,27 @@ public:
 
     /// Evicts any images that overlap the unmapped range.
     void UnmapMemory(VAddr cpu_addr, size_t size);
+
+#ifdef __APPLE__
+    /// bbport (frame capture, docs/macos/capture-replay.md): one record per GPU-modified image,
+    /// read-only (nothing is written back). Call at a quiescent point
+    /// (Rasterizer::QuiesceForCapture). Not const: the slot vector's const iteration is unusable.
+    void ReportGpuModifiedForCapture(std::vector<CaptureImageRecord>& out);
+
+    /// bbport (perf replay, capture_images.h): every GPU-modified image, texels and state, one
+    /// at a time to `sink`, then the metadata surfaces. Call at a quiescent point
+    /// (Rasterizer::QuiesceForCapture) on the GPU command thread. False with `why` (nothing
+    /// partial is meaningful) for an image it cannot capture exactly: multisampled, a reduced
+    /// scene proxy, more than one backing, a format without a packed buffer layout.
+    bool CaptureForReplay(const std::function<void(CapturedImage&&)>& sink,
+                          CapturedMetadata& metadata, std::string& why);
+    /// bbport (perf replay): recreates the images `next` yields (until it returns false) at
+    /// their keys, copies their texels in, restores flags, usage, hashes, CPU write tracking
+    /// and depth associations, then the metadata surfaces. The cache must hold no image
+    /// overlapping them (a fresh replay). False with `why` on any mismatch.
+    bool RestoreForReplay(const std::function<bool(CapturedImage&)>& next,
+                          const CapturedMetadata& metadata, std::string& why);
+#endif
 
     /// Schedules a copy of pending images for download back to CPU memory.
     void ProcessDownloadImages();

@@ -99,12 +99,16 @@ int main(int argc, char** argv) {
                          float scene_depth=0.5f, float z_translation=0.f,
                          float jitter_x=0.f, bool edge=false, float depth_slope=0.f,
                          bool thin_edge=false, bool history_edge=false,
-                         bool thin_history=false) {
+                         bool thin_history=false, u32 py=3, float previous_z_y=0.f,
+                         int verdict=-1) {
+        // The sampled pixel (X, py) and its dark left neighbour; verdict 1/0: only whether the
+        // history was accepted (blended towards 0.75) or rejected (the current 0.25).
+        const u32 sampled=py*W+X;
         auto* pixels = static_cast<float*>(ai.pMappedData);
         for (u32 image = 0; image < 4; ++image) {
             for (u32 p = 0; p < N; ++p) {
                 float* c=pixels+image*N*4+p*4;
-                c[0]=c[1]=c[2]=image==0 ? (p==center ? 0.25f : high) :
+                c[0]=c[1]=c[2]=image==0 ? (p==sampled ? 0.25f : high) :
                     image==1 ? scene_depth : image==2 ? 0.f : history;
                 c[3]=image==3 ? history_depth : 1.f;
                 if (image==2) c[0]=motion;
@@ -119,7 +123,7 @@ int main(int argc, char** argv) {
             }
         }
         // A dark neighbor and a bright neighbor make history clipping measurable.
-        pixels[(center-1)*4]=pixels[(center-1)*4+1]=pixels[(center-1)*4+2]=0.f;
+        pixels[(sampled-1)*4]=pixels[(sampled-1)*4+1]=pixels[(sampled-1)*4+2]=0.f;
         const auto cmd=scheduler.CommandBuffer();
         std::array<vk::ImageMemoryBarrier2,7> transitions{};
         for (u32 i=0;i<7;++i) {
@@ -149,7 +153,7 @@ int main(int argc, char** argv) {
             float x,y;u32 reset,pad;
             std::array<float,4> proj,prev_proj,previous_z;
         } params{jitter_x,0,reset,0,{1,1,1,-0.05f},{1,1,1,-0.05f},
-                 {0,0,1,z_translation}};
+                 {0,previous_z_y,1,z_translation}};
         cmd.bindPipeline(vk::PipelineBindPoint::eCompute,*pipeline,d);
         cmd.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute,*layout,0,writes,d);
         cmd.pushConstants(*layout,vk::ShaderStageFlagBits::eCompute,0,sizeof(params),&params,d);
@@ -159,13 +163,23 @@ int main(int argc, char** argv) {
         for (u32 i=4;i<6;++i) {
             const vk::BufferImageCopy region{.bufferOffset=(i-4)*16,
                 .imageSubresource={vk::ImageAspectFlagBits::eColor,0,0,1},
-                .imageOffset={s32(X),3,0},.imageExtent={1,1,1}};
+                .imageOffset={s32(X),s32(py),0},.imageExtent={1,1,1}};
             cmd.copyImageToBuffer(vk::Image(images[i]),vk::ImageLayout::eGeneral,staging,region,d);
         }
         barrier(cmd,vk::PipelineStageFlagBits2::eTransfer,vk::AccessFlagBits2::eTransferWrite,
                 vk::PipelineStageFlagBits2::eHost,vk::AccessFlagBits2::eHostRead);
         scheduler.Finish();
         const auto* result=static_cast<u16*>(ai.pMappedData);
+        if (verdict>=0) {
+            const float value=half(result[0]);
+            const bool accepted=value>0.5f, rejected=std::abs(value-0.25f)<0.001f;
+            std::printf("TAA shader: %s measured %.4f, %s\n",label,value,
+                        accepted ? "history accepted" : rejected ? "history rejected" : "neither");
+            std::fflush(stdout);
+            assert(verdict==1 ? accepted : rejected);
+            std::printf("TAA shader: %s PASS (%.3f)\n",label,value);
+            return;
+        }
         if (std::abs(half(result[0])-expected)>=0.001f) {
             std::fprintf(stderr,"TAA regression: %s: actual %.6f, expected %.6f\n",
                          label,half(result[0]),expected);
@@ -206,6 +220,20 @@ int main(int argc, char** argv) {
         false,0.5f,0,0,false,0,false,false,true);
     run("tiny motion at large pixel coordinate",0,0.75f,0.5f,-0.00003f,1,0.739985f,
         false,0.5f,0,0,false,0,false,true);
+    // Off-centre (row 1: view y != 0) with the previous depth depending on view y
+    // (previous_z.y = 0.5): expectedPreviousDepth's y reconstruction sign decides which history
+    // depth is the same surface. Reference, view +y down the rows: v = 1.5/7, ndc y = 2v - 1,
+    // z = 0.1 at depth 0.5, prev z = z + 0.5 * ndc_y * z, depth = 1 - 0.05 / prev z. Motion 2
+    // (>= 1 px) so that only the depth test decides (no keep-in-front rule).
+    {
+        const float z=-0.05f/(0.5f-1.f), ndc_y=2.f*(1.5f/H)-1.f;
+        const float right=1.f-0.05f/(z+0.5f*ndc_y*z), wrong=1.f-0.05f/(z-0.5f*ndc_y*z);
+        assert(right>0.f && right<1.f && wrong>0.f && wrong<1.f && std::abs(right-wrong)>0.1f);
+        run("off-centre: matching previous depth (view y) accepted",0,0.75f,right,2,1,0,
+            false,0.5f,0,0,false,0,false,false,false,1,0.5f,1);
+        run("off-centre: y-flipped previous depth rejected",0,0.75f,wrong,2,1,0,
+            false,0.5f,0,0,false,0,false,false,false,1,0.5f,0);
+    }
     std::array<vk::DescriptorSetLayoutBinding,2> sharpen_bindings{};
     for (u32 i=0;i<2;++i) sharpen_bindings[i]={.binding=i,
         .descriptorType=vk::DescriptorType::eStorageImage,.descriptorCount=1,

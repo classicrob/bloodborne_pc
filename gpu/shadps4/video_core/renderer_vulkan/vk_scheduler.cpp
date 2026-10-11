@@ -12,6 +12,7 @@
 #include <functional>
 
 #include "bbport_copy.h"
+#include "bbport_label_mode.h"
 #include "video_core/renderer_vulkan/vk_gpu_profiler.h"
 #include "bbport_toggles.h"
 #include "common/assert.h"
@@ -20,6 +21,7 @@
 #include "imgui/renderer/texture_manager.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "bbport_parse_split.h"
 #include "bbport_threads.h"
 
 namespace Vulkan {
@@ -59,6 +61,7 @@ void Scheduler::BeginRendering(const RenderState& new_state) {
     if (is_rendering && render_state == new_state) {
         return;
     }
+    BB_SPLIT_SCOPE(KRenderPassSwitch);
     EndRendering();
     is_rendering = true;
     render_state = new_state;
@@ -108,12 +111,14 @@ void Scheduler::BeginRendering(const RenderState& new_state) {
     };
 
     if (!recording_threaded) {
+        BB_SPLIT_SCOPE(KEncRendering);
         current_cmdbuf.beginRendering(rendering_info);
         return;
     }
     // The attachment infos live on this stack frame: the recorded closure keeps copies.
     Record([info = rendering_info, color_attachments, depth_attachment,
             stencil_attachment](vk::CommandBuffer cmdbuf) mutable {
+        BB_SPLIT_SCOPE(KEncRendering);
         info.pColorAttachments = color_attachments.data();
         if (info.pDepthAttachment) {
             info.pDepthAttachment = &depth_attachment;
@@ -130,7 +135,11 @@ void Scheduler::EndRendering() {
         return;
     }
     is_rendering = false;
-    Record([](vk::CommandBuffer cmdbuf) { cmdbuf.endRendering(); });
+    BB_SPLIT_SCOPE(KRenderPassSwitch);
+    Record([](vk::CommandBuffer cmdbuf) {
+        BB_SPLIT_SCOPE(KEncRendering);
+        cmdbuf.endRendering();
+    });
 }
 
 void Scheduler::TraceDirectRecording(void* caller) {
@@ -188,29 +197,42 @@ void Scheduler::SignalAfterHostCopies(std::function<void()> signal) {
     }
     BbCopy::FlushBatch();
     deferred_signals_issued.fetch_add(1, std::memory_order_relaxed);
+#ifdef __APPLE__
+    recorder_signals.Issue();
+    Record([signal = std::move(signal), done = deferred_signals_done,
+            recorder_done = recorder_signals.done](vk::CommandBuffer) mutable {
+        BbCopy::AfterCopies([signal = std::move(signal), done = std::move(done),
+                             recorder_done = std::move(recorder_done)] {
+            signal();
+            recorder_done->fetch_add(1, std::memory_order_release);
+            done->fetch_add(1, std::memory_order_release);
+        });
+    });
+#else
     Record([signal = std::move(signal), done = deferred_signals_done](vk::CommandBuffer) mutable {
         BbCopy::AfterCopies([signal = std::move(signal), done = std::move(done)] {
             signal();
             done->fetch_add(1, std::memory_order_release);
         });
     });
+#endif
     KickRecording(true);
 }
 
 #ifdef __APPLE__
 bool Scheduler::LabelsAtGpuComplete() {
-    static const bool whole_run = [] {
-        const char* env = std::getenv("BB_LABELS_AT_GPU_COMPLETE");
-        const bool on = env && env[0] == '1';
-        if (on) {
-            std::fprintf(stderr, "BB_LABELS_AT_GPU_COMPLETE=1: EOP/EOS/RELEASE_MEM labels are "
-                                 "written once the GPU completed the work before them (one "
-                                 "submission per label)\n");
-        }
-        return on;
+    static const BbLabels::RunMode run = [] {
+        const auto mode = BbLabels::ParseRunMode(std::getenv("BB_LABELS_AT_GPU_COMPLETE"));
+        std::fprintf(stderr, "Labels (EOP/EOS/RELEASE_MEM): %s\n",
+                     mode == BbLabels::RunMode::AtGpuComplete
+                         ? "at GPU completion for the whole run (BB_LABELS_AT_GPU_COMPLETE=1)"
+                     : mode == BbLabels::RunMode::AtSubmit
+                         ? "at submit for the whole run (BB_LABELS_AT_GPU_COMPLETE=0, diagnosis)"
+                         : "at GPU completion (default; toggle bit 59 writes them at submit)");
+        return mode;
     }();
     // Toggle bit 59 (BB_TOGGLE_FILE) switches it live; Liverpool keeps the order at a switch.
-    return whole_run || BbToggle::Disabled(BbToggle::LabelsAtGpuComplete);
+    return BbLabels::AtGpuComplete(run, BbToggle::Disabled(BbToggle::LabelsAtSubmit));
 }
 
 void Scheduler::FlushLabels(bool idle) {
@@ -228,6 +250,8 @@ void Scheduler::SignalAtGpuCompletion(std::function<void()> signal, bool batch) 
     // Issued now, in stream order; the writer takes labels only in this order, whichever
     // becomes ready first (deferred ones after the copy threads, direct ones at once).
     const u64 sequence = labels.Issue();
+    completion_labels.Issue();
+    last_label_tick.store(tick, std::memory_order_relaxed);
     deferred_signals_issued.fetch_add(1, std::memory_order_relaxed);
     std::call_once(label_thread_once, [this] {
         label_thread = std::jthread([this](std::stop_token stoken) { LabelThread(stoken); });
@@ -302,16 +326,44 @@ void Scheduler::LabelThread(std::stop_token stoken) {
             break;
         }
         label->write();
+        completion_labels.Complete();
         deferred_signals_done->fetch_add(1, std::memory_order_release);
     }
     // Stopping (exit): labels not written are dropped, and counted as done so that nothing is
     // left waiting for them (WaitDeferredSignals).
     dropped += labels.Outstanding();
     if (dropped) {
+        completion_labels.Complete(dropped);
         deferred_signals_done->fetch_add(dropped, std::memory_order_release);
         std::fprintf(stderr, "Labels at GPU completion: %llu labels not written at shutdown\n",
                      static_cast<unsigned long long>(dropped));
     }
+}
+#endif
+
+#ifdef __APPLE__
+bool Scheduler::WaitQuiescentForCapture(std::chrono::milliseconds limit, std::string& why) {
+    const auto deadline = std::chrono::steady_clock::now() + limit;
+    while ((num_pending_ops.load(std::memory_order_acquire) || PriorityOperationsOutstanding() ||
+            DeferredSignalsOutstanding()) &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    std::string outstanding;
+    if (const u32 ops = num_pending_ops.load(std::memory_order_acquire)) {
+        outstanding += fmt::format("{} deferred operations; ", ops);
+    }
+    if (const u64 ops = PriorityOperationsOutstanding()) {
+        outstanding += fmt::format("{} priority operations not finished; ", ops);
+    }
+    if (const u64 signals = DeferredSignalsOutstanding()) {
+        outstanding += fmt::format("{} deferred signals (labels) not written; ", signals);
+    }
+    if (outstanding.empty()) {
+        return true;
+    }
+    why = outstanding.substr(0, outstanding.size() - 2);
+    return false;
 }
 #endif
 
@@ -322,6 +374,7 @@ void Scheduler::WaitDeferredSignals() {
         return;
     }
     BbStats::WaitTimer timer{BbStats::deferred_signals_wait_ns};
+    BB_SPLIT_SCOPE(KDeferred);
     KickRecording(true);
     while (deferred_signals_done->load(std::memory_order_acquire) < issued) {
         // Helps the copy threads the signals wait for.
@@ -330,9 +383,27 @@ void Scheduler::WaitDeferredSignals() {
     }
 }
 
+#ifdef __APPLE__
+void Scheduler::WaitRecorderSignals() {
+    // Its own counts (bbport_deferred_counts.h), not a difference of the total and the labels.
+    const u64 issued = recorder_signals.Issued();
+    if (recorder_signals.CompleteThrough(issued) ||
+        BbToggle::Disabled(BbToggle::OrderedGuestWrites)) {
+        return;
+    }
+    BB_SPLIT_SCOPE(KRecorderSignals);
+    KickRecording(true);
+    while (!recorder_signals.CompleteThrough(issued)) {
+        BbCopy::WaitAsync();
+        std::this_thread::yield();
+    }
+}
+#endif
+
 void Scheduler::WaitHostCopies() {
     if (host_copies_done.load(std::memory_order_acquire) < host_copies_issued) {
         BbStats::WaitTimer timer{BbStats::host_copy_record_wait_ns};
+        BB_SPLIT_SCOPE(KHostCopies);
         BbStats::host_copy_waits.fetch_add(1, std::memory_order_relaxed);
         KickRecording(true);
         while (host_copies_done.load(std::memory_order_acquire) < host_copies_issued) {
@@ -384,12 +455,16 @@ void Scheduler::SyncRecording() {
     }
     KickRecording(true);
     BbStats::WaitTimer timer{BbStats::sync_recording_ns};
+    BB_SPLIT_SCOPE(KRecorderSync);
     std::unique_lock lk{recorder_mutex};
     recorder_idle_cv.wait(lk, [this] { return recorder_queue.empty() && !recorder_busy; });
 }
 
 void Scheduler::RecorderThread(std::stop_token stoken) {
     Common::SetCurrentThreadName("bb:VkRecorder");
+#ifdef __APPLE__
+    BbSplit::Attach(BbSplit::recorder, BbSplit::RIdle);
+#endif
     while (true) {
         // Spin briefly before sleeping: the next chunk usually follows within microseconds,
         // and a sleeping recorder costs the GPU thread a wake-up syscall per kick. With few
@@ -423,8 +498,12 @@ void Scheduler::RecorderThread(std::stop_token stoken) {
         {
 #ifdef __APPLE__
             BbPerf::RecorderTimer perf_timer;
+            BbSplit::Mark(BbSplit::RExecute);
 #endif
             chunk->Execute(current_cmdbuf);
+#ifdef __APPLE__
+            BbSplit::Mark(BbSplit::RIdle);
+#endif
         }
         {
             std::scoped_lock lk{recorder_mutex};
@@ -439,6 +518,7 @@ void Scheduler::RecorderThread(std::stop_token stoken) {
 
 u64 Scheduler::Flush(SubmitInfo& info) {
     // When flushing, we only send data to the driver; no waiting is necessary.
+    BB_SPLIT_SCOPE(KFlush);
     return SubmitExecution(info);
 }
 
@@ -474,6 +554,7 @@ void Scheduler::Wait(u64 tick) {
         Flush(info);
     }
     BbStats::WaitTimer timer{BbStats::tick_wait_ns};
+    BB_SPLIT_SCOPE(KGpuTick);
     work_semaphore.Wait(tick);
 }
 
@@ -653,10 +734,14 @@ void Scheduler::PriorityPendingOpsThread(std::stop_token stoken) {
         }
 
         op.callback();
+#ifdef __APPLE__
+        priority_ops_completed.fetch_add(1, std::memory_order_acq_rel);
+#endif
     }
 }
 
 void DynamicState::Commit(const Instance& instance, const vk::CommandBuffer& cmdbuf) {
+    BB_SPLIT_SCOPE(KDynamicState);
     // A null command buffer only updates the dirty flags, exactly as recording would.
     CommitWith(instance.IsDepthBoundsSupported(), instance.IsDynamicColorWriteMaskSupported(),
                instance.IsAttachmentFeedbackLoopLayoutSupported(), [&](auto&& command) {

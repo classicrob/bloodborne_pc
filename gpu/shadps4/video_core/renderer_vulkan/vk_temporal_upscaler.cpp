@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+#include <filesystem>
 #include "video_core/renderer_vulkan/vk_temporal_upscaler.h"
 #include "video_core/renderer_vulkan/vk_gpu_profiler.h"
 #include "video_core/renderer_vulkan/motion_history.h"
@@ -54,6 +55,15 @@ FfxVkPortableImage Describe(vk::Image image, vk::Format format, u32 width, u32 h
 /// the upscaler's images of the next BB_DUMP_FRAMES (8) frames as raw files
 /// <dir>/fNNN_<name>_<w>x<h>_<format>.raw, for checking temporal stability offline.
 /// Returns the frame number to dump, or -1.
+/// The dump session (one per consumed trigger): microseconds since the epoch at the trigger. Its
+/// files go to <BB_DUMP_DIR>/session-<id>, created exclusively, so a session's files are only its
+/// own (a missing or pending write is missing, never an older capture's file of the same name).
+u64 dump_session = 0;
+const std::string& DumpDir();
+std::string SessionDir() {
+    return DumpDir() + "/session-" + std::to_string(dump_session);
+}
+
 int DumpFrame() {
     static const char* trigger = std::getenv("BB_DUMP_TRIGGER");
     static int remaining = 0, index = 0, polls = 0;
@@ -67,6 +77,18 @@ int DumpFrame() {
         const char* frames = std::getenv("BB_DUMP_FRAMES");
         remaining = frames ? std::max(1, std::atoi(frames)) : 8;
         index = 0;
+        dump_session = u64(std::chrono::duration_cast<std::chrono::microseconds>(
+                               std::chrono::system_clock::now().time_since_epoch())
+                               .count());
+        std::error_code error;
+        std::filesystem::create_directories(DumpDir(), error);
+        if (!std::filesystem::create_directory(SessionDir(), error)) {
+            std::printf("Dump: session directory %s not created (%s): no dump\n",
+                        SessionDir().c_str(), error ? error.message().c_str() : "exists");
+            remaining = 0;
+            return -1;
+        }
+        std::printf("Dump: %d frames to %s\n", remaining, SessionDir().c_str());
     }
     --remaining;
     return index++;
@@ -82,12 +104,17 @@ struct DumpImage {
 
 /// Copies `images` into host buffers after the commands recorded so far and writes them to
 /// files once the GPU is done.
-void DumpImages(const Instance& instance, Scheduler& scheduler, vk::CommandBuffer cmdbuf,
-                int frame, std::initializer_list<DumpImage> images) {
+const std::string& DumpDir() {
     static const std::string dir = [] {
         const char* env = std::getenv("BB_DUMP_DIR");
         return std::string{env && env[0] ? env : "out/dump"};
     }();
+    return dir;
+}
+
+void DumpImages(const Instance& instance, Scheduler& scheduler, vk::CommandBuffer cmdbuf,
+                int frame, std::initializer_list<DumpImage> images) {
+    const std::string dir = SessionDir();
     const vk::MemoryBarrier2 before{
         .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
         .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
@@ -168,6 +195,13 @@ TemporalUpscaler::TemporalUpscaler(const Instance& instance_, Scheduler& schedul
     // Available unless BB_UPSCALER=none; on/off and the parameters are the menu's settings.
     const char* env = std::getenv("BB_UPSCALER");
     enabled = !(env && std::strcmp(env, "none") == 0);
+    if (const char* trigger = std::getenv("BB_DUMP_TRIGGER")) {
+        // The trigger is polled after each upscaler dispatch (FSR 3 in place or scaled, FSR 4,
+        // TAA): with the upscaler off or MetalFX selected it stays unconsumed.
+        std::printf("Dump: BB_DUMP_TRIGGER=%s is polled every 30 upscaler frames (FSR 3, FSR 4 "
+                    "or TAA dispatching; not with the upscaler off or MetalFX)%s\n",
+                    trigger, enabled ? "" : "; BB_UPSCALER=none: never");
+    }
     if (const char* hash = std::getenv("BB_UPSCALE_BEFORE_CS")) {
         trigger_hash = std::strtoull(hash, nullptr, 16);
     }
@@ -1161,6 +1195,19 @@ void TemporalUpscaler::Run() {
         if (BbSettings::Get().upscaler != BbSettings::UpscalerTaa) {
             ExtraSharpen(cmdbuf, vk::Image(output_image), false, ow, oh);
         }
+        DumpUpscalerFrame(cmdbuf, {.input = input_color,
+                                   .input_width = w,
+                                   .input_height = h,
+                                   .input_bytes = 8,
+                                   .input_format = "rgba16f",
+                                   .depth = input_depth,
+                                   .w = w,
+                                   .h = h,
+                                   .output = vk::Image(output_image),
+                                   .ow = ow,
+                                   .oh = oh,
+                                   .output_bytes = 8,
+                                   .output_format = "rgba16f"});
         // The result replaces the scene color's RGB (its alpha carries data for the post).
         own_barrier(vk::Image(output_image), vk::ImageLayout::eGeneral, all, rw,
                     vk::ImageLayout::eGeneral, vk::PipelineStageFlagBits2::eComputeShader,
@@ -1648,28 +1695,19 @@ void TemporalUpscaler::RunScaled() {
                     vk::PipelineStageFlagBits2::eColorAttachmentOutput, color_access);
             reset = false;
             dispatched_last_frame = true;
-            if (const int dump = DumpFrame(); dump >= 0) {
-                DumpImages(instance, scheduler, cmdbuf, dump,
-                           {{color_image, source_width, source_height, 4, "input", "rgba"},
-                            {vk::Image(motion_image), w, h, 4, "motion", "rg16f"},
-                            {vk::Image(output_image), ow, oh, 8, "output", "rgba16f"}});
-                DumpImages(instance, scheduler, cmdbuf, dump,
-                           {{depth_image, source_width, source_height, 4, "depth", "f32",
-                             vk::ImageAspectFlagBits::eDepth}});
-                if (BbSettings::Get().upscaler == BbSettings::UpscalerTaa &&
-                    std::getenv("BB_TAA_DIAGNOSTICS")) {
-                    DumpImages(instance, scheduler, cmdbuf, dump,
-                               {{vk::Image(taa_history[taa_next]),ow,oh,16,
-                                 "previous_history","rgba32f"},
-                                {vk::Image(opaque_image),ow,oh,8,"history_sample","rgba16f"}});
-                }
-                // ObjectMotion's attachment can be in a different resolution from the FSR
-                // inputs: only dump it when it matches, to avoid an out-of-bounds GPU copy.
-                if (const auto object = camera_motion.ObjectMotionImage(w, h); object) {
-                    DumpImages(instance, scheduler, cmdbuf, dump,
-                               {{object, w, h, 16, "objects", "rgba32f"}});
-                }
-            }
+            DumpUpscalerFrame(cmdbuf, {.input = color_image,
+                                       .input_width = source_width,
+                                       .input_height = source_height,
+                                       .input_bytes = 4,
+                                       .input_format = "rgba",
+                                       .depth = depth_image,
+                                       .w = w,
+                                       .h = h,
+                                       .output = vk::Image(output_image),
+                                       .ow = ow,
+                                       .oh = oh,
+                                       .output_bytes = 8,
+                                       .output_format = "rgba16f"});
         }
         done_this_frame = true;
         if (ok4) {
@@ -1740,6 +1778,19 @@ void TemporalUpscaler::RunScaled() {
         reset = false;
         dispatched_last_frame = true;
         ExtraSharpen(cmdbuf, vk::Image(ui_image), true, ow, oh);
+        DumpUpscalerFrame(cmdbuf, {.input = color_image,
+                                   .input_width = source_width,
+                                   .input_height = source_height,
+                                   .input_bytes = 4,
+                                   .input_format = "rgba",
+                                   .depth = depth_image,
+                                   .w = w,
+                                   .h = h,
+                                   .output = vk::Image(ui_image),
+                                   .ow = ow,
+                                   .oh = oh,
+                                   .output_bytes = 4,
+                                   .output_format = "rgba"});
     }
     barrier(vk::Image(ui_image), vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eGeneral, all,
             rw, vk::ImageLayout::eGeneral, vk::PipelineStageFlagBits2::eColorAttachmentOutput,
@@ -1750,6 +1801,50 @@ void TemporalUpscaler::RunScaled() {
         ui_phase = true;
         ui_color = ldr_target;
         ui_depth = camera_motion.Depth();
+    }
+}
+
+/// BB_DUMP_TRIGGER: one frame of whichever path dispatched the upscaler (in place, scaled
+/// FSR 3, FSR 4 or TAA), recorded after its dispatch.
+void TemporalUpscaler::DumpUpscalerFrame(vk::CommandBuffer cmdbuf, const DumpSources& s) {
+    const int dump = DumpFrame();
+    if (dump < 0) {
+        return;
+    }
+    // Provenance of the motion dump: what the camera motion pass did this frame.
+    const auto record = camera_motion.LastRecord();
+    char meta_path[512];
+    std::snprintf(meta_path, sizeof(meta_path), "%s/f%03d_meta.json",
+                  SessionDir().c_str(), dump);
+    if (FILE* meta = std::fopen(meta_path, "w")) {
+        std::fprintf(meta,
+                     "{\"session\": %llu, \"frame\": %d, \"motion_size\": [%u, %u], "
+                     "\"camera_only\": %s, \"mode\": %u, \"object_valid\": %s, "
+                     "\"proj_z\": %.9g}\n",
+                     (unsigned long long)dump_session, dump, s.w, s.h,
+                     record.camera_only ? "true" : "false", record.mode,
+                     record.object_valid ? "true" : "false", record.proj_z);
+        std::fclose(meta);
+    }
+    DumpImages(instance, scheduler, cmdbuf, dump,
+               {{s.input, s.input_width, s.input_height, s.input_bytes, "input", s.input_format},
+                {vk::Image(motion_image), s.w, s.h, 4, "motion", "rg16f"},
+                {s.output, s.ow, s.oh, s.output_bytes, "output", s.output_format}});
+    DumpImages(instance, scheduler, cmdbuf, dump,
+               {{s.depth, s.input_width, s.input_height, 4, "depth", "f32",
+                 vk::ImageAspectFlagBits::eDepth}});
+    if (BbSettings::Get().upscaler == BbSettings::UpscalerTaa &&
+        std::getenv("BB_TAA_DIAGNOSTICS")) {
+        DumpImages(instance, scheduler, cmdbuf, dump,
+                   {{vk::Image(taa_history[taa_next]),s.ow,s.oh,16,
+                     "previous_history","rgba32f"},
+                    {vk::Image(opaque_image),s.ow,s.oh,8,"history_sample","rgba16f"}});
+    }
+    // ObjectMotion's attachment can be in a different resolution from the FSR
+    // inputs: only dump it when it matches, to avoid an out-of-bounds GPU copy.
+    if (const auto object = camera_motion.ObjectMotionImage(s.w, s.h); object) {
+        DumpImages(instance, scheduler, cmdbuf, dump,
+                   {{object, s.w, s.h, 16, "objects", "rgba32f"}});
     }
 }
 

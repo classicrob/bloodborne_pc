@@ -23,7 +23,12 @@
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/texture_cache/host_compatibility.h"
 #include "video_core/texture_cache/texture_cache.h"
+#ifdef __APPLE__
+#include "video_core/renderer_vulkan/vk_scene_resolution.h"
+#endif
 #include "video_core/texture_cache/tile_manager.h"
+#include "bbport_parse_split.h"
+#include <vk_mem_alloc.h>
 
 namespace VideoCore {
 
@@ -892,6 +897,7 @@ void TextureCache::RefreshImage(Image& image) {
         return;
     }
     BbStats::Timer timer{BbStats::t_refresh};
+    BB_SPLIT_SCOPE(KImageRefresh);
 #ifdef __APPLE__
     const ImageFlagBits entry_flags = image.flags;
     u64 hashed_bytes = 0, copied_bytes = 0;
@@ -1355,5 +1361,343 @@ void TextureCache::DeleteImage(ImageId image_id) {
         slot_images.erase(image_id);
     });
 }
+
+#ifdef __APPLE__
+void TextureCache::ReportGpuModifiedForCapture(std::vector<CaptureImageRecord>& out) {
+    std::scoped_lock lock{mutex};
+    for (Image& image : slot_images) {
+        if (False(image.flags & ImageFlagBits::GpuModified)) {
+            continue;
+        }
+        const auto& info = image.info;
+        const u32 samples = std::max(info.num_samples, image.backing ? image.backing->num_samples : 1u);
+        const char* reject = nullptr;
+        if (samples > 1) {
+            reject = "msaa";
+        } else if (info.props.is_depth && info.props.has_stencil) {
+            reject = "depth+stencil"; // TileImage writes the depth plane only
+        } else if (info.meta_info.htile_addr || info.meta_info.cmask_addr ||
+                   info.meta_info.fmask_addr) {
+            reject = "metadata"; // no compressed metadata is kept
+        } else if (info.props.is_block) {
+            reject = "bc gpu-written";
+        } else if (runtime.scene_targets && runtime.scene_targets->Tracks(image.image_uid)) {
+            reject = "scene proxy"; // content at another resolution
+        }
+        out.push_back({
+            .addr = info.guest_address,
+            .size = info.guest_size,
+            .pixel_format = static_cast<u32>(info.pixel_format),
+            .tile_mode = static_cast<u32>(info.tile_mode),
+            .aspects = static_cast<u32>(image.aspect_mask),
+            .samples = samples,
+            .mips = info.resources.levels,
+            .layers = info.resources.layers,
+            .reject = reject,
+        });
+    }
+}
+
+namespace {
+/// A host-visible, coherent transfer buffer for the replay capture and restore.
+struct ReplayHostBuffer {
+    VmaAllocator allocator{};
+    VkBuffer buffer{};
+    VmaAllocation allocation{};
+    u8* data{};
+    ReplayHostBuffer(VmaAllocator allocator_, u64 bytes, std::string& why) : allocator{allocator_} {
+        const VkBufferCreateInfo info{.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+                                      .size = bytes,
+                                      .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                                               VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+        const VmaAllocationCreateInfo create{
+            .flags = VMA_ALLOCATION_CREATE_MAPPED_BIT |
+                     VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT,
+            .usage = VMA_MEMORY_USAGE_AUTO,
+            .requiredFlags = VK_MEMORY_PROPERTY_HOST_COHERENT_BIT};
+        VmaAllocationInfo allocated{};
+        if (vmaCreateBuffer(allocator, &info, &create, &buffer, &allocation, &allocated) !=
+            VK_SUCCESS) {
+            why = fmt::format("no {} byte host buffer", bytes);
+            buffer = {};
+            return;
+        }
+        data = static_cast<u8*>(allocated.pMappedData);
+    }
+    ~ReplayHostBuffer() {
+        if (buffer) {
+            vmaDestroyBuffer(allocator, buffer, allocation);
+        }
+    }
+    ReplayHostBuffer(const ReplayHostBuffer&) = delete;
+    ReplayHostBuffer& operator=(const ReplayHostBuffer&) = delete;
+};
+
+/// The (aspect, mip) records of `image` with their texel sizes, or why it cannot be captured.
+std::optional<std::vector<CapturedAspect>> ReplayAspects(const Image& image, std::string& why) {
+    std::vector<CapturedAspect> aspects;
+    for (const auto aspect : SplitAspects(image.aspect_mask)) {
+        const u32 texel_bytes = AspectTexelBytes(image.info.pixel_format, aspect);
+        if (!texel_bytes) {
+            why = fmt::format("format {} aspect {} has no packed buffer layout here",
+                              vk::to_string(image.info.pixel_format), vk::to_string(aspect));
+            return std::nullopt;
+        }
+        for (u32 mip = 0; mip < image.info.resources.levels; ++mip) {
+            const auto extent = MipExtent(image.info, mip);
+            if (!AspectBytes(image.info, mip, texel_bytes)) {
+                why = "an aspect over 4 GiB";
+                return std::nullopt;
+            }
+            aspects.push_back({.aspect = static_cast<u32>(aspect),
+                               .mip = mip,
+                               .layers = image.info.resources.layers,
+                               .width = extent.width,
+                               .height = extent.height,
+                               .depth = extent.depth,
+                               .texel_bytes = texel_bytes});
+        }
+    }
+    return aspects;
+}
+
+std::vector<vk::BufferImageCopy> ReplayCopies(std::span<const CapturedAspect> aspects,
+                                              u64& total) {
+    std::vector<vk::BufferImageCopy> copies;
+    total = 0;
+    for (const auto& a : aspects) {
+        copies.push_back({
+            .bufferOffset = total,
+            .bufferRowLength = 0,
+            .bufferImageHeight = 0,
+            .imageSubresource = {static_cast<vk::ImageAspectFlags>(
+                                     static_cast<vk::ImageAspectFlagBits>(a.aspect)),
+                                 a.mip, 0, a.layers},
+            .imageOffset = {0, 0, 0},
+            .imageExtent = {a.width, a.height, a.depth},
+        });
+        total += u64(a.width) * a.height * a.depth * a.texel_bytes * a.layers;
+    }
+    return copies;
+}
+} // namespace
+
+bool TextureCache::CaptureForReplay(const std::function<void(CapturedImage&&)>& sink,
+                                    CapturedMetadata& metadata, std::string& why) {
+    std::vector<ImageId> ids;
+    {
+        std::scoped_lock lock{mutex};
+        for (auto it = slot_images.begin(); it != slot_images.end(); ++it) {
+            if (True(it->flags & ImageFlagBits::GpuModified)) {
+                ids.push_back(it.Id());
+            }
+        }
+        std::vector<CapturedMetadataEntry> entries;
+        for (const auto& [address, meta] : surface_metas) {
+            entries.push_back({address, static_cast<u32>(meta.type), meta.clear_mask});
+        }
+        metadata.state.resize(entries.size() * sizeof(CapturedMetadataEntry));
+        std::memcpy(metadata.state.data(), entries.data(), metadata.state.size());
+    }
+    scheduler.EndRendering();
+    for (const ImageId id : ids) {
+        Image& image = slot_images[id];
+        const auto describe = [&] {
+            return fmt::format("image {:#x} ({} bytes, {})", image.info.guest_address,
+                               image.info.guest_size, vk::to_string(image.info.pixel_format));
+        };
+        if (image.info.num_samples > 1 || !image.backing || image.backing->num_samples > 1 ||
+            image.backing_images.size() != 1) {
+            why = describe() + ": multisampled or more than one backing";
+            return false;
+        }
+        if (runtime.scene_targets && runtime.scene_targets->Tracks(image.image_uid)) {
+            why = describe() + ": a reduced scene proxy holds its content";
+            return false;
+        }
+        std::string aspect_why;
+        auto aspects = ReplayAspects(image, aspect_why);
+        if (!aspects) {
+            why = describe() + ": " + aspect_why;
+            return false;
+        }
+        u64 total = 0;
+        const auto copies = ReplayCopies(*aspects, total);
+        std::string buffer_why;
+        ReplayHostBuffer host{instance.GetAllocator(), total, buffer_why};
+        if (!host.buffer) {
+            why = describe() + ": " + buffer_why;
+            return false;
+        }
+        runtime.Transit(&image, vk::ImageLayout::eTransferSrcOptimal,
+                        vk::PipelineStageFlagBits2::eTransfer,
+                        vk::AccessFlagBits2::eTransferRead);
+        runtime.FlushBarriers();
+        scheduler.Record([vk_image = image.GetImage(), buffer = vk::Buffer{host.buffer},
+                          regions = scheduler.RecordData(std::span<const vk::BufferImageCopy>{
+                              copies})](vk::CommandBuffer cmdbuf) {
+            cmdbuf.copyImageToBuffer(vk_image, vk::ImageLayout::eTransferSrcOptimal, buffer,
+                                     regions.size(), regions.data());
+        });
+        scheduler.Finish();
+
+        CapturedImageState state;
+        state.flags = static_cast<u32>(image.flags & ~(ImageFlagBits::Registered |
+                                                        ImageFlagBits::Picked));
+        state.usage = image.usage.texture | image.usage.storage << 1 |
+                      image.usage.render_target << 2 | image.usage.depth_target << 3 |
+                      image.usage.vo_surface << 4;
+        state.aspect_mask = static_cast<u32>(image.aspect_mask);
+        state.num_mip_hashes = static_cast<u32>(image.mip_hashes.size());
+        std::copy(image.mip_hashes.begin(), image.mip_hashes.end(), state.mip_hashes);
+        state.tracked = image.track_addr == image.info.guest_address &&
+                        image.track_addr_end == image.info.guest_address + image.info.guest_size;
+        state.image_uid = image.image_uid;
+        state.depth_uid = slot_images.is_allocated(image.depth_id) ? image.depth_uid : 0;
+        state.hash = image.hash;
+        state.info = image.info;
+
+        CapturedImage captured;
+        captured.state = EncodeState(state);
+        for (u64 i = 0; i < aspects->size(); ++i) {
+            auto& a = (*aspects)[i];
+            const u64 bytes = u64(a.width) * a.height * a.depth * a.texel_bytes * a.layers;
+            a.texels.assign(host.data + copies[i].bufferOffset,
+                            host.data + copies[i].bufferOffset + bytes);
+        }
+        captured.aspects = std::move(*aspects);
+        sink(std::move(captured));
+    }
+    return true;
+}
+
+bool TextureCache::RestoreForReplay(const std::function<bool(CapturedImage&)>& next,
+                                    const CapturedMetadata& metadata, std::string& why) {
+    if (metadata.version != CapturedImageVersion ||
+        metadata.state.size() % sizeof(CapturedMetadataEntry)) {
+        why = "metadata record version or size mismatch";
+        return false;
+    }
+    std::unordered_map<u64, ImageId> by_uid; ///< captured image_uid -> restored image
+    std::vector<std::pair<ImageId, u64>> depth_links;
+    scheduler.EndRendering();
+    CapturedImage captured;
+    while (next(captured)) {
+        std::string state_why;
+        const auto state = captured.version == CapturedImageVersion
+                               ? DecodeState(captured.state, state_why)
+                               : std::nullopt;
+        if (!state) {
+            why = state_why.empty() ? "image record version mismatch" : state_why;
+            return false;
+        }
+        const auto& info = state->info;
+        const auto describe = [&] {
+            return fmt::format("image {:#x} ({} bytes, {})", info.guest_address, info.guest_size,
+                               vk::to_string(info.pixel_format));
+        };
+        ImageId id;
+        {
+            std::scoped_lock lock{mutex};
+            bool overlap = false;
+            ForEachImageInRegion(info.guest_address, info.guest_size,
+                                 [&](ImageId, Image&) { overlap = true; });
+            if (overlap) {
+                why = describe() + ": the cache already holds an image over it";
+                return false;
+            }
+            id = slot_images.insert(instance, runtime, slot_image_views, info);
+            RegisterImage(id);
+        }
+        Image& image = slot_images[id];
+        if (static_cast<u32>(image.aspect_mask) != state->aspect_mask) {
+            why = describe() + ": recreated with other aspects";
+            return false;
+        }
+        std::string aspect_why;
+        const auto expected = ReplayAspects(image, aspect_why);
+        if (!expected || expected->size() != captured.aspects.size()) {
+            why = describe() + ": " + (expected ? "aspect records differ" : aspect_why);
+            return false;
+        }
+        for (u64 i = 0; i < expected->size(); ++i) {
+            const auto& e = (*expected)[i];
+            const auto& c = captured.aspects[i];
+            if (e.aspect != c.aspect || e.mip != c.mip || e.layers != c.layers ||
+                e.width != c.width || e.height != c.height || e.depth != c.depth ||
+                e.texel_bytes != c.texel_bytes ||
+                c.texels.size() != u64(c.width) * c.height * c.depth * c.texel_bytes * c.layers) {
+                why = fmt::format("{}: aspect record {} differs from the recreated image",
+                                  describe(), i);
+                return false;
+            }
+        }
+        u64 total = 0;
+        const auto copies = ReplayCopies(captured.aspects, total);
+        std::string buffer_why;
+        ReplayHostBuffer host{instance.GetAllocator(), total, buffer_why};
+        if (!host.buffer) {
+            why = describe() + ": " + buffer_why;
+            return false;
+        }
+        for (u64 i = 0; i < captured.aspects.size(); ++i) {
+            std::memcpy(host.data + copies[i].bufferOffset, captured.aspects[i].texels.data(),
+                        captured.aspects[i].texels.size());
+        }
+        runtime.Transit(&image, vk::ImageLayout::eTransferDstOptimal,
+                        vk::PipelineStageFlagBits2::eTransfer,
+                        vk::AccessFlagBits2::eTransferWrite);
+        runtime.FlushBarriers();
+        scheduler.Record([vk_image = image.GetImage(), buffer = vk::Buffer{host.buffer},
+                          regions = scheduler.RecordData(std::span<const vk::BufferImageCopy>{
+                              copies})](vk::CommandBuffer cmdbuf) {
+            cmdbuf.copyBufferToImage(buffer, vk_image, vk::ImageLayout::eTransferDstOptimal,
+                                     regions.size(), regions.data());
+        });
+        scheduler.Finish();
+
+        image.flags = static_cast<ImageFlagBits>(state->flags) | ImageFlagBits::Registered;
+        image.usage.texture = state->usage & 1;
+        image.usage.storage = (state->usage >> 1) & 1;
+        image.usage.render_target = (state->usage >> 2) & 1;
+        image.usage.depth_target = (state->usage >> 3) & 1;
+        image.usage.vo_surface = (state->usage >> 4) & 1;
+        image.mip_hashes.assign(state->mip_hashes, state->mip_hashes + state->num_mip_hashes);
+        image.hash = state->hash;
+        if (state->tracked) {
+            TrackImage(id);
+        }
+        by_uid[state->image_uid] = id;
+        if (state->depth_uid) {
+            depth_links.emplace_back(id, state->depth_uid);
+        }
+    }
+    for (const auto& [id, depth_uid] : depth_links) {
+        const auto it = by_uid.find(depth_uid);
+        if (it == by_uid.end()) {
+            why = fmt::format("image {:#x}: its depth image was not captured",
+                              slot_images[id].info.guest_address);
+            return false;
+        }
+        slot_images[id].AssociateDepth(it->second, slot_images[it->second].image_uid);
+    }
+    std::vector<CapturedMetadataEntry> entries(metadata.state.size() /
+                                               sizeof(CapturedMetadataEntry));
+    std::memcpy(entries.data(), metadata.state.data(), metadata.state.size());
+    std::scoped_lock lock{mutex};
+    for (const auto& entry : entries) {
+        const MetaDataInfo info{.type = static_cast<MetaType>(entry.type),
+                                .clear_mask = entry.clear_mask};
+        const auto [it, inserted] = surface_metas.try_emplace(entry.address, info);
+        if (!inserted && (it->second.type != info.type ||
+                          it->second.clear_mask != info.clear_mask)) {
+            why = fmt::format("metadata surface {:#x} already registered differently",
+                              entry.address);
+            return false;
+        }
+    }
+    return true;
+}
+#endif
 
 } // namespace VideoCore

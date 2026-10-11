@@ -248,21 +248,24 @@ if [[ ${1:-} == --test || ${1:-} == --test-dry ]]; then
         BB_DEPS_PREFIX="$deps" t sh tests/test_geometry_runtime_info.sh
         BB_DEPS_PREFIX="$deps" BB_GPU_BUILD="$PWD/out/gpu" t bash tests/macos_fp16/run.sh
         BB_DEPS_PREFIX="$deps" BB_GPU_BUILD="$PWD/out/gpu" t sh tests/macos_pkrtz/run.sh
+        BB_DEPS_PREFIX="$deps" BB_GPU_BUILD="$PWD/out/gpu" t sh tests/macos_ufloat_fold/run.sh
         BB_DEPS_PREFIX="$deps" BB_GPU_BUILD="$PWD/out/gpu" BB_GPU_THIRD_PARTY="$PWD/gpu/third_party" \
             t bash tests/macos_gs/run.sh
         # GPU library unit tests: Apple paths (PM4 parsing, feature checks, views, scheduler,
         # vertex fetch, null buffers, rect interface, overlay) and the renderer's cross-platform
         # tests (motion, UI composition, scene resolution, TAA, camera motion).
-        unit_tests=(cmd-snapshot-test cond-exec-test label-check-test flip-publish-test videoout-lifecycle-test strmout-update-test equeue-concurrency-test feature-checks-test image-view-storage-test
+        unit_tests=(cmd-snapshot-test cond-exec-test label-check-test capture-quiesce-test flip-publish-test videoout-lifecycle-test strmout-update-test equeue-concurrency-test feature-checks-test image-view-storage-test
             submit-info-bounds-test vertex-fetch-translation-test buffer-null-test rect-interface-test
-            fence-address-test overlay-concurrency-test depth-bounds-probe-test motion-history-test
+            fence-address-test fill-clear-device-test capture-images-test overlay-concurrency-test depth-bounds-probe-test replay-capture-test
+            motion-history-test
             motion-shader-test
-            ui-composition-test scene-resolution-test taa-shader-test camera-motion-test)
+            ui-composition-test fill-clear-test scene-resolution-test taa-shader-test camera-motion-test)
         ninja -C out/gpu "${ninja_jobs[@]}" "${unit_tests[@]}"
         for unit_test in "${unit_tests[@]}"; do sign_darwin "out/gpu/$unit_test"; done
         t out/gpu/cmd-snapshot-test
         t out/gpu/cond-exec-test
         t out/gpu/label-check-test
+        t out/gpu/capture-quiesce-test
         t out/gpu/flip-publish-test
         t out/gpu/videoout-lifecycle-test
         t out/gpu/strmout-update-test
@@ -272,9 +275,12 @@ if [[ ${1:-} == --test || ${1:-} == --test-dry ]]; then
         t out/gpu/submit-info-bounds-test
         t out/gpu/vertex-fetch-translation-test
         t out/gpu/fence-address-test
+        t out/gpu/fill-clear-device-test
+        t out/gpu/capture-images-test
         t out/gpu/overlay-concurrency-test
         t out/gpu/rect-interface-test
         t out/gpu/depth-bounds-probe-test
+        t out/gpu/replay-capture-test
         rm -rf out/buffer-null && mkdir -p out/buffer-null
         t out/gpu/buffer-null-test out/buffer-null
         t spirv-val --target-env vulkan1.3 out/buffer-null/null-buffer.spv
@@ -284,6 +290,7 @@ if [[ ${1:-} == --test || ${1:-} == --test-dry ]]; then
         t out/gpu/motion-shader-test out/motion-shaders
         for spv in out/motion-shaders/*.spv; do t spirv-val --target-env vulkan1.3 "$spv"; done
         t out/gpu/ui-composition-test
+        t out/gpu/fill-clear-test
         t out/gpu/scene-resolution-test
         t out/gpu/taa-shader-test
         t out/gpu/camera-motion-test
@@ -298,6 +305,7 @@ if [[ ${1:-} == --test || ${1:-} == --test-dry ]]; then
         t sh tests/test_guest_alloc_macos.sh
         t sh tests/test_memory_clamp.sh
         t sh tests/test_memory_cpu_alias_macos.sh
+        t sh tests/test_memory_inventory_macos.sh
         t sh tests/test_audio_macos.sh
         t sh tests/test_guest_heap_lock_macos.sh
         t sh tests/test_low_map_trace_macos.sh
@@ -363,6 +371,7 @@ if [[ ${1:-} == --test || ${1:-} == --test-dry ]]; then
         t sh tests/test_sync_diagnostics_macos.sh
         t sh tests/test_cond_wake_check_macos.sh
         t python3 tests/test_restart_macos.py
+        t python3 tests/test_motion_agree.py
         # Last: every test file under tests/ is run above or excluded with a reason.
         python3 tools/macos/check_test_wiring.py
     fi

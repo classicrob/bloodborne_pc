@@ -11,6 +11,7 @@
 #include "bb_mac_compat.h"
 #include "../../../../src/runtime_hle_trace.h"
 #include "../../../../src/runtime_memory.h"
+#include "video_core/amdgpu/replay_capture.h"
 #endif
 #ifndef _WIN32
 #include <sys/resource.h>
@@ -34,8 +35,10 @@
 #include "core/platform.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "bbport_write_log.h"
+#include "bbport_cmd_data.h"
 #include "bbport_label_check.h"
 #include "bbport_label_store.h"
+#include "bbport_parse_split.h"
 #include "video_core/amdgpu/pm4_cmds.h"
 #include "video_core/renderdoc.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
@@ -53,19 +56,43 @@ static_assert(Liverpool::NumComputeRings <= MAX_NAMES);
 
 static const char* acb_task_name[] = NAME_ARRAY(ACB_TASK, MAX_NAMES);
 
+#ifdef __APPLE__
+// Parse split (bbport_parse_split.h): a yielding packet's bucket is reopened when it resumes,
+// and a parent's after the child it resumed returns.
+#define YIELD(name)                                                                                \
+    {                                                                                              \
+        const u32 bb_split_open = BbSplit::Suspend();                                              \
+        FIBER_EXIT;                                                                                \
+        co_yield {};                                                                               \
+        FIBER_ENTER(name);                                                                         \
+        BbSplit::Resume(bb_split_open);                                                            \
+    }
+#else
 #define YIELD(name)                                                                                \
     FIBER_EXIT;                                                                                    \
     co_yield {};                                                                                   \
     FIBER_ENTER(name);
+#endif
 
 #define YIELD_CE() YIELD(ccb_task_name)
 #define YIELD_GFX() YIELD(dcb_task_name)
 #define YIELD_ASC(id) YIELD(acb_task_name[id])
 
+#ifdef __APPLE__
+#define RESUME(task, name)                                                                         \
+    {                                                                                              \
+        const u32 bb_split_open = BbSplit::Suspend();                                              \
+        FIBER_EXIT;                                                                                \
+        task.handle.resume();                                                                      \
+        FIBER_ENTER(name);                                                                         \
+        BbSplit::Resume(bb_split_open);                                                            \
+    }
+#else
 #define RESUME(task, name)                                                                         \
     FIBER_EXIT;                                                                                    \
     task.handle.resume();                                                                          \
     FIBER_ENTER(name);
+#endif
 
 #define RESUME_CE(task) RESUME(task, ccb_task_name)
 #define RESUME_GFX(task) RESUME(task, dcb_task_name)
@@ -174,34 +201,87 @@ static std::span<const u32> NextPacket(std::span<const u32> span, size_t offset)
     return span.subspan(offset);
 }
 
+#ifdef __APPLE__
+BbCmdData::Result Liverpool::LookupCommandData(void* owner, u64 address, u64 size,
+                                               const void* bytes_read) {
+    // Runs under BbCmdData's registry lock, so ~Liverpool's Unregister waits for it.
+    Liverpool* self = static_cast<Liverpool*>(owner);
+    // Classified under the lock against the snapshots' own copies; no guest memory is read here
+    // (the caller reads a chunk tail's status word after this returns).
+    static thread_local std::vector<BbCmdData::HeldRegion> held;
+    held.clear();
+    std::scoped_lock lk{self->snapshots_mutex};
+    for (const auto& snapshot : self->gfx_snapshots) {
+        for (const auto& region : snapshot->Regions()) {
+            held.push_back({reinterpret_cast<u64>(region.guest),
+                            u64(region.size_dw) * sizeof(u32), snapshot->submit_number,
+                            reinterpret_cast<const u8*>(snapshot->Words(region).data())});
+        }
+    }
+    return BbCmdData::Classify(address, size, bytes_read, held, BbCmdData::Pools(),
+                               BbCmdData::current_submission);
+}
+#endif
+
 Liverpool::Liverpool() : guest_markers_enabled{EmulatorSettings.IsVkGuestMarkersEnabled()} {
 #ifdef __APPLE__
     SetAssertStopHook(&ReportParserStop);
+    if (BbCmdData::Enabled()) {
+        BbCmdData::Register(&Liverpool::LookupCommandData, this);
+    }
 #endif
     num_counter_pairs = Libraries::Kernel::sceKernelIsNeoMode() ? 16 : 8;
     process_thread = std::jthread{std::bind_front(&Liverpool::Process, this)};
 }
 
 Liverpool::~Liverpool() {
+#ifdef __APPLE__
+    // First, holding none of this object's locks: waits out any lookup in flight on any thread
+    // (GPU, draw, preparation workers); later reads are not located.
+    BbCmdData::Unregister(this);
+#endif
     process_thread.request_stop();
     process_thread.join();
 }
 
-void Liverpool::ProcessCommands() {
-    if (num_commands && rasterizer) {
-        rasterizer->DrainDrawPipe(Vulkan::DrawPipe::ReasonCommands); // bbport: commands touch the caches
-    }
+u32 Liverpool::ProcessCommands(bool* stopped_at_cpu_flip) {
     // Process incoming commands with high priority
+    u32 ran = 0;
+    const bool stop_at_cpu_flip = stopped_at_cpu_flip || replay_held_left;
+#ifdef __APPLE__
+    const u32 split_open = BbSplit::Open();
+    if (num_commands) {
+        BbSplit::Mark(BbSplit::AHostCmds);
+    }
+#endif
     while (num_commands) {
         Common::UniqueFunction<void> callback{};
         {
             std::scoped_lock lk{submit_mutex};
-            callback = std::move(command_queue.front());
+            if (stop_at_cpu_flip && command_queue.front().cpu_flip) {
+                if (stopped_at_cpu_flip) {
+                    *stopped_at_cpu_flip = true;
+                }
+                break;
+            }
+            callback = std::move(command_queue.front().func);
             command_queue.pop();
             --num_commands;
         }
+        // Before the first command that runs (a CPU flip left waiting drains nothing: this is
+        // called per packet while held work parses).
+        if (ran == 0 && rasterizer) {
+            rasterizer->DrainDrawPipe(Vulkan::DrawPipe::ReasonCommands); // bbport: commands touch the caches
+        }
         callback();
+        ++ran;
     }
+#ifdef __APPLE__
+    if (BbSplit::Open() == BbSplit::AHostCmds) {
+        BbSplit::Mark(split_open);
+    }
+#endif
+    return ran;
 }
 
 void Liverpool::Process(std::stop_token stoken) {
@@ -218,27 +298,106 @@ void Liverpool::Process(std::stop_token stoken) {
 #if defined(__linux__) || defined(_WIN32) || defined(__APPLE__)
     gpu_tid = static_cast<u32>(gettid());
 #endif
+#ifdef __APPLE__
+    BbSplit::Attach(BbSplit::stage_a, BbSplit::ALoop);
+#endif
 
     while (!stoken.stop_requested()) {
         {
+#ifdef __APPLE__
+            BbSplit::Mark(BbSplit::AIdle);
+#endif
             const auto idle_start = std::chrono::steady_clock::now();
             std::unique_lock lk{submit_mutex};
+#ifdef __APPLE__
+            if (replay_hold) {
+                // Replay capture hold (replay_capture.h): host commands and the guest's frame end
+                // wake this thread; held submissions wait, for at most the hold bound. Slices keep
+                // a stop request (checked below) prompt.
+                using namespace std::chrono_literals;
+                submit_cv.wait_for(lk, std::min<std::chrono::steady_clock::duration>(
+                                           ReplayCapture::HoldRemaining(), 100ms),
+                                   [this] { return num_commands || submit_done; });
+            } else
+#endif
             Common::CondvarWait(submit_cv, lk, stoken,
                                 [this] { return num_commands || num_submits || submit_done; });
             BbStats::gpu_idle_ns.fetch_add(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(
                     std::chrono::steady_clock::now() - idle_start).count(),
                 std::memory_order_relaxed);
+#ifdef __APPLE__
+            BbSplit::Mark(BbSplit::ALoop);
+#endif
         }
         if (stoken.stop_requested()) {
             break;
         }
+
+#ifdef __APPLE__
+        if (replay_hold) {
+            // Blocking host commands (buffer synchronize, import pause) must run, or the guest
+            // never ends the frame. A CPU flip must not: it would present the held frame's
+            // framebuffer before its draws parse, so it ends the hold and rejects the cut.
+            bool cpu_flip = false;
+            replay_hold_commands += ProcessCommands(&cpu_flip);
+            if (cpu_flip || submit_done ||
+                ReplayCapture::HoldRemaining() == std::chrono::steady_clock::duration::zero()) {
+                // The held work: no queue task was resumed since the cut, so the queues hold
+                // exactly what was submitted since; the gfx snapshots not parsed yet match them.
+                // Gfx queue lock before snapshots_mutex, as SubmitGfx.
+                std::vector<std::shared_ptr<CmdSnapshot>> held_gfx;
+                u32 gfx_tasks = 0, asc_tasks = 0;
+                const u64 asc_seen = ReplayCapture::AscSubmitted(); // before sampling
+                {
+                    auto& gfx_queue = mapped_queues[GfxQueueId];
+                    std::scoped_lock lk{gfx_queue.m_access, snapshots_mutex};
+                    gfx_tasks = static_cast<u32>(gfx_queue.submits.size());
+                    for (const auto& snapshot : gfx_snapshots) {
+                        if (!snapshot->done) {
+                            held_gfx.push_back(snapshot);
+                        }
+                    }
+                }
+                std::array<u32, NumTotalQueues> queued{};
+                queued[GfxQueueId] = gfx_tasks;
+                for (u32 qid = GfxQueueId + 1; qid < NumTotalQueues; ++qid) {
+                    std::scoped_lock lk{mapped_queues[qid].m_access};
+                    queued[qid] = static_cast<u32>(mapped_queues[qid].submits.size());
+                    asc_tasks += queued[qid];
+                }
+                if (cpu_flip) {
+                    // The flip waits until the held work has parsed (as it would have, unheld).
+                    // A held task that waits on memory only a command behind the flip would write
+                    // cannot finish: the same as a command queued behind any flip.
+                    replay_held_tasks = queued;
+                    replay_held_left = gfx_tasks + asc_tasks;
+                }
+                ReplayCapture::HoldEnded(
+                    rasterizer,
+                    {.frame_ended = submit_done,
+                     .ended_early = cpu_flip ? "a CPU (non-EOP) flip arrived; it would present the "
+                                               "held frame's framebuffer before its draws parse"
+                                             : nullptr,
+                     .gfx = held_gfx,
+                     .gfx_tasks = gfx_tasks,
+                     .asc_tasks = asc_tasks,
+                     .asc_seen = asc_seen,
+                     .host_commands = replay_hold_commands});
+                replay_hold = false;
+            }
+            continue; // the held submissions (and the frame end, if it came) run next
+        }
+#endif
 
         VideoCore::StartCapture();
 
         curr_qid = -1;
 
         while (num_submits || num_commands) {
+#ifdef __APPLE__
+            BbSplit::Mark(BbSplit::ALoop);
+#endif
             ProcessCommands();
 
             curr_qid = (curr_qid + 1) % num_mapped_queues;
@@ -254,9 +413,21 @@ void Liverpool::Process(std::stop_token stoken) {
                 task = queue.submits.front();
             }
             task.resume();
+#ifdef __APPLE__
+            if (BbSplit::current && BbSplit::current->depth) {
+                BbSplit::Stop("a scope is open after a queue task returned");
+            }
+            BbSplit::Mark(BbSplit::ALoop); // the task yielded or finished
+#endif
 
             if (task.done()) {
                 task.destroy();
+#ifdef __APPLE__
+                if (replay_held_tasks[curr_qid]) { // held tasks are each queue's oldest
+                    --replay_held_tasks[curr_qid];
+                    --replay_held_left;
+                }
+#endif
 
                 std::scoped_lock lock{queue.m_access};
                 queue.submits.pop();
@@ -267,7 +438,22 @@ void Liverpool::Process(std::stop_token stoken) {
             }
         }
 
+#ifdef __APPLE__
+        // The frame-end flag and its sceGnmSubmitDone time, sampled together (a later
+        // SubmitDone may overwrite submit_done_at before GpuIdle); this iteration's frame-end
+        // body and the GpuIdle split use this same flag. (The body's submit_done reset is
+        // unchanged: a SubmitDone during OnSubmit/Flush can still be cleared by it.)
+        BbSplit::Mark(BbSplit::AFrameEnd); // the frame end (if any) and the GpuIdle below
+        bool frame_ended;
+        {
+            std::scoped_lock lk{submit_mutex};
+            frame_ended = submit_done;
+            idle_split_frame_submit_done = submit_done_at;
+        }
+        if (frame_ended) {
+#else
         if (submit_done) {
+#endif
 #ifdef __APPLE__
             {
                 std::scoped_lock lk{submit_mutex};
@@ -289,6 +475,17 @@ void Liverpool::Process(std::stop_token stoken) {
                              parse_lag.prep_build_ns_max / 1000.0);
                     std::fflush(stdout);
                     parse_lag = {};
+                    if (predication.packets) {
+                        fmt::print("SET_PREDICATION (not implemented), so far: {} packets "
+                                   "(clear {}, zpass {}, primcount {}, other {}; continue {}); "
+                                   "draws/dispatches parsed while a predicate was set: {}\n",
+                                   predication.packets, predication.by_op[0],
+                                   predication.by_op[1], predication.by_op[2],
+                                   predication.packets - predication.by_op[0] -
+                                       predication.by_op[1] - predication.by_op[2],
+                                   predication.continues, predication.draws_while_set);
+                        std::fflush(stdout);
+                    }
                 }
             }
 #endif
@@ -307,24 +504,61 @@ void Liverpool::Process(std::stop_token stoken) {
         // heap free list after minutes of play).
         // The same holds when sceGnmSubmitDone finds the GPU idle and does not block at all:
         // decoded (num_submits 0) is not done until then (work_retired).
+#ifdef __APPLE__
+        // GpuIdle's wait split (R0): the drain, the recorder-side writes, then the completion
+        // labels, timed separately; the waits are the same as without it.
+        u64 drain_ns = 0, recorder_ns = 0, labels_ns = 0;
+        if (rasterizer) {
+            const auto t0 = std::chrono::steady_clock::now();
+            rasterizer->DrainDrawPipe(Vulkan::DrawPipe::ReasonSubmissionEnd);
+            const auto t1 = std::chrono::steady_clock::now();
+            rasterizer->WaitRecorderSignals();
+            const auto t2 = std::chrono::steady_clock::now();
+            rasterizer->WaitDeferredSignals();
+            const auto t3 = std::chrono::steady_clock::now();
+            using std::chrono::duration_cast, std::chrono::nanoseconds;
+            drain_ns = duration_cast<nanoseconds>(t1 - t0).count();
+            recorder_ns = duration_cast<nanoseconds>(t2 - t1).count();
+            labels_ns = duration_cast<nanoseconds>(t3 - t2).count();
+        }
+#else
         if (rasterizer) {
             rasterizer->DrainDrawPipe(Vulkan::DrawPipe::ReasonSubmissionEnd);
             rasterizer->WaitDeferredSignals();
         }
+#endif
 #ifdef __APPLE__
         // GpuIdle releases the guest's sceGnmSubmitDone throttle (submission_lock), after which
         // it rebuilds command buffers it double-buffers. The drain above can take long while the
         // recording thread lags; a guest that submitted (and called sceGnmSubmitDone) meanwhile
         // must not be told the GPU is idle: it would rewrite buffers the parser has not reached
         // (torn packets, "Wrong PM4 type"). Decide and raise under the lock submissions take.
+        bool retired_frame = false;
         {
             std::scoped_lock lk{submit_mutex};
             if (num_submits == 0) {
                 work_retired = true;
+                retired_frame = frame_ended;
                 Platform::IrqC::Instance()->Signal(Platform::InterruptId::GpuIdle);
+                if (frame_ended) {
+                    NoteIdleSplit(drain_ns, recorder_ns, labels_ns);
+                }
             } else if (++parse_lag.idle_held_back <= 8) {
                 LOG_INFO(Render, "GpuIdle held back: {} submissions arrived while retiring",
                          num_submits.load());
+            }
+        }
+        // Replay capture (off unless BB_REPLAY_CAPTURE): a frame end with all its work retired is
+        // where the hold starts; the guest may already be submitting the next frame, which this
+        // thread will not parse while holding.
+        if (retired_frame) {
+            BbSplit::NoteFrameEnd(BbStats::draws.load(std::memory_order_relaxed));
+        }
+        if (retired_frame && ReplayCapture::Armed()) {
+            ReplayCapture::OnReleasedFrameRetired();
+            if (ReplayCapture::OnFrameRetired(rasterizer)) {
+                replay_hold = true;
+                replay_hold_commands = 0;
             }
         }
 #else
@@ -338,6 +572,164 @@ void Liverpool::Process(std::stop_token stoken) {
 #endif
     }
 }
+
+#ifdef __APPLE__
+void Liverpool::NoteIdleSplit(u64 drain_ns, u64 recorder_ns, u64 labels_ns) {
+    // Under submit_mutex, with GpuIdle just raised for a frame end.
+    auto& s = idle_split;
+    const u64 total_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             std::chrono::steady_clock::now() - idle_split_frame_submit_done)
+                             .count();
+    if (total_ns < drain_ns + recorder_ns + labels_ns) {
+        ++s.unpaired; // the parts were not all after this SubmitDone: not a frame-end sample
+        return;
+    }
+    s.total_ns += total_ns;
+    s.total_ns_max = std::max(s.total_ns_max, total_ns);
+    s.drain_ns += drain_ns;
+    s.recorder_ns += recorder_ns;
+    s.labels_ns += labels_ns;
+    if (rasterizer) {
+        const auto progress = rasterizer->GetLabelProgress();
+        if (progress.issued == s.labels_issued_before) {
+            ++s.unlabeled_frames;
+        } else if (progress.last_submitted_tick > progress.last_label_tick) {
+            ++s.tail_frames;
+            s.tail_ticks += progress.last_submitted_tick - progress.last_label_tick;
+        }
+        s.labels_issued_before = progress.issued;
+    }
+    if (++s.frames < 600) {
+        return;
+    }
+    const double n = double(s.frames);
+    const u64 parts = s.drain_ns + s.recorder_ns + s.labels_ns; // each sample's total >= its parts
+    // Printed like the Stall lines: Info-level logging is filtered in perf runs.
+    fmt::print("GpuIdle split, last 600 frame ends: sceGnmSubmitDone to GpuIdle {:.2f} ms mean "
+               "({:.2f} max) = parse and queue {:.2f} + stage-B drain {:.2f} + recorder writes "
+               "{:.2f} + completion labels {:.2f} ms; of the GpuIdles with a completion label "
+               "issued since the previous reported one, those whose last GPU submission follows "
+               "that last label {} (mean {:.1f} ticks); without one {}; samples excluded as "
+               "unpaired {}\n",
+               s.total_ns / n / 1e6, s.total_ns_max / 1e6, (s.total_ns - parts) / n / 1e6,
+               s.drain_ns / n / 1e6, s.recorder_ns / n / 1e6, s.labels_ns / n / 1e6,
+               s.tail_frames, s.tail_frames ? double(s.tail_ticks) / s.tail_frames : 0.0,
+               s.unlabeled_frames, s.unpaired);
+    std::fflush(stdout);
+    const u64 keep = s.labels_issued_before;
+    s = {};
+    s.labels_issued_before = keep;
+}
+#endif
+
+#ifdef __APPLE__
+namespace {
+bool IsDrawOrDispatch(PM4ItOpcode opcode) {
+    switch (opcode) {
+    case PM4ItOpcode::DrawIndex2:
+    case PM4ItOpcode::DrawIndexOffset2:
+    case PM4ItOpcode::DrawIndexAuto:
+    case PM4ItOpcode::DrawIndirect:
+    case PM4ItOpcode::DrawIndirectMulti:
+    case PM4ItOpcode::DrawIndexIndirect:
+    case PM4ItOpcode::DrawIndexIndirectMulti:
+    case PM4ItOpcode::DrawIndexIndirectCountMulti:
+    case PM4ItOpcode::DispatchDirect:
+    case PM4ItOpcode::DispatchIndirect:
+        return true;
+    default:
+        return false;
+    }
+}
+} // namespace
+
+/// IT_SET_PREDICATION census (it is not implemented): what the game sets, and how many draws
+/// and dispatches the parser meets while a predicate is set. DW2: START_ADDR_HI[7:0],
+/// PREDICATION_BOOLEAN[8], HINT[12], PRED_OP[18:16] (0 clear, 1 zpass, 2 primcount),
+/// CONTINUE[31].
+void Liverpool::NotePredication(const PM4Header* header) {
+    const u32* dw = reinterpret_cast<const u32*>(header);
+    const u32 count = header->type3.NumWords();
+    const u32 addr_lo = count >= 1 ? dw[1] : 0;
+    const u32 control = count >= 2 ? dw[2] : 0;
+    const u32 op = (control >> 16) & 7;
+    const u64 address = (u64(control & 0xff) << 32) | (addr_lo & ~0xfu);
+    ++predication.packets;
+    ++predication.by_op[op];
+    if (control >> 31) {
+        ++predication.continues;
+    }
+    predication.active = op != 0;
+    if (predication.packets <= 8) {
+        fmt::print("SET_PREDICATION #{}: op {} ({}), boolean {}, hint {}, continue {}, address "
+                   "{:#x}, {} dwords\n",
+                   predication.packets, op,
+                   op == 0 ? "clear" : op == 1 ? "zpass" : op == 2 ? "primcount" : "other",
+                   (control >> 8) & 1, (control >> 12) & 1, control >> 31, address, count);
+        std::fflush(stdout);
+    }
+}
+#endif
+
+#ifdef __APPLE__
+namespace {
+/// Parse split (bbport_parse_split.h): the stage A bucket of a graphics packet.
+BbSplit::A SplitClass(PM4ItOpcode opcode) {
+    switch (opcode) {
+    case PM4ItOpcode::DrawIndex2:
+    case PM4ItOpcode::DrawIndexOffset2:
+    case PM4ItOpcode::DrawIndexAuto:
+        return BbSplit::ADraw;
+    case PM4ItOpcode::DrawIndirect:
+    case PM4ItOpcode::DrawIndirectMulti:
+    case PM4ItOpcode::DrawIndexIndirect:
+    case PM4ItOpcode::DrawIndexIndirectMulti:
+    case PM4ItOpcode::DrawIndexIndirectCountMulti:
+        return BbSplit::AIndirect;
+    case PM4ItOpcode::DispatchDirect:
+    case PM4ItOpcode::DispatchIndirect:
+        return BbSplit::ADispatch;
+    case PM4ItOpcode::Nop:
+    case PM4ItOpcode::ContextControl:
+    case PM4ItOpcode::ClearState:
+    case PM4ItOpcode::SetConfigReg:
+    case PM4ItOpcode::SetContextReg:
+    case PM4ItOpcode::SetShReg:
+    case PM4ItOpcode::SetUconfigReg:
+    case PM4ItOpcode::SetPredication:
+    case PM4ItOpcode::IndexType:
+    case PM4ItOpcode::NumInstances:
+    case PM4ItOpcode::IndexBase:
+    case PM4ItOpcode::IndexBufferSize:
+    case PM4ItOpcode::SetBase:
+    case PM4ItOpcode::IncrementDeCounter:
+    case PM4ItOpcode::WaitOnCeCounter:
+    case PM4ItOpcode::PfpSyncMe:
+        return BbSplit::ARegisters;
+    case PM4ItOpcode::EventWrite:
+    case PM4ItOpcode::EventWriteEop:
+    case PM4ItOpcode::EventWriteEos:
+    case PM4ItOpcode::ReleaseMem:
+    case PM4ItOpcode::WriteData:
+        return BbSplit::ALabels;
+    case PM4ItOpcode::WaitRegMem:
+        return BbSplit::AWaitRegMem;
+    case PM4ItOpcode::IndirectBuffer:
+        return BbSplit::AIndBuffer;
+    case PM4ItOpcode::DmaData:
+    case PM4ItOpcode::CopyData:
+    case PM4ItOpcode::MemSemaphore:
+    case PM4ItOpcode::AcquireMem:
+    case PM4ItOpcode::CondExec:
+    case PM4ItOpcode::Rewind:
+    case PM4ItOpcode::StrmoutBufferUpdate:
+        return BbSplit::AMemory;
+    default:
+        return BbSplit::AOther;
+    }
+}
+} // namespace
+#endif
 
 namespace {
 /// bbport: packets the GPU command thread handles while the draw recording thread may still
@@ -387,7 +779,7 @@ bool PipelinedOpcode(PM4ItOpcode opcode) {
 
 namespace {
 #ifdef __APPLE__
-/// BB_LABELS_AT_GPU_COMPLETE: labels are written on the label writer thread. A faulting store
+/// Labels at GPU completion (the default): labels are written on the label writer thread. A faulting store
 /// there could enter the write-fault handler (DrainDrawPipe, cache locks) while a recording thread
 /// waits for this very label, so labels are stored only through the memory's backing, which
 /// cannot fault; a label without a backing stops.
@@ -424,6 +816,32 @@ bool LabelsAtGpuCompleteForIssue(Vulkan::Rasterizer& rasterizer) {
                      now ? "ON" : "OFF", stamp, static_cast<long long>(ms));
     }
     return now;
+}
+#endif
+
+#ifdef __APPLE__
+/// BB_LABEL_CHECK covers RELEASE_MEM labels with 32/64-bit data too: the guest's compute-queue
+/// chunk release (0x26d3cb0) zeroes a chunk's status word that way (docs/macos/gpu-idle.md).
+bool LabelCheckedReleaseMem(const PM4CmdReleaseMem& packet) {
+    return BbLabelCheck::Enabled() && (packet.data_sel.Value() == DataSelect::Data32Low ||
+                                       packet.data_sel.Value() == DataSelect::Data64);
+}
+/// A RELEASE_MEM label store: through the backing on the label writer (at GPU completion),
+/// otherwise one store at the guest address, as the packet's default write does; checked
+/// around the store as EOP labels are.
+void WriteReleaseMemLabel(void* address, u64 data, u32 num_bytes, bool backing_only,
+                          bool checked) {
+    if (checked) {
+        BbLabelCheck::BeforeWrite(reinterpret_cast<u64>(address), num_bytes);
+    }
+    if (backing_only) {
+        WriteLabelBacking(address, data, num_bytes);
+    } else {
+        BbLabelStore::StoreOnce(address, data, num_bytes);
+    }
+    if (checked) {
+        BbLabelCheck::AfterWrite(reinterpret_cast<u64>(address), data, num_bytes);
+    }
 }
 #endif
 
@@ -686,6 +1104,9 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb,
 
         const PM4ItOpcode opcode = header->type3.opcode;
         const auto* it_body = reinterpret_cast<const u32*>(header) + 1;
+#ifdef __APPLE__
+        BbSplit::Mark(BbSplit::AConstEng);
+#endif
         switch (opcode) {
         case PM4ItOpcode::Nop: {
             // const auto* nop = reinterpret_cast<const PM4CmdNop*>(header);
@@ -1037,6 +1458,11 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
         if (region) {
             region->parsed_dw = region->size_dw - static_cast<u32>(dcb.size());
         }
+#ifdef __APPLE__
+        // BB_CMD_DATA_CHECK: the submission this thread parses (a coroutine; set per packet, as
+        // other submissions' tasks run on this thread in between).
+        BbCmdData::current_submission = snapshot ? snapshot->submit_number : 0;
+#endif
 
         const auto* header = reinterpret_cast<const PM4Header*>(dcb.data());
         const u32 type = header->type;
@@ -1059,6 +1485,12 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
         case 3:
             const u32 count = header->type3.NumWords();
             const PM4ItOpcode opcode = header->type3.opcode;
+#ifdef __APPLE__
+            BbSplit::Mark(SplitClass(opcode));
+            if (predication.active && IsDrawOrDispatch(opcode)) {
+                ++predication.draws_while_set; // executed here; the PS4 may have skipped it
+            }
+#endif
             ApplyGraphicsRegisterPacket(regs, header, gfx_reg_checksum, &pipe_dirty);
             // DmaData to 0x3022C does nothing here (skipped below): no need to wait.
             if (rasterizer && !PipelinedOpcode(opcode) &&
@@ -1216,6 +1648,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
             case PM4ItOpcode::SetPredication: {
                 LOG_WARNING(Render, "Unimplemented IT_SET_PREDICATION");
+#ifdef __APPLE__
+                NotePredication(header);
+#endif
                 break;
             }
             case PM4ItOpcode::IndexType: {
@@ -1580,7 +2015,10 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     if (rasterizer) {
                         rasterizer->DrainDrawPipe(static_cast<u32>(opcode));
                     }
-                    vo_port->WaitVoLabel([&] { return wait_reg_mem->Test(regs.reg_array); });
+                    {
+                        BB_SPLIT_SCOPE(KVoLabel);
+                        vo_port->WaitVoLabel([&] { return wait_reg_mem->Test(regs.reg_array); });
+                    }
                     break;
                 }
                 // bbport: a fence handed to the draw recording thread counts as written: that
@@ -1782,6 +2220,10 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
     auto base_addr = reinterpret_cast<VAddr>(acb.data());
     size_t acb_size = acb.size_bytes();
     while (!acb.empty()) {
+#ifdef __APPLE__
+        BbCmdData::current_submission = 0; // compute has no snapshot
+        BbSplit::Mark(BbSplit::ACompute);
+#endif
         ProcessCommands();
         if (rasterizer) {
             rasterizer->DrainDrawPipe(Vulkan::DrawPipe::ReasonCompute); // bbport: compute work uses the caches
@@ -2044,6 +2486,14 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 rasterizer->WaitDeferredSignals();
             }
             const auto* release_mem = reinterpret_cast<const PM4CmdReleaseMem*>(header);
+#ifdef __APPLE__
+            const bool label_checked = LabelCheckedReleaseMem(*release_mem);
+            if (label_checked) {
+                BbLabelCheck::NoteParsed(
+                    release_mem->Address<u64>(),
+                    release_mem->data_sel.Value() == DataSelect::Data32Low ? 4 : 8);
+            }
+#endif
             if (rasterizer) {
                 rasterizer->ProcessDownloadImages();
 #ifdef __APPLE__
@@ -2058,9 +2508,13 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                     };
                     if (release_mem->data_sel.Value() != DataSelect::GdsMemStore) {
                         const PM4CmdReleaseMem packet = *release_mem;
-                        rasterizer->SignalAtGpuCompletion([packet, irq] {
-                            packet.SignalFence(WriteLabelBacking, irq,
-                                               [](VAddr, u16, u16) { UNREACHABLE(); });
+                        rasterizer->SignalAtGpuCompletion([packet, irq, label_checked] {
+                            packet.SignalFence(
+                                [label_checked](void* address, u64 data, u32 num_bytes) {
+                                    WriteReleaseMemLabel(address, data, num_bytes, true,
+                                                         label_checked);
+                                },
+                                irq, [](VAddr, u16, u16) { UNREACHABLE(); });
                         });
                         break;
                     }
@@ -2082,6 +2536,18 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 }
 #endif
             }
+#ifdef __APPLE__
+            release_mem->SignalFence(
+                [label_checked](void* address, u64 data, u32 num_bytes) {
+                    WriteReleaseMemLabel(address, data, num_bytes, false, label_checked);
+                },
+                [pipe_id = queue.pipe_id] {
+                    Platform::IrqC::Instance()->Signal(static_cast<Platform::InterruptId>(pipe_id));
+                },
+                [this](VAddr dst, u16 gds_index, u16 num_dwords) {
+                    rasterizer->CopyBuffer(dst, gds_index, num_dwords * sizeof(u32), false, true);
+                });
+#else
             release_mem->SignalFence(
                 [pipe_id = queue.pipe_id] {
                     Platform::IrqC::Instance()->Signal(static_cast<Platform::InterruptId>(pipe_id));
@@ -2089,6 +2555,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 [this](VAddr dst, u16 gds_index, u16 num_dwords) {
                     rasterizer->CopyBuffer(dst, gds_index, num_dwords * sizeof(u32), false, true);
                 });
+#endif
             break;
         }
         case PM4ItOpcode::EventWrite: {
@@ -2229,6 +2696,9 @@ void Liverpool::SubmitAsc(u32 gnm_vqid, std::span<const u32> acb) {
         std::scoped_lock lock{queue.m_access};
         queue.submits.emplace(task.handle);
     }
+#ifdef __APPLE__
+    ReplayCapture::NoteAscSubmit(); // after the enqueue: a replay capture's queue sample or count
+#endif
 
     std::scoped_lock lk{submit_mutex};
     num_mapped_queues = std::max(num_mapped_queues, gnm_vqid + 1);
