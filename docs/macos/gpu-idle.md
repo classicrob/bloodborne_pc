@@ -266,7 +266,14 @@ published by `BbFlip::Publisher` (`gpu/shim/bbport_flip_publish.h`, test `flip-p
 - The publisher's thread waits for each tick in flip order, then publishes.
 - With the bit cleared, flips publish at once, unless publications are still queued. Then they
   queue behind them, so order holds across a live switch.
-- Close bumps the port's generation and holds the port lifecycle lock for its whole reset. A
-  publication holds the same lock for its generation check and all three effects. A flip
-  submitted before a Close is dropped and reported, rather than applied to the reopened port.
+- The port's flip lifecycle is shared code (`core/libraries/videoout/port_lifecycle.h`, test
+  `videoout-lifecycle-test`):
+  - A flip is admitted only to an open port, together with its pending count and generation. A
+    closed port gives the guest invalid handle.
+  - Close resets the port and bumps the generation in one step under port_mutex, and holds the
+    lifecycle lock across its whole reset. A publication holds the same lock for its check and
+    all three effects.
+  - A flip admitted before a Close is dropped before its frame is prepared (it is never read
+    from the reset or reopened port's buffers) and again at publication (nothing decremented,
+    no buffer released). Both are reported.
 - Flips still queued at shutdown are reported.

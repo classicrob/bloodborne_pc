@@ -108,7 +108,8 @@ public:
     int ChangeBufferAttribute(VideoOutPort* port, s32 bufferIndex,
                               const BufferAttribute* attribute);
 
-    bool SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg, bool is_eop = false);
+    /// ORBIS_OK, or the guest's error (flip queue full; on Apple a closed port: invalid handle).
+    s32 SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg, bool is_eop = false);
 
 private:
     struct Request {

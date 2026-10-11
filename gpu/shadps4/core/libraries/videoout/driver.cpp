@@ -27,6 +27,9 @@
 #include "core/emulator_settings.h"
 #include "core/libraries/kernel/time.h"
 #include "core/libraries/videoout/driver.h"
+#ifdef __APPLE__
+#include "core/libraries/videoout/port_lifecycle.h"
+#endif
 #include "core/libraries/videoout/videoout_error.h"
 #include "imgui/renderer/imgui_core.h"
 #include "video_core/amdgpu/liverpool.h"
@@ -143,7 +146,11 @@ int VideoOutDriver::Open(const ServiceThreadParams* params) {
     if (main_port.is_open) {
         return ORBIS_VIDEO_OUT_ERROR_RESOURCE_BUSY;
     }
+#ifdef __APPLE__
+    PortLifecycle::Reopen(main_port);
+#else
     main_port.is_open = true;
+#endif
     liverpool->SetVoPort(&main_port);
     return 1;
 }
@@ -155,12 +162,13 @@ void VideoOutDriver::Close(s32 handle) {
     std::scoped_lock lifecycle{lifecycle_mutex};
 #endif
 
+#ifdef __APPLE__
+    // In one step with the generation bump, under port_mutex: a flip is admitted either before
+    // (and dropped later) or not at all (closed).
+    PortLifecycle::ResetOnClose(main_port);
+#else
     // Mark as closed
     main_port.is_open = false;
-    {
-        std::scoped_lock port_lock{main_port.port_mutex};
-        ++main_port.generation; // flips submitted before this are dropped when published
-    }
     main_port.flip_rate = 0;
     main_port.prev_index = -1;
 
@@ -175,6 +183,7 @@ void VideoOutDriver::Close(s32 handle) {
     for (auto& buffer : main_port.buffer_slots) {
         buffer.group_index = -1;
     }
+#endif
 
     // Clear events
     for (auto event : main_port.flip_events) {
@@ -611,16 +620,17 @@ void VideoOutDriver::PublishFlip(const Request& req) {
     // Update flip status.
     auto* port = req.port;
     int previous;
+#ifdef __APPLE__
+    if (!PortLifecycle::ApplyStatus(*port, req.generation, req.index, req.flip_arg, req.eop,
+                                    previous)) {
+        static std::atomic<u64> dropped{0};
+        std::fprintf(stderr, "Flip publication: a flip of a closed port dropped (%llu)\n",
+                     static_cast<unsigned long long>(++dropped));
+        return;
+    }
+#else
     {
         std::unique_lock lock{port->port_mutex};
-#ifdef __APPLE__
-        if (port->generation != req.generation) {
-            static std::atomic<u64> dropped{0};
-            std::fprintf(stderr, "Flip publication: a flip of a closed port dropped (%llu)\n",
-                         static_cast<unsigned long long>(++dropped));
-            return;
-        }
-#endif
         auto& flip_status = port->flip_status;
         flip_status.count++;
         flip_status.process_time = Libraries::Kernel::sceKernelGetProcessTime();
@@ -631,10 +641,10 @@ void VideoOutDriver::PublishFlip(const Request& req) {
             --flip_status.gc_queue_num;
         }
         --flip_status.flip_pending_num;
-        // Under the lock with the generation check: a Close cannot come between.
         previous = port->prev_index;
         port->prev_index = req.index;
     }
+#endif
 
     // Trigger flip events for the port.
     for (auto event : port->flip_events) {
@@ -671,14 +681,19 @@ void VideoOutDriver::DrawLastFrame() {
     }, true);
 }
 
-bool VideoOutDriver::SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg,
-                                bool is_eop /*= false*/) {
-    u64 generation;
+s32 VideoOutDriver::SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg,
+                               bool is_eop /*= false*/) {
+    u64 generation = 0;
+#ifdef __APPLE__
+    if (const s32 result = PortLifecycle::Admit(*port, index, is_eop, generation);
+        result != ORBIS_OK) {
+        return result;
+    }
+#else
     {
         std::unique_lock lock{port->port_mutex};
         if (index != -1 && port->flip_status.flip_pending_num > 16) {
-            LOG_ERROR(Lib_VideoOut, "Flip queue is full");
-            return false;
+            return ORBIS_VIDEO_OUT_ERROR_FLIP_QUEUE_FULL;
         }
 
         if (is_eop) {
@@ -686,8 +701,8 @@ bool VideoOutDriver::SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg,
         }
         ++port->flip_status.flip_pending_num; // integral GPU and CPU pending flips counter
         port->flip_status.submit_tsc = Libraries::Kernel::sceKernelReadTsc();
-        generation = port->generation; // with the pending count: Close resets both
     }
+#endif
 
     if (!is_eop) {
         // Non EOP flips can arrive from any thread so ask GPU thread to perform them
@@ -697,12 +712,26 @@ bool VideoOutDriver::SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg,
         SubmitFlipInternal(port, index, flip_arg, is_eop, generation);
     }
 
-    return true;
+    return ORBIS_OK;
 }
 
 void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_arg, bool is_eop,
                                         u64 generation) {
     Vulkan::Frame* frame;
+#ifdef __APPLE__
+    // A Close since the flip was admitted reset (or reopened) the port: drop the flip before
+    // reading its buffers. Prepare from a copy taken under port_mutex.
+    BufferAttributeGroup group{};
+    uintptr_t address = 0;
+    if (!PortLifecycle::Snapshot(*port, generation, index, group, address)) {
+        static std::atomic<u64> dropped{0};
+        std::fprintf(stderr, "Flip: a flip of a closed port dropped before preparing (%llu)\n",
+                     static_cast<unsigned long long>(++dropped));
+        return;
+    }
+    frame = index == -1 ? presenter->PrepareBlankFrame(false)
+                        : presenter->PrepareFrame(group, address);
+#else
     if (index == -1) {
         frame = presenter->PrepareBlankFrame(false);
     } else {
@@ -711,6 +740,7 @@ void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_
         const auto& group = port->groups[buffer.group_index];
         frame = presenter->PrepareFrame(group, buffer.address_left);
     }
+#endif
 
     {
         std::scoped_lock lock{mutex};

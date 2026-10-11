@@ -176,9 +176,9 @@ s32 PS4_SYSV_ABI sceVideoOutSubmitFlip(s32 handle, s32 bufferIndex, s32 flipMode
     LOG_DEBUG(Lib_VideoOut, "bufferIndex = {}, flipMode = {}, flipArg = {}", bufferIndex, flipMode,
               flipArg);
 
-    if (!driver->SubmitFlip(port, bufferIndex, flipArg)) {
-        LOG_ERROR(Lib_VideoOut, "Flip queue is full");
-        return ORBIS_VIDEO_OUT_ERROR_FLIP_QUEUE_FULL;
+    if (const s32 result = driver->SubmitFlip(port, bufferIndex, flipArg); result != ORBIS_OK) {
+        LOG_ERROR(Lib_VideoOut, "Flip not submitted: {:#x}", static_cast<u32>(result));
+        return result;
     }
 
     return ORBIS_OK;
@@ -353,7 +353,8 @@ s32 sceVideoOutSubmitEopFlip(s32 handle, u32 buf_id, u32 mode, s64 flip_arg, voi
             ASSERT_MSG(irq == Platform::InterruptId::GfxFlip, "An unexpected IRQ occured");
             ASSERT_MSG(port->buffer_labels[buf_id] == 1, "Out of order flip IRQ");
             const auto result = driver->SubmitFlip(port, buf_id, flip_arg, true);
-            ASSERT_MSG(result, "EOP flip submission failed");
+            ASSERT_MSG(result == ORBIS_OK, "EOP flip submission failed: {:#x}",
+                       static_cast<u32>(result));
         });
 
     return ORBIS_OK;
