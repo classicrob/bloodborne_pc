@@ -757,9 +757,9 @@ struct PM4CmdWaitRegMem {
     void AssertStreamOutFlushWaitMet(std::span<const u32> regs) const {
         AssertRegisterInRange(regs.size());
         ASSERT_MSG(!IsStreamOutFlushWait() || Test(regs),
-                   "macOS: WAIT_REG_MEM on CP_STRMOUT_CNTL ({:#x}) can never be met on the graphics "
-                   "queue (no SO_VGTSTREAMOUT_FLUSH before it): value {:#x}, mask {:#x}, function "
-                   "{}, reference {:#x}",
+                   "macOS: WAIT_REG_MEM on CP_STRMOUT_CNTL ({:#x}) can never be met on the "
+                   "graphics queue (the current stream-out state does not satisfy it): value "
+                   "{:#x}, mask {:#x}, function {}, reference {:#x}",
                    Reg(), regs[Reg()], mask, static_cast<u32>(function.Value()), ref);
     }
 #endif
