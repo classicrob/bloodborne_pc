@@ -191,6 +191,24 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(PipelineSelection& se
             info.gs_role = Shader::GsEmulationRole::CopyVertex;
             info.gs_max_vert_out = regs.vgt_gs_max_vert_out;
             info.gs_vertex_dwords = regs.vgt_gs_vert_itemsize[0];
+            // Rasterized GS points take PA_SU_POINT_SIZE (Vulkan would otherwise use 1 px).
+            if (Shader::GsEmulation::PointOutput(regs.vgt_gs_out_prim_type.GetPrimitiveType(0)) &&
+                !regs.clipper_control.dx_rasterization_kill) {
+                const auto& size = regs.point_size;
+                ASSERT_MSG(!regs.vs_output_control.use_vtx_point_size,
+                           "macOS geometry emulation: GS points with an exported point size "
+                           "(PA_SU_POINT_MINMAX clamp {:#x} not emulated)",
+                           std::bit_cast<u32>(regs.point_minmax));
+                ASSERT_MSG(size.half_width == size.half_height && size.half_width != 0,
+                           "macOS geometry emulation: GS points of {}x{} (half sizes, 12.4): "
+                           "Vulkan points are square and not empty",
+                           u32(size.half_width), u32(size.half_height));
+                info.hw.vs.point_size = float(size.half_width) / 8.0f;
+                ASSERT_MSG(info.hw.vs.point_size <= instance.GetMaxPointSize(),
+                           "macOS geometry emulation: GS points of {} px exceed the device's "
+                           "{} px maximum",
+                           info.hw.vs.point_size, instance.GetMaxPointSize());
+            }
         }
         break;
     }
@@ -548,6 +566,8 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
             stages->vertex_dwords = regs.vgt_gs_vert_itemsize[0];
             stages->run_length = Shader::GsEmulation::IndexRunLength(
                 stages->max_vert_out, regs.vgt_gs_out_prim_type.GetPrimitiveType(0));
+            stages->point_output = Shader::GsEmulation::PointOutput(
+                regs.vgt_gs_out_prim_type.GetPrimitiveType(0));
             it.value()->SetGsEmulation(std::move(stages));
         } else if (!on_worker) {
             RegisterPipelineData(sel.graphics_key, pipeline_hash, sdata);
@@ -608,11 +628,22 @@ bool PipelineCache::RefreshGraphicsKey(PipelineSelection& sel) {
     const auto& regs = (*sel.regs);
     auto& key = sel.graphics_key;
 
-    const bool db_enabled = regs.depth_buffer.DepthValid() || regs.depth_buffer.StencilValid();
+    // bbport: the pipeline declares exactly the depth/stencil attachments the render pass binds.
+    // The rasterizer binds the depth target only when the depth or stencil test is enabled
+    // (Rasterizer::PrepareRenderState); with both off a valid depth buffer is not attached, and a
+    // pipeline still declaring its format does not match the pass (Vulkan dynamic rendering;
+    // Metal validation: "the renderPipelineState pixelFormat must be MTLPixelFormatInvalid").
+    // With both tests off the guest neither tests nor writes depth or stencil, so this is exact.
+    const bool db_bound =
+        (regs.depth_control.depth_enable && regs.depth_buffer.DepthValid()) ||
+        (regs.depth_control.stencil_enable && regs.depth_buffer.StencilValid());
+    const bool db_enabled =
+        db_bound && (regs.depth_buffer.DepthValid() || regs.depth_buffer.StencilValid());
 
-    key.z_format = regs.depth_buffer.DepthValid() ? regs.depth_buffer.z_info.format
-                                                  : AmdGpu::DepthBuffer::ZFormat::Invalid;
-    key.stencil_format = regs.depth_buffer.StencilValid()
+    key.z_format = db_bound && regs.depth_buffer.DepthValid()
+                       ? regs.depth_buffer.z_info.format
+                       : AmdGpu::DepthBuffer::ZFormat::Invalid;
+    key.stencil_format = db_bound && regs.depth_buffer.StencilValid()
                              ? regs.depth_buffer.stencil_info.format
                              : AmdGpu::DepthBuffer::StencilFormat::Invalid;
     key.depth_clamp_enable = !regs.depth_render_override.disable_viewport_clamp;
@@ -623,11 +654,18 @@ bool PipelineCache::RefreshGraphicsKey(PipelineSelection& sel) {
 #ifdef __APPLE__
     if (profile.emulate_geometry_stage &&
         regs.stage_enable.raw == AmdGpu::ShaderStageEnable::VgtStages::EsGs) {
-        // The emulated draw rasterizes the GS output strips (vk_gs_emulation.h).
-        key.prim_type = regs.vgt_gs_out_prim_type.GetPrimitiveType(0) ==
-                                AmdGpu::GsOutputPrimitiveType::LineStrip
-                            ? AmdGpu::PrimitiveType::LineStrip
-                            : AmdGpu::PrimitiveType::TriangleStrip;
+        // The emulated draw rasterizes the GS output strips, or its points (vk_gs_emulation.h).
+        switch (regs.vgt_gs_out_prim_type.GetPrimitiveType(0)) {
+        case AmdGpu::GsOutputPrimitiveType::LineStrip:
+            key.prim_type = AmdGpu::PrimitiveType::LineStrip;
+            break;
+        case AmdGpu::GsOutputPrimitiveType::PointList:
+            key.prim_type = AmdGpu::PrimitiveType::PointList;
+            break;
+        default:
+            key.prim_type = AmdGpu::PrimitiveType::TriangleStrip;
+            break;
+        }
     }
     // One Vulkan polygon mode: the visible faces' (vk_feature_checks.h; mismatches are errors).
     {

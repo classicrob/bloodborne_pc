@@ -3,7 +3,8 @@
 //                              owned by <pid>; exits 2 when there is none.
 //   window_tool diff <a> <b>   prints the fraction of changed pixels (largest channel delta > 24).
 //   window_tool stats <png>    prints JSON image statistics: width, height, the fraction of
-//                              pixels with any RGB channel above 16, and the mean luma (0..255).
+//                              pixels with any RGB channel above 16, the mean luma (0..255) and
+//                              the fraction of strongly saturated pixels (max - min channel > 96).
 import CoreGraphics
 import Foundation
 import ImageIO
@@ -47,14 +48,16 @@ case "stats":
     }
     if !drawn { fail("stats: cannot decode \(args[2])", 1) }
     var nonblack = 0
+    var saturated = 0
     var luma = 0.0
     for i in stride(from: 0, to: pixels.count, by: 4) {
         let r = pixels[i], g = pixels[i + 1], b = pixels[i + 2]
         if r > 16 || g > 16 || b > 16 { nonblack += 1 }
+        if Int(max(r, g, b)) - Int(min(r, g, b)) > 96 { saturated += 1 }
         luma += 0.2126 * Double(r) + 0.7152 * Double(g) + 0.0722 * Double(b)
     }
     let count = Double(width * height)
-    print("{\"width\": \(width), \"height\": \(height), \"nonblack\": \(Double(nonblack) / count), \"mean_luma\": \(luma / count)}")
+    print("{\"width\": \(width), \"height\": \(height), \"nonblack\": \(Double(nonblack) / count), \"mean_luma\": \(luma / count), \"saturated\": \(Double(saturated) / count)}")
 case "diff":
     // window_tool diff <a.png> <b.png>: the fraction of pixels whose largest channel difference
     // exceeds 24 (same-size images; a size change counts as fully changed).

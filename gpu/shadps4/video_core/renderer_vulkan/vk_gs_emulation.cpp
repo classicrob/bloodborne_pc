@@ -13,6 +13,7 @@
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/host_shaders/gs_indirect_setup_comp.h"
+#include "video_core/host_shaders/gs_point_compact_comp.h"
 #include "video_core/renderer_vulkan/vk_gs_emulation.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
@@ -82,9 +83,10 @@ const char* GsEmulationUnsupported(const AmdGpu::Regs& regs) {
     switch (regs.vgt_gs_out_prim_type.GetPrimitiveType(0)) {
     case AmdGpu::GsOutputPrimitiveType::TriangleStrip:
     case AmdGpu::GsOutputPrimitiveType::LineStrip:
+    case AmdGpu::GsOutputPrimitiveType::PointList:
         break;
     default:
-        return "point-list geometry shader output";
+        return "this geometry shader output primitive type";
     }
     switch (regs.primitive_type) {
     case AmdGpu::PrimitiveType::PointList:
@@ -128,10 +130,12 @@ GsEmulationDraw Rasterizer::RecordGsEmulation(const GraphicsPipeline* pipeline,
     // A trailing partial primitive is not assembled (as on the hardware).
     const u32 prims = records / stages.verts_per_prim;
     const u64 slots = u64(prims) * instances * stages.invocations;
-    const u64 esgs_base = GsEmu::HeaderDwords;
+    // Point output draws through the compaction kernel's indirect command after the header.
+    const u64 esgs_base = stages.point_output ? GsEmu::IndirectDwords : GsEmu::HeaderDwords;
     const u64 gsvs_base = esgs_base + u64(records) * instances * stages.esgs_dwords;
     const u64 index_base = gsvs_base + slots * stages.max_vert_out * stages.vertex_dwords;
-    const u64 bytes = (index_base + slots * stages.run_length) * 4;
+    const u64 compact_base = index_base + slots * stages.run_length;
+    const u64 bytes = (compact_base + (stages.point_output ? slots * stages.run_length : 0)) * 4;
     ASSERT_MSG(bytes <= MaxScratchBytes,
                "macOS geometry emulation: draw needs {} bytes of scratch ({} index positions x {} "
                "instances, {} output slots of {} vertices x {} dwords), limit {}",
@@ -148,6 +152,7 @@ GsEmulationDraw Rasterizer::RecordGsEmulation(const GraphicsPipeline* pipeline,
     header[GsEmu::EsgsBase] = u32(esgs_base);
     header[GsEmu::GsvsBase] = u32(gsvs_base);
     header[GsEmu::IndexBase] = u32(index_base);
+    header[GsEmu::CompactBase] = u32(compact_base);
 
     const u64 alignment = instance.StorageMinAlignment();
     auto& stream = buffer_cache.GetStreamBuffer();
@@ -195,6 +200,11 @@ GsEmulationDraw Rasterizer::RecordGsEmulation(const GraphicsPipeline* pipeline,
         header[GsEmu::IndexKind] = u32(GsEmu::IndexKind::None);
     }
     std::memcpy(data, header.data(), sizeof(header));
+    if (stages.point_output) {
+        // An empty point draw until the compaction kernel writes it.
+        std::memset(static_cast<u8*>(data) + GsEmu::CompactDraw * 4, 0,
+                    sizeof(VkDrawIndexedIndirectCommand));
+    }
     stream.Commit();
 
     gs_stats.draws.fetch_add(1, std::memory_order_relaxed);
@@ -212,6 +222,23 @@ GsEmulationDraw Rasterizer::RecordGsEmulation(const GraphicsPipeline* pipeline,
                     vk::AccessFlagBits2::eShaderStorageRead);
     RecordGsDispatch(*stages.gs, Common::DivCeil(prims, GsEmu::WorkgroupSize),
                      instances * stages.invocations);
+    if (stages.point_output) {
+        RecordGsBarrier(vk::PipelineStageFlagBits2::eComputeShader,
+                        vk::AccessFlagBits2::eShaderStorageRead |
+                            vk::AccessFlagBits2::eShaderStorageWrite);
+        RecordGsPointCompaction(stages);
+        RecordGsBarrier(vk::PipelineStageFlagBits2::eVertexShader |
+                            vk::PipelineStageFlagBits2::eIndexInput |
+                            vk::PipelineStageFlagBits2::eDrawIndirect,
+                        vk::AccessFlagBits2::eShaderStorageRead |
+                            vk::AccessFlagBits2::eIndexRead |
+                            vk::AccessFlagBits2::eIndirectCommandRead);
+        return {.index_buffer = stream.Handle(),
+                .index_offset = scratch_offset,
+                .indirect = true,
+                .indirect_offset = scratch_offset + GsEmu::CompactDraw * 4,
+                .ended_pass = ended_pass};
+    }
     RecordGsBarrier(vk::PipelineStageFlagBits2::eVertexShader |
                         vk::PipelineStageFlagBits2::eIndexInput,
                     vk::AccessFlagBits2::eShaderStorageRead | vk::AccessFlagBits2::eIndexRead);
@@ -281,8 +308,78 @@ struct SetupParams {
     u32 verts_per_prim, invocations, max_vert_out, esgs_dwords, vertex_dwords, run_length;
     u32 capacity_dwords;
     u32 args_address_lo, args_address_hi;
+    u32 point_output;
 };
+
+struct CompactParams {
+    u32 invocations, run_length;
+};
+
+/// A one-binding compute kernel with push descriptors and push constants.
+SetupKernel MakeKernel(vk::Device device, std::span<const u32> spv, u32 num_bindings,
+                       u32 push_size) {
+    SetupKernel k;
+    std::array<vk::DescriptorSetLayoutBinding, 3> bindings{};
+    for (u32 i = 0; i < num_bindings; ++i) {
+        bindings[i] = {.binding = i,
+                       .descriptorType = vk::DescriptorType::eStorageBuffer,
+                       .descriptorCount = 1,
+                       .stageFlags = vk::ShaderStageFlagBits::eCompute};
+    }
+    auto [layout_result, set_layout] = device.createDescriptorSetLayoutUnique({
+        .flags = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR,
+        .bindingCount = num_bindings,
+        .pBindings = bindings.data(),
+    });
+    ASSERT(layout_result == vk::Result::eSuccess);
+    k.set_layout = std::move(set_layout);
+    const vk::PushConstantRange range{.stageFlags = vk::ShaderStageFlagBits::eCompute,
+                                      .offset = 0,
+                                      .size = push_size};
+    auto [pipeline_layout_result, pipeline_layout] = device.createPipelineLayoutUnique({
+        .setLayoutCount = 1,
+        .pSetLayouts = &*k.set_layout,
+        .pushConstantRangeCount = 1,
+        .pPushConstantRanges = &range,
+    });
+    ASSERT(pipeline_layout_result == vk::Result::eSuccess);
+    k.layout = std::move(pipeline_layout);
+    const auto module = CompileSPV(spv, device);
+    auto [pipeline_result, compute] = device.createComputePipelineUnique(
+        {}, vk::ComputePipelineCreateInfo{
+                .stage = {.stage = vk::ShaderStageFlagBits::eCompute,
+                          .module = module,
+                          .pName = "main"},
+                .layout = *k.layout,
+            });
+    ASSERT(pipeline_result == vk::Result::eSuccess);
+    k.pipeline = std::move(compute);
+    device.destroyShaderModule(module);
+    return k;
+}
 } // namespace
+
+void Rasterizer::RecordGsPointCompaction(const GsEmulationStages& stages) {
+    static const SetupKernel kernel = MakeKernel(instance.GetDevice(), GS_POINT_COMPACT_COMP, 1,
+                                                 sizeof(CompactParams));
+    const CompactParams params{.invocations = stages.invocations,
+                               .run_length = stages.run_length};
+    const auto binding = gs_binding;
+    scheduler.Record([=](vk::CommandBuffer cmdbuf) {
+        const vk::DescriptorBufferInfo info{binding.scratch, binding.scratch_offset,
+                                            binding.scratch_size};
+        const vk::WriteDescriptorSet write{.dstBinding = 0,
+                                           .descriptorCount = 1,
+                                           .descriptorType = vk::DescriptorType::eStorageBuffer,
+                                           .pBufferInfo = &info};
+        cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, *kernel.pipeline);
+        cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *kernel.layout, 0, write);
+        cmdbuf.pushConstants(*kernel.layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(params),
+                             &params);
+        cmdbuf.dispatch(1, 1, 1);
+    });
+    gs_stats.dispatches.fetch_add(1, std::memory_order_relaxed);
+}
 
 void Rasterizer::CheckGsEmulationErrors() {
     if (!gs_errors) {
@@ -308,46 +405,8 @@ GsEmulationDraw Rasterizer::RecordGsEmulationIndirect(const GraphicsPipeline* pi
     const auto& stages = *pipeline->GsEmulation();
     const auto device = instance.GetDevice();
     const u64 alignment = instance.StorageMinAlignment();
-    static const SetupKernel kernel = [&] {
-        SetupKernel k;
-        std::array<vk::DescriptorSetLayoutBinding, 3> bindings{};
-        for (u32 i = 0; i < bindings.size(); ++i) {
-            bindings[i] = {.binding = i,
-                           .descriptorType = vk::DescriptorType::eStorageBuffer,
-                           .descriptorCount = 1,
-                           .stageFlags = vk::ShaderStageFlagBits::eCompute};
-        }
-        auto [layout_result, set_layout] = device.createDescriptorSetLayoutUnique({
-            .flags = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR,
-            .bindingCount = static_cast<u32>(bindings.size()),
-            .pBindings = bindings.data(),
-        });
-        ASSERT(layout_result == vk::Result::eSuccess);
-        k.set_layout = std::move(set_layout);
-        const vk::PushConstantRange range{.stageFlags = vk::ShaderStageFlagBits::eCompute,
-                                          .offset = 0,
-                                          .size = sizeof(SetupParams)};
-        auto [pipeline_layout_result, pipeline_layout] = device.createPipelineLayoutUnique({
-            .setLayoutCount = 1,
-            .pSetLayouts = &*k.set_layout,
-            .pushConstantRangeCount = 1,
-            .pPushConstantRanges = &range,
-        });
-        ASSERT(pipeline_layout_result == vk::Result::eSuccess);
-        k.layout = std::move(pipeline_layout);
-        const auto module = CompileSPV(GS_INDIRECT_SETUP_COMP, device);
-        auto [pipeline_result, compute] = device.createComputePipelineUnique(
-            {}, vk::ComputePipelineCreateInfo{
-                    .stage = {.stage = vk::ShaderStageFlagBits::eCompute,
-                              .module = module,
-                              .pName = "main"},
-                    .layout = *k.layout,
-                });
-        ASSERT(pipeline_result == vk::Result::eSuccess);
-        k.pipeline = std::move(compute);
-        device.destroyShaderModule(module);
-        return k;
-    }();
+    static const SetupKernel kernel = MakeKernel(device, GS_INDIRECT_SETUP_COMP, 3,
+                                                 sizeof(SetupParams));
     if (!gs_indirect_scratch) {
         gs_indirect_scratch = std::make_unique<VideoCore::StreamBuffer>(
             instance, scheduler, VideoCore::MemoryType::Stream, IndirectRingBytes);
@@ -388,6 +447,7 @@ GsEmulationDraw Rasterizer::RecordGsEmulationIndirect(const GraphicsPipeline* pi
         .capacity_dwords = u32(IndirectScratchBytes / 4),
         .args_address_lo = u32(args),
         .args_address_hi = u32(args >> 32),
+        .point_output = stages.point_output ? 1u : 0u,
     };
     if (is_indexed) {
         ASSERT_MSG((regs.enable_primitive_restart & 1) == 0,
@@ -465,6 +525,12 @@ GsEmulationDraw Rasterizer::RecordGsEmulationIndirect(const GraphicsPipeline* pi
     RecordGsBarrier(vk::PipelineStageFlagBits2::eComputeShader,
                     vk::AccessFlagBits2::eShaderStorageRead);
     RecordGsDispatch(*stages.gs, 0, 0, scratch, *scratch_offset + GsEmu::GsDispatch * 4);
+    if (stages.point_output) {
+        RecordGsBarrier(vk::PipelineStageFlagBits2::eComputeShader,
+                        vk::AccessFlagBits2::eShaderStorageRead |
+                            vk::AccessFlagBits2::eShaderStorageWrite);
+        RecordGsPointCompaction(stages);
+    }
     RecordGsBarrier(vk::PipelineStageFlagBits2::eVertexShader |
                         vk::PipelineStageFlagBits2::eIndexInput |
                         vk::PipelineStageFlagBits2::eDrawIndirect,
@@ -473,7 +539,8 @@ GsEmulationDraw Rasterizer::RecordGsEmulationIndirect(const GraphicsPipeline* pi
     return {.index_buffer = scratch,
             .index_offset = *scratch_offset,
             .indirect = true,
-            .indirect_offset = *scratch_offset + GsEmu::StripDraw * 4,
+            .indirect_offset = *scratch_offset + (stages.point_output ? GsEmu::CompactDraw
+                                                                      : GsEmu::StripDraw) * 4,
             .ended_pass = ended_pass};
 }
 

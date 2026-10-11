@@ -70,7 +70,7 @@ STEPS = {
 }
 # The unattended route, as observed on c436893 (1080p, 2026-10-10). Operations:
 #   ('wait_log', regex, timeout)              a log line since the last press matches
-#   ('wait_draws', minimum, windows, timeout) that many frame-stats windows since the last press with at least
+#   ('wait_draws', minimum, windows, timeout[, no_compiles]) that many frame-stats windows since the last press with at least
 #                                             minimum draws/frame in a row
 #   ('press', tokens) / ('hold', tokens, seconds) / ('sleep', seconds)
 #   ('press_screen', token, min_changed, tries, settle)  press until the window changes that much
@@ -81,8 +81,9 @@ STEPS = {
 TITLE = ('title', [('wait_log', r'^Runtime: pad opened', 120), ('wait_draws', 14, 3, 240), ('sleep', 3),
                    ('capture', 'title', 0.2), ('check_user_cache',)])
 OFFLINE = ('offline', [('press', 'down'), ('press', 'cross'), ('sleep', 4), ('capture', 'offline-menu', 0.2)])
-# The world is loaded when the scene draws far more than the menus and loading screens (<= ~210).
-WORLD = ('world', [('wait_draws', 400, 3, 900), ('sleep', 5), ('capture', 'world', 0.05)])
+# Loading screens already draw the world behind them while pipelines compile, so "in the world"
+# means scene-sized draw counts in windows with no compiles.
+WORLD = ('world', [('wait_draws', 1000, 2, 1800, True), ('sleep', 5), ('capture', 'world', 0.05)])
 # New game: Options skips the opening movie (--movie plays it to the end for movie-path coverage).
 NEW_GAME = [
     TITLE, OFFLINE,
@@ -318,8 +319,11 @@ def launch(args):
     if removed:
         print('play_route: not passed to the game: ' + ', '.join(removed), file=sys.stderr)
     # The game runs in a slot of the machine-wide playtest pool (tools/macos/heavy.sh: three
-    # games at once). The pool settings are read here; they never reach the game.
-    heavy = {k: os.environ[k] for k in ('BB_HEAVY_DIR', 'BB_HEAVY_PLAYTEST_SLOTS') if k in os.environ}
+    # games at once). The pool settings are read here; they never reach the game. A route started
+    # inside a heavy.sh hold (perf_run.sh holds a playtest slot and the GPU exclusively) passes the
+    # hold on, so the game's heavy.sh runs it directly instead of waiting for its own caller.
+    heavy = {k: os.environ[k] for k in ('BB_HEAVY_DIR', 'BB_HEAVY_PLAYTEST_SLOTS', 'BB_HEAVY_HELD',
+                                        'BB_HEAVY_GPU') if k in os.environ}
     running = translated_games()
     if len(running) >= 4:
         die(f'{len(running)} bb-probe processes are already running ({running}); the Rosetta limit is four')
@@ -646,11 +650,13 @@ def route(run, until, hold=0, stages=NEW_GAME):
                 pattern = re.compile(op[1])
                 wait_until(run, op[2], op[1], lambda lines, since: any(pattern.search(l) for l in lines[since:]), mark)
             elif op[0] == 'wait_draws':
+                no_compiles = len(op) > 4 and op[4]
                 def enough(lines, since, minimum=op[1], count=op[2]):
                     streak = 0
                     for sample in frame_stats(lines):
                         if sample['line'] > since:
-                            streak = streak + 1 if sample['draws'] >= minimum else 0
+                            ok = sample['draws'] >= minimum and not (no_compiles and sample['compiles'])
+                            streak = streak + 1 if ok else 0
                     return streak >= count
                 wait_until(run, op[3], f'{op[2]} windows with >= {op[1]} draws/frame', enough, mark)
             elif op[0] == 'press':

@@ -1,0 +1,66 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// bbport (Apple): geometry-stage emulation with point output (shader_recompiler/gs_emulation.h).
+// The GS wrote one run per output slot: the slot's emitted vertices, padded with RestartIndex.
+// This one workgroup compacts all runs, in slot order (input primitive, instance, GS instance)
+// and emission order, into a dense index list at CompactBase, and writes the
+// VkDrawIndexedIndirectCommand of the point draw at CompactDraw. The order is the PS4 output
+// order, which stream-out writes and blending see.
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) buffer Scratch { uint scratch[]; };
+
+layout(push_constant) uniform Params {
+    uint invocations; // GS instances
+    uint run_length;  // index entries per slot
+};
+
+// Header (gs_emulation.h)
+const uint PrimsPerInstance = 1, Instances = 2, IndexBase = 9, CompactBase = 10,
+           CompactDraw = 27;
+const uint RestartIndex = 0xFFFFFFFFu;
+const uint Threads = 256;
+
+shared uint sums[Threads];
+shared uint written;
+
+void main() {
+    const uint lane = gl_LocalInvocationIndex;
+    const uint total = scratch[PrimsPerInstance] * scratch[Instances] * invocations * run_length;
+    const uint runs = scratch[IndexBase];
+    const uint compact = scratch[CompactBase];
+    if (lane == 0) {
+        written = 0;
+    }
+    barrier();
+    for (uint start = 0; start < total; start += Threads) {
+        const uint i = start + lane;
+        const uint index = i < total ? scratch[runs + i] : RestartIndex;
+        const uint keep = index != RestartIndex ? 1u : 0u;
+        // Inclusive scan of keep over the workgroup.
+        sums[lane] = keep;
+        barrier();
+        for (uint offset = 1; offset < Threads; offset <<= 1) {
+            const uint add = lane >= offset ? sums[lane - offset] : 0u;
+            barrier();
+            sums[lane] += add;
+            barrier();
+        }
+        if (keep != 0) {
+            scratch[compact + written + sums[lane] - 1] = index;
+        }
+        barrier();
+        if (lane == Threads - 1) {
+            written += sums[lane];
+        }
+        barrier();
+    }
+    if (lane == 0) {
+        scratch[CompactDraw + 0] = written;
+        scratch[CompactDraw + 1] = 1;
+        scratch[CompactDraw + 2] = compact;
+        scratch[CompactDraw + 3] = 0;
+        scratch[CompactDraw + 4] = 0;
+    }
+}

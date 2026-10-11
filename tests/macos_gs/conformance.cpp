@@ -65,6 +65,7 @@ constexpr u32 OutDwords = 8;        // GSVS vertex: pos0 + param0
 constexpr u32 EsDwords = 4;         // ESGS record: vertex id, instance id, 0, 1
 constexpr u32 Iterations = 8;       // unrolled emit attempts (count = p & 7)
 constexpr u32 BaseVertex = 7;
+constexpr float PointSizePx = 3.0f; // point output: PA_SU_POINT_SIZE (list.vert writes it too)
 
 enum class Index { None, U16, U32 };
 
@@ -90,6 +91,7 @@ struct SetupParams {
     u32 verts_per_prim, invocations, max_vert_out, esgs_dwords, vertex_dwords, run_length;
     u32 capacity_dwords;
     u32 args_address_lo, args_address_hi;
+    u32 point_output;
 };
 
 u32 VertsPerPrim(AmdGpu::PrimitiveType t) {
@@ -247,6 +249,7 @@ struct Expected {
     std::vector<u32> runs;                 // index runs of all slots
     std::vector<std::pair<u32, Vertex>> records; // emitted vertices: (record index, data)
     std::vector<Vertex> list;              // reference primitives as a plain list
+    std::vector<u32> compact;              // point output: the compacted index list
 };
 
 Expected Model(const Case& k, const std::vector<u32>& vertex_ids) {
@@ -254,6 +257,7 @@ Expected Model(const Case& k, const std::vector<u32>& vertex_ids) {
     const u32 per = VertsPerPrim(k.in_prim);
     const u32 prims = k.records / per;
     const u32 m = GsEmu::MinStripVertices(k.out_prim);
+    const bool points = GsEmu::PointOutput(k.out_prim);
     const u32 run_length = GsEmu::IndexRunLength(n, k.out_prim);
     Expected x;
     for (u32 inst = 0; inst < k.instances; ++inst) {
@@ -279,7 +283,7 @@ Expected Model(const Case& k, const std::vector<u32>& vertex_ids) {
                     ++emitted;
                     ++strip_len;
                 }
-                if ((cuts >> e) & 1) {
+                if (!points && (cuts >> e) & 1) { // a cut ends nothing for points
                     if (strip_len >= m) {
                         run.push_back(GsEmu::RestartIndex);
                     } else {
@@ -296,10 +300,17 @@ Expected Model(const Case& k, const std::vector<u32>& vertex_ids) {
             }
             REQUIRE(run.size() <= run_length);
             run.resize(run_length, GsEmu::RestartIndex);
+            for (const u32 index : run) {
+                if (points && index != GsEmu::RestartIndex) {
+                    x.compact.push_back(index);
+                }
+            }
             x.runs.insert(x.runs.end(), run.begin(), run.end());
             // Strip assembly (Vulkan order; the provoking vertex is the first of each primitive).
             for (const auto& s : strips) {
-                if (m == 3) {
+                if (points) {
+                    x.list.insert(x.list.end(), s.begin(), s.end());
+                } else if (m == 3) {
                     for (size_t t = 0; t + 2 < s.size(); ++t) {
                         std::array<Vertex, 3> tri{s[t], s[t + 1 + t % 2], s[t + 2 - t % 2]};
                         if (g_control == "rotate-provoking") {
@@ -317,7 +328,9 @@ Expected Model(const Case& k, const std::vector<u32>& vertex_ids) {
         }
     }
     if (g_control == "reverse-order") {
-        const size_t per_prim = GsEmu::MinStripVertices(k.out_prim) == 3 ? 3 : 2;
+        const size_t per_prim = GsEmu::MinStripVertices(k.out_prim) == 3 ? 3
+                                : GsEmu::PointOutput(k.out_prim)          ? 1
+                                                                          : 2;
         std::vector<Vertex> reversed;
         for (size_t i = x.list.size(); i >= per_prim; i -= per_prim) {
             reversed.insert(reversed.end(), x.list.begin() + (i - per_prim), x.list.begin() + i);
@@ -675,16 +688,21 @@ bool RunCase(const Case& k, const std::string& spv_dir) {
     copy.props.num_user_data = 4;
     copy.props.num_allocated_vgprs = 64;
     copy.hw.vs.num_outputs = 0;
+    if (GsEmu::PointOutput(k.out_prim)) {
+        copy.hw.vs.point_size = PointSizePx; // as BuildRuntimeInfo sets it from PA_SU_POINT_SIZE
+    }
     const auto es_spv = Compile(EsProgram(), es);
     const auto gs_spv = Compile(GsProgram(k), gs);
     const auto copy_spv = Compile(copy_code, copy);
 
     // Scratch, laid out as RecordGsEmulation does.
     const u64 slots = u64(prims) * k.instances;
-    const u64 esgs_base = k.indirect ? GsEmu::IndirectDwords : GsEmu::HeaderDwords;
+    const bool points = GsEmu::PointOutput(k.out_prim);
+    const u64 esgs_base = k.indirect || points ? GsEmu::IndirectDwords : GsEmu::HeaderDwords;
     const u64 gsvs_base = esgs_base + u64(k.records) * k.instances * EsDwords;
     const u64 index_base = gsvs_base + slots * n * OutDwords;
-    const u64 needed_bytes = (index_base + slots * run_length) * 4;
+    const u64 compact_base = index_base + slots * run_length;
+    const u64 needed_bytes = (compact_base + (points ? slots * run_length : 0)) * 4;
     const u64 bytes = k.overflow ? needed_bytes - 4 : needed_bytes;
     Buffer scratch = MakeBuffer(bytes);
     std::memset(scratch.data, 0xCD, bytes); // unwritten records stay recognisable
@@ -697,6 +715,10 @@ bool RunCase(const Case& k, const std::string& spv_dir) {
     header[GsEmu::EsgsBase] = u32(esgs_base);
     header[GsEmu::GsvsBase] = u32(gsvs_base);
     header[GsEmu::IndexBase] = u32(index_base);
+    header[GsEmu::CompactBase] = u32(compact_base);
+    if (points) {
+        std::memset(header + GsEmu::CompactDraw, 0, sizeof(VkDrawIndexedIndirectCommand));
+    }
     // Guest index buffer: data starts index_skip_bytes into the bound range, which is rounded up to
     // whole dwords and padded with a canary dword.
     const u32 index_size = k.index == Index::U16 ? 2 : 4;
@@ -754,14 +776,25 @@ bool RunCase(const Case& k, const std::string& spv_dir) {
     const VkPipeline es_pipe = ComputePipeline(es_module, es_layout.layout);
     const VkPipeline gs_pipe = ComputePipeline(gs_module, gs_layout.layout);
     const bool tris = k.out_prim == AmdGpu::GsOutputPrimitiveType::TriangleStrip;
-    const VkPipeline draw_pipe =
-        GraphicsPipeline(copy_module, fs_module, draw_layout.layout,
-                         tris ? VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP : VK_PRIMITIVE_TOPOLOGY_LINE_STRIP,
-                         true, false);
-    const VkPipeline ref_pipe =
-        GraphicsPipeline(ref_vs_module, fs_module, ref_layout.layout,
-                         tris ? VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST : VK_PRIMITIVE_TOPOLOGY_LINE_LIST,
-                         false, true);
+    const VkPipeline draw_pipe = GraphicsPipeline(
+        copy_module, fs_module, draw_layout.layout,
+        points ? VK_PRIMITIVE_TOPOLOGY_POINT_LIST
+        : tris ? VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP
+               : VK_PRIMITIVE_TOPOLOGY_LINE_STRIP,
+        !points, false);
+    const VkPipeline ref_pipe = GraphicsPipeline(ref_vs_module, fs_module, ref_layout.layout,
+                                                 points ? VK_PRIMITIVE_TOPOLOGY_POINT_LIST
+                                                 : tris ? VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST
+                                                        : VK_PRIMITIVE_TOPOLOGY_LINE_LIST,
+                                                 false, true);
+    // Point output: the production compaction kernel.
+    VkPipeline compact_pipe = VK_NULL_HANDLE;
+    Layout compact_layout{};
+    if (points) {
+        compact_layout = MakeLayout(VK_SHADER_STAGE_COMPUTE_BIT, {{scratch.buffer, 0, bytes}});
+        compact_pipe = ComputePipeline(Module(ReadFile(spv_dir + "/gs_point_compact.comp.spv")),
+                                       compact_layout.layout);
+    }
 
     Expected want = k.overflow ? Expected{} : Model(k, vertex_ids);
     Buffer vertices = MakeBuffer(std::max<u64>(want.list.size(), 1) * sizeof(Vertex));
@@ -791,7 +824,8 @@ bool RunCase(const Case& k, const std::string& spv_dir) {
                  .run_length = run_length,
                  .capacity_dwords = u32(bytes / 4),
                  .args_address_lo = 0x1234560,
-                 .args_address_hi = 0x7f};
+                 .args_address_hi = 0x7f,
+                 .point_output = points ? 1u : 0u};
         // The CPU header is not used: the kernel writes it.
         std::memset(scratch.data, 0xCD, GsEmu::IndirectDwords * 4);
         std::vector<VkDescriptorBufferInfo> r = {{args.buffer, 0, 64},
@@ -841,6 +875,18 @@ bool RunCase(const Case& k, const std::string& spv_dir) {
         vkCmdDispatch(g.cmd, (prims + GsEmu::WorkgroupSize - 1) / GsEmu::WorkgroupSize, k.instances,
                       1);
     }
+    if (points) {
+        Barrier(VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+        const u32 compact_params[2] = {1, run_length}; // invocations, run_length
+        vkCmdBindPipeline(g.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, compact_pipe);
+        vkCmdBindDescriptorSets(g.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, compact_layout.layout, 0, 1,
+                                &compact_layout.set, 0, nullptr);
+        vkCmdPushConstants(g.cmd, compact_layout.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                           sizeof(compact_params), compact_params);
+        vkCmdDispatch(g.cmd, 1, 1, 1);
+    }
     Barrier(VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
             VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_2_INDEX_INPUT_BIT |
                 VK_PIPELINE_STAGE_2_COPY_BIT | VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT,
@@ -853,9 +899,10 @@ bool RunCase(const Case& k, const std::string& spv_dir) {
         vkCmdPushConstants(g.cmd, draw_layout.layout,
                            VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
                            sizeof(push), &push);
-        if (k.indirect) {
+        if (k.indirect || points) {
             vkCmdBindIndexBuffer(g.cmd, scratch.buffer, 0, VK_INDEX_TYPE_UINT32);
-            vkCmdDrawIndexedIndirect(g.cmd, scratch.buffer, GsEmu::StripDraw * 4, 1,
+            vkCmdDrawIndexedIndirect(g.cmd, scratch.buffer,
+                                     (points ? GsEmu::CompactDraw : GsEmu::StripDraw) * 4, 1,
                                      sizeof(VkDrawIndexedIndirectCommand));
         } else if (slots) {
             vkCmdBindIndexBuffer(g.cmd, scratch.buffer, index_base * 4, VK_INDEX_TYPE_UINT32);
@@ -911,6 +958,27 @@ bool RunCase(const Case& k, const std::string& spv_dir) {
             std::snprintf(line, sizeof line, "    index run entry %zu (slot %zu): got %#x want %#x\n",
                           i, i / run_length, runs[i], want.runs[i]);
             failures += line;
+        }
+    }
+    if (points && !k.overflow) {
+        const u32* draw = reinterpret_cast<const u32*>(scratch.data) + GsEmu::CompactDraw;
+        const u32* compact = reinterpret_cast<const u32*>(scratch.data) + compact_base;
+        u32 diffs = 0;
+        if (draw[0] != want.compact.size() || draw[1] != 1 || draw[2] != compact_base) {
+            char line[200];
+            std::snprintf(line, sizeof line,
+                          "    point draw: %u indices from %u (x%u), want %zu from %llu\n",
+                          draw[0], draw[2], draw[1], want.compact.size(),
+                          (unsigned long long)compact_base);
+            failures += line;
+        }
+        for (size_t i = 0; i < want.compact.size(); ++i) {
+            if (compact[i] != want.compact[i] && diffs++ < 8) {
+                char line[160];
+                std::snprintf(line, sizeof line, "    compacted index %zu: got %#x want %#x\n", i,
+                              compact[i], want.compact[i]);
+                failures += line;
+            }
         }
     }
     u32 record_diffs = 0;
@@ -1149,6 +1217,10 @@ int main(int argc, char** argv) {
         {"indirect: u16, firstIndex 3, 2-byte skip, 2 instances", P::PointList, O::TriangleStrip, 8, 37, 2, Index::U16, 2, true},
         {"indirect: triangle list in, u32, N=4", P::TriangleList, O::TriangleStrip, 4, 60, 1, Index::U32, 0, true},
         {"indirect: scratch one dword short -> empty + report", P::PointList, O::TriangleStrip, 8, 64, 1, Index::None, 0, true, true},
+        {"points -> points, N=4", P::PointList, O::PointList, 4, 64, 1, Index::None, 0},
+        {"triangle list in -> points, N=8, u16, 2 instances", P::TriangleList, O::PointList, 8, 61, 2, Index::U16, 0},
+        {"points -> points, 5000: compaction over many chunks", P::PointList, O::PointList, 2, 5000, 1, Index::None, 0},
+        {"indirect: points -> points, N=8, 3 instances", P::PointList, O::PointList, 8, 64, 3, Index::None, 0, true},
     };
     InitGpu();
     if (provoking) {

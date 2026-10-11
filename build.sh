@@ -288,6 +288,7 @@ if [[ ${1:-} == --test || ${1:-} == --test-dry ]]; then
         # exit 0 only (FAIL, INVALID-SPIRV, CRASH and harness errors exit non-zero).
         BB_GPU_BUILD="$PWD/out/gpu" BB_GPU_THIRD_PARTY="$PWD/gpu/third_party" \
             bash tests/gcn_buffer_conformance/build.sh --out "$PWD/out/gcnconf"
+        sign_darwin out/gcnconf/gcn-conformance-dylib
         BB_GPU_USER_DIR="$PWD/out/gcnconf/user" t "$PWD/out/gcnconf/gcn-conformance-dylib" \
             --out "$PWD/out/gcnconf" --label shared
         # Standalone qualification probes and runtime pieces.
