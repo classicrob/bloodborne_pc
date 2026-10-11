@@ -86,7 +86,7 @@ u8 CanaryByte(u64 va) { return u8(Hash32(va ^ 0xC0FFEE123ull) % 255 + 1); }
 enum class SoffSrc { Inline, Sgpr };
 enum class SmemSrc { None, Imm, Sgpr };
 // Wave64 lane-semantics programs (no buffer access under test).
-enum class Wave { None, Lane, MbcntMask, Readlane, Exec1, Exec2, LoopReadFirstLane, Lds, CtrlPhi, CtrlBreak, Pkrtz, Pkrtz3 };
+enum class Wave { None, Lane, MbcntMask, Readlane, Exec1, Exec2, LoopReadFirstLane, Lds, CtrlPhi, CtrlBreak, Pkrtz, Pkrtz3, SmemFallback };
 
 struct Template {
     std::string name;
@@ -137,6 +137,7 @@ struct Template {
     u32 workgroups = 1;              // compute dispatch width (spilled LDS: one region per workgroup)
     u32 pushud_mask = 0;             // pushud: user-data SGPRs the stage reads (s[0:3] = its V#)
     bool fs_count = false;           // pushud-style FS: buffer_atomic_add 1 at its V# (side-effect count)
+    u32 smemfb = 0;                  // SmemFallback: 0 in range, 1 mask also stored, 2 mask also a branch, 3 OOB too
     u32 Threads() const { return wg[0] * wg[1] * wg[2]; }
     std::vector<u32> code;
     u64 hash = 0;
@@ -223,6 +224,32 @@ u64 BoundSize(const gcn_vsharp& v) { // AmdGpu::Buffer::GetSize(): u32 arithmeti
 // Shader templates
 
 // v2 = active (exec predicate), v3 = per-lane value, v5 = ballot predicate, v9 = 0; s12/s13 = lane selects.
+// A VOP3 compare into s[30:31] inside an exec-masked (workgroup-divergent) scope, then
+// s_buffer_load_dword s30 (the compare's SGPR reused as a destination; in range, or out of range
+// for variant 3) and an unrelated out-of-range s_buffer_load_dword s40 whose old value is 0x1234.
+// v10 = s30, v11 = s40. Variant 1 also copies the mask to v12 inside the scope (a visible use),
+// variant 2 branches on it (a control use): both must stay loud.
+void AssembleSmemFallback(GcnAsm::Code& c, u32 variant) {
+    using namespace GcnAsm;
+    c.SMovLiteral(40, 0x1234u);
+    c.VCmpNeU32(Inline(0), 5);
+    c.SAndSaveexecB64(22, VCC_LO);
+    c.words.push_back(0xD0000000u | (197u << 17) | 30u); // v_cmp_ne_u32 s[30:31], 0, v3 (VOP3)
+    c.words.push_back(Inline(0) | (Vgpr(3) << 9));
+    if (variant == 1) c.VMov(12, 30);
+    if (variant == 2) {
+        c.words.push_back(0xBF000000u | (6u << 16) | (Inline(0) << 8) | 30u); // s_cmp_eq_u32 s30, 0
+        c.Sopp(5, 1);                                                      // s_cbranch_scc1 +1
+        c.VMovLiteral(13, 0x77u);
+    }
+    c.SMovB64(EXEC_LO, 22);
+    c.SBufferLoad(1, 30, 0, true, variant == 3 ? 100 : 2); // s30 <- dword 2 (in range) or 100
+    c.SBufferLoad(1, 40, 0, true, 100);                    // s40 <- dword 100: out of range
+    c.SWaitcntAll();
+    c.VMov(10, 30);
+    c.VMov(11, 40);
+}
+
 void AssembleWave(GcnAsm::Code& c, Wave w) {
     using namespace GcnAsm;
     switch (w) {
@@ -642,7 +669,9 @@ void Assemble(Template& t) {
     c.SWaitcntAll();
     for (u32 i = 0; i < 4; ++i) c.VMovLiteral(10 + i, VgprMarker + i);
     const bool smem = t.smem != SmemSrc::None;
-    if (t.wave == Wave::Lds) {
+    if (t.wave == Wave::SmemFallback) {
+        AssembleSmemFallback(c, t.smemfb);
+    } else if (t.wave == Wave::Lds) {
         AssembleLds(c, t.lds_bits, t.lds_only, t.lds_contend, t.lds_cross);
     } else if (t.wave != Wave::None) {
         AssembleWave(c, t.wave);
@@ -1598,6 +1627,31 @@ void AddWaveCases() {
             const u32 g = l / 3, r = l % 3;
             const u32 value = r == 0 ? (0xA5A5u ^ g) : (r == 1 ? (0x5A5Au ^ g) : (0x3C00u | g));
             SetLane(j, l, value, g * 4 + (r == 2 ? 2 : 0));
+        }
+    }
+    // Scalar-load destination reuse of a divergent compare (shader 0xa509af23's shape). The mask
+    // only matters if the load is out of range, so production reads out-of-range scalar dwords as
+    // 0 for the whole shader (SMEM_ZERO reading); any other use of the mask stays loud.
+    for (u32 x : {64u, 128u}) {
+        for (u32 variant : {0u, 3u, 1u, 2u}) {
+            Template t;
+            static const char* vn[] = {"s30 in range", "mask also stored (must be loud)", "mask also a branch (must be loud)",
+                                       "s30 out of range"};
+            t.name = std::string("wave: divergent VOP3 compare into s[30:31], s_buffer_load s30/s40: ") + vn[variant] + " [" +
+                     std::to_string(x) + "x1]";
+            t.op.kind = GCN_LOAD;
+            t.wave = Wave::SmemFallback;
+            t.smemfb = variant;
+            t.wg = {x, 1, 1};
+            t.wave_divergent = true; // trees without the reading switch reject it loudly
+            if (variant == 1 || variant == 2) {
+                t.compile_only = true;
+                t.compute_compile = true;
+                t.expect_loud = true;
+            }
+            const u32 tt = AddTemplate(t);
+            Job& j = NewJob("wave64", tt, RawV(64), 0);
+            for (u32 l = 0; l < x; ++l) SetLane(j, l, 0x5000u + (l % 7), 0, {u32(l % 3 != 0), 0, 0, 0});
         }
     }
     // Control-dependent phi feeding a loop bound (Sol-2's review case), compile-only.
@@ -3065,7 +3119,8 @@ std::vector<u32> WaveExpected(const Job& j) {
         }
         case Wave::Pkrtz:
         case Wave::Pkrtz3:
-            break; // EvaluatePkrtz
+        case Wave::SmemFallback:
+            break; // custom evaluators
         case Wave::Lds: {
             const Lane& L = j.lanes[l];
             if (t.lds_cross == 1) {
@@ -3973,6 +4028,30 @@ JobResult EvaluatePkrtz(const Job& j, const u32* res) {
                                " wrong halves)\n" + why[0]};
 }
 
+// SmemFallback: v10 = the in-range dword (or 0 when out of range), v11 = 0: the shader reads
+// out-of-range scalar dwords as 0 (the SMEM_ZERO reading, taken for the whole shader), never the
+// old 0x1234; v12/v13 keep their markers.
+JobResult EvaluateSmemFallback(Gpu& g, const Job& j, const u32* res) {
+    const Template& t = g_templates[j.tmpl];
+    u32 in_range;
+    std::memcpy(&in_range, g.pristine.data() + (ActualV(j).base + 8 - GuestVa), 4);
+    const u32 want0 = t.smemfb == 3 ? 0u : in_range;
+    u32 bad = 0;
+    std::string d;
+    for (u32 l = 0; l < t.Threads(); ++l) {
+        const u32 want[4] = {want0, 0u, VgprMarker + 2, VgprMarker + 3};
+        for (u32 i = 0; i < 4; ++i) {
+            if (res[l * 4 + i] != want[i] && bad++ < 6) {
+                char b[160];
+                std::snprintf(b, sizeof(b), "    lane %u v%u: got %#010x want %#010x\n", l, 10 + i, res[l * 4 + i], want[i]);
+                d += b;
+            }
+        }
+    }
+    if (!bad) return {Verdict::Strict, ""};
+    return {Verdict::Fail, "  " + std::to_string(bad) + " registers wrong\n" + d};
+}
+
 // Same-halfword LDS contention: lanes 3g, 3g+1 read the same value, one of the two written; lane
 // 3g+2 reads its own halfword.
 JobResult EvaluateLdsContend(const Job& j, const u32* res) {
@@ -4134,6 +4213,10 @@ std::map<u32, JobResult> RunBatch(Gpu& g, const std::vector<u32>& jobs) {
         const u32* res = reinterpret_cast<const u32*>(g.results.data + u64(j.slot) * ResultSlot);
         if (g_templates[j.tmpl].lds_contend) {
             out[ji] = EvaluateLdsContend(j, res);
+            continue;
+        }
+        if (g_templates[j.tmpl].wave == Wave::SmemFallback) {
+            out[ji] = EvaluateSmemFallback(g, j, res);
             continue;
         }
         if (g_templates[j.tmpl].wave == Wave::Pkrtz || g_templates[j.tmpl].wave == Wave::Pkrtz3) {
