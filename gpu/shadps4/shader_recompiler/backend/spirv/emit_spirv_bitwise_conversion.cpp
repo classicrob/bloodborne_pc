@@ -270,7 +270,10 @@ Id EmitUnpackSnorm2_10_10_10(EmitContext& ctx, Id value) {
     const auto as_float{ctx.OpConvertSToF(ctx.F32[4], unpacked)};
     const auto snorm_div{ctx.ConstantComposite(ctx.F32[4], ctx.ConstF32(511.f), ctx.ConstF32(511.f),
                                                ctx.ConstF32(511.f), ctx.ConstF32(1.f))};
-    return ctx.OpFDiv(ctx.F32[4], as_float, snorm_div);
+    const auto normalized{ctx.OpFDiv(ctx.F32[4], as_float, snorm_div)};
+    const auto minimum{ctx.ConstantComposite(ctx.F32[4], ctx.ConstF32(-1.f), ctx.ConstF32(-1.f),
+                                             ctx.ConstF32(-1.f), ctx.ConstF32(-1.f))};
+    return ctx.OpFMax(ctx.F32[4], normalized, minimum);
 }
 
 Id EmitPackUint2_10_10_10(EmitContext& ctx, Id value) {
