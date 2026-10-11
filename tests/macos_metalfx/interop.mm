@@ -15,6 +15,7 @@
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <chrono>
 #include <thread>
 #include <vector>
 #include <sys/sysctl.h>
@@ -456,10 +457,27 @@ int main(int argc,char** argv) {
             if(provider) provider->Drain(); else metalComplete(cb);
         }
         if(provider) {
-            // The renderer may destroy the provider after its encoding thread has stopped: the
-            // destructor must not require the encoding thread (it aborted here before).
-            std::thread([&]{ provider.reset(); }).join();
-            std::puts("PASS: provider destroyed off its encoding thread");
+            // The renderer may destroy the provider after its encoding thread has stopped, with a
+            // frame still in flight: the destructor must not require the encoding thread (it
+            // aborted here before) and must wait for that frame. The frame's Metal work waits for
+            // a producer value the host signals only after the destroying thread has started.
+            constexpr uint64_t producer=1000, consumer=1001;
+            provider->Submit(binding,{producer,consumer,1000,999,0,0});
+            const auto start=std::chrono::steady_clock::now();
+            double destroy_ms=0;
+            std::thread destroyer([&]{
+                provider.reset();
+                destroy_ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count();
+            });
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            VkSemaphoreSignalInfo signal{VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO};
+            signal.semaphore=ready; signal.value=producer;
+            VK(vkSignalSemaphore(e.device,&signal));
+            destroyer.join();
+            uint64_t completed=0; VK(vkGetSemaphoreCounterValue(e.device,done,&completed));
+            require(completed>=consumer,"provider destructor returned before its in-flight frame completed");
+            require(destroy_ms>=90,"provider destructor did not wait for its in-flight frame");
+            std::printf("PASS: provider destroyed off its encoding thread after waiting %.0f ms for its in-flight frame\n",destroy_ms);
         }
         for(bool isTemporal:{true,false}) {
             std::vector<double> times;
