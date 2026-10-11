@@ -303,7 +303,7 @@ if [[ ${1:-} == --test ]]; then
         sign_darwin out/macos-ui-test
         out/macos-ui-test
         "$CC" "${platform_flags[@]}" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread \
-            "${includes[@]}" -I. -Isrc tests/test_fault_mac.c "${compat[@]}" \
+            "${includes[@]}" -I. -Isrc tests/test_fault_mac.c src/runtime_cpu_profile.c "${compat[@]}" \
             -Wl,-dead_strip -o out/fault-mac-test
         sign_darwin out/fault-mac-test
         out/fault-mac-test
