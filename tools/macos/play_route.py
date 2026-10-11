@@ -431,13 +431,18 @@ def supervise(run):
 # ---------------------------------------------------------------- input and observation
 
 def press(run, tokens, seconds=0.12, gap=0.8):
+    """Holds the tokens for about two game frames (the game reads the pad once per frame, so a
+    shorter press can fall between two reads at low frame rates; much longer holds auto-repeat)."""
     game_pid(run)
+    samples = frame_stats(log_lines(run))
+    fps = samples[-1]['fps'] if samples else 60.0
+    hold = max(seconds, min(1.0, 2.2 / max(fps, 1.0)))
     pad = run / 'pad.txt'
     pad.write_text(tokens + '\n')
-    time.sleep(seconds)
+    time.sleep(hold)
     pad.write_text('\n')
-    event(run, 'press', tokens=tokens, seconds=seconds)
-    time.sleep(gap)
+    event(run, 'press', tokens=tokens, seconds=hold, fps=fps)
+    time.sleep(max(gap, hold))
 
 
 def snapshot(run, name):
