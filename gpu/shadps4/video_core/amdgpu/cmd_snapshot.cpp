@@ -148,8 +148,11 @@ u32 CmdSnapshot::ReportRecentOverlaps() {
         const u32* end = region.guest + region.size_dw;
         for (const auto& old : recent_regions) {
             const u32* old_end = old.guest + old.size_dw;
-            const bool same = old.guest == region.guest && old.size_dw == region.size_dw;
-            if (same || !(region.guest < old_end && old.guest < end)) {
+            // The same start from the same thread is one buffer submitted again (called again, or
+            // a per-frame buffer at a fixed address with a different length): not two writers.
+            // From two threads it can be two claims of one chunk, which both start there.
+            if ((old.guest == region.guest && old.thread == thread) ||
+                !(region.guest < old_end && old.guest < end)) {
                 continue;
             }
             ++overlaps;
@@ -157,9 +160,10 @@ u32 CmdSnapshot::ReportRecentOverlaps() {
             if (const u64 n = ++reports; n <= 16 || (n & 1023) == 0) {
                 LOG_CRITICAL(Render,
                              "CMD-OVERLAP #{}: submission {} (thread {}) buffer {}+{} dwords "
-                             "partly overlaps submission {} (thread {}) buffer {}+{} dwords",
+                             "partly overlaps submission {} (thread {}) buffer {}+{} dwords{}",
                              n, submit_number, thread, fmt::ptr(region.guest), region.size_dw,
-                             old.submit_number, old.thread, fmt::ptr(old.guest), old.size_dw);
+                             old.submit_number, old.thread, fmt::ptr(old.guest), old.size_dw,
+                             thread == old.thread ? "" : " (different threads)");
             }
         }
     }

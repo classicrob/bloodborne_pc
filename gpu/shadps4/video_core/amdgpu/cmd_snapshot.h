@@ -54,9 +54,10 @@ public:
     u32 ReportGuestRewrites(const Region& region) const;
 
     /// Diagnostic, at submit: logs regions of this submission that partly overlap command memory
-    /// submitted in the last 64 submissions. A command ring takes far longer to wrap, and a
-    /// buffer called again is the same range, so a partial overlap means two command buffers
-    /// were written into the same memory. Returns the number of overlaps.
+    /// submitted in the last 64 submissions, except a buffer the same thread submits again at the
+    /// same start (whatever its length). A command ring takes far longer to wrap, so any other
+    /// overlap means two command buffers were written into the same memory. Returns the number of
+    /// overlaps.
     u32 ReportRecentOverlaps();
 
     u64 submit_number{};
