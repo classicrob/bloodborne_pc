@@ -107,6 +107,20 @@ static inline u32* WriteTrailingNop(u32* cmdbuf) {
     return cmdbuf + data_block_size + 1 /* header */;
 }
 
+// bbport (macOS): the guest's Gnm wrappers reserve `size` dwords, call the builder and advance
+// past them whatever it returns. A builder that rejects the call writes nothing, so the guest
+// submits whatever those dwords held before and the command processor parses it (lost packet
+// alignment: "Unimplemented PM4 type 0"). Gnm sizes these calls exactly, so a rejection is a gap
+// in this implementation: stop and name it instead of leaving stale words in the stream.
+static s32 BuilderFailed(const char* builder, u32 size, s32 result = -1) {
+#ifdef __APPLE__
+    UNREACHABLE_MSG("macOS: {} rejected a {}-dword command buffer request; the guest would "
+                    "submit the stale dwords it reserved",
+                    builder, size);
+#endif
+    return result;
+}
+
 static inline u32* ClearContextState(u32* cmdbuf) {
     static constexpr std::array ClearStateSequence{
         0xc0012800u, 0x80000000u, 0x80000000u, 0xc0001200u, 0u, 0xc0055800u,
@@ -196,7 +210,7 @@ s32 PS4_SYSV_ABI sceGnmComputeWaitOnAddress(u32* cmdbuf, u32 size, uintptr_t add
         WriteTrailingNop<2>(cmdbuf + 7);
         return ORBIS_OK;
     }
-    return -1;
+    return BuilderFailed(__func__, size);
 }
 
 int PS4_SYSV_ABI sceGnmComputeWaitSemaphore() {
@@ -387,7 +401,7 @@ s32 PS4_SYSV_ABI sceGnmDispatchDirect(u32* cmdbuf, u32 size, u32 threads_x, u32 
         WriteTrailingNop<3>(cmdbuf + 1);
         return ORBIS_OK;
     }
-    return -1;
+    return BuilderFailed(__func__, size);
 }
 
 s32 PS4_SYSV_ABI sceGnmDispatchIndirect(u32* cmdbuf, u32 size, u32 data_offset, u32 flags) {
@@ -403,7 +417,7 @@ s32 PS4_SYSV_ABI sceGnmDispatchIndirect(u32* cmdbuf, u32 size, u32 data_offset, 
         WriteTrailingNop<3>(cmdbuf + 2);
         return ORBIS_OK;
     }
-    return -1;
+    return BuilderFailed(__func__, size);
 }
 
 s32 PS4_SYSV_ABI sceGnmDispatchIndirectOnMec(u32* cmdbuf, u32 size, VAddr args, u32 modifier) {
@@ -415,7 +429,7 @@ s32 PS4_SYSV_ABI sceGnmDispatchIndirectOnMec(u32* cmdbuf, u32 size, VAddr args, 
         cmdbuf[5] = 0;
         return ORBIS_OK;
     }
-    return ORBIS_FAIL;
+    return BuilderFailed(__func__, size, ORBIS_FAIL);
 }
 
 u32 PS4_SYSV_ABI sceGnmDispatchInitDefaultHardwareState(u32* cmdbuf, u32 size) {
@@ -470,7 +484,7 @@ s32 PS4_SYSV_ABI sceGnmDrawIndex(u32* cmdbuf, u32 size, u32 index_count, uintptr
         WriteTrailingNop<3>(cmdbuf + 6);
         return ORBIS_OK;
     }
-    return -1;
+    return BuilderFailed(__func__, size);
 }
 
 s32 PS4_SYSV_ABI sceGnmDrawIndexAuto(u32* cmdbuf, u32 size, u32 index_count, u32 flags) {
@@ -484,7 +498,7 @@ s32 PS4_SYSV_ABI sceGnmDrawIndexAuto(u32* cmdbuf, u32 size, u32 index_count, u32
         WriteTrailingNop<3>(cmdbuf);
         return ORBIS_OK;
     }
-    return -1;
+    return BuilderFailed(__func__, size);
 }
 
 s32 PS4_SYSV_ABI sceGnmDrawIndexIndirect(u32* cmdbuf, u32 size, u32 data_offset, u32 shader_stage,
@@ -510,7 +524,7 @@ s32 PS4_SYSV_ABI sceGnmDrawIndexIndirect(u32* cmdbuf, u32 size, u32 data_offset,
         WriteTrailingNop<3>(cmdbuf);
         return ORBIS_OK;
     }
-    return -1;
+    return BuilderFailed(__func__, size);
 }
 
 s32 PS4_SYSV_ABI sceGnmDrawIndexIndirectCountMulti(u32* cmdbuf, u32 size, u32 data_offset,
@@ -547,7 +561,7 @@ s32 PS4_SYSV_ABI sceGnmDrawIndexIndirectCountMulti(u32* cmdbuf, u32 size, u32 da
         WriteTrailingNop<2>(cmdbuf);
         return ORBIS_OK;
     }
-    return -1;
+    return BuilderFailed(__func__, size);
 }
 
 int PS4_SYSV_ABI sceGnmDrawIndexIndirectMulti(u32* cmdbuf, u32 size, u32 data_offset, u32 max_count,
@@ -576,7 +590,7 @@ int PS4_SYSV_ABI sceGnmDrawIndexIndirectMulti(u32* cmdbuf, u32 size, u32 data_of
         WriteTrailingNop<3>(cmdbuf);
         return ORBIS_OK;
     }
-    return -1;
+    return BuilderFailed(__func__, size);
 }
 
 int PS4_SYSV_ABI sceGnmDrawIndexMultiInstanced() {
@@ -599,7 +613,7 @@ s32 PS4_SYSV_ABI sceGnmDrawIndexOffset(u32* cmdbuf, u32 size, u32 index_offset, 
         WriteTrailingNop<3>(cmdbuf);
         return ORBIS_OK;
     }
-    return -1;
+    return BuilderFailed(__func__, size);
 }
 
 s32 PS4_SYSV_ABI sceGnmDrawIndirect(u32* cmdbuf, u32 size, u32 data_offset, u32 shader_stage,
@@ -624,7 +638,7 @@ s32 PS4_SYSV_ABI sceGnmDrawIndirect(u32* cmdbuf, u32 size, u32 data_offset, u32 
         WriteTrailingNop<3>(cmdbuf);
         return ORBIS_OK;
     }
-    return -1;
+    return BuilderFailed(__func__, size);
 }
 
 int PS4_SYSV_ABI sceGnmDrawIndirectCountMulti() {
@@ -656,7 +670,7 @@ s32 PS4_SYSV_ABI sceGnmDrawIndirectMulti(u32* cmdbuf, u32 size, u32 data_offset,
         WriteTrailingNop<3>(cmdbuf);
         return ORBIS_OK;
     }
-    return -1;
+    return BuilderFailed(__func__, size);
 }
 
 u32 PS4_SYSV_ABI sceGnmDrawInitDefaultHardwareState(u32* cmdbuf, u32 size) {
@@ -1055,7 +1069,7 @@ s32 PS4_SYSV_ABI sceGnmInsertDingDongMarker(u32* cmdbuf, u32 size) {
     LOG_TRACE(Lib_GnmDriver, "called");
 
     if (cmdbuf == nullptr || size != 4) {
-        return -1;
+        return BuilderFailed(__func__, size);
     }
     WritePacket<PM4ItOpcode::Nop>(cmdbuf, PM4ShaderType::ShaderGraphics, 0u, 0u, 0u);
     return ORBIS_OK;
@@ -1070,7 +1084,7 @@ s32 PS4_SYSV_ABI sceGnmInsertPopMarker(u32* cmdbuf, u32 size) {
                                           PM4CmdNop::PayloadType::DebugMarkerPop, 0u, 0u, 0u, 0u);
         return ORBIS_OK;
     }
-    return -1;
+    return BuilderFailed(__func__, size);
 }
 
 s32 PS4_SYSV_ABI sceGnmInsertPushColorMarker(u32* cmdbuf, u32 size, const char* marker, u32 color) {
@@ -1093,7 +1107,7 @@ s32 PS4_SYSV_ABI sceGnmInsertPushColorMarker(u32* cmdbuf, u32 size, const char* 
             return ORBIS_OK;
         }
     }
-    return -1;
+    return BuilderFailed(__func__, size);
 }
 
 s32 PS4_SYSV_ABI sceGnmInsertPushMarker(u32* cmdbuf, u32 size, const char* marker) {
@@ -1114,7 +1128,7 @@ s32 PS4_SYSV_ABI sceGnmInsertPushMarker(u32* cmdbuf, u32 size, const char* marke
             return ORBIS_OK;
         }
     }
-    return -1;
+    return BuilderFailed(__func__, size);
 }
 
 int PS4_SYSV_ABI sceGnmInsertSetColorMarker() {
@@ -1140,7 +1154,7 @@ s32 PS4_SYSV_ABI sceGnmInsertSetMarker(u32* cmdbuf, u32 size, const char* marker
             return ORBIS_OK;
         }
     }
-    return -1;
+    return BuilderFailed(__func__, size);
 }
 
 int PS4_SYSV_ABI sceGnmInsertThreadTraceMarker() {
@@ -1153,7 +1167,7 @@ s32 PS4_SYSV_ABI sceGnmInsertWaitFlipDone(u32* cmdbuf, u32 size, s32 vo_handle, 
     LOG_TRACE(Lib_GnmDriver, "called");
 
     if (size != 7) {
-        return -1;
+        return BuilderFailed(__func__, size);
     }
 
     uintptr_t label_addr{};
@@ -1317,7 +1331,7 @@ int PS4_SYSV_ABI sceGnmRequestMipStatsReportAndReset() {
 s32 PS4_SYSV_ABI sceGnmResetVgtControl(u32* cmdbuf, u32 size) {
     LOG_TRACE(Lib_GnmDriver, "called");
     if (cmdbuf == nullptr || size != 3) {
-        return -1;
+        return BuilderFailed(__func__, size);
     }
     if (sceKernelIsNeoMode()) {
         if (!UseNeoCompatSequences) {
@@ -1383,15 +1397,15 @@ s32 PS4_SYSV_ABI sceGnmSetCsShader(u32* cmdbuf, u32 size, const u32* cs_regs) {
     LOG_TRACE(Lib_GnmDriver, "called");
 
     if (!cmdbuf || size <= 0x18) {
-        return -1;
+        return BuilderFailed(__func__, size);
     }
     if (!cs_regs) {
         LOG_ERROR(Lib_GnmDriver, "Null pointer in shader registers.");
-        return -1;
+        return BuilderFailed(__func__, size);
     }
     if (cs_regs[1] != 0) {
         LOG_ERROR(Lib_GnmDriver, "Invalid shader address.");
-        return -1;
+        return BuilderFailed(__func__, size);
     }
 
     cmdbuf = PM4CmdSetData::SetShReg(cmdbuf, 0x20cu, cs_regs[0],
@@ -1411,19 +1425,19 @@ s32 PS4_SYSV_ABI sceGnmSetCsShaderWithModifier(u32* cmdbuf, u32 size, const u32*
     LOG_TRACE(Lib_GnmDriver, "called");
 
     if (!cmdbuf || size <= 0x18) {
-        return -1;
+        return BuilderFailed(__func__, size);
     }
     if (!cs_regs) {
         LOG_ERROR(Lib_GnmDriver, "Null pointer in shader registers.");
-        return -1;
+        return BuilderFailed(__func__, size);
     }
     if ((modifier & 0xfffffc3fu) != 0) {
         LOG_ERROR(Lib_GnmDriver, "Invalid modifier mask.");
-        return -1;
+        return BuilderFailed(__func__, size);
     }
     if (cs_regs[1] != 0) {
         LOG_ERROR(Lib_GnmDriver, "Invalid shader address.");
-        return -1;
+        return BuilderFailed(__func__, size);
     }
 
     cmdbuf = PM4CmdSetData::SetShReg(cmdbuf, 0x20cu, cs_regs[0],
@@ -1445,7 +1459,7 @@ s32 PS4_SYSV_ABI sceGnmSetEmbeddedPsShader(u32* cmdbuf, u32 size, u32 shader_id,
 
     if (shader_id > 1) {
         LOG_ERROR(Lib_GnmDriver, "Unknown shader id {}", shader_id);
-        return ORBIS_GNM_ERROR_FAILURE;
+        return BuilderFailed(__func__, size, ORBIS_GNM_ERROR_FAILURE);
     }
 
     // clang-format off
@@ -1514,7 +1528,7 @@ s32 PS4_SYSV_ABI sceGnmSetEmbeddedVsShader(u32* cmdbuf, u32 size, u32 shader_id,
 
     if (shader_id != 0) {
         LOG_ERROR(Lib_GnmDriver, "Unknown shader id {}", shader_id);
-        return ORBIS_GNM_ERROR_FAILURE;
+        return BuilderFailed(__func__, size, ORBIS_GNM_ERROR_FAILURE);
     }
 
     // A fullscreen triangle with one uv set
@@ -1564,22 +1578,22 @@ s32 PS4_SYSV_ABI sceGnmSetEsShader(u32* cmdbuf, u32 size, const u32* es_regs, u3
     LOG_TRACE(Lib_GnmDriver, "called");
 
     if (!cmdbuf || size < 0x14) {
-        return -1;
+        return BuilderFailed(__func__, size);
     }
 
     if (!es_regs) {
         LOG_ERROR(Lib_GnmDriver, "Null pointer passed as argument");
-        return -1;
+        return BuilderFailed(__func__, size);
     }
 
     if (shader_modifier & 0xfcfffc3f) {
         LOG_ERROR(Lib_GnmDriver, "Invalid modifier mask");
-        return -1;
+        return BuilderFailed(__func__, size);
     }
 
     if (es_regs[1] != 0) {
         LOG_ERROR(Lib_GnmDriver, "Invalid shader address");
-        return -1;
+        return BuilderFailed(__func__, size);
     }
 
     const u32 var =
@@ -1600,17 +1614,17 @@ s32 PS4_SYSV_ABI sceGnmSetGsShader(u32* cmdbuf, u32 size, const u32* gs_regs) {
     LOG_TRACE(Lib_GnmDriver, "called");
 
     if (!cmdbuf || size < 0x1d) {
-        return -1;
+        return BuilderFailed(__func__, size);
     }
 
     if (!gs_regs) {
         LOG_ERROR(Lib_GnmDriver, "Null pointer passed as argument");
-        return -1;
+        return BuilderFailed(__func__, size);
     }
 
     if (gs_regs[1] != 0) {
         LOG_ERROR(Lib_GnmDriver, "Invalid shader address");
-        return -1;
+        return BuilderFailed(__func__, size);
     }
 
     cmdbuf = PM4CmdSetData::SetShReg(cmdbuf, 0x88u, gs_regs[0], 0u); // SPI_SHADER_PGM_LO_GS
@@ -1627,17 +1641,17 @@ s32 PS4_SYSV_ABI sceGnmSetGsShader(u32* cmdbuf, u32 size, const u32* gs_regs) {
 s32 PS4_SYSV_ABI sceGnmSetHsShader(u32* cmdbuf, u32 size, const u32* hs_regs, u32 param4) {
     LOG_TRACE(Lib_GnmDriver, "called");
     if (!cmdbuf || size < 0x1E) {
-        return -1;
+        return BuilderFailed(__func__, size);
     }
 
     if (!hs_regs) {
         LOG_ERROR(Lib_GnmDriver, "Null pointer passed as argument");
-        return -1;
+        return BuilderFailed(__func__, size);
     }
 
     if (hs_regs[1] != 0) {
         LOG_ERROR(Lib_GnmDriver, "Invalid shader address");
-        return -1;
+        return BuilderFailed(__func__, size);
     }
 
     cmdbuf = PM4CmdSetData::SetShReg(cmdbuf, 0x108u, hs_regs[0], 0u); // SPI_SHADER_PGM_LO_HS
@@ -1658,23 +1672,23 @@ s32 PS4_SYSV_ABI sceGnmSetLsShader(u32* cmdbuf, u32 size, const u32* ls_regs, u3
     LOG_TRACE(Lib_GnmDriver, "called");
 
     if (!cmdbuf || size < 0x17) {
-        return -1;
+        return BuilderFailed(__func__, size);
     }
 
     if (!ls_regs) {
         LOG_ERROR(Lib_GnmDriver, "Null pointer passed as argument");
-        return -1;
+        return BuilderFailed(__func__, size);
     }
 
     const auto modifier_mask = ((shader_modifier & 0xfffffc3f) == 0) ? 0xfffffc3f : 0xfcfffc3f;
     if (shader_modifier & modifier_mask) {
         LOG_ERROR(Lib_GnmDriver, "Invalid modifier mask");
-        return -1;
+        return BuilderFailed(__func__, size);
     }
 
     if (ls_regs[1] != 0) {
         LOG_ERROR(Lib_GnmDriver, "Invalid shader address");
-        return -1;
+        return BuilderFailed(__func__, size);
     }
 
     const u32 var =
@@ -1691,7 +1705,7 @@ s32 PS4_SYSV_ABI sceGnmSetPsShader(u32* cmdbuf, u32 size, const u32* ps_regs) {
     LOG_TRACE(Lib_GnmDriver, "called");
 
     if (!cmdbuf || size <= 0x27) {
-        return -1;
+        return BuilderFailed(__func__, size);
     }
     if (!ps_regs) {
         cmdbuf = PM4CmdSetData::SetShReg(cmdbuf, 8u, 0u,
@@ -1702,7 +1716,7 @@ s32 PS4_SYSV_ABI sceGnmSetPsShader(u32* cmdbuf, u32 size, const u32* ps_regs) {
     } else {
         if (ps_regs[1] != 0) {
             LOG_ERROR(Lib_GnmDriver, "Invalid shader address.");
-            return -1;
+            return BuilderFailed(__func__, size);
         }
 
         cmdbuf = PM4CmdSetData::SetShReg(cmdbuf, 8u, ps_regs[0],
@@ -1728,7 +1742,7 @@ s32 PS4_SYSV_ABI sceGnmSetPsShader350(u32* cmdbuf, u32 size, const u32* ps_regs)
     LOG_TRACE(Lib_GnmDriver, "called");
 
     if (!cmdbuf || size <= 0x27) {
-        return -1;
+        return BuilderFailed(__func__, size);
     }
     if (!ps_regs) {
         cmdbuf = PM4CmdSetData::SetShReg(cmdbuf, 8u, 0u,
@@ -1740,7 +1754,7 @@ s32 PS4_SYSV_ABI sceGnmSetPsShader350(u32* cmdbuf, u32 size, const u32* ps_regs)
     } else {
         if (ps_regs[1] != 0) {
             LOG_ERROR(Lib_GnmDriver, "Invalid shader address.");
-            return -1;
+            return BuilderFailed(__func__, size);
         }
 
         cmdbuf = PM4CmdSetData::SetShReg(cmdbuf, 8u, ps_regs[0],
@@ -1797,7 +1811,7 @@ s32 PS4_SYSV_ABI sceGnmSetVgtControl(u32* cmdbuf, u32 size, u32 prim_group_sz_mi
 
     if (!cmdbuf || size != 3 || (prim_group_sz_minus_one >= 0x100) ||
         ((wd_switch_only_on_eop_mode | partial_vs_wave_mode) >= 2)) {
-        return -1;
+        return BuilderFailed(__func__, size);
     }
 
     if (sceKernelIsNeoMode()) {
@@ -1826,22 +1840,22 @@ s32 PS4_SYSV_ABI sceGnmSetVsShader(u32* cmdbuf, u32 size, const u32* vs_regs, u3
     LOG_TRACE(Lib_GnmDriver, "called");
 
     if (!cmdbuf || size <= 0x1c) {
-        return -1;
+        return BuilderFailed(__func__, size);
     }
 
     if (!vs_regs) {
         LOG_ERROR(Lib_GnmDriver, "Null pointer passed as argument");
-        return -1;
+        return BuilderFailed(__func__, size);
     }
 
     if (shader_modifier & 0xfcfffc3f) {
         LOG_ERROR(Lib_GnmDriver, "Invalid modifier mask");
-        return -1;
+        return BuilderFailed(__func__, size);
     }
 
     if (vs_regs[1] != 0) {
         LOG_ERROR(Lib_GnmDriver, "Invalid shader address");
-        return -1;
+        return BuilderFailed(__func__, size);
     }
 
     const u32 var = shader_modifier == 0 ? vs_regs[2] : (vs_regs[2] & 0xfcfffc3f) | shader_modifier;
@@ -2394,17 +2408,17 @@ s32 PS4_SYSV_ABI sceGnmUpdateGsShader(u32* cmdbuf, u32 size, const u32* gs_regs)
     LOG_TRACE(Lib_GnmDriver, "called");
 
     if (!cmdbuf || size < 0x1d) {
-        return -1;
+        return BuilderFailed(__func__, size);
     }
 
     if (!gs_regs) {
         LOG_ERROR(Lib_GnmDriver, "Null pointer passed as argument");
-        return -1;
+        return BuilderFailed(__func__, size);
     }
 
     if (gs_regs[1] != 0) {
         LOG_ERROR(Lib_GnmDriver, "Invalid shader address");
-        return -1;
+        return BuilderFailed(__func__, size);
     }
 
     cmdbuf = PM4CmdSetData::SetShReg(cmdbuf, 0x88u, gs_regs[0], 0u); // SPI_SHADER_PGM_LO_GS
@@ -2425,17 +2439,17 @@ int PS4_SYSV_ABI sceGnmUpdateHsShader(u32* cmdbuf, u32 size, const u32* hs_regs,
     LOG_TRACE(Lib_GnmDriver, "called");
 
     if (!cmdbuf || size <= 0x1c) {
-        return -1;
+        return BuilderFailed(__func__, size);
     }
 
     if (!hs_regs) {
         LOG_ERROR(Lib_GnmDriver, "Null pointer passed as argument");
-        return -1;
+        return BuilderFailed(__func__, size);
     }
 
     if (hs_regs[1] != 0) {
         LOG_ERROR(Lib_GnmDriver, "Invalid shader address");
-        return -1;
+        return BuilderFailed(__func__, size);
     }
 
     cmdbuf = PM4CmdSetData::SetShReg(cmdbuf, 0x108u, hs_regs[0],
@@ -2458,7 +2472,7 @@ s32 PS4_SYSV_ABI sceGnmUpdatePsShader(u32* cmdbuf, u32 size, const u32* ps_regs)
     LOG_TRACE(Lib_GnmDriver, "called");
 
     if (!cmdbuf || size <= 0x27) {
-        return -1;
+        return BuilderFailed(__func__, size);
     }
     if (!ps_regs) {
         cmdbuf = PM4CmdSetData::SetShReg(cmdbuf, 8u, 0u,
@@ -2469,7 +2483,7 @@ s32 PS4_SYSV_ABI sceGnmUpdatePsShader(u32* cmdbuf, u32 size, const u32* ps_regs)
     } else {
         if (ps_regs[1] != 0) {
             LOG_ERROR(Lib_GnmDriver, "Invalid shader address.");
-            return -1;
+            return BuilderFailed(__func__, size);
         }
 
         cmdbuf = PM4CmdSetData::SetShReg(cmdbuf, 8u, ps_regs[0],
@@ -2501,7 +2515,7 @@ s32 PS4_SYSV_ABI sceGnmUpdatePsShader350(u32* cmdbuf, u32 size, const u32* ps_re
     LOG_TRACE(Lib_GnmDriver, "called");
 
     if (!cmdbuf || size <= 0x27) {
-        return -1;
+        return BuilderFailed(__func__, size);
     }
     if (!ps_regs) {
         cmdbuf = PM4CmdSetData::SetShReg(cmdbuf, 8u, 0u,
@@ -2514,7 +2528,7 @@ s32 PS4_SYSV_ABI sceGnmUpdatePsShader350(u32* cmdbuf, u32 size, const u32* ps_re
     } else {
         if (ps_regs[1] != 0) {
             LOG_ERROR(Lib_GnmDriver, "Invalid shader address.");
-            return -1;
+            return BuilderFailed(__func__, size);
         }
 
         cmdbuf = PM4CmdSetData::SetShReg(cmdbuf, 8u, ps_regs[0],
@@ -2547,22 +2561,22 @@ s32 PS4_SYSV_ABI sceGnmUpdateVsShader(u32* cmdbuf, u32 size, const u32* vs_regs,
     LOG_TRACE(Lib_GnmDriver, "called");
 
     if (!cmdbuf || size <= 0x1c) {
-        return -1;
+        return BuilderFailed(__func__, size);
     }
 
     if (!vs_regs) {
         LOG_ERROR(Lib_GnmDriver, "Null pointer passed as argument");
-        return -1;
+        return BuilderFailed(__func__, size);
     }
 
     if (shader_modifier & 0xfcfffc3f) {
         LOG_ERROR(Lib_GnmDriver, "Invalid modifier mask");
-        return -1;
+        return BuilderFailed(__func__, size);
     }
 
     if (vs_regs[1] != 0) {
         LOG_ERROR(Lib_GnmDriver, "Invalid shader address");
-        return -1;
+        return BuilderFailed(__func__, size);
     }
 
     const u32 var =
