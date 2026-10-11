@@ -92,6 +92,17 @@ int main(void) {
             found_block|=blks[i].start==(uint64_t)physical && blks[i].size==4*PAGE;
         }
         assert(found_a && found_flex && found_block);
+        /* The capture keeps backing pages by VM disposition: a page written only through a guest
+         * view must show as present through the backing view; a never-touched one must not. */
+        int disp[2]={-1,-1};
+        mach_vm_size_t one=1;
+        assert(mach_vm_page_range_query(mach_task_self(),(mach_vm_address_t)(backing+physical),vm_page_size,
+                                        (mach_vm_address_t)&disp[0],&one)==KERN_SUCCESS && one==1);
+        one=1;
+        assert(mach_vm_page_range_query(mach_task_self(),(mach_vm_address_t)(backing+physical+3*PAGE),vm_page_size,
+                                        (mach_vm_address_t)&disp[1],&one)==KERN_SUCCESS && one==1);
+        printf("  backing dispositions: written page %#x, untouched page %#x\n",disp[0],disp[1]);
+        assert(disp[0]!=0 && disp[1]==0);
         printf("  layout: %zu views, %zu direct blocks; backing reads match guest writes\n",nv,nb);
     }
     /* Unmapping the duplicate leaves A shared with the partial alias only. */
