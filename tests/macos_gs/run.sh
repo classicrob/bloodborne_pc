@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Geometry emulation (Apple) checks: compile-negative controls, the runtime conformance suite on
-# MoltenVK, and its three negative controls (each must make every case that could show it FAIL).
+# MoltenVK and its three negative controls (each must make every case that could show it FAIL),
+# and the device's provoking vertex with its control.
 #   BB_GPU_BUILD=<tree>/out/gpu BB_GPU_THIRD_PARTY=<tree>/gpu/third_party tests/macos_gs/run.sh
 # The GPU library must be built from this checkout's tree (the tools compile its recompiler).
 set -euo pipefail
@@ -33,4 +34,10 @@ run "$out/conformance" "$out" --control reverse-order > "$out/control-reverse-or
 expect "control reverse-order (only the 4 empty cases pass)" "4 of 18 cases passed" "$out/control-reverse-order.log"
 run "$out/conformance" "$out" --control rotate-provoking > "$out/control-rotate-provoking.log" 2>&1 || true
 expect "control rotate-provoking (empty and line cases pass)" "6 of 18 cases passed" "$out/control-rotate-provoking.log"
+# The device's flat vertex is Vulkan's FIRST provoking vertex (lists, strips incl. odd triangles
+# and restarts, fans): what lowering GCN's flat P0 reads to Flat relies on.
+run "$out/conformance" "$out" --provoking > "$out/provoking.log" 2>&1 || true
+expect "provoking vertex" "4 of 4 cases passed" "$out/provoking.log"
+run "$out/conformance" "$out" --provoking --control provoking-last > "$out/control-provoking-last.log" 2>&1 || true
+expect "control provoking-last (every case fails)" "0 of 4 cases passed" "$out/control-provoking-last.log"
 exit $fail
