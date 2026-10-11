@@ -90,8 +90,9 @@ ignored").
 | SMEM_ZERO | an out-of-range scalar dword leaves SDST unwritten | it writes 0 | §7.4 says "not performed"; drivers often describe zero |
 | FMT_SEL | out-of-range format load returns 0 in every component | dst_sel constants (SEL_1) still apply to the zero data | "return 0" vs the later dst_sel stage |
 | SHORT_ALIGN | 16-bit accesses use the exact byte address | the address LSB is ignored for 16-bit accesses | §8.1.6 only covers Dword or larger; misaligned shorts are not described |
-| SEL1_FLOAT | dst_sel ONE is 1 in the number format (integer 1 for UINT; "integer formats are returned as integers", §8.1.3) | ONE is 1.0f for every format | Table 8.5 only says "1=1" |
+| SEL1_FLOAT | dst_sel ONE is 1 in the number format (integer 1 for UINT/SINT; "integer formats are returned as integers", §8.1.3) | ONE is 1.0f for every format | DECIDED (orchestrator, 2026-10-10): integer 1; the alternative is no longer accepted |
 | MTBUF_BOUND | resource dfmt INVALID makes TBUFFER_* unbound too | TBUFFER_* uses the instruction format and accesses normally | the NOTE is written for "derived" formats |
+| PACK_MIRROR | packed formats (10_11_11, 11_11_10, 10_10_10_2, 2_10_10_10) laid out from the LSB, X in the low bits (Mesa's BUF_DATA_FORMAT mapping) | the same fields laid out from the MSB, X in the top bits | Table 8.13 gives no bit layout |
 
 A result is **STRICT PASS** when every reading agrees and the implementation matches. It is
 **AMBIGUOUS PASS** when it matches only some readings (each reported). Any memory effect or
@@ -129,10 +130,11 @@ layouts. The model uses the D3D10+/AMD conventions:
 - Packed formats are named MSB first, X in the low bits of the name's last field:
   2_10_10_10 has X in bits 9:0 and W in 31:30 (Mesa maps R10G10B10A2 to BUF_DATA_FORMAT_2_10_10_10);
   10_10_10_2 has X (2 bits) in 1:0 and W in 31:22; 10_11_11 has X (11 bits) in 10:0, Z (10) in 31:22;
-  11_11_10 has X (10 bits) in 9:0, Z (11) in 31:21. A tree that reverses a layout FAILs and the
-  report shows it; the layout is a convention, not ISA text, so check it against hardware data.
+  11_11_10 has X (10 bits) in 9:0, Z (11) in 31:21. Reading PACK_MIRROR: the same fields laid
+  out from the MSB (X in the top bits: 10_10_10_2 X in 31:30, 11_11_10 X in 31:22). No ISA text or
+  hardware data decides it; both are accepted and the report names the one matched.
 - Not fixed by the ISA, accepted as PASS(ambiguous) with the reason named: NaN payloads of FLOAT
   formats (any NaN), and the last bit of UNORM/SNORM conversions (division vs a reciprocal
   multiply: within 1 ulp, same sign).
-- dst_sel ONE: integer 1 for UINT/SINT (literal reading, §8.1.3), 1.0f for every other number
-  format; SEL1_FLOAT (1.0f for integers too) stays an accepted reading.
+- dst_sel ONE: integer 1 for UINT/SINT (§8.1.3), 1.0f for every other number format (decided;
+  1.0f for an integer format FAILs: a bone index swizzled to ONE would read 0x3F800000).

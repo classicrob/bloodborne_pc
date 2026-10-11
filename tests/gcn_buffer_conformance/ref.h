@@ -19,7 +19,8 @@ enum {
     GCN_R_MTBUF_BOUND = 1 << 6,
     GCN_R_SHORT_ALIGN = 1 << 7,
     GCN_R_SEL1_FLOAT = 1 << 8,
-    GCN_NUM_READINGS = 1 << 9,
+    GCN_R_PACK_MIRROR = 1 << 9, /* packed formats laid out from the MSB (X in the top bits) */
+    GCN_NUM_READINGS = 1 << 10,
 };
 
 typedef struct {

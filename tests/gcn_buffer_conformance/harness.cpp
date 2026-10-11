@@ -1744,6 +1744,10 @@ void AddVertexCases() {
             for (u32 w = 0; w < 2 * f.stride / 4; ++w) j.init_words.push_back(0x5A5A0000u | w);
             j.init_words[0] = edges(f.dfmt, 0);
             j.init_words[f.stride / 4] = edges(f.dfmt, 1);
+            if (f.dfmt == GCN_DFMT_2_10_10_10 || f.dfmt == GCN_DFMT_10_10_10_2) {
+                j.init_words.resize(3 * f.stride / 4, 0x5A5A5A5Au);
+                j.init_words[2 * f.stride / 4] = 0xA007FE00u; // 2_10_10_10: X -512, Y 511, Z -512, W -2
+            }
             if (f.dfmt == GCN_DFMT_16_16_16_16) { // second dword: more edges
                 j.init_words[1] = 0x00007FFFu;
                 j.init_words[f.stride / 4 + 1] = 0x80008001u;
@@ -1755,7 +1759,10 @@ void AddVertexCases() {
                                  std::pair{GCN_NFMT_UNORM, std::array<u8, 4>{7, 6, 5, 4}},
                                  std::pair{GCN_NFMT_UINT, std::array<u8, 4>{4, 0, 0, 1}},
                                  std::pair{GCN_NFMT_UNORM, std::array<u8, 4>{4, 5, 0, 1}},
-                                 std::pair{GCN_NFMT_SINT, std::array<u8, 4>{5, 4, 1, 1}}}) {
+                                 std::pair{GCN_NFMT_SINT, std::array<u8, 4>{5, 4, 1, 1}},
+                                 std::pair{GCN_NFMT_USCALED, std::array<u8, 4>{4, 0, 0, 1}},
+                                 std::pair{GCN_NFMT_SSCALED, std::array<u8, 4>{4, 5, 1, 1}},
+                                 std::pair{GCN_NFMT_SNORM, std::array<u8, 4>{4, 5, 6, 1}}}) {
             gcn_vsharp v = StructV(20, 6, GCN_DFMT_8_8_8_8, nfmt);
             for (u32 c = 0; c < 4; ++c) v.dst_sel[c] = sel[c];
             Job& j = NewJob("vertex-format", fetch(4), v, 0);
@@ -3101,7 +3108,11 @@ std::vector<Outcome> Expected(Gpu& g, const Job& j, std::vector<u8>& work, const
     const gcn_vsharp v = ActualV(j);
     std::map<std::string, size_t> index;
     std::vector<Outcome> outs;
+    const u32 typed_dfmt = t.op.inst_typed ? t.op.inst_dfmt : v.dfmt;
+    const bool packed = t.op.typed && typed_dfmt >= GCN_DFMT_10_11_11 && typed_dfmt <= GCN_DFMT_2_10_10_10;
     for (u32 r = 0; r < GCN_NUM_READINGS; ++r) {
+        if ((r & GCN_R_PACK_MIRROR) && !packed) continue; // only packed formats have a layout question
+        if (r & GCN_R_SEL1_FLOAT) continue;                // decided: integer ONE (SPEC.md)
         Outcome o;
         o.regs.assign(kLanes * 4, 0);
         for (u32 lane = 0; lane < kLanes; ++lane) {
@@ -3201,6 +3212,7 @@ const char* ReadingName(u32 bit) {
     case GCN_R_MTBUF_BOUND: return "MTBUF_BOUND";
     case GCN_R_SHORT_ALIGN: return "SHORT_ALIGN";
     case GCN_R_SEL1_FLOAT: return "SEL1_FLOAT";
+    case GCN_R_PACK_MIRROR: return "PACK_MIRROR";
     }
     return "?";
 }

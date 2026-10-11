@@ -341,7 +341,8 @@ void gcn_execute(const gcn_vsharp* v, const gcn_addr* a, const gcn_op* op, const
                 if (byte_comps) {
                     raw = (uint32_t)read_le(p + c * cb, cb);
                 } else {
-                    raw = (uint32_t)((lo >> shift[c]) & ((1ull << width[c]) - 1));
+                    const uint32_t sh = (r & GCN_R_PACK_MIRROR) ? 32 - shift[c] - width[c] : shift[c];
+                    raw = (uint32_t)((lo >> sh) & ((1ull << width[c]) - 1));
                 }
                 int unk = 0;
                 comps[c] = gcn_convert_component(raw, width[c], nfmt, &unk);
@@ -356,10 +357,10 @@ void gcn_execute(const gcn_vsharp* v, const gcn_addr* a, const gcn_op* op, const
         for (uint32_t c = 0; c < 4; c++) {
             sel[c] = op->inst_typed ? (uint8_t)(c < k ? 4 + c : 0) : v->dst_sel[c];
         }
-        /* "integer formats are returned as integers" (§8.1.3): integer 1 only for UINT/SINT
-         * (unless reading SEL1_FLOAT); every other number format yields floats, so 1.0f. */
+        /* "integer formats are returned as integers" (§8.1.3): integer 1 for UINT/SINT, 1.0f for
+         * every other number format. (Decided; SEL1_FLOAT is no longer an accepted reading.) */
         const int int_fmt = nfmt == GCN_NFMT_UINT || nfmt == GCN_NFMT_SINT;
-        const uint32_t one = (!int_fmt || (r & GCN_R_SEL1_FLOAT)) ? 0x3f800000u : 1u;
+        const uint32_t one = !int_fmt ? 0x3f800000u : 1u;
         for (uint32_t c = 0; c < op->ncomp && c < 4; c++) {
             if (!in_range && !(r & GCN_R_FMT_SEL)) {
                 out->value[c] = 0;
