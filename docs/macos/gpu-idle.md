@@ -168,3 +168,9 @@ changed it in between (the allocator's free-list link, a reset), `LABEL-CHECK` i
 values, the 48 bytes around it, and how long the write was pending. With several EOPs on one label
 in flight, a later one finding the earlier one's value is not a report. Any change to when the
 guest is released must keep the count at zero. Test: `label-check-test`.
+
+`BB_SUBMIT_THROTTLE=none` (UNSAFE diagnostic) never holds the guest for GPU idle. Together with
+`BB_LABEL_CHECK=1` it measures whether the guest depends on the throttle, and how far behind its
+early frees run: the `pending` time of each report. That decides whether the guest may run a frame
+ahead of the GPU thread (the P0b throughput lever). It may corrupt the guest heap, so it is not
+for play.
