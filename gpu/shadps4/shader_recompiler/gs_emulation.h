@@ -46,6 +46,14 @@ inline u32 RecordDword(IR::Attribute attr, u32 comp) {
     return 4 + (static_cast<u32>(attr) - static_cast<u32>(IR::Attribute::Param0)) * 4 + comp;
 }
 
+/// Point output: every emitted vertex is a primitive and a cut does nothing. The runs then hold
+/// the emitted vertices padded with RestartIndex, and a compaction pass
+/// (host_shaders/gs_point_compact.comp) turns them into one dense index list in PS4 order, drawn
+/// as a point list (list topologies cannot restart on Apple).
+inline bool PointOutput(AmdGpu::GsOutputPrimitiveType type) {
+    return type == AmdGpu::GsOutputPrimitiveType::PointList;
+}
+
 /// Minimum vertices of a strip that draws something.
 inline u32 MinStripVertices(AmdGpu::GsOutputPrimitiveType type) {
     switch (type) {
@@ -53,14 +61,20 @@ inline u32 MinStripVertices(AmdGpu::GsOutputPrimitiveType type) {
         return 3;
     case AmdGpu::GsOutputPrimitiveType::LineStrip:
         return 2;
+    case AmdGpu::GsOutputPrimitiveType::PointList:
+        return 1;
     default:
-        UNREACHABLE_MSG("Geometry emulation: GS output type {} is not a strip", u32(type));
+        UNREACHABLE_MSG("Geometry emulation: GS output type {}", u32(type));
     }
 }
 
 /// Index entries per output slot: N vertices, plus one restart after each strip that draws
-/// something (a cut after a shorter strip rewinds it instead), so at most N / M restarts.
+/// something (a cut after a shorter strip rewinds it instead), so at most N / M restarts. Points
+/// need no restarts.
 inline u32 IndexRunLength(u32 max_vert_out, AmdGpu::GsOutputPrimitiveType type) {
+    if (PointOutput(type)) {
+        return max_vert_out;
+    }
     return max_vert_out + max_vert_out / MinStripVertices(type);
 }
 
@@ -83,6 +97,7 @@ enum Header : u32 {
     EsgsBase,           ///< dword offset of the ESGS records
     GsvsBase,           ///< dword offset of the GSVS records
     IndexBase,          ///< dword offset of the index runs
+    CompactBase,        ///< point output: dword offset of the compacted index list
     HeaderDwords = 16,
 };
 
@@ -92,7 +107,8 @@ enum IndirectCommands : u32 {
     EsDispatch = 16,  ///< VkDispatchIndirectCommand of the ES
     GsDispatch = 19,  ///< VkDispatchIndirectCommand of the GS
     StripDraw = 22,   ///< VkDrawIndexedIndirectCommand of the copy-shader draw (firstIndex = runs)
-    IndirectDwords = 32, ///< header + commands; the records follow
+    CompactDraw = 27, ///< point output: VkDrawIndexedIndirectCommand of the compacted point list
+    IndirectDwords = 32, ///< header + commands; the records follow (also for point output draws)
 };
 
 } // namespace Shader::GsEmulation

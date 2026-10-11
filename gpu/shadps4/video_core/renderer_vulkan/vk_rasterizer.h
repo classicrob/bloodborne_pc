@@ -281,6 +281,8 @@ private:
     /// returns the strip draw (vk_gs_emulation.cpp).
     GsEmulationDraw RecordGsEmulation(const GraphicsPipeline* pipeline, const AmdGpu::Regs& regs,
                                       bool is_indexed, u32 index_offset);
+    /// Point output: compacts the GS's index runs into the point draw (gs_point_compact.comp).
+    void RecordGsPointCompaction(const GsEmulationStages& stages);
     GsEmulationDraw RecordGsEmulationIndirect(const GraphicsPipeline* pipeline,
                                               const AmdGpu::Regs& regs, bool is_indexed,
                                               VAddr args, u32 stride, u32 max_count,

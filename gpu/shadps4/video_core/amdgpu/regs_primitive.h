@@ -97,6 +97,19 @@ struct PolygonControl {
     }
 };
 
+/// PA_SU_POINT_SIZE: half the height and width of a point whose size the vertex shader does not
+/// export, unsigned 12.4 fixed point (Mesa radeonsi writes size * 8).
+struct PointSize {
+    u32 half_height : 16;
+    u32 half_width : 16;
+};
+
+/// PA_SU_POINT_MINMAX: the clamp of exported point sizes (half sizes, 12.4).
+struct PointMinMax {
+    u32 min_half : 16;
+    u32 max_half : 16;
+};
+
 struct VsOutputControl {
     u32 clip_distance_enable : 8;
     u32 cull_distance_enable : 8;

@@ -22,7 +22,7 @@ static constexpr u32 ShaderBinaryVersion = 27u; // Wave64: SMEM_ZERO choice foll
 #else
 static constexpr u32 ShaderBinaryVersion = 15u; // IMAGE_GET_LOD sampler tracking and stage-correct subgroup decorations.
 #endif
-static constexpr u32 ShaderMetaVersion = 13u; // Persistent Info: image binding counts, attribute loads/stores, FS interpolation.
+static constexpr u32 ShaderMetaVersion = 14u; // HwVertexRuntimeInfo::point_size (GS points).
 static constexpr u32 PipelineKeyVersion = 11u; // Keys name the ES/GS of an emulated geometry stage.
 } // namespace Serialization
 

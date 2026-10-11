@@ -111,7 +111,9 @@ union Regs {
         PolygonControl polygon_control;
         ViewportControl viewport_control;
         VsOutputControl vs_output_control;
-        INSERT_PADDING_WORDS(122);
+        INSERT_PADDING_WORDS(120);
+        PointSize point_size;
+        PointMinMax point_minmax;
         LineControl line_control;
         INSERT_PADDING_WORDS(4);
         TessFactorClamp hs_clamp;
