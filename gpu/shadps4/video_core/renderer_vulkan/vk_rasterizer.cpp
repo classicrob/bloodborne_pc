@@ -4677,7 +4677,8 @@ void Rasterizer::GpuReadCheck(const GraphicsPipeline* pipeline, bool is_indexed,
     const u64 frame = BbStats::gpu_frames.load(std::memory_order_relaxed);
     const u64 sequence = VideoCore::record_context.sequence;
     GpuReadChecker::Batch batch;
-    const auto add = [&](VAddr address, u64 size, char kind, u32 stage, u32 binding) {
+    const auto add = [&](VAddr address, u64 size, char kind, u32 stage, u32 binding,
+                         u64 stage_hash) {
         if (!address || size == 0 || size > small ||
             buffer_cache.IsRegionGpuModified(address, size)) {
             return; // GPU-written data: ordered by the GPU, not a guest race
@@ -4691,10 +4692,16 @@ void Rasterizer::GpuReadCheck(const GraphicsPipeline* pipeline, bool is_indexed,
         }
         runtime_fault_recover = &recover;
         const u64 hash = XXH3_64bits(reinterpret_cast<const void*>(address), size);
+        std::array<u8, GpuReadChecker::SmallBytes> bytes{};
+        if (size <= bytes.size()) {
+            std::memcpy(bytes.data(), reinterpret_cast<const void*>(address), size);
+        }
         runtime_fault_recover = previous;
-        batch.ranges.push_back({address, u32(size), hash, vs.pgm_hash, ps ? ps->pgm_hash : 0,
-                                frame, sequence, kind, u8(stage), u16(binding),
-                                std::chrono::steady_clock::now()});
+        auto& range = batch.ranges.emplace_back(GpuReadChecker::Range{
+            address, u32(size), hash, vs.pgm_hash, ps ? ps->pgm_hash : 0, frame, sequence, kind,
+            u8(stage), u16(binding), std::chrono::steady_clock::now()});
+        range.recorded_bytes = bytes;
+        range.stage_hash = stage_hash;
     };
     const auto stages = pipeline->GetStages();
     for (u32 stage = 0; stage < stages.size(); ++stage) {
@@ -4708,14 +4715,15 @@ void Rasterizer::GpuReadCheck(const GraphicsPipeline* pipeline, bool is_indexed,
                 continue;
             }
             const auto sharp = desc.GetSharp(info);
-            add(sharp.base_address, SharpSpan(sharp), 'b', stage, i);
+            add(sharp.base_address, SharpSpan(sharp), 'b', stage, i, info.pgm_hash);
         }
     }
     if (gpu_read_check >= 2 && !pipeline->GsEmulation()) {
         if (const auto& fetch = pipeline->GetFetchShader()) {
             for (const auto& attribute : fetch->attributes) {
                 if (const auto sharp = GuardedSharp(attribute, vs)) {
-                    add(sharp->base_address, SharpSpan(*sharp), 'v', 0, attribute.semantic);
+                    add(sharp->base_address, SharpSpan(*sharp), 'v', 0, attribute.semantic,
+                        vs.pgm_hash);
                 }
             }
         }
@@ -4725,7 +4733,7 @@ void Rasterizer::GpuReadCheck(const GraphicsPipeline* pipeline, bool is_indexed,
         const u32 index_size =
             regs.index_buffer_type.index_type == AmdGpu::IndexType::Index16 ? 2u : 4u;
         add(regs.index_base_address.Address<VAddr>() + u64(index_offset) * index_size,
-            u64(regs.num_indices) * index_size, 'i', 0, 0);
+            u64(regs.num_indices) * index_size, 'i', 0, 0, 0);
     }
     if (batch.ranges.empty()) {
         return;
