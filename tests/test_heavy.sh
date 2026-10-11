@@ -8,7 +8,8 @@ cd "$(dirname "$0")/.."
 heavy=tools/macos/heavy.sh
 dir=$(mktemp -d)
 trap 'rm -rf "$dir"; kill $(jobs -p) 2>/dev/null || true' EXIT
-export BB_HEAVY_DIR=$dir BB_HEAVY_BUILD_SLOTS=1 BB_HEAVY_PLAYTEST_SLOTS=2 BB_HEAVY_QUICK_SLOTS=2 BB_HEAVY_SWEEP_SLOTS=1
+# The user counts as active unless a case says otherwise (the real idle time varies).
+export BB_HEAVY_DIR=$dir BB_HEAVY_BUILD_SLOTS=1 BB_HEAVY_PLAYTEST_SLOTS=2 BB_HEAVY_QUICK_SLOTS=2 BB_HEAVY_SWEEP_SLOTS=1 BB_HEAVY_IDLE_SECONDS=0
 unset BB_HEAVY_HELD
 fail() { echo "heavy test FAILED: $*" >&2; exit 1; }
 until_held() { for _ in $(seq 100); do "$heavy" status | grep -q "$1: held by $2" && return; sleep 0.1; done; fail "$1 never held by $2"; }
@@ -172,6 +173,28 @@ kill -9 "$long"; wait "$long" 2>/dev/null || true
 err=$("$heavy" B9 -- "$heavy" --pool sweep SW2 -- true 2>&1 >/dev/null)
 [[ $err == *'SW2: started inside build0'* ]] || fail "a sweep nested in a build job was not reported ('$err')"
 
+# Idle-aware admission: while the user is idle (>= BB_HEAVY_IDLE_MINUTES), a second build job
+# runs (build-idle) at nice +5 with a utility clamp and says why; while active it waits, and a
+# job runs as background QoS and says why.
+"$heavy" LONG2 -- sleep 30 &
+long=$!
+until_held build0 LONG2
+start=$(date +%s)
+out=$(BB_HEAVY_IDLE_SECONDS=4500 "$heavy" IDLE1 -- sh -c 'echo "$(ps -o pri= -p $$) $(ps -o nice= -p $$) $BB_BUILD_JOBS"' 2>"$dir/idle.err")
+(( $(date +%s) - start < 10 )) || fail "idle user: a second build job waited for build0"  # the holder sleeps 30 s
+read -r ipri inic ijobs <<< "$out"
+[[ $inic == $(want 5) && $ijobs == 8 ]] || fail "idle admission not nice +5 with 8 jobs ('$out')"
+(( base_pri < 20 || ipri == 20 )) || fail "idle admission not utility QoS (priority $ipri)"
+grep -q 'IDLE1: user idle 75 min: nice 5, utility QoS, 8 jobs' "$dir/idle.err" || fail "idle decision not logged: $(cat "$dir/idle.err")"
+( BB_HEAVY_IDLE_SECONDS=0 "$heavy" ACTIVE1 -- true 2>/dev/null; echo done > "$dir/active1" ) &
+sleep 3
+[[ ! -e $dir/active1 ]] || fail "active user: a second build job ran while build0 was held"
+kill -9 "$long"; wait "$long" 2>/dev/null || true
+for _ in $(seq 100); do [[ -e $dir/active1 ]] && break; sleep 0.1; done
+[[ -e $dir/active1 ]] || fail "active user: the waiting build job never ran"
+err=$(BB_HEAVY_IDLE_SECONDS=120 "$heavy" ACTIVE2 -- true 2>&1 >/dev/null)
+[[ $err == *'ACTIVE2: user active (idle 2 min): background QoS, 8 jobs'* ]] || fail "active decision not logged ('$err')"
+
 # Bad usage is an error, not a silent no-op.
 if "$heavy" G true 2>/dev/null; then fail "missing -- accepted"; fi
 if BB_HEAVY_BUILD_SLOTS=0 "$heavy" H -- true 2>/dev/null; then fail "zero slots accepted"; fi
@@ -188,4 +211,4 @@ assert any(l['label'] == 'B' and l['waited_s'] >= 1 for l in starts), 'B waited'
 assert all({'pool', 'slot', 'waited_s', 'load', 'held'} <= set(l) for l in starts)
 assert any(l['label'] == 'Q4' and l['status'] == 124 for l in ends), 'Q4 killed'
 PY
-echo "heavy.sh: history log, build/playtest/quick pools, quick hints and time limit, waiting, priority slot, GPU shared/exclusive lock with gate, start announcement, polite scheduling, sweep lane, release on SIGKILL, nesting, exit status, usage errors PASS"
+echo "heavy.sh: history log, build/playtest/quick pools, quick hints and time limit, waiting, priority slot, GPU shared/exclusive lock with gate, start announcement, polite scheduling, idle-aware admission, sweep lane, release on SIGKILL, nesting, exit status, usage errors PASS"
