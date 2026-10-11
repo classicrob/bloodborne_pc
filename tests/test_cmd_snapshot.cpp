@@ -7,12 +7,14 @@
 #include <csetjmp>
 #include <csignal>
 #include <cstdio>
+#include <string>
 #include <thread>
 #include <pthread.h>
 #include <vector>
 #include <sys/mman.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include "common/assert_hook.h"
 #include "video_core/amdgpu/cmd_snapshot.h"
 #include "video_core/amdgpu/pm4_cmds.h"
 
@@ -70,6 +72,8 @@ void AppendNop(std::vector<u32>& stream, u32 marker) {
 } // namespace
 
 int main() {
+    // Off-stack call chains are read only in diagnostic runs; the low-stack case needs them.
+    setenv("BB_CMD_SNAPSHOT_CHECK", "1", 1);
     struct sigaction action{};
     action.sa_sigaction = OnFault;
     action.sa_flags = SA_SIGINFO;
@@ -273,6 +277,22 @@ int main() {
         Expect("trace: thread name recorded",
                with_chain.size() == 1 &&
                    BuilderTrace::ThreadName(with_chain[0].thread).starts_with("TraceNamed pthread 0x"));
+        // A chain off the pthread stack (a low guest stack) is read through the kernel and
+        // follows into this thread's own stack: fake frames in static memory link to a real one.
+        static u32 lowchained[8];
+        static uintptr_t low_frames[4][2];
+        std::thread([] {
+            const auto real = reinterpret_cast<uintptr_t>(__builtin_frame_address(0));
+            low_frames[0][0] = reinterpret_cast<uintptr_t>(&low_frames[1]);
+            low_frames[0][1] = 0x1111;
+            low_frames[1][0] = real; // the stack switch back to the host frames
+            low_frames[1][1] = 0x2222;
+            BuilderTrace::Note("LowStack", lowchained, 4, reinterpret_cast<uintptr_t>(&low_frames[0]));
+        }).join();
+        const auto low = BuilderTrace::Around(lowchained, lowchained + 1, 0);
+        Expect("trace: a low-stack chain is read and crosses into the thread's stack",
+               low.size() == 1 && low[0].depth >= 3 && low[0].chain[0] == 0x1111 &&
+                   low[0].chain[1] == 0x2222);
         static u32 unchained[8];
         BuilderTrace::Note("NoFrame", unchained, 4, 0x10); // not on this stack: no chain
         const auto without = BuilderTrace::Around(unchained, unchained + 1, 0);
@@ -300,6 +320,39 @@ int main() {
         Expect("overlap: partial overlap reported", submit(10, 16, 1002) == 2);
         Expect("overlap: adjacent buffer clean", submit(26, 8, 1003) == 0);
         Expect("overlap: older than 64 submissions forgotten", submit(4, 8, 1100) == 0);
+    }
+
+    // A GPU assertion runs the stop hook once before stopping (the parser's report), even if the
+    // hook itself asserts; the exit code stays 23.
+    {
+        int out[2];
+        Expect("stop hook: pipe", pipe(out) == 0);
+        std::fflush(stderr);
+        const pid_t child = fork();
+        if (child == 0) {
+            dup2(out[1], 2);
+            SetAssertStopHook([] {
+                std::fputs("HOOK-RAN\n", stderr);
+                ASSERT_MSG(false, "assertion inside the hook");
+            });
+            UNREACHABLE_MSG("deliberate stop");
+        }
+        close(out[1]);
+        std::string text;
+        char buffer[512];
+        for (ssize_t n; (n = read(out[0], buffer, sizeof(buffer))) > 0;) {
+            text.append(buffer, size_t(n));
+        }
+        close(out[0]);
+        int status = 0;
+        waitpid(child, &status, 0);
+        size_t runs = 0;
+        for (size_t at = text.find("HOOK-RAN"); at != std::string::npos;
+             at = text.find("HOOK-RAN", at + 1)) {
+            ++runs;
+        }
+        Expect("stop hook: ran exactly once, exit 23",
+               runs == 1 && WIFEXITED(status) && WEXITSTATUS(status) == 23);
     }
 
     std::fprintf(stderr, "%s: %u failures\n", failures ? "FAIL" : "PASS", failures);

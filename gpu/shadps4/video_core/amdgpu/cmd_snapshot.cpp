@@ -7,9 +7,13 @@
 #include <chrono>
 #include <condition_variable>
 #include <csetjmp>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <mutex>
+#ifndef _WIN32
+#include <dlfcn.h>
+#endif
 #ifndef _WIN32
 #include <pthread.h>
 #endif
@@ -109,7 +113,7 @@ u32 StreamWrites::WaitLanded(VAddr address, u64 size) {
 }
 
 namespace {
-std::mutex builder_trace_mutex;
+std::timed_mutex builder_trace_mutex; ///< timed: the stop report must not wait forever
 std::array<BuilderTrace::Call, 8192> builder_trace;
 u64 builder_trace_calls = 0;
 std::atomic<u32> builder_trace_threads = 0;
@@ -148,7 +152,14 @@ void BuilderTrace::Note(const char* builder, const u32* cmdbuf, u32 size,
     Call call{builder, cmdbuf, size, thread, 0, 0, {}};
 #ifdef __APPLE__
     if (frame) {
-        call.depth = static_cast<u32>(guest_backtrace(frame, call.chain, std::size(call.chain)));
+        // Frames off the pthread stack (main thread, HLE workers) take a system call each: only
+        // in diagnostic runs (BB_CMD_SNAPSHOT_CHECK=1).
+        static const bool kernel_reads = [] {
+            const char* env = std::getenv("BB_CMD_SNAPSHOT_CHECK");
+            return env && env[0] == '1';
+        }();
+        call.depth = static_cast<u32>(
+            guest_backtrace_ex(frame, call.chain, std::size(call.chain), kernel_reads));
     }
 #endif
     std::scoped_lock lk{builder_trace_mutex};
@@ -226,18 +237,53 @@ std::vector<BuilderTrace::Call> BuilderTrace::Around(const u32* begin, const u32
 
 void BuilderTrace::Report(const u32* at) {
     constexpr u32 Window = 64; // dwords on each side
+    // At a stop the asserting thread may hold the trace lock (an assert inside Note): never wait
+    // for it indefinitely.
+    std::unique_lock lk{builder_trace_mutex, std::defer_lock};
+    if (!lk.try_lock_for(std::chrono::seconds(1))) {
+        LOG_CRITICAL(Render, "Builder trace locked at the stop, skipped");
+        return;
+    }
+    std::vector<Call> calls;
+    std::vector<std::string> names;
+    {
+        const u64 count = std::min<u64>(builder_trace_calls, builder_trace.size());
+        for (u64 seq = builder_trace_calls - count; seq < builder_trace_calls; ++seq) {
+            const auto& call = builder_trace[seq % builder_trace.size()];
+            if ((call.cmdbuf < at + Window && at - Window < call.cmdbuf + call.size) ||
+                seq + 8 >= builder_trace_calls) {
+                calls.push_back(call);
+                const u32 slot = call.thread % builder_thread_names.size();
+                names.push_back(fmt::format("{} pthread {:#x}", builder_thread_names[slot].data(),
+                                            builder_thread_ids[slot]));
+            }
+        }
+    }
+    lk.unlock();
     LOG_CRITICAL(Render, "Builder calls writing within {} dwords of the malformed packet at {} "
                          "(and the 8 latest), oldest first:",
                  Window, fmt::ptr(at));
-    for (const auto& call : Around(at - Window, at + Window, 8)) {
+    for (size_t index = 0; index < calls.size(); ++index) {
+        const auto& call = calls[index];
         std::string chain;
         for (u32 i = 0; i < call.depth; ++i) {
             chain += fmt::format(" {:#x}", call.chain[i]);
+#ifndef _WIN32
+            // Host frames (the HLE code that called into the guest) by library and symbol.
+            // Offsets resolve exactly offline; the nearest exported symbol is only a hint.
+            if (Dl_info where{}; dladdr(reinterpret_cast<void*>(call.chain[i]), &where) &&
+                where.dli_fname) {
+                const char* file = std::strrchr(where.dli_fname, '/');
+                chain += fmt::format("={}+{:#x}({})", file ? file + 1 : where.dli_fname,
+                                     call.chain[i] - reinterpret_cast<uintptr_t>(where.dli_fbase),
+                                     where.dli_sname ? where.dli_sname : "?");
+            }
+#endif
         }
         LOG_CRITICAL(Render,
                      "  #{} thread {} \"{}\" {} cmdbuf {} ({:+} dwords from the packet) size {}, "
                      "called from{}",
-                     call.seq, call.thread, ThreadName(call.thread), call.builder,
+                     call.seq, call.thread, names[index], call.builder,
                      fmt::ptr(call.cmdbuf),
                      (std::bit_cast<intptr_t>(call.cmdbuf) - std::bit_cast<intptr_t>(at)) /
                          intptr_t{sizeof(u32)},

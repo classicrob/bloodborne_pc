@@ -3,6 +3,8 @@
 
 #include <algorithm>
 #include <chrono>
+#include <memory>
+#include <thread>
 #include <pthread.h>
 #ifdef __APPLE__
 #include "bb_mac_compat.h"
@@ -18,6 +20,7 @@
 #include <boost/preprocessor/stringize.hpp>
 
 #include "common/assert.h"
+#include "common/assert_hook.h"
 #include "common/debug.h"
 #include "common/polyfill_thread.h"
 #include "common/thread.h"
@@ -92,6 +95,57 @@ static void ReportCommandMemoryAliases(const u32* guest) {
     }
 }
 
+/// The packet the command parser on this thread is decoding: its guest address and the words it
+/// reads (a submit-time copy or live memory), for the report at a stop (ReportParserStop).
+static thread_local const u32* parsing_guest = nullptr;
+static thread_local const u32* parsing_words = nullptr;
+static thread_local size_t parsing_left = 0;
+
+static void NoteParsing(const u32* guest, std::span<const u32> words) {
+    parsing_guest = guest;
+    parsing_words = words.data();
+    parsing_left = words.size();
+}
+
+/// Any GPU assertion while this thread decodes a packet (a type-0/1 header, an unknown opcode, an
+/// invalid data_sel in a fence, ...) usually means the stream lost alignment or holds words
+/// another writer put there: the words, the builder calls around it, other guest views of the
+/// memory and GPU-side writes into it, before the stop (SetAssertStopHook).
+static void ReportParserStop() {
+    if (!parsing_guest) {
+        return;
+    }
+    std::string words;
+    for (size_t i = 0; i < std::min<size_t>(parsing_left, 8); ++i) {
+        words += fmt::format(" {:08x}", parsing_words[i]);
+    }
+    LOG_CRITICAL(Render, "GPU stop on the command thread while decoding the packet at {} (parsed "
+                         "words{})",
+                 fmt::ptr(parsing_guest), words);
+    BuilderTrace::Report(parsing_guest);
+    // The alias query takes the runtime's VMA lock, which the asserting code may hold: run it on a
+    // helper thread and wait at most a second (the process exits right after either way).
+    struct AliasQuery {
+        const u32* guest;
+        std::atomic<bool> done{false};
+    };
+    auto query = std::make_shared<AliasQuery>();
+    query->guest = parsing_guest;
+    std::thread([query] {
+        ReportCommandMemoryAliases(query->guest);
+        query->done.store(true);
+    }).detach();
+    for (int waited_ms = 0; !query->done.load() && waited_ms < 1000; waited_ms += 10) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    if (!query->done.load()) {
+        LOG_CRITICAL(Render, "Alias query blocked at the stop (runtime VMA lock held), skipped");
+    }
+    // BB_WRITE_LOG: GPU-side writes into the command chunk around it (256 KiB each way).
+    BbWriteLog::DumpNear(reinterpret_cast<u64>(parsing_guest) - 256_KB,
+                         reinterpret_cast<u64>(parsing_guest) + 256_KB, "the stop");
+}
+
 /// BB_CMD_SNAPSHOT_CHECK=1: command snapshot diagnostics (guest rewrites, CMD-OVERLAP).
 static bool SnapshotCheck() {
     static const bool check = EmulatorSettingsImpl::Flag("BB_CMD_SNAPSHOT_CHECK", false);
@@ -114,6 +168,9 @@ static std::span<const u32> NextPacket(std::span<const u32> span, size_t offset)
 }
 
 Liverpool::Liverpool() : guest_markers_enabled{EmulatorSettings.IsVkGuestMarkersEnabled()} {
+#ifdef __APPLE__
+    SetAssertStopHook(&ReportParserStop);
+#endif
     num_counter_pairs = Libraries::Kernel::sceKernelIsNeoMode() ? 16 : 8;
     process_thread = std::jthread{std::bind_front(&Liverpool::Process, this)};
 }
@@ -511,6 +568,9 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb,
 
         const auto* header = reinterpret_cast<const PM4Header*>(ccb.data());
         const u32 type = header->type;
+#ifdef __APPLE__
+        NoteParsing(region ? region->guest + (region->size_dw - ccb.size()) : ccb.data(), ccb);
+#endif
         if (type != 3) {
             // No other types of packets were spotted so far
             UNREACHABLE_MSG("Invalid PM4 type {}", type);
@@ -870,19 +930,10 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
 
         const auto* header = reinterpret_cast<const PM4Header*>(dcb.data());
         const u32 type = header->type;
-
 #ifdef __APPLE__
-        if (type == 0 || type == 1) {
-            // Lost packet alignment: which builder calls wrote around here (guest address).
-            const u32* guest = region ? region->guest + (region->size_dw - dcb.size())
-                                      : dcb.data();
-            BuilderTrace::Report(guest);
-            ReportCommandMemoryAliases(guest);
-            // BB_WRITE_LOG: GPU-side writes into the command chunk around it (256 KiB each way).
-            BbWriteLog::DumpNear(reinterpret_cast<u64>(guest) - 256_KB,
-                                 reinterpret_cast<u64>(guest) + 256_KB, "the malformed packet");
-        }
+        NoteParsing(region ? region->guest + (region->size_dw - dcb.size()) : dcb.data(), dcb);
 #endif
+
         switch (type) {
         default:
             UNREACHABLE_MSG("Wrong PM4 type {}", type);
@@ -1441,6 +1492,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     RESUME_GFX(task);
                 }
 #ifdef __APPLE__
+                NoteParsing(region ? region->guest + (region->size_dw - dcb.size()) : dcb.data(),
+                            dcb);
                 if (indirect_buffer->chain.Value()) {
                     // A chained IB is a jump: the CP does not return to this buffer, whose rest
                     // (typically an unused chunk tail) is never executed.
@@ -1519,6 +1572,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
         ce_task.handle.destroy();
     }
 #ifdef __APPLE__
+    parsing_guest = nullptr;
     if (region) {
         region->parsed_dw = region->size_dw;
     }
@@ -1585,6 +1639,9 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
 
         auto* header = reinterpret_cast<const PM4Header*>(acb.data());
         u32 next_dw_off = header->type3.NumWords() + 1;
+#ifdef __APPLE__
+        NoteParsing(acb.data(), acb); // compute rings and their IBs are parsed live
+#endif
 
         // If we have a buffered packet, use it.
         if (queue.tmp_dwords > 0) [[unlikely]] {

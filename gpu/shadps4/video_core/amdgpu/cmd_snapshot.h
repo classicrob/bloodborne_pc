@@ -101,7 +101,7 @@ public:
         u32 thread; ///< small per-thread number, in order of first call
         u64 seq;
         u32 depth;              ///< return addresses in `chain`
-        uintptr_t chain[6];     ///< guest callers, innermost first (frame-pointer walk)
+        uintptr_t chain[10];    ///< callers (guest, then host HLE), innermost first
     };
     /// Guest thread, on entry to a builder. `frame`: the builder's frame pointer
     /// (__builtin_frame_address(0)), from which the guest call chain is walked; 0 for none.
