@@ -17,6 +17,7 @@ xcrun clang++ -arch x86_64 -std=c++23 -O1 -g -UNDEBUG \
     -I"$prefix/include" -I/opt/homebrew/include \
     tests/test_avplayer_lifecycle_macos.cpp \
     gpu/shadps4/core/libraries/avplayer/avplayer_source.cpp \
+    gpu/shadps4/core/libraries/avplayer/avplayer_state.cpp \
     gpu/shadps4/core/libraries/avplayer/avplayer_file_streamer.cpp \
     gpu/shadps4/core/libraries/videodec/video_utils.cpp gpu/shim/common/assert.cpp \
     out/mac-avplayer/runtime_thread.o out/mac-avplayer/runtime_memory.o out/mac-avplayer/compat_mac.o \
