@@ -86,7 +86,7 @@ u8 CanaryByte(u64 va) { return u8(Hash32(va ^ 0xC0FFEE123ull) % 255 + 1); }
 enum class SoffSrc { Inline, Sgpr };
 enum class SmemSrc { None, Imm, Sgpr };
 // Wave64 lane-semantics programs (no buffer access under test).
-enum class Wave { None, Lane, MbcntMask, Readlane, Exec1, Exec2, LoopReadFirstLane, Lds, CtrlPhi, CtrlBreak, Pkrtz, Pkrtz3, SmemFallback };
+enum class Wave { None, Lane, MbcntMask, Readlane, Exec1, Exec2, LoopReadFirstLane, Lds, CtrlPhi, CtrlBreak, Pkrtz, Pkrtz3, SmemFallback, Exec3 };
 
 struct Template {
     std::string name;
@@ -310,6 +310,22 @@ void AssembleWave(GcnAsm::Code& c, Wave w) {
         c.VMov(10, 21);
         c.VMov(11, 24);
         break;
+    case Wave::Exec3: { // a real branch around the scope (s_cbranch_execz): structured divergence
+        c.SMovLiteral(21, 0xDEAD0000u);
+        c.SMovLiteral(24, 0xDEAD0001u);
+        c.VCmpNeU32(Inline(0), 2);
+        c.SAndSaveexecB64(22, VCC_LO);
+        const size_t br = c.words.size();
+        c.Sopp(8, 0); // s_cbranch_execz END (patched)
+        c.VReadfirstlane(21, 3);
+        c.VCmpNeU32(Inline(0), 5); // VOPC ballot of data0 != 0 under the partial exec
+        c.SBcnt1B64(24, VCC_LO);
+        c.VMov(10, 21); // copied inside the scope: the active lanes' view
+        c.VMov(11, 24);
+        c.words[br] |= u32(int32_t(c.words.size()) - int32_t(br + 1)) & 0xFFFF;
+        c.SMovB64(EXEC_LO, 22); // END
+        break;
+    }
     case Wave::Exec2: // exec as a 64-bit value; mbcnt over exec inside the scope
         c.VCmpNeU32(Inline(0), 2);
         c.SAndSaveexecB64(22, VCC_LO);
@@ -1521,6 +1537,34 @@ void AddWaveCases() {
             }
         }
     }
+    // Wave operations under divergent exec (s_and_saveexec scopes) in compute workgroups of one
+    // subgroup (16/24/32 invocations: one GCN wave, lanes beyond the workgroup absent): exact with
+    // native subgroup operations. 33 invocations span two subgroups: still loud by design.
+    for (u32 x : {16u, 24u, 32u, 33u, 64u}) {
+        const std::string shape = " [" + std::to_string(x) + "x1]";
+        for (auto [name, w] : {std::pair{"wave: under saveexec: v_readfirstlane, s_bcnt1 exec, masked v_mov", Wave::Exec1},
+                               std::pair{"wave: under saveexec: s_mov_b64 exec, v_mbcnt over exec", Wave::Exec2},
+                               std::pair{"wave: s_cbranch_execz scope: v_readfirstlane, VOPC ballot s_bcnt1", Wave::Exec3}}) {
+            if (x == 64 && w != Wave::Exec3) continue; // the 64x1 saveexec shapes are covered above
+            Template t;
+            t.name = std::string(name) + shape;
+            t.op.kind = GCN_LOAD;
+            t.wave = w;
+            t.wg = {x, 1, 1};
+            t.wave_divergent = x > 32;
+            const u32 tt = AddTemplate(t);
+            for (const M& m : masks) {
+                const std::string mn = m.name;
+                if (mn != "even" && mn != "lanes5+40" && mn != "lower32" && mn != "all") continue;
+                Job& j = NewJob("wave64", tt, RawV(64), 0);
+                j.label += " exec=" + mn;
+                for (u32 l = 0; l < x; ++l) {
+                    SetLane(j, l, value(l), 0, {u32(l % 3 != 1), 0, 0, 0});
+                    j.lanes[l].active = u32((m.mask >> (l % 64)) & 1);
+                }
+            }
+        }
+    }
     // V_CVT_PKRTZ_F16_F32 (VOP2 47, VOP3 303 with a negated src1): truncation, overflow to the
     // largest finite half, f16 subnormals, infinities, NaNs, f32 denormals, signed zeros.
     {
@@ -2209,6 +2253,10 @@ struct DeviceCaps {
     u32 subgroup_stages, subgroup_ops;
     u32 explicit_layout; // VK_KHR_workgroup_memory_explicit_layout
     u32 depth_bounds;    // VkPhysicalDeviceFeatures::depthBounds
+    // float controls (VkPhysicalDeviceVulkan12Properties), as PipelineCache fills the Profile
+    u32 denorm_independence, rounding_independence;
+    u32 fp16_denorm_preserve, fp16_denorm_flush, fp16_rtz, fp32_denorm_preserve, fp32_denorm_flush, fp32_rtz;
+    u32 fp64_denorm_preserve, fp64_denorm_flush, fp64_rtz, fp16_szinp, fp32_szinp, fp64_szinp;
 };
 
 vk::UniqueInstance CreateInstance() {
@@ -2236,7 +2284,7 @@ DeviceCaps QueryCaps() {
                                        vk::PhysicalDeviceVulkan12Features, vk::PhysicalDeviceRobustness2FeaturesEXT,
                                        vk::PhysicalDeviceVulkan13Features>();
     auto props = physical.getProperties2<vk::PhysicalDeviceProperties2, vk::PhysicalDeviceSubgroupProperties,
-                                         vk::PhysicalDeviceVulkan13Properties>();
+                                         vk::PhysicalDeviceVulkan13Properties, vk::PhysicalDeviceVulkan12Properties>();
     const auto& f = chain.get<vk::PhysicalDeviceFeatures2>().features;
     const auto& f12 = chain.get<vk::PhysicalDeviceVulkan12Features>();
     const auto& r2 = chain.get<vk::PhysicalDeviceRobustness2FeaturesEXT>();
@@ -2256,6 +2304,23 @@ DeviceCaps QueryCaps() {
     c.buffer_int64_atomics = f12.shaderBufferInt64Atomics;
     c.max_shared = p.limits.maxComputeSharedMemorySize;
     c.depth_bounds = f.depthBounds;
+    {
+        const auto& v12 = props.get<vk::PhysicalDeviceVulkan12Properties>();
+        c.denorm_independence = v12.denormBehaviorIndependence != vk::ShaderFloatControlsIndependence::eNone;
+        c.rounding_independence = v12.roundingModeIndependence != vk::ShaderFloatControlsIndependence::eNone;
+        c.fp16_denorm_preserve = v12.shaderDenormPreserveFloat16;
+        c.fp16_denorm_flush = v12.shaderDenormFlushToZeroFloat16;
+        c.fp16_rtz = v12.shaderRoundingModeRTZFloat16;
+        c.fp32_denorm_preserve = v12.shaderDenormPreserveFloat32;
+        c.fp32_denorm_flush = v12.shaderDenormFlushToZeroFloat32;
+        c.fp32_rtz = v12.shaderRoundingModeRTZFloat32;
+        c.fp64_denorm_preserve = v12.shaderDenormPreserveFloat64;
+        c.fp64_denorm_flush = v12.shaderDenormFlushToZeroFloat64;
+        c.fp64_rtz = v12.shaderRoundingModeRTZFloat64;
+        c.fp16_szinp = v12.shaderSignedZeroInfNanPreserveFloat16;
+        c.fp32_szinp = v12.shaderSignedZeroInfNanPreserveFloat32;
+        c.fp64_szinp = v12.shaderSignedZeroInfNanPreserveFloat64;
+    }
     const auto& p13 = props.get<vk::PhysicalDeviceVulkan13Properties>();
     const auto& f13 = chain.get<vk::PhysicalDeviceVulkan13Features>();
     const auto& sg = props.get<vk::PhysicalDeviceSubgroupProperties>();
@@ -2306,6 +2371,25 @@ Shader::Profile MakeProfile(const DeviceCaps& c) {
     p.support_int16 = c.int16;
     p.support_int64 = c.int64;
     p.support_float16 = c.float16;
+    // Float controls exactly as PipelineCache fills them (fields absent on older trees are skipped).
+    [&](auto& pr) {
+        if constexpr (requires { pr.support_fp16_signed_zero_inf_nan_preserve; }) {
+            pr.supports_denorm_behavior_independence = c.denorm_independence;
+            pr.supports_rounding_mode_independence = c.rounding_independence;
+            pr.support_fp16_denorm_preserve = c.fp16_denorm_preserve;
+            pr.support_fp16_denorm_flush = c.fp16_denorm_flush;
+            pr.support_fp16_round_to_zero = c.fp16_rtz;
+            pr.support_fp32_denorm_preserve = c.fp32_denorm_preserve;
+            pr.support_fp32_denorm_flush = c.fp32_denorm_flush;
+            pr.support_fp32_round_to_zero = c.fp32_rtz;
+            pr.support_fp64_denorm_preserve = c.fp64_denorm_preserve;
+            pr.support_fp64_denorm_flush = c.fp64_denorm_flush;
+            pr.support_fp64_round_to_zero = c.fp64_rtz;
+            pr.support_fp16_signed_zero_inf_nan_preserve = c.fp16_szinp;
+            pr.support_fp32_signed_zero_inf_nan_preserve = c.fp32_szinp;
+            pr.support_fp64_signed_zero_inf_nan_preserve = c.fp64_szinp;
+        }
+    }(p);
     p.support_float64 = c.float64;
     p.supports_buffer_int64_atomics = c.buffer_int64_atomics;
     p.needs_buffer_offsets = c.storage_align > 4;
@@ -3121,6 +3205,12 @@ std::vector<u32> WaveExpected(const Job& j) {
             r[0] = value(gcn_first_lane(exec)); r[1] = gcn_popcount64(exec);
             if (exec >> lane & 1) r[3] = value(lane);
             break;
+        case Wave::Exec3:
+            if (exec >> lane & 1) {
+                r[0] = value(gcn_first_lane(exec));
+                r[1] = gcn_popcount64(ballot & exec);
+            }
+            break;
         case Wave::Exec2:
             r[0] = u32(exec); r[1] = u32(exec >> 32);
             if (exec >> lane & 1) r[2] = gcn_mbcnt(u32(exec >> 32), gcn_mbcnt(u32(exec), 0, lane, 0), lane, 1);
@@ -3337,6 +3427,7 @@ struct Options {
     std::array<u32, 16> ud{};
     std::vector<u32> ud_ptr; // --compile-only: UD[n:n+1] point at a zeroed host table (extended user data)
     bool ud_table_vsharp = false; // --compile-only: that table holds valid raw buffer V#s instead of zeros
+    std::array<u32, 3> wg{64, 1, 1}; // --compile-only --stage cs: workgroup shape
 };
 
 void FillPristine(Gpu& g, const std::vector<u32>& jobs) {
@@ -4460,6 +4551,11 @@ int main(int argc, char** argv) {
         else if (a == "--fs-export" && i + 1 < argc) g_fs_export = u32(std::atoi(argv[++i]));
         else if (a == "--ud-ptr" && i + 1 < argc) opt.ud_ptr.push_back(u32(std::atoi(argv[++i])));
         else if (a == "--ud-table-vsharp") opt.ud_table_vsharp = true;
+        else if (a == "--wg" && i + 1 < argc) { // compute workgroup x,y,z
+            u32 v[3] = {1, 1, 1};
+            std::sscanf(argv[++i], "%u,%u,%u", &v[0], &v[1], &v[2]);
+            opt.wg = {v[0], v[1], v[2]};
+        }
         else if (a == "--ud" && i + 1 < argc) {
             std::string list = argv[++i];
             u32 k = 0;
@@ -4548,6 +4644,10 @@ int main(int argc, char** argv) {
         if (which == 2) { if constexpr (requires { prof.emulate_vertex_fetch; }) { present = true; on = prof.emulate_vertex_fetch; } }
         return !present ? "absent" : (on ? "ON" : "off");
     };
+    std::printf("float controls: fp16 %u (signed-zero/inf/nan preserve %u, denorm preserve %u flush %u, RTZ %u), "
+                "fp32 preserve %u, fp64 preserve %u\n",
+                g_caps.float16, g_caps.fp16_szinp, g_caps.fp16_denorm_preserve, g_caps.fp16_denorm_flush, g_caps.fp16_rtz,
+                g_caps.fp32_szinp, g_caps.fp64_szinp);
     std::printf("profile: null_descriptors %d, robust_buffer_access %s, wave64 %s, vertex_fetch %s; "
                 "robustBufferAccess %s\n",
                 g_profile.emulate_null_descriptors, flag(g_profile, 0), flag(g_profile, 1), flag(g_profile, 2),
@@ -4567,6 +4667,7 @@ int main(int argc, char** argv) {
         std::fclose(f);
         t.fragment = opt.stage == "fs";
         t.vertex = opt.stage == "vs";
+        t.wg = opt.wg;
         t.hash = 0x9e3779b97f4a7c15ull ^ t.code.size();
         for (u32 x : t.code) t.hash = (t.hash ^ x) * 0x100000001b3ull;
         g_templates.push_back(t);
@@ -4591,7 +4692,9 @@ int main(int argc, char** argv) {
         g_jobs.push_back(j);
         CompileAll(opt.outdir);
         ValidateModules(opt.outdir);
-        const Job& r = g_jobs[0];
+        Job& r = g_jobs[0];
+        // compile-only translates and validates; images/samplers only matter for execution
+        if (r.status == Status::HarnessError && r.message == "shader uses images/samplers") r.status = Status::Ok;
         const bool invalid = g_spirv_invalid.count({0, r.perm});
         std::printf("%s: %s%s\n%s", t.name.c_str(),
                     r.status == Status::Ok ? "compiled" : (r.status == Status::LoudCompile ? "LOUD ABORT" : "CRASH"),
