@@ -751,6 +751,9 @@ public:
     /// each such value is submitted first (a waiter ahead of its producer in the one in-order
     /// Metal queue would block it). Stops for a wait on this scheduler's own unsubmitted value.
     void WaitDependencies(const SubmitInfo& info, u64 own_value);
+    /// Submissions enqueued and not yet handed to vkQueueSubmit at most; Flush waits beyond.
+    /// Bounds the encode that can sit ahead of a label's submission (async A/B arm C: 2).
+    static constexpr u32 MaxQueuedSubmits = 8;
     /// The tick of the command buffer being recorded where this runs: in a Record() closure on
     /// the recording thread, the submission it lands in (CurrentTick() there is the owner's open
     /// value, possibly several submissions ahead).
@@ -1138,7 +1141,6 @@ private:
     std::deque<RecorderItem> recorder_queue;
     bool async_submit = false;      ///< Apple, threaded recording: Flush enqueues (fixed)
     u32 queued_submits = 0;         ///< enqueued, not yet submitted (recorder_mutex)
-    static constexpr u32 MaxQueuedSubmits = 8;
     size_t live_chunks = 0;         ///< chunks allocated (recorder_mutex)
     static constexpr size_t MaxChunks = 128; ///< 16 MiB of recorded commands in flight
     std::condition_variable_any recorder_space_cv; ///< a submit or a chunk was freed

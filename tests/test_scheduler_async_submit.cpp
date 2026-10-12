@@ -4,7 +4,7 @@
 // - order: 300 consecutive small submissions (several share a record chunk), each a distinct
 //   fill of its own slot, with increasing values; all land; Wait on a value still queued;
 // - direct recording between asynchronous submissions;
-// - the packet cap: with the recorder held, the ninth Flush waits until it is released;
+// - the packet cap: with the recorder held, Flush MaxQueuedSubmits + 1 waits until it is released;
 // - a delayed producer on another scheduler: a submission waiting on this scheduler's value is
 //   not handed to the queue before that value is (its fill lands after the producer's);
 // - the host-copy prefix: a submission waits for an earlier held copy and not for a later one;
@@ -265,9 +265,10 @@ int main() {
         Vulkan::Scheduler scheduler(instance, true);
         std::atomic<bool> release{false};
         RecordHold(scheduler, &release);
+        constexpr u32 Cap = Vulkan::Scheduler::MaxQueuedSubmits;
         std::atomic<u32> flushed{0};
         std::thread producer([&] {
-            for (u32 i = 0; i < 9; ++i) {
+            for (u32 i = 0; i < Cap + 1; ++i) {
                 RecordFill(scheduler, dispatch, host.buffer, 10 + i, 1, 0xC0 + i);
                 scheduler.Flush();
                 flushed.fetch_add(1);
@@ -277,14 +278,14 @@ int main() {
         const u32 before = flushed.load();
         release.store(true);
         producer.join();
-        Expect("packet cap: with the recorder held, 8 Flushes return and the ninth waits",
-               before == 8);
+        Expect("packet cap: with the recorder held, MaxQueuedSubmits Flushes return, the next waits",
+               before == Cap);
         scheduler.Finish();
         bool all = true;
-        for (u32 i = 0; i < 9; ++i) {
+        for (u32 i = 0; i < Cap + 1; ++i) {
             all = all && host.words[10 + i] == 0xC0 + i;
         }
-        Expect("  ... after the release all nine landed", all);
+        Expect("  ... after the release all of them landed", all);
         scheduler.Close();
     }
 
