@@ -4,6 +4,7 @@
 // frame's submissions through the real HLE submit path N times and reports each iteration.
 // Pixel output is not qualified; iteration 1 is warm-up.
 
+#include <cerrno>
 #include <cstdint>
 
 #ifdef __APPLE__
@@ -22,6 +23,7 @@
 #include <fmt/format.h>
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
+#include <sys/resource.h>
 #include "bbport_toggles.h"
 #include "macos_perf.h"
 #include "core/libraries/gnmdriver/gnmdriver.h"
@@ -311,6 +313,53 @@ struct Counters {
                 BbStats::images_registered.load(),
                 BbStats::image_upload_bytes.load(),
                 BbStats::buffer_upload_bytes.load()};
+    }
+};
+
+/// Process and host memory counters, read around each iteration to find what changes when the
+/// replay loop slows down: CPU time split user/system, page faults, context switches, the
+/// process's physical footprint and the host's paging/compressor activity.
+struct ProcessCounters {
+    u64 user_us = 0, system_us = 0, minor_faults = 0, major_faults = 0, voluntary_switches = 0,
+        involuntary_switches = 0, footprint = 0, pageins = 0, pageouts = 0, compressions = 0,
+        decompressions = 0, swapins = 0, swapouts = 0;
+    static bool Now(ProcessCounters& c, std::string& why) {
+        rusage usage{};
+        if (getrusage(RUSAGE_SELF, &usage) != 0) {
+            why = fmt::format("getrusage failed (errno {})", errno);
+            return false;
+        }
+        c.user_us = u64(usage.ru_utime.tv_sec) * 1000000 + u64(usage.ru_utime.tv_usec);
+        c.system_us = u64(usage.ru_stime.tv_sec) * 1000000 + u64(usage.ru_stime.tv_usec);
+        c.minor_faults = u64(usage.ru_minflt);
+        c.major_faults = u64(usage.ru_majflt);
+        c.voluntary_switches = u64(usage.ru_nvcsw);
+        c.involuntary_switches = u64(usage.ru_nivcsw);
+        task_vm_info_data_t vm{};
+        mach_msg_type_number_t vm_count = TASK_VM_INFO_COUNT;
+        if (task_info(mach_task_self(), TASK_VM_INFO, reinterpret_cast<task_info_t>(&vm),
+                      &vm_count) != KERN_SUCCESS) {
+            why = "task_info(TASK_VM_INFO) failed";
+            return false;
+        }
+        c.footprint = vm.phys_footprint;
+        vm_statistics64_data_t host{};
+        mach_msg_type_number_t host_count = HOST_VM_INFO64_COUNT;
+        mach_port_t self = mach_host_self();
+        const kern_return_t kr = host_statistics64(
+            self, HOST_VM_INFO64, reinterpret_cast<host_info64_t>(&host), &host_count);
+        mach_port_deallocate(mach_task_self(), self);
+        if (kr != KERN_SUCCESS) {
+            why = "host_statistics64(HOST_VM_INFO64) failed";
+            return false;
+        }
+        c.pageins = host.pageins;
+        c.pageouts = host.pageouts;
+        c.compressions = host.compressions;
+        c.decompressions = host.decompressions;
+        c.swapins = host.swapins;
+        c.swapouts = host.swapouts;
+        return true;
     }
 };
 
@@ -682,6 +731,11 @@ extern "C" int bbgpu_replay_run(const char* dir, unsigned iterations) {
         }
         const auto prep_before = prep_totals();
         const Counters before = Counters::Now();
+        ProcessCounters process_before;
+        if (!ProcessCounters::Now(process_before, why)) {
+            std::fprintf(stderr, "STOP: perf replay: %s\n", why.c_str());
+            return 3;
+        }
         const auto t0 = std::chrono::steady_clock::now();
         for (const auto& sub : capture.submissions) {
             const u32* dcb[1] = {sub.dcb};
@@ -705,6 +759,11 @@ extern "C" int bbgpu_replay_run(const char* dir, unsigned iterations) {
         const double ms =
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         const Counters after = Counters::Now();
+        ProcessCounters process_after;
+        if (!ProcessCounters::Now(process_after, why)) {
+            std::fprintf(stderr, "STOP: perf replay: %s\n", why.c_str());
+            return 3;
+        }
         double gpu_done = 0;
         if (gpu_wait) {
             std::string quiet_why;
@@ -745,6 +804,21 @@ extern "C" int bbgpu_replay_run(const char* dir, unsigned iterations) {
                    after.images - before.images,
                    (after.image_bytes - before.image_bytes) / 1048576.0,
                    (after.buffer_bytes - before.buffer_bytes) / 1048576.0);
+        // Read before the GPU wait: submit -> idle, the same span as the timing above.
+        const auto& pb = process_before;
+        const auto& pa = process_after;
+        fmt::print("  process during submit-to-idle: CPU user {:.2f} ms, system {:.2f} ms; faults "
+                   "{} minor, {} major; context switches {} voluntary, {} involuntary; footprint "
+                   "{:.1f} MiB ({:+.1f}); host: pageins {}, pageouts {}, compressions {}, "
+                   "decompressions {}, swapins {}, swapouts {}\n",
+                   (pa.user_us - pb.user_us) / 1000.0, (pa.system_us - pb.system_us) / 1000.0,
+                   pa.minor_faults - pb.minor_faults, pa.major_faults - pb.major_faults,
+                   pa.voluntary_switches - pb.voluntary_switches,
+                   pa.involuntary_switches - pb.involuntary_switches, pa.footprint / 1048576.0,
+                   (double(pa.footprint) - double(pb.footprint)) / 1048576.0,
+                   pa.pageins - pb.pageins, pa.pageouts - pb.pageouts,
+                   pa.compressions - pb.compressions, pa.decompressions - pb.decompressions,
+                   pa.swapins - pb.swapins, pa.swapouts - pb.swapouts);
         if (BbPerf::Enabled() && gpu_wait && it >= 2) {
             fmt::print("  GPU busy of iteration {} (per-submission timestamps, {} submissions): "
                        "{:.2f} ms\n",
