@@ -282,3 +282,10 @@ Controls added to scheduler-async-submit-test:
   MoltenVK's default prefill (0); the shelved prefill setting does not accompany it. The changed
   capacity changes game behavior only when more than 64 Metal command buffers are in flight, and
   the preview A/B with asynchronous submission qualifies it.
+
+## Recorder accounting (parse split)
+
+The recording thread's submission work (SubmitFromRecorder: end, vkQueueSubmit, in which
+MoltenVK encodes the command buffer, then commit and begin of the next buffer) is its "queue
+submit" scope; the host-copy wait inside it stays "host copies". Before this, that time showed
+as the recorder's "idle" (async A/B pair 1, 88 ms), so its real load was unreadable.

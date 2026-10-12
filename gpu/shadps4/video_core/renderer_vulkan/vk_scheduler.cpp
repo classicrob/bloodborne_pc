@@ -908,6 +908,9 @@ u64 Scheduler::EnqueueSubmission(SubmitInfo& info, u64 signal_value) {
 }
 
 void Scheduler::SubmitFromRecorder(SubmitPacket& packet) {
+    // The recorder's "queue submit": end, the host-copy wait (its own scope), vkQueueSubmit
+    // (MoltenVK encodes the command buffer here), commit and begin of the next buffer.
+    BB_SPLIT_SCOPE(KFlush);
     if (perf) perf->End(current_cmdbuf);
     Check(current_cmdbuf.end());
     // The host copies this submission reads: their dispatch commands were recorded before the
