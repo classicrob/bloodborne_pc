@@ -251,6 +251,12 @@ iteration's GPU work and report submit -> GPU done), `BB_SPLIT_WINDOW` (the repl
 "Parse split" block per iteration), and with `BB_PERF=1` the GPU busy time of each iteration
 (per-submission timestamps). State the power mode (`pmset -g custom`) with any timing.
 
+A/B runs for anyone: `bash tools/macos/replay-ab.sh A_REF B_REF [--iters N] [--order ABBA]
+[--env "K=V ..."] [--env-a ...] [--env-b ...]` (from a tree root) merges each ref with the harness
+when it lacks it, builds it in its own scratch worktree, replays the newest capture interleaved
+under heavy.sh (playtest slot, GPU exclusive, CPU quiet), records the host state before each run
+and prints the per-arm table (`replay_summary.py --arms`); `--help` lists the options.
+
 Capture tools (`tools/macos/`, read a capture directory; no replay run): `pm4find.py` (the
 WRITE_DATA packets covering an address, with context, and the view holding it), `pm4dump.py`
 (the packets around a guest address), `frameseg.py` (per captured command buffer: draws,
