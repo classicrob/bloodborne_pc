@@ -15,6 +15,8 @@ extern "C" __attribute__((returns_twice)) int bb_setjmp(sigjmp_buf buffer);
 #endif
 
 extern "C" std::uint64_t runtime_disabled_optimizations;
+/// Word 2: the optional second number in BB_TOGGLE_FILE (runtime_memory.c).
+extern "C" std::uint64_t runtime_disabled_optimizations2;
 /// Recovery point for speculative guest memory reads on this thread (runtime_memory.c).
 extern "C" __thread sigjmp_buf* runtime_fault_recover;
 
@@ -59,6 +61,18 @@ enum : std::uint64_t {
     SampleSceneProxies = 1ull << 48,
     OrderedGuestWrites = 1ull << 49,
     SceneHalfRes = 1ull << 50, ///< live scaling also reduces the 960x540 post targets
+    // Renderer debug switches (bit set: the named effect), read live:
+    // BB_DEBUG_MOTION=1 overlay modes instead of the motion-vector colours (the first set wins).
+    MotionOverlayDepth = 1ull << 20,       ///< raw depth
+    MotionOverlayViewZ = 1ull << 21,       ///< view-space z / 50
+    MotionOverlayReprojected = 1ull << 22, ///< the previous frame reprojected by camera motion
+    MotionOverlayDifference = 1ull << 23,  ///< |reprojected previous - current| * 4
+    TemporalUpscalerOff = 1ull << 24,      ///< FSR 3/4 and TAA switched off at run time
+    UpscalerJitterOff = 1ull << 25,        ///< no sub-pixel jitter of scene geometry
+    UpscalerJitterSign = 1ull << 26,       ///< the opposite jitter sign convention (tests)
+    ReactiveMaskOff = 1ull << 27,          ///< no reactive mask for FSR 3
+    ReactiveMaskView = 1ull << 28,         ///< the reactive mask in red over a darkened frame
+    ObjectMotionOff = 1ull << 29,          ///< no object motion vectors (camera motion only)
     UpdateImageFastPath = 1u << 30,
     // TAA A/B in one run: optional techniques, off by default (no measured gain, 2026-10-02).
     TaaTonemapBlend = 1ull << 51,
@@ -99,10 +113,23 @@ enum : std::uint64_t {
     // recorder-side writes, as on the PS4, where the CP writes it when it parses it. Read per
     // WRITE_DATA (live A/B).
     WriteDataAfterLabels = 1ull << 63,
-    // Bits 20-29 are used as raw debug toggles by the camera/object motion and the upscaler.
 };
 inline bool Disabled(std::uint64_t bit) {
     return (__atomic_load_n(&runtime_disabled_optimizations, __ATOMIC_RELAXED) & bit) != 0;
+}
+// Word 2, the second number in BB_TOGGLE_FILE ("<mask> <mask2>"); the first 64 bits are all
+// taken. New toggles go here, from bit 0 up: Word2::Name = 1ull << n. A scoped type, so
+// Disabled(Word2::Name) reads word 2 and a word-2 bit cannot be passed as a word-1 number.
+// The words switch independently (a reader can see a new word 2 with the old word 1), so a
+// toggle must not need a bit in the other word to be set at the same moment.
+enum class Word2 : std::uint64_t {
+};
+constexpr Word2 operator|(Word2 a, Word2 b) {
+    return Word2(std::uint64_t(a) | std::uint64_t(b));
+}
+inline bool Disabled(Word2 bit) {
+    return (__atomic_load_n(&runtime_disabled_optimizations2, __ATOMIC_RELAXED) &
+            std::uint64_t(bit)) != 0;
 }
 } // namespace BbToggle
 

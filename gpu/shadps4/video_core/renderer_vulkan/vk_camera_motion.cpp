@@ -364,11 +364,11 @@ void CameraMotion::Overlay(VideoCore::ImageId frame) {
         .prev_proj = {previous.proj[0], previous.proj[1]},
         .size = {float(color.info.size.width), float(color.info.size.height)},
         .jitter = jitter,
-        .mode = BbToggle::Disabled(1u << 20)   ? 1u
-                : BbToggle::Disabled(1u << 21) ? 2u
-                : BbToggle::Disabled(1u << 22) ? 3u
-                : BbToggle::Disabled(1u << 23) ? 4u
-                                               : 0u,
+        .mode = BbToggle::Disabled(BbToggle::MotionOverlayDepth)         ? 1u
+                : BbToggle::Disabled(BbToggle::MotionOverlayViewZ)       ? 2u
+                : BbToggle::Disabled(BbToggle::MotionOverlayReprojected) ? 3u
+                : BbToggle::Disabled(BbToggle::MotionOverlayDifference)  ? 4u
+                                                                         : 0u,
         .pad = 0,
         .previous_jitter = previous_jitter,
     };

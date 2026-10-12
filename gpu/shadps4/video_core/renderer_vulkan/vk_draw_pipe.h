@@ -13,6 +13,7 @@
 
 #include <cstdlib>
 #include "bbport_parse_split.h"
+#include "bbport_hot_thread_qos.h"
 #include "bbport_threads.h"
 
 #include <array>
@@ -163,6 +164,9 @@ private:
 
     void Run(std::stop_token stop) {
         Common::SetCurrentThreadName("bb:DrawRec");
+#ifdef __APPLE__
+        BbHotThreadQos::Start("draw recording (stage B)");
+#endif
         on_stage_b = true;
         stage_b_tid.store(static_cast<u32>(gettid()), std::memory_order_release);
 #ifdef __APPLE__
@@ -234,6 +238,7 @@ private:
     /// bbport: optional, on stage B after each packet, before it counts as consumed (labels
     /// batched at GPU completion).
     void (*after_packet)(void* context, bool idle) = nullptr;
+
     friend class Rasterizer;
     void* context;
     std::unique_ptr<u8[]> ring;

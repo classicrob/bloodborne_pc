@@ -166,14 +166,14 @@ if [[ $(uname -s) == Darwin ]]; then
     # The debug map points at out/probe-obj; an old one-step build's bb-probe.dSYM would be stale.
     rm -rf out/probe-obj out/bb-probe.dSYM && mkdir -p out/probe-obj
     probe_objects=()
-    for source in src/probe.c "${runtime[@]}" src/vulkan_smoke.c; do
+    for source in src/probe.c "${runtime[@]}" src/vulkan_smoke.c src/macos_activity.c; do
         object=out/probe-obj/$(basename "${source%.c}").o
         "$CC" "${platform_flags[@]}" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread "${includes[@]}" -I. -Isrc \
             -c "$source" -o "$object"
         probe_objects+=("$object")
     done
     "$CC" "${platform_flags[@]}" -g -pthread "${probe_link_flags[@]}" "${probe_objects[@]}" out/libatrac9.a -lm \
-        "${gpu[@]}" "${libraries[@]}" -o out/bb-probe
+        "${gpu[@]}" "${libraries[@]}" -lobjc -framework Foundation -o out/bb-probe
 else
 "$CC" "${platform_flags[@]}" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread "${probe_link_flags[@]}" "${includes[@]}" -I. -Isrc src/probe.c "${runtime[@]}" src/vulkan_smoke.c out/libatrac9.a -lm "${gpu[@]}" "${libraries[@]}" -o out/bb-probe
 fi
@@ -305,7 +305,9 @@ if [[ ${1:-} == --test || ${1:-} == --test-dry ]]; then
             --out "$PWD/out/gcnconf" --label shared
         # Standalone qualification probes and runtime pieces.
         t sh tests/test_guest_alloc_macos.sh
+        t bash tests/test_macos_activity.sh
         t sh tests/test_memory_clamp.sh
+        t sh tests/test_toggle_file.sh
         t sh tests/test_memory_cpu_alias_macos.sh
         t sh tests/test_memory_inventory_macos.sh
         t sh tests/test_audio_macos.sh
@@ -325,8 +327,6 @@ if [[ ${1:-} == --test || ${1:-} == --test-dry ]]; then
         BB_GPU_BUILD="$PWD/out/gpu" t sh tests/macos_metalfx/library.sh
         # Scaled presets: tonemapped RGBA8 content in larger aligned textures, both output formats.
         BB_DEPS_PREFIX="$deps" t bash tests/macos_metalfx/run.sh --ldr-padded
-        # Every tests/test_*.py (a skipped test fails).
-        t bash tests/run_python_tests.sh
         # BB_PERF's GPU numbers rely on per-submission timestamps; qualify them on this device.
         # It takes the GPU exclusively (heavy.sh): it waits for running games instead of measuring
         # a shared GPU.
@@ -399,4 +399,10 @@ if [[ ${1:-} == --test || ${1:-} == --test-dry ]]; then
     "$CC" "${platform_flags[@]}" -std=c11 -D_GNU_SOURCE -O2 -g -Wall -Wextra -Werror -I. -Isrc tests/test_content.c src/runtime_content.c -o out/content-test
     sign_darwin out/content-test
     t out/content-test
+    if [[ $(uname -s) == Darwin ]]; then
+        # Every tests/test_*.py (a skipped test fails). Last: test_runtime.py and test_sema.py run
+        # out/runtime-test and out/sema-test, which must be this build's (a stale pair from an
+        # older --test cannot load the current libbbgpu, and stopped the run before the rebuild).
+        t bash tests/run_python_tests.sh
+    fi
 fi
