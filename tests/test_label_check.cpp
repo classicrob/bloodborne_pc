@@ -670,7 +670,7 @@ int main() {
         struct Fixture {
             BbDeferred::Count labels, recorder;
             BbWriteOrder::Barrier barrier;
-            std::atomic<bool> hold{true}, written{false};
+            std::atomic<bool> hold{true}, written{false}, waiting{false};
         };
         enum Op : std::uint8_t { Hold, IssueLabel, ForwardedWait, RecorderWrite, WriteData };
         const auto handler = [](void* context, const std::uint8_t* packet, std::uint32_t) {
@@ -693,6 +693,7 @@ int main() {
                 break;
             case WriteData:
                 f.barrier.BeforeWriteData([&](std::uint64_t through) {
+                    f.waiting.store(true); // reached its wait (the test's handshake)
                     while (!f.labels.CompleteThrough(through)) {
                         std::this_thread::sleep_for(std::chrono::milliseconds(1));
                     }
@@ -713,8 +714,13 @@ int main() {
             Fixture f;
             Vulkan::DrawPipe pipe(handler, &f);
             run({Hold, IssueLabel, ForwardedWait, RecorderWrite, WriteData}, f, pipe);
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            held_back = !f.written.load() && f.recorder.CompleteThrough(1);
+            // Bounded handshake: WRITE_DATA has reached its wait (after the recorder write
+            // completed); it must still be held there.
+            for (int i = 0; i < 5000 && !f.waiting.load(); ++i) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            held_back = f.waiting.load() && !f.written.load() && f.recorder.CompleteThrough(1);
             f.labels.Complete(); // the label lands
             for (int i = 0; i < 2000 && !f.written.load(); ++i) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
