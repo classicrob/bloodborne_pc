@@ -296,28 +296,6 @@ reaches the GPU without waiting for the batch age or the next idle. This is exac
 submission, never an earlier write. The Flushes line counts these WAITs ("WAIT_REG_MEMs met
 early N per frame").
 
-### Later label flushing (toggle bit 56, an A/B; off by default)
-
-Stage B batches the completion labels it issues and submits them at the next packet boundary
-where the draw pipe is momentarily idle, or once the oldest has waited 500 us. Each submission
-ends the open command buffer: a render pass split and a recorder sync. With async submission
-those idle flushes went from about 5 to 22 per frame.
-
-With bit 56 set, a momentary idle no longer flushes. The batch is submitted:
-- at LabelBatchAge or frame end, as before;
-- when stage B is about to sleep, after its spin of about 200 us with no packet (the draw pipe's
-  idle hook). This is the backstop: whenever stage B stops working, its labels go out within its
-  spin time, so a guest or stage A waiting for one never waits on an unsubmitted batch for
-  longer than that;
-- when a thread about to wait for labels asks. Stage A's WaitDeferredSignals and WaitLabelsThrough
-  set a request that the spinning stage B serves within 256 spins.
-
-Labels are still written only at GPU completion of a submission that contains their work: later,
-never earlier. The census reasons are "label batch before sleep" and "label batch asked for".
-Renderer's proposed "no idle flush while a submission is queued" is covered: no idle flush at all,
-with the sleep backstop, in the async and sync builds alike. Read the A/B against the Flushes
-line, the label age at write, and the render pass census.
-
 ## Flip publication at GPU retirement (the default on Apple)
 
 A flip tells the guest that its previous display buffer may be reused. That means the flip

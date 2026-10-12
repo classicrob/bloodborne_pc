@@ -93,11 +93,6 @@ enum : std::uint64_t {
     // Apple: bit set always runs the SDK fill kernel 0x8b355b5a, instead of clearing the render
     // target it exactly covers (vk_shader_hle.cpp FillAsImageClear); for before/after A/Bs.
     RtFillKernel = 1ull << 62,
-    // Apple, (b) step 2, A/B (off by default): bit set submits stage B's batched completion
-    // labels when the draw recording thread is about to sleep (after its spin), when a thread
-    // waiting for them asks, at LabelBatchAge or at frame end, instead of at every packet
-    // boundary where the draw pipe is momentarily idle. Read per packet boundary (live).
-    LabelFlushWhenAsleep = 1ull << 56,
     // Apple, with labels at GPU completion: bit set makes an in-order WRITE_DATA wait for every
     // earlier completion label (end of pipe) before it writes, as before. Clear (the default):
     // it waits only for what is ordered before it at ME time, the host copies and the
