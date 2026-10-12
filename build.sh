@@ -327,6 +327,7 @@ if [[ ${1:-} == --test || ${1:-} == --test-dry || ${1:-} == --test-one ]]; then
             submit-info-bounds-test vertex-fetch-translation-test buffer-null-test rect-interface-test
             fence-address-test fill-clear-device-test capture-images-test scheduler-close-test scheduler-async-submit-test overlay-concurrency-test depth-bounds-probe-test replay-capture-test
             slot-vector-test
+            barrier-alias-test
             motion-history-test
             motion-shader-test
             ui-composition-test fill-clear-test scene-resolution-test taa-shader-test camera-motion-test)
@@ -357,6 +358,7 @@ if [[ ${1:-} == --test || ${1:-} == --test-dry || ${1:-} == --test-one ]]; then
         t out/gpu/depth-bounds-probe-test
         t out/gpu/replay-capture-test
         t out/gpu/slot-vector-test
+        t out/gpu/barrier-alias-test
         fresh_dir out/gpu/buffer-null-test out/buffer-null
         t out/gpu/buffer-null-test out/buffer-null
         t spirv-val --target-env vulkan1.3 out/buffer-null/null-buffer.spv
