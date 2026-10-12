@@ -307,6 +307,21 @@ def descendants(pid):
     return found
 
 
+def job_processes(root, info):
+    """A job's processes below its slot holder (root): its process tree, and every member of the
+    command's own process group (heavy starts each command in a new session), which also holds
+    those whose parent exited (re-parented to launchd, out of the tree). A job from an older
+    heavy.sh has no group of its own: its tree only (its group is the caller's)."""
+    pids = descendants(root)
+    leader = info.get('command_pid')
+    if leader:
+        out = subprocess.run(['ps', '-Ao', 'pid=,pgid='], capture_output=True, text=True).stdout
+        table = [tuple(map(int, line.split())) for line in out.splitlines() if len(line.split()) == 2]
+        if (leader, leader) in table:  # the command leads its own group
+            pids += [pid for pid, group in table if group == leader and pid not in pids and pid != root]
+    return pids
+
+
 def alive(pid):
     try:
         os.kill(pid, 0)
@@ -384,7 +399,7 @@ def pause_quiet_pools(label):
         tree = [] if info.get('pool') == 'quick' else [root]
         handled, pids, foreign = set(), [], []
         for _ in range(4):  # stop the tree; again for processes started while stopping it
-            tree += [p for p in descendants(root) if p not in tree]
+            tree += [p for p in job_processes(root, info) if p not in tree]
             new = [p for p in tree if p not in handled]
             if not new:
                 break
@@ -429,7 +444,7 @@ def process_table(pids):
 
 
 def quiet_jobs():
-    """[(slot, job label, slot holder pid)] of the running build/quick/sweep jobs."""
+    """[(slot, job label, slot holder pid, slot info)] of the running build/quick/sweep jobs."""
     jobs = []
     for name in ['build-priority', 'build-idle'] + [n for pool in QUIET_POOLS for n in slot_names(pool)]:
         fd = try_lock(name)
@@ -438,7 +453,7 @@ def quiet_jobs():
             continue
         info = holder(name)
         if info.get('pid') and alive(info['pid']):
-            jobs.append((name, info.get('label', name), info['pid']))
+            jobs.append((name, info.get('label', name), info['pid'], info))
     return jobs
 
 
@@ -449,8 +464,8 @@ def demote_quiet_pools(label, demoted, seen, noted):
     later inherit it. demoted: pid -> slot holder, the processes this run demoted or that inherited
     it from them (it restores those). A process already in the background (a job started with
     taskpolicy -b) is left alone and not restored."""
-    for name, job, root in quiet_jobs():
-        tree = [root] + [p for p in descendants(root)]
+    for name, job, root, info in quiet_jobs():
+        tree = [root] + job_processes(root, info)
         table = process_table([p for p in tree if p not in seen])
         count = 0
         for pid, (ppid, priority) in table.items():
@@ -487,10 +502,20 @@ def restore_demoted(label, demoted, noted):
 
 
 def top_processes(count=5):
-    """The COUNT processes using most CPU now, 'pcpu% pid command' each (ps -r)."""
-    out = subprocess.run(['ps', '-Ao', 'pcpu=,pid=,comm=', '-r'], capture_output=True, text=True).stdout
-    return [' '.join(line.split(None, 2)[:2]) + ' ' + os.path.basename(line.split(None, 2)[2])
-            for line in out.splitlines()[:count] if len(line.split(None, 2)) == 3]
+    """The COUNT processes using most CPU now (ps -r): 'pcpu% pid pgid <group> <command> cwd <dir>'
+    each, so a process running outside any heavy job names its owner (its group, its directory)."""
+    out = subprocess.run(['ps', '-Ao', 'pcpu=,pid=,pgid=,comm=', '-r'], capture_output=True, text=True).stdout
+    top = []
+    for line in out.splitlines()[:count]:
+        fields = line.split(None, 3)
+        if len(fields) != 4:
+            continue
+        pcpu, pid, pgid, command = fields
+        cwd = subprocess.run(['lsof', '-a', '-p', pid, '-d', 'cwd', '-Fn'], capture_output=True,
+                             text=True).stdout
+        cwd = next((l[1:] for l in cwd.splitlines() if l.startswith('n')), '?')
+        top.append(f'{pcpu}% {pid} pgid {pgid} {os.path.basename(command)} cwd {cwd}')
+    return top
 
 
 def settle(label, limit, bound):
@@ -653,7 +678,7 @@ def run(pool, priority, gpu, label, command, pool_given=False, quiet=False, sett
                     settle(label, *settle_at)
             announce(label)
             if pool == 'quick':
-                supervise_quick(label, command)
+                supervise_quick(label, command, fd, info)
             if not in_place:
                 supervise(label, pool, command, fd, info)
             try:
@@ -776,13 +801,14 @@ def record_end(label, pool, status, started, **extra):
 
 
 def supervise(label, pool, command, fd=None, info=None):
-    """Runs the job's command as a child in the same process group, forwards SIGINT/SIGTERM/SIGHUP
-    to it, records its end (exit status, or the signal that killed it, and the duration) and exits
-    with its status. A caller that needs the job's pid to be the command's (play_route.py: the
-    game) sets BB_HEAVY_EXEC=1 and records the end itself."""
+    """Runs the job's command as a child in its own session (its own process group, so CPU quiet
+    finds every process of the job, including ones whose parent exited, and none of the caller's),
+    forwards SIGINT/SIGTERM/SIGHUP to that group, records its end (exit status, or the signal that
+    killed it, and the duration) and exits with its status. A caller that needs the job's pid to
+    be the command's (play_route.py: the game) sets BB_HEAVY_EXEC=1 and records the end itself."""
     started = time.monotonic()
     try:
-        child = subprocess.Popen(command, close_fds=False)
+        child = subprocess.Popen(command, start_new_session=True, close_fds=False)
     except OSError as error:
         record_end(label, pool, 127, started, error=str(error))
         fail(f'cannot run {command[0]}: {error}', 127)
@@ -792,7 +818,7 @@ def supervise(label, pool, command, fd=None, info=None):
         os.pwrite(fd, json.dumps(info).encode(), 0)
     def forward(signum, _):
         try:
-            child.send_signal(signum)
+            os.killpg(child.pid, signum)
         except ProcessLookupError:
             pass
     for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
@@ -800,7 +826,7 @@ def supervise(label, pool, command, fd=None, info=None):
     sys.exit(record_end(label, pool, child.wait(), started))
 
 
-def supervise_quick(label, command):
+def supervise_quick(label, command, fd=None, info=None):
     """Runs a quick job as a child in its own process group, enforcing the time limit; exits."""
     warn, limit = seconds('BB_HEAVY_QUICK_WARN', 300), seconds('BB_HEAVY_QUICK_LIMIT', 600)
     for name in ('BB_BUILD_JOBS', 'CMAKE_BUILD_PARALLEL_LEVEL'):
@@ -810,6 +836,9 @@ def supervise_quick(label, command):
         child = subprocess.Popen(command, start_new_session=True, close_fds=False)
     except OSError as error:
         fail(f'cannot run {command[0]}: {error}', 127)
+    if fd is not None:  # the command's process group, for CPU quiet
+        os.ftruncate(fd, 0)
+        os.pwrite(fd, json.dumps({**info, 'command_pid': child.pid}).encode(), 0)
     started, warned = time.monotonic(), False
     forward = lambda signum, _: os.killpg(child.pid, signum)
     for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):

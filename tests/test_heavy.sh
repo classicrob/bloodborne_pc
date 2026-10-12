@@ -429,6 +429,32 @@ job_b=$(pgrep -P "$b17_ninja" | head -1 || true)
 job_b_pri=$( [[ -n $job_b ]] && pri "$job_b" || echo none)
 wait "$p16"; wait "$b17" || fail "B17 (ninja) failed"
 [[ $job_b_pri == 4 ]] || fail "a job ninja spawned during the E-core quiet is not in the background (priority $job_b_pri)"
+# A job's process whose parent exited (re-parented to launchd, out of the job's tree) is still in
+# the job's own process group: CPU quiet stops it, and under ecore demotes it and the children it
+# keeps forking.
+BB_HEAVY_POLITE=0 "$heavy" B18 -- sh -c "(sh -c 'while :; do echo t >> $dir/b18; sleep 0.2; done' &); while :; do sleep 0.5; done" &
+b18=$!
+for _ in $(seq 50); do [[ -s $dir/b18 ]] && break; sleep 0.1; done
+orphan=$(pgrep -f "^sh -c while :; do echo t >> $dir/b18" || true)
+[[ -n $orphan && $(ps -o ppid= -p "$orphan" | tr -d ' ') == 1 ]] || fail "B18's loop is not an orphan (pid '$orphan')"
+"$heavy" --pool playtest --gpu exclusive --cpu-quiet P21 -- sh -c "sleep 0.5; a=\$(wc -l < '$dir/b18'); sleep 1.5; b=\$(wc -l < '$dir/b18'); echo \$a \$b > '$dir/p21'" 2> /dev/null
+read -r a b < "$dir/p21"
+(( a == b )) || fail "an orphaned process of a job kept running during CPU quiet ($a -> $b ticks)"
+"$heavy" --pool playtest --gpu exclusive --cpu-quiet=ecore P22 -- sleep 2.5 2> /dev/null &
+p22=$!
+sleep 1.6
+orphan_pri=$(pri "$orphan")
+orphan_child=none
+for _ in $(seq 20); do
+    c=$(pgrep -P "$orphan" | head -1 || true)
+    if [[ -n $c ]]; then orphan_child=$(pri "$c"); [[ -n $orphan_child ]] && break; fi
+    orphan_child=none; sleep 0.05
+done
+wait "$p22"
+(( orphan_pri == 4 )) && [[ $orphan_child == 4 ]] ||
+    fail "an orphaned process (priority $orphan_pri) or its new child ($orphan_child) not demoted under ecore"
+kill "$b18" 2>/dev/null; wait "$b18" 2>/dev/null || true
+sleep 0.3; ! kill -0 "$orphan" 2>/dev/null || fail "the job's orphan outlived the job's SIGTERM (group forwarding)"
 # --settle LOAD,SECONDS: a quiet run waits for the 1-minute load to fall below LOAD, or refuses
 # (exit 75) past SECONDS, naming the top processes; the quiet start records the top 5 CPU
 # processes; a GPU request is recorded before its grant; --settle needs --cpu-quiet.
@@ -448,6 +474,7 @@ settles = {e['label']: e for e in events if e.get('event') == 'settle'}
 assert settles['P17']['settled'] is True and settles['P18']['settled'] is False and settles['P18']['top'], settles
 starts = [e for e in events if e.get('event') == 'quiet-start' and e['by'] == 'P17']
 assert starts and len(starts[0]['top']) == 5 and starts[0]['mode'] == 'stop', starts
+assert all(' pgid ' in t and ' cwd ' in t for t in starts[0]['top']), starts[0]['top']
 order = [e['event'] for e in events if e.get('label') == 'P17' and e['event'] in ('gpu-request', 'gpu')]
 assert order[:2] == ['gpu-request', 'gpu'], order
 PY

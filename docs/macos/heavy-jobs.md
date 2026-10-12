@@ -99,7 +99,10 @@ The pause is bounded by `BB_HEAVY_QUIET_MAX` (1200 s); past that the jobs resume
 "CPU QUIET BOUND REACHED". Each pause and resume is printed in the run's output and recorded in
 the history. Games are not paused (the exclusive GPU hold already keeps them off).
 
-`--cpu-quiet=ecore` (an option; `--cpu-quiet` and `--cpu-quiet=stop` stay as above) does not
+`--cpu-quiet=ecore` is **not for perf A/Bs; correctness runs only**. Measured 2026-10-12 (replay,
+clinic, 100 iterations, A/B/A with stop mode): median +2.1%, p90 +2.7%, and one 72.7 ms
+iteration against about 43.6 in both stop arms. Perf runs keep `--cpu-quiet` (stop). What it does
+(an option; `--cpu-quiet` and `--cpu-quiet=stop` stay as above): it does not
 pause anything. While the run lasts, the watcher moves each running build, quick and sweep process
 to darwin background QoS every second (`setpriority(PRIO_DARWIN_PROCESS, PRIO_DARWIN_BG)`, as
 `taskpolicy -b`: efficiency cores, low CPU and I/O priority; `ps -o pri` shows 4), and processes
@@ -107,13 +110,15 @@ they start meanwhile, including ninja's compiles, inherit it. New jobs start at 
 `taskpolicy -b`, instead of waiting. At the end, the processes it demoted, and those that
 inherited it from them, are restored; a job started in the background stays there. A job that ran
 at E-core QoS says so at its end (`ran N s at E-core QoS for perf runs (...)`; `ecore_s`,
-`ecore_by` in its end event). It is for A/Bs only once measured: a replay pair, idle against a
-full build at E-core QoS, with medians within 1% and no tail change.
+`ecore_by` in its end event). Every job's command runs in its own session (its own process group): stop and ecore act on the
+job's tree and on every member of that group, so a process whose parent exited (re-parented to
+launchd) is paused or demoted too, and SIGINT/SIGTERM/SIGHUP reach the whole group.
 
 `--settle LOAD,SECONDS` (with `--cpu-quiet` only): after the other jobs are paused or demoted
 and before the perf run starts, wait until the 1-minute load average is below LOAD; past SECONDS
 the run is refused (exit 75) with the load and the top CPU processes. Every quiet start records
-the top 5 CPU processes in the history (`quiet-start`, `top`), so a stray hog shows there. GPU
+the top 5 CPU processes in the history (`quiet-start`, `top`: CPU, pid, process group, command,
+working directory), so a stray hog shows there with its owner. GPU
 lock requests are recorded too (`gpu-request` before the `gpu` grant): a job that ended while
 waiting has a request and no grant.
 
