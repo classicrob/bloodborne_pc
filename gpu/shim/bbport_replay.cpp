@@ -23,7 +23,10 @@
 #include <fmt/format.h>
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
+#include <libproc.h>
+#include <mach/task_policy.h>
 #include <sys/resource.h>
+#include <unistd.h>
 #include "bbport_toggles.h"
 #include "macos_perf.h"
 #include "core/libraries/gnmdriver/gnmdriver.h"
@@ -31,6 +34,7 @@
 #include "video_core/amdgpu/replay_format.h"
 #include "video_core/amdgpu/replay_state_access.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
+#include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/texture_cache/capture_images.h"
 #include <map>
 #include <xxhash.h>
@@ -323,6 +327,11 @@ struct ProcessCounters {
     u64 user_us = 0, system_us = 0, minor_faults = 0, major_faults = 0, voluntary_switches = 0,
         involuntary_switches = 0, footprint = 0, pageins = 0, pageouts = 0, compressions = 0,
         decompressions = 0, swapins = 0, swapouts = 0;
+    // proc_pid_rusage v6 (kernel time units; printed as ratios, which cancel them).
+    u64 ri_time = 0, ri_ptime = 0, ri_runnable = 0, instructions = 0, cycles = 0, energy_nj = 0;
+    u64 qos[7] = {}; // default, maintenance, background, utility, legacy, user initiated, user
+                     // interactive
+    int role = 0; // task_role_t of TASK_CATEGORY_POLICY
     static bool Now(ProcessCounters& c, std::string& why) {
         rusage usage{};
         if (getrusage(RUSAGE_SELF, &usage) != 0) {
@@ -359,6 +368,33 @@ struct ProcessCounters {
         c.decompressions = host.decompressions;
         c.swapins = host.swapins;
         c.swapouts = host.swapouts;
+        rusage_info_v6 ri{};
+        if (proc_pid_rusage(getpid(), RUSAGE_INFO_V6, reinterpret_cast<rusage_info_t*>(&ri)) !=
+            0) {
+            why = fmt::format("proc_pid_rusage(RUSAGE_INFO_V6) failed (errno {})", errno);
+            return false;
+        }
+        c.ri_time = ri.ri_user_time + ri.ri_system_time;
+        c.ri_ptime = ri.ri_user_ptime + ri.ri_system_ptime;
+        c.ri_runnable = ri.ri_runnable_time;
+        c.instructions = ri.ri_instructions;
+        c.cycles = ri.ri_cycles;
+        c.energy_nj = ri.ri_energy_nj;
+        const u64 qos[7] = {ri.ri_cpu_time_qos_default,     ri.ri_cpu_time_qos_maintenance,
+                            ri.ri_cpu_time_qos_background,  ri.ri_cpu_time_qos_utility,
+                            ri.ri_cpu_time_qos_legacy,      ri.ri_cpu_time_qos_user_initiated,
+                            ri.ri_cpu_time_qos_user_interactive};
+        std::copy(std::begin(qos), std::end(qos), c.qos);
+        task_category_policy_data_t category{};
+        mach_msg_type_number_t category_count = TASK_CATEGORY_POLICY_COUNT;
+        boolean_t get_default = FALSE;
+        if (task_policy_get(mach_task_self(), TASK_CATEGORY_POLICY,
+                            reinterpret_cast<task_policy_t>(&category), &category_count,
+                            &get_default) != KERN_SUCCESS) {
+            why = "task_policy_get(TASK_CATEGORY_POLICY) failed";
+            return false;
+        }
+        c.role = category.role;
         return true;
     }
 };
@@ -804,6 +840,22 @@ extern "C" int bbgpu_replay_run(const char* dir, unsigned iterations) {
                    after.images - before.images,
                    (after.image_bytes - before.image_bytes) / 1048576.0,
                    (after.buffer_bytes - before.buffer_bytes) / 1048576.0);
+        // Staging pool contents after the iteration (Renderer's Totals(), any thread): growth per
+        // iteration with identical work would be our pools not reusing their buffers.
+        {
+            static constexpr const char* kStagingNames[] = {"DeviceLocal", "HostUncached",
+                                                            "HostCached"};
+            const auto staging = rasterizer->GetRuntime().GetStagingPool().Totals();
+            std::string line;
+            for (size_t i = 0; i < staging.size(); ++i) {
+                const auto& t = staging[i];
+                line += fmt::format("{}{} ring {} blocks {:.1f} MiB, large {} ({} held) {:.1f} MiB",
+                                    i ? "; " : "", kStagingNames[i], t.ring_blocks,
+                                    t.ring_bytes / 1048576.0, t.large_buffers, t.large_held,
+                                    t.large_bytes / 1048576.0);
+            }
+            fmt::print("  staging pool after the iteration: {}\n", line);
+        }
         // Read before the GPU wait: submit -> idle, the same span as the timing above.
         const auto& pb = process_before;
         const auto& pa = process_after;
@@ -819,6 +871,39 @@ extern "C" int bbgpu_replay_run(const char* dir, unsigned iterations) {
                    pa.pageins - pb.pageins, pa.pageouts - pb.pageouts,
                    pa.compressions - pb.compressions, pa.decompressions - pb.decompressions,
                    pa.swapins - pb.swapins, pa.swapouts - pb.swapouts);
+        {
+            // Where the CPU time ran: share on P cores, by QoS class, effective clock (cycles per
+            // CPU second, from getrusage's microseconds), IPC, runnable-but-not-running time
+            // relative to CPU time, energy. The task role names the app state (2 = background).
+            const double ri_time = double(pa.ri_time - pb.ri_time);
+            const double cpu_s = ((pa.user_us - pb.user_us) + (pa.system_us - pb.system_us)) / 1e6;
+            const double cycles = double(pa.cycles - pb.cycles);
+            static constexpr const char* kQos[7] = {"default", "maintenance", "background",
+                                                    "utility", "legacy", "user-initiated",
+                                                    "user-interactive"};
+            double qos_all = 0;
+            for (int q = 0; q < 7; ++q) {
+                qos_all += double(pa.qos[q] - pb.qos[q]);
+            }
+            std::string qos_line;
+            for (int q = 0; q < 7; ++q) {
+                const double d = double(pa.qos[q] - pb.qos[q]);
+                if (d > 0 && qos_all > 0) {
+                    qos_line += fmt::format("{}{} {:.0f}%", qos_line.empty() ? "" : ", ", kQos[q],
+                                            100.0 * d / qos_all);
+                }
+            }
+            fmt::print("  cores during submit-to-idle: P-core share {:.0f}%; CPU by QoS: {}; "
+                       "{:.2f} GHz effective, IPC {:.2f}; runnable not running {:.0f}% of CPU "
+                       "time; energy {:.1f} mJ; task role {} (before {})\n",
+                       ri_time > 0 ? 100.0 * double(pa.ri_ptime - pb.ri_ptime) / ri_time : 0.0,
+                       qos_line.empty() ? std::string{"none"} : qos_line,
+                       cpu_s > 0 ? cycles / cpu_s / 1e9 : 0.0,
+                       cycles > 0 ? double(pa.instructions - pb.instructions) / cycles : 0.0,
+                       ri_time > 0 ? 100.0 * double(pa.ri_runnable - pb.ri_runnable) / ri_time
+                                   : 0.0,
+                       (pa.energy_nj - pb.energy_nj) / 1e6, pa.role, pb.role);
+        }
         if (BbPerf::Enabled() && gpu_wait && it >= 2) {
             fmt::print("  GPU busy of iteration {} (per-submission timestamps, {} submissions): "
                        "{:.2f} ms\n",
