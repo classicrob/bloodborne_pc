@@ -8,7 +8,10 @@
 #include <cassert>
 #include <cstdio>
 #include <string>
+#include <utility>
 #include "video_core/buffer_cache/buffer.h"
+#include "bbport_toggles.h"
+#include "video_core/renderer_vulkan/vk_gs_emulation.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -65,6 +68,59 @@ int main() {
     Expect("... but not by a read-only check (reads do not conflict)",
            !runtime.IsBufferAccessed(&arena_a, Page, 256, false));
     runtime.FlushBarriers();
+
+    // Fixed-function input reads recorded after a draw (Rasterizer::InputRead): an indirect
+    // argument read is tracked, so a later write to the arguments gets its barrier.
+    runtime.AccessBuffer(&y, 64, 16, vk::PipelineStageFlagBits2::eDrawIndirect,
+                         vk::AccessFlagBits2::eIndirectCommandRead);
+    Expect("an indirect argument read is found by a later write check (WAR)",
+           runtime.IsBufferAccessed(&y, 64, 16, true));
+    runtime.FlushBarriers();
+    runtime.AccessBuffer(&y, 128, 16, vk::PipelineStageFlagBits2::eVertexAttributeInput,
+                         vk::AccessFlagBits2::eVertexAttributeRead);
+    runtime.AccessBuffer(&y, 256, 16, vk::PipelineStageFlagBits2::eIndexInput,
+                         vk::AccessFlagBits2::eIndexRead);
+    Expect("vertex and index reads are found by later write checks (WAR)",
+           runtime.IsBufferAccessed(&y, 128, 16, true) &&
+               runtime.IsBufferAccessed(&y, 256, 16, true));
+    runtime.FlushBarriers();
+
+    // The GS ES kernel's guest index reads are whole dwords (Vulkan::GsIndexLoadRange). With
+    // 4 KiB read rounding off, the tracked range must hold the halfword before a u16 range that
+    // starts mid-dword and the one after a range that ends mid-dword.
+    {
+        using Vulkan::GsIndexLoadRange;
+        Expect("ES index load range: one u16 at offset 2 loads [0, 4)",
+               GsIndexLoadRange(2, 2) == std::pair<u64, u64>{0, 4});
+        Expect("ES index load range: three u16 at offset 4 load [4, 12)",
+               GsIndexLoadRange(4, 6) == std::pair<u64, u64>{4, 12});
+        Expect("ES index load range: dword-aligned u32 indices load exactly their bytes",
+               GsIndexLoadRange(8, 8) == std::pair<u64, u64>{8, 16});
+        __atomic_or_fetch(&runtime_disabled_optimizations, BbToggle::CoarseReadTracking,
+                          __ATOMIC_RELAXED);
+        const auto record = [&](u64 offset, u64 bytes) {
+            const auto [begin, end] = GsIndexLoadRange(offset, bytes);
+            runtime.AccessBuffer(&y, begin, end - begin, vk::PipelineStageFlagBits2::eComputeShader,
+                                 vk::AccessFlagBits2::eShaderRead);
+        };
+        record(2, 2);
+        Expect("leading halfword: a write to [0, 2) is found (exact tracking)",
+               runtime.IsBufferAccessed(&y, 0, 2, true));
+        runtime.FlushBarriers();
+        record(4, 6);
+        Expect("trailing halfword: a write to [10, 12) is found (exact tracking)",
+               runtime.IsBufferAccessed(&y, 10, 2, true));
+        Expect("... and the dword after the load is not (the tracking is exact)",
+               !runtime.IsBufferAccessed(&y, 12, 4, true));
+        runtime.FlushBarriers();
+        runtime.AccessBuffer(&y, 2, 2, vk::PipelineStageFlagBits2::eComputeShader,
+                             vk::AccessFlagBits2::eShaderRead);
+        Expect("control: the index bytes alone ([2, 4)) miss the leading halfword",
+               !runtime.IsBufferAccessed(&y, 0, 2, true));
+        runtime.FlushBarriers();
+        __atomic_and_fetch(&runtime_disabled_optimizations, ~BbToggle::CoarseReadTracking,
+                           __ATOMIC_RELAXED);
+    }
 
     write(arena_b, 0, 0);
     Expect("an empty range accesses nothing", !runtime.IsBufferAccessed(&arena_a, Page, 256) &&

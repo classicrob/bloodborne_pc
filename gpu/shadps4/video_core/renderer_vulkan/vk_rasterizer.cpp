@@ -1061,6 +1061,9 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
                             bool is_indexed, u32 index_offset) {
     BB_SPLIT_MARK_ON(stage_b, BDrawSetup);
     NoteRecordContext("draw", pipeline);
+#ifdef __APPLE__
+    input_reads.clear(); // a rejected draw or dispatch before this one executed nothing
+#endif
     if (DrawPipe::OnStageB()) {
         FrameCapture::Poll();
         scheduler.PopPendingOperations();
@@ -1370,6 +1373,13 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
         }
     }
 #ifdef __APPLE__
+    if (is_indexed && !pipeline->GsEmulation()) {
+        const u64 index_size = index_bind.type == vk::IndexType::eUint16 ? 2 : 4;
+        const std::array<InputBinding, 1> inputs{{
+            {"index buffer", index_bind.handle, index_bind.offset, u64(regs.num_indices) * index_size},
+        }};
+        VerifyInputReads(inputs);
+    }
     GpuReadCheck(pipeline, is_indexed, index_offset);
 #endif
     DebugState.IncDrawCall();
@@ -1413,6 +1423,9 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
 void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_indexed,
                                     const IndirectDraw& indirect) {
     NoteRecordContext("indirect draw", pipeline);
+#ifdef __APPLE__
+    input_reads.clear(); // a rejected draw or dispatch before this one executed nothing
+#endif
     if (DrawPipe::OnStageB()) {
         FrameCapture::Poll();
         scheduler.PopPendingOperations();
@@ -1479,6 +1492,11 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
         : buffer_cache.ObtainBuffer(indirect.args, stride * max_count, false);
     if (buffer) {
         needs_barrier |= runtime.IsBufferAccessed(buffer, base, stride * max_count);
+#ifdef __APPLE__
+        NoteInputRead(buffer, base, u64(stride) * max_count,
+                      vk::PipelineStageFlagBits2::eDrawIndirect,
+                      vk::AccessFlagBits2::eIndirectCommandRead);
+#endif
     }
 
     const VideoCore::Buffer* count_buffer;
@@ -1486,6 +1504,10 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
     if (count_address != 0) {
         std::tie(count_buffer, count_offset) = buffer_cache.ObtainBuffer(count_address, 4, false);
         needs_barrier |= runtime.IsBufferAccessed(count_buffer, count_offset, 4);
+#ifdef __APPLE__
+        NoteInputRead(count_buffer, count_offset, 4, vk::PipelineStageFlagBits2::eDrawIndirect,
+                      vk::AccessFlagBits2::eIndirectCommandRead);
+#endif
     }
 
     if (needs_barrier) {
@@ -1557,6 +1579,16 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
         }
     });
 #ifdef __APPLE__
+    {
+        const u64 index_size = index_bind.type == vk::IndexType::eUint16 ? 2 : 4;
+        const std::array<InputBinding, 3> inputs{{
+            {"indirect argument buffer", args, args_offset, u64(stride) * max_count},
+            {"indirect count buffer", counts, counts_offset, counts ? 4u : 0u},
+            {"index buffer", is_indexed ? index_bind.handle : vk::Buffer{}, index_bind.offset,
+             u64(Regs().num_indices) * index_size},
+        }};
+        VerifyInputReads(inputs);
+    }
     GpuReadCheck(pipeline, false, 0); // its index and vertex counts are on the GPU
 #endif
     DebugState.IncDrawCall();
@@ -1666,6 +1698,9 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
 void Rasterizer::DispatchIndirectRecord(const ComputePipeline* pipeline, VAddr address,
                                         u32 size) {
     NoteRecordContext("indirect dispatch", pipeline);
+#ifdef __APPLE__
+    input_reads.clear(); // a rejected draw or dispatch before this one executed nothing
+#endif
     scheduler.PopPendingOperations();
     const u32 offset = 0;
 
@@ -1675,6 +1710,10 @@ void Rasterizer::DispatchIndirectRecord(const ComputePipeline* pipeline, VAddr a
 
     const auto [buffer, base] = buffer_cache.ObtainBuffer(address + offset, size, false);
     needs_barrier |= runtime.IsBufferAccessed(buffer, base, size);
+#ifdef __APPLE__
+    NoteInputRead(buffer, base, size, vk::PipelineStageFlagBits2::eDrawIndirect,
+                  vk::AccessFlagBits2::eIndirectCommandRead);
+#endif
 
     if (needs_barrier) {
         runtime.FlushBarriers();
@@ -1695,6 +1734,12 @@ void Rasterizer::DispatchIndirectRecord(const ComputePipeline* pipeline, VAddr a
         cmdbuf.dispatchIndirect(args, args_offset);
     });
     DebugState.IncDispatch();
+#ifdef __APPLE__
+    {
+        const std::array<InputBinding, 1> inputs{{{"indirect dispatch arguments", args, args_offset, size}}};
+        VerifyInputReads(inputs);
+    }
+#endif
 
     ResetBindings(true);
     scheduler.KickRecording();
@@ -2314,10 +2359,57 @@ void Rasterizer::ResolveIndexBuffer(u32 index_offset) {
     const auto [buffer, offset] =
         buffer_cache.ObtainBuffer(index_address, index_buffer_size, false);
     needs_barrier |= runtime.IsBufferAccessed(buffer, offset, index_buffer_size);
+#ifdef __APPLE__
+    NoteInputRead(buffer, offset, index_buffer_size, vk::PipelineStageFlagBits2::eIndexInput,
+                  vk::AccessFlagBits2::eIndexRead);
+#endif
     index_bind = {buffer->Handle(), offset, index_type};
 }
 
+#ifdef __APPLE__
+void Rasterizer::VerifyInputReads(std::span<const InputBinding> bindings) {
+    static const bool enabled = [] {
+        const char* env = std::getenv("BB_INPUT_READ_VERIFY");
+        return env && env[0] == '1';
+    }();
+    if (!enabled) {
+        return;
+    }
+    for (const auto& binding : bindings) {
+        if (!binding.handle || binding.size == 0) {
+            continue;
+        }
+        // The union of the noted reads on this buffer must cover the bound range.
+        std::vector<std::pair<u64, u64>> ranges;
+        for (const auto& read : input_reads) {
+            if (read.buffer && read.buffer->Handle() == binding.handle) {
+                ranges.emplace_back(read.offset, read.offset + read.size);
+            }
+        }
+        std::ranges::sort(ranges);
+        u64 covered = binding.offset;
+        for (const auto& [begin, end] : ranges) {
+            if (begin > covered) {
+                break;
+            }
+            covered = std::max(covered, end);
+        }
+        ASSERT_MSG(covered >= binding.offset + binding.size,
+                   "macOS input reads: {} of a draw or dispatch reads VkBuffer {:#x} [{:#x}, +{:#x}), "
+                   "which is not recorded as a read after it",
+                   binding.what, u64(static_cast<VkBuffer>(binding.handle)), binding.offset,
+                   binding.size);
+    }
+}
+#endif
+
 void Rasterizer::ResetBindings(bool is_compute) {
+#ifdef __APPLE__
+    for (const auto& read : input_reads) {
+        runtime.AccessBuffer(read.buffer, read.offset, read.size, read.stage, read.access);
+    }
+    input_reads.clear();
+#endif
     for (auto& image_id : bound_images) {
         texture_cache.GetImage(image_id).binding = {};
     }

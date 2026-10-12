@@ -208,7 +208,15 @@ GsEmulationDraw Rasterizer::RecordGsEmulation(const GraphicsPipeline* pipeline,
             regs.index_base_address.Address<VAddr>() + u64(index_offset) * index_size;
         const u32 index_bytes = records * index_size;
         const auto [buffer, offset] = buffer_cache.ObtainBuffer(address, index_bytes, false);
-        needs_barrier |= runtime.IsBufferAccessed(buffer, offset, index_bytes);
+        // The dwords the ES kernel loads: the check and the recorded read cover them all.
+        const auto [load_begin, load_end] = GsIndexLoadRange(offset, index_bytes);
+        needs_barrier |= runtime.IsBufferAccessed(buffer, load_begin, load_end - load_begin);
+#ifdef __APPLE__
+        // Recorded after the ES dispatch (RecordGsDispatch's ResetBindings(true)).
+        NoteInputRead(buffer, load_begin, load_end - load_begin,
+                      vk::PipelineStageFlagBits2::eComputeShader,
+                      vk::AccessFlagBits2::eShaderRead);
+#endif
         // Bound from the storage-aligned start; FirstIndex skips the elements before the draw's
         // first index. The shader reads whole dwords (u16 indices in pairs): the range is rounded
         // up to a dword, which must stay inside the cached buffer.
@@ -565,7 +573,15 @@ GsEmulationDraw Rasterizer::RecordGsEmulationIndirect(const GraphicsPipeline* pi
         ASSERT_MSG(index_bytes != 0, "macOS geometry emulation: indirect ES/GS draw without an "
                                      "index buffer size");
         const auto [buffer, offset] = buffer_cache.ObtainBuffer(address, index_bytes, false);
-        needs_barrier |= runtime.IsBufferAccessed(buffer, offset, index_bytes);
+        // The dwords the ES kernel loads: the check and the recorded read cover them all.
+        const auto [load_begin, load_end] = GsIndexLoadRange(offset, index_bytes);
+        needs_barrier |= runtime.IsBufferAccessed(buffer, load_begin, load_end - load_begin);
+#ifdef __APPLE__
+        // Recorded after the ES dispatch (RecordGsDispatch's ResetBindings(true)).
+        NoteInputRead(buffer, load_begin, load_end - load_begin,
+                      vk::PipelineStageFlagBits2::eComputeShader,
+                      vk::AccessFlagBits2::eShaderRead);
+#endif
         const u64 bind_offset = Common::AlignDown(offset, alignment);
         const u64 skip = offset - bind_offset;
         ASSERT_MSG(skip % index_size == 0,
