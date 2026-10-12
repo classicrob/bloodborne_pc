@@ -91,6 +91,18 @@ The pause is bounded by `BB_HEAVY_QUIET_MAX` (1200 s); past that the jobs resume
 "CPU QUIET BOUND REACHED". Each pause and resume is printed in the run's output and recorded in
 the history. Games are not paused (the exclusive GPU hold already keeps them off).
 
+A paused job says so when it ends, with its exit status, and its end event in the history
+carries `paused_s` and `paused_by`:
+
+    heavy: PREVIEW-26 full --test: PAUSED 712 s for perf runs (R0 perf); ended with exit 2: a
+    wall-clock timeout in the job may have fired on resume; rerun before calling it a failure
+
+A test's own `alarm()` kept counting through the stop and fired as soon as it resumed
+(PREVIEW-25a, the fp16 probe). Our tests use `test_alarm()` from `tests/test_alarm.h` instead:
+a forked watchdog that is paused with the test and counts at most half a second per step, so a
+pause does not use up the limit. A failure in a paused job gets one rerun, and both results are
+reported.
+
 - Slots are flocks under `~/bbport-deps/locks` (`BB_HEAVY_DIR`). A job waits for a free slot of
   its pool and prints who holds them every 30 s.
 - The slot's locked descriptor is inherited by the command and everything it starts, and the

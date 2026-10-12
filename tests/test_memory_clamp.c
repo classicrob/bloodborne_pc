@@ -2,6 +2,7 @@
 #include "../src/runtime_memory.c"
 #include <assert.h>
 #include <signal.h>
+#include "test_alarm.h"
 uintptr_t runtime_lookup(const RuntimeExport *table,size_t count,const char *name) {
     for (size_t i=0;i<count;++i) if (!strcmp(table[i].name,name)) return (uintptr_t)table[i].function;
     return 0;
@@ -42,7 +43,7 @@ static void check_ranges(uintptr_t base,const char *stage) {
     printf("PASS %s\n",stage);
 }
 int main(void) {
-    alarm(30);
+    test_alarm(30);
     puts("Memory clamp: actual host backend mapping test"); fflush(stdout);
     runtime_memory_reserve();
     int64_t phys;

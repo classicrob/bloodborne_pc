@@ -306,6 +306,7 @@ if [[ ${1:-} == --test || ${1:-} == --test-dry ]]; then
         # Standalone qualification probes and runtime pieces.
         t sh tests/test_guest_alloc_macos.sh
         t bash tests/test_macos_activity.sh
+        t sh tests/test_alarm.sh
         t sh tests/test_memory_clamp.sh
         t sh tests/test_toggle_file.sh
         t sh tests/test_memory_cpu_alias_macos.sh

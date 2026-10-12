@@ -6,6 +6,7 @@
 struct GuestThread;
 struct GuestThread *runtime_thread_current(void);
 #include <unistd.h>
+#include "test_alarm.h"
 
 uintptr_t runtime_lookup(const RuntimeExport *table,size_t count,const char *name) {
     for (size_t i=0;i<count;++i) if (!strcmp(table[i].name,name)) return (uintptr_t)table[i].function;
@@ -170,7 +171,7 @@ static void semaphore_edges(void) {
     puts("PASS: max-one overflow, timeout, single-token wake, FIFO, cancel, reuse");
 }
 int main(void) {
-    alarm(60);
+    test_alarm(60);
     create_sem=(Create)runtime_sema_resolve("188x57JYp0g#p#J");
     signal_sem=(Count)runtime_sema_resolve("4czppHBiriw#p#J");
     wait_sem=(Wait)runtime_sema_resolve("Zxa0VhQVTsk#p#J");
