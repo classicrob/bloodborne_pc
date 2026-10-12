@@ -1613,6 +1613,15 @@ bool TextureCache::RestoreForReplay(const std::function<bool(CapturedImage&)>& n
     }
     std::unordered_map<u64, ImageId> by_uid; ///< captured image_uid -> restored image
     std::vector<std::pair<ImageId, u64>> depth_links;
+    // Registered after all are recreated, in captured image_uid order (the live creation order):
+    // the live cache holds overlapping images, so they must not refuse each other, and the page
+    // table lists them in the order they were registered.
+    struct Restored {
+        u64 uid;
+        ImageId id;
+        bool tracked;
+    };
+    std::vector<Restored> restored;
     scheduler.EndRendering();
     CapturedImage captured;
     while (next(captured)) {
@@ -1635,15 +1644,20 @@ bool TextureCache::RestoreForReplay(const std::function<bool(CapturedImage&)>& n
         std::vector<vk::BufferImageCopy> copies;
         {
             std::scoped_lock lock{mutex};
+            // Only images registered before this restore are seen here (restored ones are
+            // registered at the end): the replay's cache must hold nothing over a captured image.
             bool overlap = false;
             ForEachImageInRegion(info.guest_address, info.guest_size,
                                  [&](ImageId, Image&) { overlap = true; });
             if (overlap) {
-                why = describe() + ": the cache already holds an image over it";
+                why = describe() + ": the cache already held an image over it before the restore";
+                return false;
+            }
+            if (by_uid.contains(state->image_uid)) {
+                why = fmt::format("{}: image uid {} recorded twice", describe(), state->image_uid);
                 return false;
             }
             id = slot_images.insert(instance, runtime, slot_image_views, info);
-            RegisterImage(id);
             Image& image = slot_images[id];
             if (static_cast<u32>(image.aspect_mask) != state->aspect_mask) {
                 why = describe() + ": recreated with other aspects";
@@ -1696,7 +1710,7 @@ bool TextureCache::RestoreForReplay(const std::function<bool(CapturedImage&)>& n
         {
             std::scoped_lock lock{mutex};
             Image& image = slot_images[id];
-            image.flags = static_cast<ImageFlagBits>(state->flags) | ImageFlagBits::Registered;
+            image.flags = static_cast<ImageFlagBits>(state->flags); // RegisterImage adds Registered
             image.usage.texture = state->usage & 1;
             image.usage.storage = (state->usage >> 1) & 1;
             image.usage.render_target = (state->usage >> 2) & 1;
@@ -1704,17 +1718,22 @@ bool TextureCache::RestoreForReplay(const std::function<bool(CapturedImage&)>& n
             image.usage.vo_surface = (state->usage >> 4) & 1;
             image.mip_hashes.assign(state->mip_hashes, state->mip_hashes + state->num_mip_hashes);
             image.hash = state->hash;
-            if (state->tracked) {
-                TrackImage(id);
-            }
         }
         by_uid[state->image_uid] = id;
+        restored.push_back({state->image_uid, id, state->tracked != 0});
         if (state->depth_uid) {
             depth_links.emplace_back(id, state->depth_uid);
         }
     }
     {
         std::scoped_lock lock{mutex};
+        std::ranges::sort(restored, {}, &Restored::uid);
+        for (const auto& image : restored) {
+            RegisterImage(image.id);
+            if (image.tracked) {
+                TrackImage(image.id); // CPU write tracking, as the live image had it
+            }
+        }
         for (const auto& [id, depth_uid] : depth_links) {
             const auto it = by_uid.find(depth_uid);
             if (it == by_uid.end()) {

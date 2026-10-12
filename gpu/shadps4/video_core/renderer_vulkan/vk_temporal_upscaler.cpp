@@ -35,6 +35,9 @@ namespace Vulkan {
 
 namespace {
 
+/// taa.comp's push block: jitter, reset, pad, proj, prev_proj, previous_z, scene viewport.
+constexpr u32 TaaPushBytes = 80;
+
 FfxVkPortableImage Describe(vk::Image image, vk::Format format, u32 width, u32 height,
                             vk::ImageUsageFlags usage, vk::ImageAspectFlags aspect,
                             FfxVkPortableResourceState state) {
@@ -646,7 +649,7 @@ void TemporalUpscaler::CreatePipelines() {
         taa_desc_layout = Check(device.createDescriptorSetLayoutUnique({
             .flags = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR,
             .bindingCount = u32(bindings.size()), .pBindings = bindings.data()}));
-        const vk::PushConstantRange push{vk::ShaderStageFlagBits::eCompute, 0, 64};
+        const vk::PushConstantRange push{vk::ShaderStageFlagBits::eCompute, 0, TaaPushBytes};
         taa_pipeline_layout = Check(device.createPipelineLayoutUnique({
             .setLayoutCount = 1, .pSetLayouts = &*taa_desc_layout,
             .pushConstantRangeCount = 1, .pPushConstantRanges = &push}));
@@ -705,10 +708,11 @@ void TemporalUpscaler::RecordTaa(vk::CommandBuffer cmdbuf, vk::ImageView color,
     struct Params {
         std::array<float, 2> jitter;
         u32 reset, pad;
-        std::array<std::array<float, 4>, 3> depth;
+        std::array<std::array<float, 4>, 4> depth; ///< taa.comp proj ... viewport
     } params{jitter, reset ? 1u : 0u, std::getenv("BB_TAA_DIAGNOSTICS") ?
                  u32(std::clamp(std::atoi(std::getenv("BB_TAA_DIAGNOSTICS")),1,3)) : 0u,
              camera_motion.TaaDepthParameters()};
+    static_assert(sizeof(params) == TaaPushBytes, "the TAA pipeline layout's push range");
     // Optional techniques for A/B in one run (BB_TOGGLE_FILE bits 51-54): tonemapped blending,
     // YCoCg clipping, variance clipping, 3x3 reconstruction. Measured in game on 2026-10-02
     // (static and panning camera, interleaved captures): none improved stability beyond run
@@ -1820,10 +1824,14 @@ void TemporalUpscaler::DumpUpscalerFrame(vk::CommandBuffer cmdbuf, const DumpSou
         std::fprintf(meta,
                      "{\"session\": %llu, \"frame\": %d, \"motion_size\": [%u, %u], "
                      "\"camera_only\": %s, \"mode\": %u, \"object_valid\": %s, "
-                     "\"proj_z\": %.9g}\n",
+                     "\"proj_z\": %.9g, \"viewport\": [%.9g, %.9g, %.9g, %.9g], "
+                     "\"prev_viewport\": [%.9g, %.9g, %.9g, %.9g]}\n",
                      (unsigned long long)dump_session, dump, s.w, s.h,
                      record.camera_only ? "true" : "false", record.mode,
-                     record.object_valid ? "true" : "false", record.proj_z);
+                     record.object_valid ? "true" : "false", record.proj_z, record.viewport[0],
+                     record.viewport[1], record.viewport[2], record.viewport[3],
+                     record.prev_viewport[0], record.prev_viewport[1], record.prev_viewport[2],
+                     record.prev_viewport[3]);
         std::fclose(meta);
     }
     DumpImages(instance, scheduler, cmdbuf, dump,

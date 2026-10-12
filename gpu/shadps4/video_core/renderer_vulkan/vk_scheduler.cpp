@@ -64,7 +64,10 @@ void Scheduler::BeginRendering(const RenderState& new_state) {
     BB_SPLIT_SCOPE(KRenderPassSwitch);
 #ifdef __APPLE__
     EndRenderingFor(BbPassCensus::Why::TargetChange);
-    BbPassCensus::NoteBegin();
+    // A pass with exactly the state of the pass that ended just before it: a split the targets
+    // did not require (render_state still holds the ended pass's state).
+    BbPassCensus::NoteBegin(has_render_state && render_state == new_state);
+    has_render_state = true;
 #else
     EndRendering();
 #endif
@@ -397,6 +400,22 @@ bool Scheduler::WaitQuiescentForCapture(std::chrono::milliseconds limit, std::st
 }
 #endif
 
+#ifdef __APPLE__
+void Scheduler::WaitLabelsThrough(u64 through) {
+    // The label writer completes labels in issue order: a prefix (bbport_write_order.h).
+    if (completion_labels.CompleteThrough(through)) {
+        return;
+    }
+    BbStats::WaitTimer timer{BbStats::deferred_signals_wait_ns};
+    BbSplit::Scope split_scope{BbSplit::deferred_site};
+    KickRecording(true);
+    while (!completion_labels.CompleteThrough(through)) {
+        BbCopy::WaitAsync();
+        std::this_thread::yield();
+    }
+}
+#endif
+
 void Scheduler::WaitDeferredSignals() {
     const u64 issued = deferred_signals_issued.load(std::memory_order_relaxed);
     if (deferred_signals_done->load(std::memory_order_acquire) >= issued ||
@@ -404,7 +423,9 @@ void Scheduler::WaitDeferredSignals() {
         return;
     }
     BbStats::WaitTimer timer{BbStats::deferred_signals_wait_ns};
-    BB_SPLIT_SCOPE(KDeferred);
+#ifdef __APPLE__
+    BbSplit::Scope split_scope{BbSplit::deferred_site}; // by site (RunWriteData, SignalFlip)
+#endif
     KickRecording(true);
     while (deferred_signals_done->load(std::memory_order_acquire) < issued) {
         // Helps the copy threads the signals wait for.

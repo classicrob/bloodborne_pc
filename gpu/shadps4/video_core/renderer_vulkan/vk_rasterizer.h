@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <optional>
 #include "common/recursive_lock.h"
 #ifdef __APPLE__
 #include <condition_variable>
@@ -195,6 +196,22 @@ public:
 #endif
         scheduler.WaitDeferredSignals();
     }
+#ifdef __APPLE__
+    /// Waits until the first `through` completion labels are written; stage B first submits
+    /// the labels it batched (else it would wait for labels not submitted).
+    void WaitLabelsThrough(u64 through) {
+        if (DrawPipe::OnStageB()) {
+            scheduler.FlushLabels(true);
+        }
+        scheduler.WaitLabelsThrough(through);
+    }
+    [[nodiscard]] u64 LabelsIssued() const noexcept {
+        return scheduler.LabelsIssued();
+    }
+    BbWriteOrder::Barrier& WriteBarrier() noexcept {
+        return scheduler.write_barrier;
+    }
+#endif
     /// Runs `signal` after the guest memory copies issued so far, without waiting here.
     void SignalAfterHostCopies(std::function<void()> signal) {
         scheduler.SignalAfterHostCopies(std::move(signal));
@@ -282,6 +299,10 @@ private:
 
     void UpdateDynamicState(const GraphicsPipeline* pipeline, bool is_indexed) const;
     void UpdateViewportScissorState() const;
+    /// bbport: viewport 0 as UpdateViewportScissorState maps it, in render pixels without the
+    /// upscaler's jitter ({x scale, y scale, x offset, y offset}); nullopt with clipping disabled
+    /// or a zero scale (CameraMotion::OnGBufferViewport).
+    std::optional<std::array<float, 4>> SceneViewport() const;
     void UpdateDepthStencilState() const;
     void UpdatePrimitiveState(bool is_indexed) const;
     void UpdateRasterizationState() const;
