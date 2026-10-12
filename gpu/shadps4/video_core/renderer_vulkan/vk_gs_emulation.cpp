@@ -2,6 +2,7 @@
 // bbport (Apple): renderer side of the geometry-stage emulation (vk_gs_emulation.h,
 // shader_recompiler/gs_emulation.h).
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstdio>
@@ -72,7 +73,37 @@ const char* GsEmulationUnsupported(const AmdGpu::Regs& regs) {
         return "on-chip geometry shaders (ESGS ring in LDS)";
     }
     if (regs.vgt_strmout_config.raw) {
-        return "stream-out";
+        // The modelled subset (GS-DESIGN 11): stream 0 alone, rasterizing stream 0, of points
+        // (the compacted list is the PS4 write order; strips would be written as lists), with the
+        // copy shader's stream-out SGPRs naming exactly the enabled buffers. (Gnm sets SO_EN on
+        // copy shaders whether or not a draw streams out; only a stream-out draw is checked.)
+        const auto& buffers = regs.vgt_strmout_buffer_config;
+        if (regs.vgt_strmout_config.raw != 1) {
+            return "stream-out other than stream 0 alone, rasterizing stream 0";
+        }
+        if (!regs.vs_program.settings.so_en) {
+            return "stream-out with a copy shader without stream-out SGPRs";
+        }
+        if (buffers.stream_0_buf_en == 0 || buffers.stream_1_buf_en || buffers.stream_2_buf_en ||
+            buffers.stream_3_buf_en) {
+            return "stream-out buffers other than some for stream 0";
+        }
+        if (regs.vs_program.settings.so_base_en != buffers.stream_0_buf_en) {
+            return "stream-out with copy shader offsets for other buffers than the enabled ones";
+        }
+        if (!GsEmu::PointOutput(regs.vgt_gs_out_prim_type.GetPrimitiveType(0))) {
+            return "stream-out of geometry shader strips";
+        }
+        const u32* copy = regs.vs_program.Address<const u32*>();
+        if (!copy || !GsEmu::SoTableAtS2(AmdGpu::InputUsageSlots(copy))) {
+            return "stream-out with a copy shader whose stream-out buffer table is not at s[2:3]";
+        }
+        for (u32 buffer = 0; buffer < 4; ++buffer) {
+            if (((buffers.stream_0_buf_en >> buffer) & 1) &&
+                regs.vgt_strmout_buffers[buffer].vtx_stride_dw == 0) {
+                return "stream-out with a zero vertex stride";
+            }
+        }
     }
     if (regs.vgt_gs_instance_cnt.IsEnabled()) {
         return "geometry shader instancing";
@@ -226,7 +257,13 @@ GsEmulationDraw Rasterizer::RecordGsEmulation(const GraphicsPipeline* pipeline,
         RecordGsBarrier(vk::PipelineStageFlagBits2::eComputeShader,
                         vk::AccessFlagBits2::eShaderStorageRead |
                             vk::AccessFlagBits2::eShaderStorageWrite);
-        RecordGsPointCompaction(stages);
+        RecordGsPointCompaction(stages, regs);
+        if (stages.so) {
+            RecordGsStreamOut(stages, regs, stream.Handle(), scratch_offset);
+            if (regs.clipper_control.dx_rasterization_kill) {
+                return {.ended_pass = ended_pass, .skip_draw = true};
+            }
+        }
         RecordGsBarrier(vk::PipelineStageFlagBits2::eVertexShader |
                             vk::PipelineStageFlagBits2::eIndexInput |
                             vk::PipelineStageFlagBits2::eDrawIndirect,
@@ -313,6 +350,8 @@ struct SetupParams {
 
 struct CompactParams {
     u32 invocations, run_length;
+    u32 so_buffers;
+    std::array<u32, 4> so_size_dw, so_stride_dw;
 };
 
 /// A one-binding compute kernel with push descriptors and push constants.
@@ -359,26 +398,88 @@ SetupKernel MakeKernel(vk::Device device, std::span<const u32> spv, u32 num_bind
 }
 } // namespace
 
-void Rasterizer::RecordGsPointCompaction(const GsEmulationStages& stages) {
-    static const SetupKernel kernel = MakeKernel(instance.GetDevice(), GS_POINT_COMPACT_COMP, 1,
+void Rasterizer::RecordGsPointCompaction(const GsEmulationStages& stages,
+                                         const AmdGpu::Regs& regs) {
+    static const SetupKernel kernel = MakeKernel(instance.GetDevice(), GS_POINT_COMPACT_COMP, 2,
                                                  sizeof(CompactParams));
-    const CompactParams params{.invocations = stages.invocations,
-                               .run_length = stages.run_length};
+    CompactParams params{.invocations = stages.invocations, .run_length = stages.run_length};
+    // Binding 1: the stream-out state of a stream-out draw (any valid buffer otherwise).
+    vk::DescriptorBufferInfo so_info{gs_binding.scratch, gs_binding.scratch_offset,
+                                     gs_binding.scratch_size};
+    if (stages.so) {
+        ASSERT_MSG(so_state, "macOS geometry emulation: stream-out draw before any "
+                             "STRMOUT_BUFFER_UPDATE set its buffer offsets");
+        params.so_buffers = stages.so_buffers;
+        for (u32 buffer = 0; buffer < 4; ++buffer) {
+            params.so_size_dw[buffer] = regs.vgt_strmout_buffers[buffer].size_dw;
+            params.so_stride_dw[buffer] = regs.vgt_strmout_buffers[buffer].vtx_stride_dw;
+        }
+        so_info = {so_state->Handle(), 0, SoStateBytes};
+    }
     const auto binding = gs_binding;
     scheduler.Record([=](vk::CommandBuffer cmdbuf) {
-        const vk::DescriptorBufferInfo info{binding.scratch, binding.scratch_offset,
-                                            binding.scratch_size};
-        const vk::WriteDescriptorSet write{.dstBinding = 0,
-                                           .descriptorCount = 1,
-                                           .descriptorType = vk::DescriptorType::eStorageBuffer,
-                                           .pBufferInfo = &info};
+        const std::array<vk::DescriptorBufferInfo, 2> infos{{
+            {binding.scratch, binding.scratch_offset, binding.scratch_size},
+            so_info,
+        }};
+        std::array<vk::WriteDescriptorSet, 2> writes{};
+        for (u32 i = 0; i < writes.size(); ++i) {
+            writes[i] = {.dstBinding = i,
+                         .descriptorCount = 1,
+                         .descriptorType = vk::DescriptorType::eStorageBuffer,
+                         .pBufferInfo = &infos[i]};
+        }
         cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, *kernel.pipeline);
-        cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *kernel.layout, 0, write);
+        cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *kernel.layout, 0, writes);
         cmdbuf.pushConstants(*kernel.layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(params),
                              &params);
         cmdbuf.dispatch(1, 1, 1);
     });
     gs_stats.dispatches.fetch_add(1, std::memory_order_relaxed);
+}
+
+void Rasterizer::RecordGsStreamOut(const GsEmulationStages& stages, const AmdGpu::Regs& regs,
+                                   vk::Buffer scratch, u64 scratch_offset) {
+    // The kernel's stores add the buffer offset as an SGPR offset, which V# bounds do not check
+    // on GCN; the compaction tail keeps every write below VGT_STRMOUT_BUFFER_SIZE. Each bound
+    // stream-out V# (its range is the binding) must hold that whole buffer, or writes would be
+    // dropped (GsEmulation::StreamOutBindingGap).
+    const auto& info = stages.so->GetStage(Shader::SwStage::Compute);
+    for (const auto& desc : info.buffers) {
+        if (desc.stream_out_buffer == Shader::BufferResource::NoStreamOut) {
+            continue;
+        }
+        const u32 buffer = desc.stream_out_buffer;
+        const auto& vgt = regs.vgt_strmout_buffers[buffer];
+        const auto sharp = desc.GetSharp(info);
+        const char* gap = GsEmu::StreamOutBindingGap(sharp, vgt.size_dw, vgt.vtx_stride_dw);
+        ASSERT_MSG(!gap,
+                   "macOS geometry emulation: {} (copy shader {:#x}, buffer {}: V# at {:#x} "
+                   "stride {} x {} records, swizzle {}; VGT size {} dwords, stride {} dwords)",
+                   gap ? gap : "", info.pgm_hash, buffer, sharp.base_address, sharp.stride,
+                   sharp.num_records, sharp.swizzle_enable, vgt.size_dw, vgt.vtx_stride_dw);
+    }
+    // After the compaction: SoDispatch, SoCount and SoOffset* are written. The kernel's guest
+    // stream-out buffers are bound (and tracked as GPU-written) like any compute pass's.
+    RecordGsBarrier(vk::PipelineStageFlagBits2::eComputeShader |
+                        vk::PipelineStageFlagBits2::eDrawIndirect,
+                    vk::AccessFlagBits2::eShaderStorageRead |
+                        vk::AccessFlagBits2::eIndirectCommandRead);
+    RecordGsDispatch(*stages.so, 0, 0, scratch, scratch_offset + GsEmu::SoDispatch * 4);
+    CheckStreamOutOverflow();
+}
+
+void Rasterizer::CheckStreamOutOverflow() {
+    const auto* state = reinterpret_cast<const volatile u32*>(so_state->mapped_data.data());
+    const u32 draws = state[SoOverflowDraws];
+    if (draws != so_overflow_reported) {
+        // PS4 behaviour (the vertices that do not fit are dropped), reported, not silent.
+        LOG_WARNING(Render_Vulkan,
+                    "macOS geometry emulation: {} stream-out draw(s) overflowed their buffers, "
+                    "{} vertices dropped in total (as on the PS4)",
+                    draws, u32(state[SoOverflowVertices]));
+        so_overflow_reported = draws;
+    }
 }
 
 void Rasterizer::CheckGsEmulationErrors() {
@@ -529,7 +630,13 @@ GsEmulationDraw Rasterizer::RecordGsEmulationIndirect(const GraphicsPipeline* pi
         RecordGsBarrier(vk::PipelineStageFlagBits2::eComputeShader,
                         vk::AccessFlagBits2::eShaderStorageRead |
                             vk::AccessFlagBits2::eShaderStorageWrite);
-        RecordGsPointCompaction(stages);
+        RecordGsPointCompaction(stages, regs);
+        if (stages.so) {
+            RecordGsStreamOut(stages, regs, scratch, *scratch_offset);
+            if (regs.clipper_control.dx_rasterization_kill) {
+                return {.ended_pass = ended_pass, .skip_draw = true};
+            }
+        }
     }
     RecordGsBarrier(vk::PipelineStageFlagBits2::eVertexShader |
                         vk::PipelineStageFlagBits2::eIndexInput |

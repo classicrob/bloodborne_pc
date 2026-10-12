@@ -252,7 +252,41 @@ the two modes never reorder labels. The switch is logged as
 `Labels at GPU completion: ON|OFF at <UTC time> (switched; ...)`. One run can therefore alternate
 the modes, say every 60 s, and compare its halves under the same load, cache and location.
 
-## Flip publication at GPU retirement (`FlipAtGpuRetire`, toggle bit 60)
+### In-order WRITE_DATA: ME-time order (default; toggle bit 63 restores the old wait)
+
+Before this change, a WRITE_DATA run in order on the draw recording thread (RunWriteData) first
+waited for **every earlier deferred signal**. With labels at GPU completion that is every earlier
+EOP/EOS/RELEASE_MEM label, i.e. GPU completion. That rule is stricter than the PS4: there the CP
+writes WRITE_DATA when it parses it, ahead of the pipeline, and earlier end-of-pipe labels may land
+after it. In the async A/B the stall was 20-34 ms per frame of stage B.
+
+Now, with labels at GPU completion, a WRITE_DATA waits for what is ordered before it at ME time:
+- the host copies (as before);
+- the recorder-side writes (WaitRecorderSignals);
+- **and the labels behind any WAIT_REG_MEM that stage A met early** from a pending fence value
+  (PendingFenceValue). On the PS4 that WAIT would have blocked the CP until the label landed, so a
+  later WRITE_DATA must not pass it. The guest has such pairs (EOS/EOP L=1 then WAIT_REG_MEM L==1,
+  0x26b08e0 / 0x26b09e0, Astra-2's deferred-signal audit).
+  - The dependency is taken **at the WAIT's position in the stream**: stage A puts an in-order
+    marker there, which runs after the producing EOP/EOS has issued its label. A value sampled on
+    stage A at parse could predate that label (Astra-2, Sol-2).
+  - It counts **completion labels only**. Their one writer completes them in issue order, so "N
+    written" is a prefix. The mixed deferred-signal count is not a prefix: a later recorder write
+    can complete first.
+  - The barrier belongs to the scheduler (gpu/shim/bbport_write_order.h) and only rises, so a
+    WRITE_DATA may wait for a later barrier than its own position needed: longer, never shorter.
+  - Stage B submits its batched labels before waiting.
+  - Tests (test_label_check, through a real draw pipe): stage B held while EOP, the marker, a
+    later recorder write and WRITE_DATA are committed. The recorder write completes first and the
+    label stays pending, and WRITE_DATA waits. Without a WAIT it does not. A negative control
+    shows that a marker taken before its producer lets WRITE_DATA through.
+
+A WRITE_DATA before a later completion label stays visible first: it is written when stage B runs
+it, the label only at GPU completion. Toggle bit 63 (WriteDataAfterLabels) restores the old wait
+live, for the A/B; with labels at submit (bit 59) nothing changes. The parse split charges these
+waits to their own kinds, "deferred signals before WRITE_DATA" and "deferred signals before a flip".
+
+## Flip publication at GPU retirement (the default on Apple)
 
 A flip tells the guest that its previous display buffer may be reused. That means the flip
 status (count, flip_arg, current buffer, pending counters), the flip events, and the previous
@@ -265,13 +299,23 @@ not guest memory. So that copy's GPU retirement is the exact point. The moment t
 actually on screen matters only for pacing, which vblank events model, and MoltenVK does not
 report it reliably.
 
-With bit 60 of `BB_TOGGLE_FILE` (or `BB_FLIP_AT_GPU_RETIRE=1` for the whole run), flips are
-published by `BbFlip::Publisher` (`gpu/shim/bbport_flip_publish.h`, test `flip-publish-test`):
+Flips are published at that point by default (`gpu/shim/bbport_flip_mode.h`). For diagnosis:
+- Bit 60 of `BB_TOGGLE_FILE` (`FlipAtEnqueue`, live) publishes them when enqueued, the old
+  behaviour.
+- `BB_FLIP_AT_GPU_RETIRE=0` does the same for the whole run, and `=1` keeps them at retirement
+  for the whole run. Either ignores bit 60. Any other value stops.
+- The startup line `Flips: ...` names the mode.
+
+Note the inversion: before this became the default, bit 60 set meant publishing at
+retirement. Masks from those A/Bs now mean the opposite.
+
+`BbFlip::Publisher` (`gpu/shim/bbport_flip_publish.h`, test `flip-publish-test`) does the
+publishing:
 - Each flip carries its frame copy's ready_tick, read in SubmitFlipInternal while the frame is
   still exclusively ours. A blank frame carries its own copy submission's tick.
 - It also carries the port generation, taken in SubmitFlip together with the pending count.
 - The publisher's thread waits for each tick in flip order, then publishes.
-- With the bit cleared, flips publish at once, unless publications are still queued. Then they
+- In the enqueue mode, flips publish at once, unless publications are still queued. Then they
   queue behind them, so order holds across a live switch.
 - The port's flip lifecycle is shared code (`core/libraries/videoout/port_lifecycle.h`, test
   `videoout-lifecycle-test`):

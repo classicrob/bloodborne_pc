@@ -3,6 +3,13 @@
 #define NDEBUG
 #define BB_RESTORE_TEST_ASSERTS
 #endif
+#ifdef __APPLE__
+#include <fstream>
+#include <sstream>
+#include <string>
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -232,11 +239,15 @@ int main() {
     regs.vgt_gs_max_vert_out = 3;
     regs.vgt_gs_vert_itemsize[0] = 4;
     regs.vgt_gs_out_prim_type.outprim_type = AmdGpu::GsOutputPrimitiveType::TriangleStrip;
+    // The value read through the user-data V# (s[4:7]) is exported, not stored: a GS copy shader
+    // only reads the GSVS ring, exports and stream-outs, and the copy-VS role stops on any other
+    // memory write (ring_access_elimination.cpp, CopyShaderAccesses). Position 0 is also ESGS
+    // record dwords 0-3 for the ES role (ring item size 4).
     GcnAsm::Code shared_shader;
     shared_shader.SBufferLoad(1, 12, 4, true, 0);
     shared_shader.SWaitcntAll();
     shared_shader.VMov(4, 12);
-    shared_shader.Mubuf(28, {.vdata=4, .srsrc=8});
+    shared_shader.Exp(12, 0xF, true, 4, 4, 4, 4);
     shared_shader.SEndpgm();
     std::array<u32, 16> es_ud{}, copy_ud{};
     std::memcpy(es_ud.data() + 4, table.data(), sizeof(table));
@@ -352,6 +363,62 @@ int main() {
     assert(std::get<1>(select(first_fetch)) == std::get<1>(first));
     assert(!fault_worker.failed && fault_worker.stages.size() == 1);
     assert(Shader::Info::num_ud_snapshots == 1);
+
+#ifdef __APPLE__
+    // A worker meeting a descriptor with no number conversion abandons the preparation: no stage
+    // is published, and the flag, snapshot count and recovery point are restored. With the
+    // descriptor valid again the worker hits. The GPU thread's own selection of the bad
+    // descriptor still stops (a child process).
+    {
+        const auto saved = table[0];
+        table[0].num_format = 6; // with Format32_32_32_32: no conversion here (the hunts' stop)
+        Vulkan::PrepWorker reject_worker;
+        selection.worker = &reject_worker;
+        const auto rejections = Shader::speculative_rejections.load();
+        const u32 snapshots = Shader::Info::num_ud_snapshots;
+        select(first_fetch);
+        assert(reject_worker.failed && reject_worker.stages.empty());
+        assert(Shader::speculative_rejections.load() == rejections + 1);
+        assert(!Shader::speculative_selection);
+        assert(runtime_fault_recover == nullptr);
+        assert(Shader::Info::num_ud_snapshots == snapshots);
+        table[0] = saved;
+        reject_worker.failed = false;
+        assert(std::get<1>(select(first_fetch)) == std::get<1>(first));
+        assert(!reject_worker.failed && reject_worker.stages.size() == 1);
+        selection.worker = nullptr;
+        table[0].num_format = 6;
+        // The child's output goes to a file: the stop must be the conversion stop (exit 23 with
+        // its message), not some other failure of a process forked after Vulkan started threads.
+        char log_path[] = "/tmp/permutation-stop-XXXXXX";
+        const int log_fd = mkstemp(log_path);
+        assert(log_fd >= 0);
+        std::fflush(nullptr);
+        const pid_t child = fork();
+        assert(child >= 0);
+        if (child == 0) {
+            dup2(log_fd, STDOUT_FILENO);
+            dup2(log_fd, STDERR_FILENO);
+            select(first_fetch); // the GPU thread's selection: stops
+            std::_Exit(0);
+        }
+        close(log_fd);
+        int status = 0;
+        const pid_t waited = waitpid(child, &status, 0);
+        std::stringstream child_log;
+        child_log << std::ifstream(log_path).rdbuf();
+        unlink(log_path);
+        const std::string text = child_log.str();
+        if (waited != child || !WIFEXITED(status) || WEXITSTATUS(status) != 23 ||
+            text.find("which this backend cannot convert") == std::string::npos) {
+            std::fprintf(stderr, "GPU-thread control: wait %d, status %#x, log:\n%s\n", int(waited),
+                         status, text.c_str());
+            std::abort();
+        }
+        table[0] = saved;
+        std::puts("Worker selection abandons an unconvertible descriptor; GPU thread stops PASS");
+    }
+#endif
 
     // On the direct path, try the last-used (wrong-layout) permutation first. Its missing
     // table must reject only that candidate, despite a partial write to the scratch flat

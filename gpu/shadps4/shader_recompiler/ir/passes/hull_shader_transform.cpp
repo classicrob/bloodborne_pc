@@ -1,7 +1,11 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <bit>
+#include <optional>
 #include <unordered_map>
+#include <vector>
 #include "common/assert.h"
 #include "shader_recompiler/info.h"
 #include "shader_recompiler/ir/attribute.h"
@@ -367,8 +371,243 @@ static IR::F32 ReadTessControlPointAttribute(IR::U32 addr, const u32 stride, IR:
 
 } // namespace
 
+/// The BFEs on V1 (packed patch id within the VGT and output control point id): the patch id
+/// within the VGT is 0 for attribute addressing, and the control point id is InvocationId (0 in a
+/// passthrough hull, whose GCN shader runs one thread per patch).
+static void ReplaceHullInvocationInfo(IR::Program& program, const RuntimeInfo& runtime_info) {
+    if (program.info.sw_stage != SwStage::TessellationControl) {
+        return;
+    }
+    // Replace the BFEs on V1 (packed with patch id within VGT and output cp id)
+    for (IR::Block* block : program.blocks) {
+        for (auto it = block->Instructions().begin(); it != block->Instructions().end(); it++) {
+            IR::Inst& inst = *it;
+            if (M_BITFIELDUEXTRACT(
+                    M_GETATTRIBUTEU32(MatchAttribute(IR::Attribute::PackedHullInvocationInfo),
+                                      MatchIgnore()),
+                    MatchU32(0), MatchU32(8))
+                    .Match(IR::Value{&inst})) {
+                IR::IREmitter emit(*block, it);
+                // This is the patch id within the VGT, not the actual PrimitiveId
+                // in the draw
+                IR::Value replacement(0u);
+                inst.ReplaceUsesWithAndRemove(replacement);
+            } else if (M_BITFIELDUEXTRACT(
+                           M_GETATTRIBUTEU32(
+                               MatchAttribute(IR::Attribute::PackedHullInvocationInfo),
+                               MatchIgnore()),
+                           MatchU32(8), MatchU32(5))
+                           .Match(IR::Value{&inst})) {
+                IR::IREmitter ir(*block, it);
+                IR::Value replacement;
+                if (runtime_info.sw.tcs.IsPassthrough()) {
+                    // Deal with annoying pattern in BB where InvocationID use makes no
+                    // sense (in addr calculation for patchconst or tess factor write)
+                    replacement = ir.Imm32(0);
+                } else {
+                    replacement = ir.GetAttributeU32(IR::Attribute::InvocationId);
+                }
+                inst.ReplaceUsesWithAndRemove(replacement);
+            }
+        }
+    }
+}
+
+/// Dwords a StoreBufferU32* stores (StoreBufferMaskedU32 sits between U32 and U32x2 in the opcode
+/// list, so the opcodes are not consecutive).
+static u32 StoreDwords(IR::Opcode op) {
+    switch (op) {
+    case IR::Opcode::StoreBufferU32:
+        return 1;
+    case IR::Opcode::StoreBufferU32x2:
+        return 2;
+    case IR::Opcode::StoreBufferU32x3:
+        return 3;
+    case IR::Opcode::StoreBufferU32x4:
+        return 4;
+    default:
+        UNREACHABLE_MSG("tess factor store {}", IR::NameOf(op));
+    }
+}
+
+#ifdef __APPLE__
+/// bbport: the value of a hull's integer expression in GCN thread `invocation` of a patch, when it
+/// is built only from immediates, InvocationId and simple integer operations; nullopt otherwise.
+static std::optional<u32> EvalPerInvocation(const IR::Value& value, u32 invocation, int depth = 0) {
+    if (value.IsImmediate()) {
+        return value.Type() == IR::Type::U32 ? std::optional<u32>{value.U32()} : std::nullopt;
+    }
+    const IR::Inst* inst = value.TryInst();
+    if (!inst || depth > 32) {
+        return std::nullopt;
+    }
+    if (inst->GetOpcode() == IR::Opcode::GetAttributeU32) {
+        return inst->Arg(0).Attribute() == IR::Attribute::InvocationId
+                   ? std::optional<u32>{invocation}
+                   : std::nullopt;
+    }
+    const auto arg = [&](size_t i) { return EvalPerInvocation(inst->Arg(i), invocation, depth + 1); };
+    const auto binary = [&](auto op) -> std::optional<u32> {
+        const auto a = arg(0), b = arg(1);
+        return a && b ? std::optional<u32>{op(*a, *b)} : std::nullopt;
+    };
+    switch (inst->GetOpcode()) {
+    case IR::Opcode::IAdd32:
+        return binary([](u32 a, u32 b) { return a + b; });
+    case IR::Opcode::ISub32:
+        return binary([](u32 a, u32 b) { return a - b; });
+    case IR::Opcode::IMul32:
+        return binary([](u32 a, u32 b) { return a * b; });
+    case IR::Opcode::ShiftLeftLogical32:
+    case IR::Opcode::ShiftRightLogical32: {
+        const auto a = arg(0), b = arg(1);
+        if (!a || !b || *b >= 32) {
+            return std::nullopt; // not a defined shift
+        }
+        return inst->GetOpcode() == IR::Opcode::ShiftLeftLogical32 ? *a << *b : *a >> *b;
+    }
+    case IR::Opcode::BitwiseAnd32:
+        return binary([](u32 a, u32 b) { return a & b; });
+    case IR::Opcode::BitwiseOr32:
+        return binary([](u32 a, u32 b) { return a | b; });
+    case IR::Opcode::BitFieldUExtract: {
+        const auto base = arg(0), offset = arg(1), count = arg(2);
+        if (!base || !offset || !count || *offset >= 32 || *count > 32 - *offset) {
+            return std::nullopt;
+        }
+        if (*count == 0) {
+            return 0u;
+        }
+        return (*base >> *offset) & (*count == 32 ? ~0u : (1u << *count) - 1);
+    }
+    default:
+        return std::nullopt;
+    }
+}
+
+/// bbport: tess factor stores at offsets that depend on the GCN thread (the control point), as in
+/// GXFfxtessellateTracer*: each of its 2 threads stores 1.0 at cp * 4 + k * 4, k < 6, so thread 1
+/// also writes factor 0 of the next patch. Accepted only in that shape: every dword of every tess
+/// factor store, in every thread of the patch, writes one immediate value to a whole, aligned
+/// factor of its own patch (index < n) or of the next one (n <= index < 2n), and thread 0 (always
+/// launched) alone writes all n factors of its patch. Then every factor of every patch ends with
+/// that value whatever the order of the stores (a store into the next patch writes the value that
+/// patch writes itself), and the stores become that value for each factor. Anything else keeps the
+/// loud "unhandled pattern in tess factor store", with the reason.
+static void LowerUniformTessFactorStores(IR::Program& program, const RuntimeInfo& runtime_info) {
+    std::vector<IR::Inst*> stores;
+    bool dynamic = false;
+    for (IR::Block* block : program.blocks) {
+        for (IR::Inst& inst : block->Instructions()) {
+            const auto op = inst.GetOpcode();
+            if (op != IR::Opcode::StoreBufferU32 && op != IR::Opcode::StoreBufferU32x2 &&
+                op != IR::Opcode::StoreBufferU32x3 && op != IR::Opcode::StoreBufferU32x4) {
+                continue;
+            }
+            if (!M_GETATTRIBUTEU32(MatchAttribute(IR::Attribute::TessFactorsBufferBase),
+                                   MatchIgnore())
+                     .Match(IR::GetBufferSOffsetArg(&inst))) {
+                continue;
+            }
+            stores.push_back(&inst);
+            IR::Value voffset;
+            dynamic |= !M_COMPOSITECONSTRUCTU32X3(MatchU32(0), MatchImm(voffset), MatchIgnore())
+                            .Match(inst.Arg(IR::StoreBufferArgs::Address));
+        }
+    }
+    if (!dynamic) {
+        return; // every offset is constant: the per-store lowering below handles them
+    }
+    const u32 factors = [&] {
+        switch (runtime_info.sw.tcs.tess_type) {
+        case AmdGpu::TessellationType::Isoline:
+            return 2u;
+        case AmdGpu::TessellationType::Triangle:
+            return 4u;
+        case AmdGpu::TessellationType::Quad:
+            return 6u;
+        default:
+            UNREACHABLE_MSG("unhandled pattern in tess factor store (tessellation type {})",
+                            u32(runtime_info.sw.tcs.tess_type));
+        }
+    }();
+    const auto immediate_bits = [](const IR::Value& v) -> std::optional<u32> {
+        IR::Value x = v;
+        if (const IR::Inst* inst = x.TryInst(); inst && inst->GetOpcode() == IR::Opcode::BitCastU32F32) {
+            x = inst->Arg(0);
+        }
+        if (!x.IsImmediate()) {
+            return std::nullopt;
+        }
+        return x.Type() == IR::Type::F32 ? std::bit_cast<u32>(x.F32()) : x.U32();
+    };
+    IR::Block* entry = program.blocks.front();
+    std::optional<u32> value;
+    std::vector<bool> covered(factors, false);
+    for (IR::Inst* inst : stores) {
+        ASSERT_MSG(inst->GetParent() == entry,
+                   "unhandled pattern in tess factor store (dynamic offset outside the entry block)");
+        const IR::Inst* address = inst->Arg(IR::StoreBufferArgs::Address).TryInst();
+        ASSERT_MSG(address && address->GetOpcode() == IR::Opcode::CompositeConstructU32x3 &&
+                       address->Arg(0).IsImmediate() && address->Arg(0).U32() == 0,
+                   "unhandled pattern in tess factor store (indexed address)");
+        const u32 num_dwords = StoreDwords(inst->GetOpcode());
+        const IR::Value data = inst->Arg(IR::StoreBufferArgs::Data);
+        const IR::Inst* composite = num_dwords > 1 ? data.TryInst() : nullptr;
+        ASSERT_MSG(num_dwords == 1 ||
+                       (composite &&
+                        (composite->GetOpcode() == IR::Opcode::CompositeConstructU32x2 ||
+                         composite->GetOpcode() == IR::Opcode::CompositeConstructU32x3 ||
+                         composite->GetOpcode() == IR::Opcode::CompositeConstructU32x4) &&
+                        composite->NumArgs() == num_dwords),
+                   "unhandled pattern in tess factor store (multi-dword data of another shape)");
+        const u64 inst_offset = inst->Flags<IR::BufferInstInfo>().inst_offset.Value();
+        const u32 threads = std::max(runtime_info.sw.tcs.num_threads, 1u);
+        for (u32 i = 0; i < num_dwords; ++i) {
+            const auto bits = immediate_bits(num_dwords == 1 ? data : composite->Arg(i));
+            ASSERT_MSG(bits && (!value || *value == *bits),
+                       "unhandled pattern in tess factor store (dynamic offset with values that "
+                       "are not one immediate)");
+            value = bits;
+            for (u32 thread = 0; thread < threads; ++thread) {
+                const auto offset = EvalPerInvocation(address->Arg(1), thread);
+                ASSERT_MSG(offset, "unhandled pattern in tess factor store (offset not computable "
+                                   "per control point)");
+                const u64 byte = u64(*offset) + inst_offset + u64(i) * 4;
+                ASSERT_MSG(byte % 4 == 0 && byte / 4 < 2 * u64(factors),
+                           "unhandled pattern in tess factor store (control point {} writes byte "
+                           "{}: not a whole factor of its patch or the next)",
+                           thread, byte);
+                if (thread == 0 && byte / 4 < factors) {
+                    covered[byte / 4] = true;
+                }
+            }
+        }
+    }
+    ASSERT_MSG(std::ranges::all_of(covered, [](bool c) { return c; }),
+               "unhandled pattern in tess factor store (control point 0 does not write every "
+               "factor)");
+    IR::IREmitter ir{*entry, IR::Block::InstructionList::s_iterator_to(*stores.front())};
+    const IR::F32 factor_value = ir.Imm32(std::bit_cast<f32>(*value));
+    for (u32 j = 0; j < factors; ++j) {
+        const bool interior_u =
+            runtime_info.sw.tcs.tess_type == AmdGpu::TessellationType::Triangle && j == 3;
+        ir.SetPatch(interior_u ? IR::Patch::TessellationLodInteriorU : IR::PatchFactor(j),
+                    factor_value);
+    }
+    for (IR::Inst* inst : stores) {
+        inst->Invalidate();
+    }
+}
+#endif
+
 void HullShaderTransform(IR::Program& program, const RuntimeInfo& runtime_info) {
     const Info& info = program.info;
+#ifdef __APPLE__
+    // bbport: tess factor stores whose offsets still depend on the control point (after
+    // TessellationPreprocess resolved the V1 fields) are lowered here, or stop with the reason.
+    LowerUniformTessFactorStores(program, runtime_info);
+#endif
 
     for (IR::Block* block : program.blocks) {
         for (IR::Inst& inst : block->Instructions()) {
@@ -397,7 +636,7 @@ void HullShaderTransform(IR::Program& program, const RuntimeInfo& runtime_info) 
                 const u32 gcn_factor_idx = (info.inst_offset.Value() + voffset.U32()) >> 2;
                 const IR::Value data = inst.Arg(IR::StoreBufferArgs::Data);
 
-                const u32 num_dwords = u32(opcode) - u32(IR::Opcode::StoreBufferU32) + 1;
+                const u32 num_dwords = StoreDwords(opcode);
 
                 const auto GetValue = [&](IR::Value data) -> IR::F32 {
                     if (auto* inst = data.TryInst();
@@ -718,41 +957,7 @@ void TessellationPreprocess(IR::Program& program, RuntimeInfo& runtime_info) {
     // These pattern matching are neccessary for now unless we support dynamic indexing of
     // PatchConst attributes and tess factors. PatchConst should be easy, turn those into a single
     // vec4 array like in/out attrs. Not sure about tess factors.
-    if (info.sw_stage == SwStage::TessellationControl) {
-        // Replace the BFEs on V1 (packed with patch id within VGT and output cp id)
-        for (IR::Block* block : program.blocks) {
-            for (auto it = block->Instructions().begin(); it != block->Instructions().end(); it++) {
-                IR::Inst& inst = *it;
-                if (M_BITFIELDUEXTRACT(
-                        M_GETATTRIBUTEU32(MatchAttribute(IR::Attribute::PackedHullInvocationInfo),
-                                          MatchIgnore()),
-                        MatchU32(0), MatchU32(8))
-                        .Match(IR::Value{&inst})) {
-                    IR::IREmitter emit(*block, it);
-                    // This is the patch id within the VGT, not the actual PrimitiveId
-                    // in the draw
-                    IR::Value replacement(0u);
-                    inst.ReplaceUsesWithAndRemove(replacement);
-                } else if (M_BITFIELDUEXTRACT(
-                               M_GETATTRIBUTEU32(
-                                   MatchAttribute(IR::Attribute::PackedHullInvocationInfo),
-                                   MatchIgnore()),
-                               MatchU32(8), MatchU32(5))
-                               .Match(IR::Value{&inst})) {
-                    IR::IREmitter ir(*block, it);
-                    IR::Value replacement;
-                    if (runtime_info.sw.tcs.IsPassthrough()) {
-                        // Deal with annoying pattern in BB where InvocationID use makes no
-                        // sense (in addr calculation for patchconst or tess factor write)
-                        replacement = ir.Imm32(0);
-                    } else {
-                        replacement = ir.GetAttributeU32(IR::Attribute::InvocationId);
-                    }
-                    inst.ReplaceUsesWithAndRemove(replacement);
-                }
-            }
-        }
-    }
+    ReplaceHullInvocationInfo(program, runtime_info);
 
     ConstantPropagationPass(program.post_order_blocks);
 }

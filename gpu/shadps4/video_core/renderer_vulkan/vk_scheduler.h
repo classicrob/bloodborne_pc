@@ -20,12 +20,16 @@
 #ifdef __APPLE__
 #include "bbport_deferred_counts.h"
 #include "bbport_label_sequencer.h"
+#include "bbport_write_order.h"
 #endif
 #include <thread>
 #include <queue>
 
 #include "bbport_toggles.h"
 #include "common/assert.h"
+#ifdef __APPLE__
+#include "bbport_pass_census.h"
+#endif
 #include "common/interval_set.h"
 #include "common/unique_function.h"
 #include "video_core/amdgpu/regs_color.h"
@@ -733,7 +737,14 @@ public:
     void BeginRendering(const RenderState& new_state);
 
     /// Ends current rendering scope.
-    void EndRendering();
+    [[gnu::noinline]] void EndRendering();
+#ifdef __APPLE__
+    /// EndRendering, counted by its cause (bbport_pass_census.h) rather than by caller.
+    void EndRenderingFor(BbPassCensus::Why why) {
+        end_reason = why;
+        EndRendering();
+    }
+#endif
 
     /// Sets a function to be called on every scheduler submission.
     void SetSubmitCallback(SubmitFunc&& on_submit) {
@@ -897,6 +908,13 @@ public:
     /// the write cannot overtake an earlier fence. Otherwise the guest, seeing the later value,
     /// may free memory the earlier fence then writes into (corrupted heap, guest fault).
     void WaitDeferredSignals();
+#ifdef __APPLE__
+    /// Waits until the first `through` completion labels are written (their writer completes
+    /// them in issue order). Labels batched by stage B must be submitted first (Rasterizer).
+    void WaitLabelsThrough(u64 through);
+    /// In-order WRITE_DATA's barrier for WAIT_REG_MEMs met early (bbport_write_order.h).
+    BbWriteOrder::Barrier write_barrier;
+#endif
 
     /// Whether a render pass with exactly this state is open.
     [[nodiscard]] bool IsRendering() const {
@@ -1036,6 +1054,10 @@ private:
     std::atomic<size_t> queued_chunks{0}; ///< recorder_queue.size() for lock-free polling
     bool recorder_sleeping = false; ///< waiting on recorder_cv (guarded by recorder_mutex)
     bool direct_mode = false; ///< the command buffer is recorded on the caller's thread
+#ifdef __APPLE__
+    BbPassCensus::Why end_reason = BbPassCensus::Why::Other; ///< for the next EndRendering
+    bool has_render_state = false; ///< a pass has begun (render_state is a real pass's state)
+#endif
     u64 host_copies_issued = 0;
     std::atomic<u64> host_copies_done{0};
     /// WaitBeforeNextSubmit, consumed by SubmitExecution (both under submit_mutex).
@@ -1046,6 +1068,16 @@ private:
     // bbport: whether recorder_thread runs, read on every Record(). std::jthread::joinable()
     // compares thread ids, which on Windows (libc++ over winpthreads) costs two system calls.
     bool recording_threaded{false};
+#ifdef __APPLE__
+public:
+    /// The draw scheduler (Rasterizer's): its submissions are counted by reason (parse split).
+    void EnableFlushCensus() {
+        flush_census = true;
+    }
+
+private:
+    bool flush_census = false;
+#endif
     std::jthread recorder_thread;
 #ifdef __APPLE__
     /// SignalAtGpuCompletion's writer: labels only, in issue order (BbLabels::Sequencer), each

@@ -22,6 +22,10 @@
 #include "bbport_label_mode.h"
 #include "bbport_label_store.h"
 #include "bbport_parse_split.h"
+#include "bbport_write_order.h"
+#include "video_core/renderer_vulkan/vk_draw_pipe.h"
+#include "bbport_compute_sh.h"
+#include "bbport_frame_marks.h"
 #include "bbport_label_sequencer.h"
 
 namespace {
@@ -43,6 +47,8 @@ std::uint64_t Addr(const void* p) {
     return reinterpret_cast<std::uint64_t>(p);
 }
 } // namespace
+
+static int owner_origin_test = 0;
 
 int main() {
     using namespace BbLabelCheck;
@@ -287,8 +293,24 @@ int main() {
                same.selected_differs && // current 9 (copy_b) vs the read of copy_a
                    Describe(same).find("DIFFERS") != std::string::npos &&
                    !reused.selected_differs && reused.differing == 1 && // only 7 (copy_a) differs
-                   Describe(reused).find("matches the read; 1 other held copy, 1 of them differ") !=
+                   Describe(reused).find("matches the read; 1 other held region, 1 of them differ") !=
                        std::string::npos);
+        // A region not copied at submit has no copy: located, never compared (Verifier).
+        const std::vector<HeldRegion> uncopied_held = {
+            {region, 16, 7, copy_a},
+            {region, 16, 9, nullptr}, // unreadable at submit
+        };
+        const Result uncopied_current = Classify(region + 4, 4, copy_b + 4, uncopied_held, pools, 9);
+        const Result uncopied_other = Classify(region + 4, 4, copy_a + 4, uncopied_held, pools, 7);
+        Expect("  ... an uncopied region is never compared, and is named as such",
+               uncopied_current.where == Where::Inside && uncopied_current.selected_uncopied &&
+                   !uncopied_current.selected_differs && uncopied_current.uncopied == 1 &&
+                   uncopied_current.differing == 1 && // copy_a vs the read of copy_b
+                   Describe(uncopied_current).find("not copied at submit (unreadable then): not "
+                                                   "compared") != std::string::npos &&
+                   !uncopied_other.selected_uncopied && !uncopied_other.differing &&
+                   Describe(uncopied_other).find("matches the read; 1 other held region, 0 of "
+                                                 "them differ, 1 not copied") != std::string::npos);
         // A containing region is never renamed by a straddling one, in either order (Astra-2).
         bool kept = true;
         for (const std::uint64_t cur : {std::uint64_t{7}, std::uint64_t{0}}) {
@@ -366,6 +388,95 @@ int main() {
         Expect("  ... the stop's latest-read text comes from the observation, not a re-read",
                text.find("latest instrumented read: ud table") != std::string::npos &&
                    text.find("DIFFERS") != std::string::npos);
+        // The stop names the guest mapping holding the read (a mapping-table query, faked here).
+        region_lookup.store([](std::uint64_t, std::uint64_t& lo, std::uint64_t& hi, bool& mapped,
+                               long long& aliases) {
+            lo = 0x7043000000;
+            hi = 0x704b000000;
+            mapped = true;
+            aliases = 1;
+            return true;
+        });
+        last.flips_parsed = 7;
+        last.pointer = {true, true, 0x7039500100, 41, 5};
+        last.pointer_high = last.pointer;
+        last.dump = {true, 0x70437a7200, 0x100, 40, 6};
+        const std::string named = LastRead();
+        last.pointer_high = {true, true, 0x7039500180, 41, 6};
+        last.dump = {true, 0x70437a7200, 0x100, 40, 9}; // recorded after the read's sample
+        const std::string split = LastRead();
+        last.pointer_high = last.pointer;
+        last.dump = {true, 0x70437a7200, 0x100, 40, 6};
+        last.pointer = {true, true, 0x7039500200, 0, 7, 3};
+        last.pointer_high = last.pointer;
+        const std::string from_compute = LastRead();
+        last.pointer = {true, false, 0, 0, 0};
+        last.pointer_high = last.pointer;
+        last.dump = {};
+        const std::string unwritten = LastRead();
+        last.pointer = {};
+        const std::string elsewhere = LastRead();
+        region_lookup.store(nullptr);
+        Expect("  ... the stop says which SET_SH_REG last wrote the table pointer and how long ago, "
+               "and any DUMP_CONST_RAM of ours over the bytes",
+               named.find("(low word) was last written by a SET_SH_REG of the graphics stream "
+                          "at 0x7039500100 (submission 41), 2 flip packet(s) before this read "
+                          "(an EARLIER frame") != std::string::npos &&
+                   from_compute.find("a SET_SH_REG of compute queue 3 at") != std::string::npos &&
+                   named.find("went to [0x70437a7200, +256) (submission 40), 1 flip "
+                              "packet(s) before") != std::string::npos &&
+                   named.find("high word") == std::string::npos &&
+                   split.find("high word was written separately, by a SET_SH_REG of the "
+                              "graphics stream at 0x7039500180") != std::string::npos &&
+                   split.find("after this read's frame sample") != std::string::npos &&
+                   named.find("retained state is a candidate, not by itself a defect)") !=
+                       std::string::npos &&
+                   unwritten.find("not written by any tracked SET_SH_REG since the check "
+                                  "started") != std::string::npos &&
+                   elsewhere.find("not a tracked graphics user-data register") !=
+                       std::string::npos);
+        Expect("  ... the stop names the guest mapping holding the read and its other views",
+               named.find("guest mapping [0x7043000000, 0x704b000000) (131072 KiB), 1 other") !=
+                   std::string::npos);
+        {
+            // A flat-buffer stop: every user-data word's writer and the pointer pairs' mappings.
+            static const std::uint32_t ud[4] = {0x10, 0x0, 0x437a72a0, 0x70}; // s[0:1] not an address
+            Register(
+                nullptr,
+                [](void*, const void* word, std::uint64_t, std::uint64_t, PointerOrigin& low,
+                   PointerOrigin& high, DumpOrigin&, std::uint64_t& flips_now) {
+                    const auto index =
+                        static_cast<std::uint64_t>(static_cast<const std::uint32_t*>(word) - ud);
+                    flips_now = 9;
+                    low = {true, index != 1, 0x7039500000 + index * 0x10, 50, 9 - index};
+                    high = low;
+                },
+                &owner_origin_test);
+            region_lookup.store([](std::uint64_t, std::uint64_t& lo, std::uint64_t& hi,
+                                   bool& mapped, long long& aliases) {
+                lo = 0x7043400040;
+                hi = 0x704d400040;
+                mapped = true;
+                aliases = 0;
+                return true;
+            });
+            const std::string origins = UserDataOrigins(ud, 4);
+            region_lookup.store(nullptr);
+            Unregister(&owner_origin_test);
+            Expect("  ... a flat-buffer stop names each user-data word's writer and where pointer "
+                   "pairs lie",
+                   origins.find("s0 gfx 0x7039500000 (submission 50) 0 flip(s) ago;") !=
+                           std::string::npos &&
+                       origins.find("s1 none tracked;") != std::string::npos &&
+                       origins.find("s3 gfx 0x7039500030 (submission 50) 3 flip(s) ago;") !=
+                           std::string::npos &&
+                       origins.find("s[2:3] 0x70437a72a0 lies in guest mapping [0x7043400040, "
+                                    "0x704d400040)") != std::string::npos &&
+                       origins.find("s[0:1]") == std::string::npos);
+        }
+        ForgetLastRead();
+        Expect("  ... after a new descriptor starts, a stop names no earlier read",
+               LastRead().find("no instrumented read for this descriptor") != std::string::npos);
         munmap(two, page);
         // Owner lifetime: Unregister waits for a lookup in flight; none runs after it.
         static std::atomic<int> entered{0}, release{0}, calls{0};
@@ -381,7 +492,7 @@ int main() {
             r.where = Where::Inside;
             return r;
         };
-        Register(blocking, &owner_object);
+        Register(blocking, nullptr, &owner_object);
         Result in_flight;
         std::thread reader([&] { in_flight = Lookup(1, 1, copy_a); });
         while (!entered.load()) {
@@ -497,6 +608,173 @@ int main() {
         waitpid(child, &status, 0);
         Expect("  ... a scope open across a yield stops",
                WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT);
+    }
+
+    {
+        const std::uint32_t vs_pointer[2] = {0x43400040, 0x70};
+        BbComputeSh::Note(2, 0x4E, 2, vs_pointer); // VS user data s[2:3]
+        BbComputeSh::Note(2, 0x260, 1, vs_pointer); // above the compute program (0x200..0x250)
+        Expect("compute SET_SH_REG: writes into graphics user data are counted and named",
+               BbComputeSh::IsGraphicsUserData(0x4E) && !BbComputeSh::IsGraphicsUserData(0x4B) &&
+                   !BbComputeSh::IsGraphicsUserData(0x15C) && BbComputeSh::into_graphics == 1 &&
+                   BbComputeSh::into_user_data == 1 && BbComputeSh::above_compute == 1 &&
+                   BbComputeSh::Describe().find("into graphics user data 1, latest: queue 2, SH "
+                                                "0x4e, 2 word(s), first 0x43400040") !=
+                       std::string::npos);
+    }
+    BbFrameMarks::attempted.Note(12);
+    BbFrameMarks::attempted.Note(13);
+    BbFrameMarks::parsed.Note(0);
+    BbFrameMarks::prepared.Note(12);
+    BbFrameMarks::published.Note(11);
+    Expect("frame marks: the stop line gives each side's flip count and latest argument",
+           BbFrameMarks::Describe().find("guest API calls 2 (latest arg 13), flip packets parsed "
+                                         "1, flip preparation entered 1 (latest arg 12), status "
+                                         "published 1 (latest arg 11)") != std::string::npos);
+
+    {
+        using namespace BbSplit;
+        detail::FlushLine(0); // baseline
+        BbSplit::NoteFlush(true); // no reason set: other
+        {
+            FlushReason frame{FFrameEnd};
+            NoteFlush(true);
+            {
+                FlushReason label{FLabel};
+                NoteFlush(false);
+            }
+            NoteFlush(false); // back to the frame end
+        }
+        NoteLabelBatch(300000);
+        NoteLabelBatch(700000);
+        NoteLabelWritten(1000000);
+        NoteLabelWritten(3000000);
+        const std::string line = detail::FlushLine(2);
+        Expect("flush census: reasons nest and restore; per frame by reason, passes ended, batch age",
+               line.find("2.0 per frame = frame end 1.0, unbatched labels 0.5") != std::string::npos &&
+                   line.find("other 0.5") != std::string::npos &&
+                   line.find("1.0 per frame ended an open render pass") != std::string::npos &&
+                   line.find("label batches 1.0 per frame, oldest label's age at submit 500 us "
+                             "mean, 700 us max") != std::string::npos &&
+                   line.find("labels written 1.0 per frame, issue to write 2000 us mean, 3000 us "
+                             "max") != std::string::npos &&
+                   flush_reason == FOther);
+    }
+
+    {
+        // WRITE_DATA ordering (bbport_write_order.h) through a real draw pipe: stage A commits
+        // EOP (a completion label), the WAIT_REG_MEM met early (its in-order marker), a later
+        // recorder-side write, then WRITE_DATA. Stage B is held while all are committed, the
+        // recorder write completes at once and the label stays pending: WRITE_DATA must not land
+        // before the label. Without a WAIT, WRITE_DATA does not wait for the label.
+        struct Fixture {
+            BbDeferred::Count labels, recorder;
+            BbWriteOrder::Barrier barrier;
+            std::atomic<bool> hold{true}, written{false}, waiting{false};
+        };
+        enum Op : std::uint8_t { Hold, IssueLabel, ForwardedWait, RecorderWrite, WriteData };
+        const auto handler = [](void* context, const std::uint8_t* packet, std::uint32_t) {
+            auto& f = *static_cast<Fixture*>(context);
+            switch (static_cast<Op>(packet[0])) {
+            case Hold:
+                while (f.hold.load()) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                }
+                break;
+            case IssueLabel:
+                f.labels.Issue();
+                break;
+            case ForwardedWait: // the marker at the WAIT's position, after its producer issued
+                f.barrier.AtForwardedWait(f.labels.Issued());
+                break;
+            case RecorderWrite:
+                f.recorder.Issue();
+                f.recorder.Complete(); // completes before the earlier label
+                break;
+            case WriteData:
+                f.barrier.BeforeWriteData([&](std::uint64_t through) {
+                    f.waiting.store(true); // reached its wait (the test's handshake)
+                    while (!f.labels.CompleteThrough(through)) {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                    }
+                });
+                f.written.store(true);
+                break;
+            }
+        };
+        const auto run = [&](std::initializer_list<Op> ops, Fixture& f, Vulkan::DrawPipe& pipe) {
+            for (const Op op : ops) {
+                *pipe.Begin(1) = op;
+                pipe.Commit(1);
+            }
+            f.hold.store(false);
+        };
+        bool held_back = false, landed_after = false, no_wait_landed = false;
+        {
+            Fixture f;
+            Vulkan::DrawPipe pipe(handler, &f);
+            run({Hold, IssueLabel, ForwardedWait, RecorderWrite, WriteData}, f, pipe);
+            // Bounded handshake: WRITE_DATA has reached its wait (after the recorder write
+            // completed); it must still be held there.
+            for (int i = 0; i < 5000 && !f.waiting.load(); ++i) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            held_back = f.waiting.load() && !f.written.load() && f.recorder.CompleteThrough(1);
+            f.labels.Complete(); // the label lands
+            for (int i = 0; i < 2000 && !f.written.load(); ++i) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            landed_after = f.written.load();
+        }
+        {
+            Fixture f;
+            Vulkan::DrawPipe pipe(handler, &f);
+            run({Hold, IssueLabel, RecorderWrite, WriteData}, f, pipe);
+            for (int i = 0; i < 2000 && !f.written.load(); ++i) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            no_wait_landed = f.written.load() && !f.labels.CompleteThrough(1);
+            f.labels.Complete();
+        }
+        bool early_capture_leaks = false;
+        {
+            // Negative control: the marker taken before its producer was issued (what sampling
+            // on stage A at parse amounts to) lets WRITE_DATA through with the label pending.
+            Fixture f;
+            Vulkan::DrawPipe pipe(handler, &f);
+            run({Hold, ForwardedWait, IssueLabel, RecorderWrite, WriteData}, f, pipe);
+            for (int i = 0; i < 2000 && !f.written.load(); ++i) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            early_capture_leaks = f.written.load() && !f.labels.CompleteThrough(1);
+            f.labels.Complete();
+        }
+        Expect("write order: after a WAIT_REG_MEM met early, WRITE_DATA waits for its label even "
+               "with stage B held and a later recorder write done first",
+               held_back && landed_after);
+        Expect("  ... without a WAIT, WRITE_DATA does not wait for an earlier completion label",
+               no_wait_landed);
+        Expect("  ... (negative control: a marker taken before the producer issued leaks, so "
+               "these controls detect a misplaced capture)",
+               early_capture_leaks);
+        BbWriteOrder::Barrier barrier;
+        barrier.AtForwardedWait(7);
+        barrier.AtForwardedWait(5);
+        Expect("  ... the barrier only rises", barrier.Required() == 7);
+        {
+            using namespace BbSplit;
+            DeferredSite outer{KDeferredWriteData};
+            const bool set = deferred_site == KDeferredWriteData;
+            {
+                DeferredSite inner{KDeferredFlip};
+                Expect("  ... deferred-signal waits are charged to their named site, nesting "
+                       "restored",
+                       set && deferred_site == KDeferredFlip);
+            }
+            Expect("  ... (outer site back)", deferred_site == KDeferredWriteData);
+        }
+        Expect("  ... (default site back)", BbSplit::deferred_site == BbSplit::KDeferred);
     }
 
     std::fprintf(stderr, "%s: %u failures\n", failures ? "FAIL" : "PASS", failures);

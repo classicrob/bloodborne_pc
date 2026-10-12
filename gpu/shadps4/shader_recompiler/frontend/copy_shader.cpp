@@ -26,6 +26,16 @@ CopyShaderData ParseCopyShader(std::span<const u32> code) {
         auto inst = decoder.decodeInstruction(code_slice);
         switch (inst.opcode) {
         case Gcn::Opcode::S_LSHL_B32: {
+#ifdef __APPLE__
+            // bbport: a stream-out copy shader turns its buffer offset SGPR into bytes
+            // (s_lshl_b32 s6, s6, 2). That is not a GSVS offset: unknown here, so a GSVS load
+            // through it still stops below.
+            if (inst.src[0].field != Gcn::OperandField::SignedConstIntPos ||
+                inst.src[1].field != Gcn::OperandField::SignedConstIntPos) {
+                sources[inst.dst[0].code] = -1;
+                break;
+            }
+#endif
             ASSERT(inst.src[0].field == Gcn::OperandField::SignedConstIntPos &&
                    inst.src[1].field == Gcn::OperandField::SignedConstIntPos);
             sources[inst.dst[0].code] =
@@ -38,10 +48,29 @@ CopyShaderData ParseCopyShader(std::span<const u32> code) {
             break;
         }
         case Gcn::Opcode::S_MOV_B32: {
+#ifdef __APPLE__
+            // bbport: the moved value, not the operand's encoding: an SGPR copies what is known
+            // of it (unknown stays unknown), a literal or positive inline constant is its value,
+            // anything else is unknown.
+            const auto& src = inst.src[0];
+            sources[inst.dst[0].code] =
+                src.field == Gcn::OperandField::ScalarGPR      ? sources[src.code]
+                : src.field == Gcn::OperandField::LiteralConst ? s32(src.code)
+                : src.field == Gcn::OperandField::ConstZero    ? 0
+                : src.field == Gcn::OperandField::SignedConstIntPos
+                    ? s32(src.code - Gcn::OperandFieldRange::SignedConstIntPosMin + 1)
+                    : -1;
+            break;
+#endif
             sources[inst.dst[0].code] = inst.src[0].code;
             break;
         }
         case Gcn::Opcode::S_ADDK_I32: {
+#ifdef __APPLE__
+            if (sources[inst.dst[0].code] == -1) {
+                break; // unknown plus a constant is unknown
+            }
+#endif
             sources[inst.dst[0].code] += inst.control.sopk.simm;
             break;
         }
@@ -76,7 +105,8 @@ CopyShaderData ParseCopyShader(std::span<const u32> code) {
             offsets[inst.src[1].code] = inst.control.mubuf.offset;
             if (inst.src[3].field != Gcn::OperandField::ConstZero) {
                 const u32 index = inst.src[3].code;
-                ASSERT(sources[index] != -1);
+                ASSERT_MSG(sources[index] != -1,
+                           "Copy shader GSVS load through SGPR {} of unknown value", index);
                 offsets[inst.src[1].code] += sources[index];
             }
             data.num_comps++;

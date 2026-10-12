@@ -38,6 +38,7 @@ itself.
 """
 import datetime
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -180,7 +181,11 @@ def busy_slots():
 
 
 def describe(info):
-    return f"{info.get('label', '?')} (pid {info.get('pid', '?')}, since {info.get('since', '?')})"
+    text = f"{info.get('label', '?')} (pid {info.get('pid', '?')}, since {info.get('since', '?')})"
+    pid, command_pid = info.get('pid'), info.get('command_pid')
+    if pid and command_pid and not alive(pid) and alive(command_pid):
+        text += f' ORPHANED: heavy.sh pid {pid} is gone, its command pid {command_pid} still holds the slot'
+    return text
 
 
 def status():
@@ -372,6 +377,8 @@ def run(pool, priority, gpu, label, command, pool_given=False, quiet=False):
     held = os.environ.get('BB_HEAVY_HELD')
     if held and quiet:
         fail(f'{label}: --cpu-quiet inside {held} would pause the job it runs in')
+    if not held and pool in TREE_POOLS:
+        take_worktree(label, pool)
     if held:
         held_pool = held.split(':', 1)[0].rstrip('0123456789').replace('build-priority', 'build')
         if pool_given and pool != held_pool and pool != 'playtest':
@@ -412,9 +419,13 @@ def run(pool, priority, gpu, label, command, pool_given=False, quiet=False):
             command, policy = polite(pool, priority, gpu, command, idle)
             if pool in ('build', 'quick', 'sweep') and not priority and policy != 'normal':
                 print(f'heavy: {label}: {policy}', file=sys.stderr, flush=True)
+            in_place = os.environ.pop('BB_HEAVY_EXEC', '') == '1'
             record({'event': 'start', 'label': label, 'pool': pool, 'slot': name, 'priority': priority,
                     'waited_s': round(waited, 1), 'load': [round(x, 2) for x in os.getloadavg()],
-                    'held': busy_slots(), 'pid': os.getpid(), 'policy': policy})
+                    'held': busy_slots(), 'pid': os.getpid(), 'policy': policy,
+                    'command': ' '.join(command)[:400], 'cwd': os.getcwd(),
+                    **({'worktree': TREE['root'], 'head': TREE['head'], 'dirty': TREE['dirty']} if TREE else {}),
+                    **({'end': 'recorded by the caller (exec in place)'} if in_place else {})})
             if waited >= 1:
                 print(f'heavy: {label}: got {name} after {waited:.0f} s', file=sys.stderr, flush=True)
             os.set_inheritable(fd, True)
@@ -426,6 +437,8 @@ def run(pool, priority, gpu, label, command, pool_given=False, quiet=False):
             announce(label)
             if pool == 'quick':
                 supervise_quick(label, command)
+            if not in_place:
+                supervise(label, pool, command, fd, info)
             try:
                 os.execvp(command[0], command)
             except OSError as error:
@@ -437,11 +450,119 @@ def run(pool, priority, gpu, label, command, pool_given=False, quiet=False):
         time.sleep(1)
 
 
+TREE = {}  # the job's worktree at start: root, HEAD and a digest of its tracked changes
+TREE_POOLS = ('build', 'quick', 'sweep')  # jobs that compile or run from the checkout
+
+
+def git(root, *args):
+    result = subprocess.run(['git', '-C', root, *args], capture_output=True, text=True, timeout=120)
+    return result.stdout if result.returncode == 0 else None
+
+
+def tree_state(path):
+    """(root, HEAD, digest of the tracked changes, dirty) of the git worktree containing path, or
+    None outside one. Submodule content changes (build.sh patches FSR once) and untracked files
+    (logs, out/) do not count."""
+    top = git(path, 'rev-parse', '--show-toplevel')
+    if top is None:
+        return None
+    root = top.strip()
+    head = (git(root, 'rev-parse', 'HEAD') or '').strip()
+    diff = git(root, 'diff', 'HEAD', '--ignore-submodules=dirty')
+    if diff is None:
+        fail(f'cannot read the state of worktree {root}')
+    return root, head, hashlib.sha256(diff.encode()).hexdigest(), bool(diff)
+
+
+def take_worktree(label, pool):
+    """One build/quick/sweep job per worktree: a second one is refused at once, naming the holder.
+    Records the worktree's HEAD and tracked changes for the end check. BB_HEAVY_SHARED_TREE=1
+    lets a read-only job share the tree."""
+    state = tree_state(os.getcwd())
+    if state is None:
+        return
+    root, head, digest, dirty = state
+    TREE.update(root=root, head=head, digest=digest, dirty=dirty)
+    if os.environ.get('BB_HEAVY_SHARED_TREE') == '1':
+        return
+    name = 'tree-' + hashlib.sha256(root.encode()).hexdigest()[:16]
+    fd = try_lock(name)
+    if fd is None:
+        fail(f'{label}: refused: worktree {root} is busy with {describe(holder(name))}; one build/test job '
+             f'per worktree (BB_HEAVY_SHARED_TREE=1 for a read-only job)')
+    os.ftruncate(fd, 0)
+    os.pwrite(fd, json.dumps({'label': label, 'pid': os.getpid(), 'pool': pool, 'worktree': root,
+                              'since': datetime.datetime.now().isoformat(timespec='seconds')}).encode(), 0)
+    os.set_inheritable(fd, True)
+
+
+def tree_changed(label):
+    """At the end: why the job's result is invalid (HEAD moved, or tracked files edited during the
+    run), or None."""
+    if not TREE:
+        return None
+    state = tree_state(TREE['root'])
+    if state is None:
+        return f'worktree {TREE["root"]} is gone'
+    _, head, digest, _ = state
+    if head != TREE['head']:
+        return f'HEAD of {TREE["root"]} changed during the run ({TREE["head"][:10]} -> {head[:10]})'
+    if digest != TREE['digest']:
+        return f'tracked files in {TREE["root"]} were edited during the run'
+    return None
+
+
 def seconds(variable, default):
     value = os.environ.get(variable, str(default))
     if not value.isdigit() or int(value) < 1:
         fail(f'{variable} must be a positive whole number of seconds')
     return int(value)
+
+
+def record_end(label, pool, status, started, **extra):
+    """The job's end event: exit status, or the signal that killed it, and its duration. A job whose
+    worktree changed during the run is INVALID: said on stderr and in the event, and a success
+    becomes exit 125 so no caller takes it for a pass."""
+    event = {'event': 'end', 'label': label, 'pool': pool,
+             'seconds': round(time.monotonic() - started, 1), 'load': [round(x, 2) for x in os.getloadavg()]}
+    if status < 0:
+        event.update(status=128 - status, signal=signal.Signals(-status).name)
+    else:
+        event['status'] = status
+    invalid = tree_changed(label)
+    if invalid:
+        print(f'heavy: {label}: INVALID: {invalid}; the result does not belong to one tree',
+              file=sys.stderr, flush=True)
+        event['invalid'] = invalid
+        if event['status'] == 0:
+            event['status'] = 125
+    record({**event, **extra})
+    return event['status']
+
+
+def supervise(label, pool, command, fd=None, info=None):
+    """Runs the job's command as a child in the same process group, forwards SIGINT/SIGTERM/SIGHUP
+    to it, records its end (exit status, or the signal that killed it, and the duration) and exits
+    with its status. A caller that needs the job's pid to be the command's (play_route.py: the
+    game) sets BB_HEAVY_EXEC=1 and records the end itself."""
+    started = time.monotonic()
+    try:
+        child = subprocess.Popen(command, close_fds=False)
+    except OSError as error:
+        record_end(label, pool, 127, started, error=str(error))
+        fail(f'cannot run {command[0]}: {error}', 127)
+    if fd is not None:  # the slot names the command too, so status can tell an orphan apart
+        info = {**info, 'command_pid': child.pid}
+        os.ftruncate(fd, 0)
+        os.pwrite(fd, json.dumps(info).encode(), 0)
+    def forward(signum, _):
+        try:
+            child.send_signal(signum)
+        except ProcessLookupError:
+            pass
+    for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(signum, forward)
+    sys.exit(record_end(label, pool, child.wait(), started))
 
 
 def supervise_quick(label, command):
@@ -458,15 +579,12 @@ def supervise_quick(label, command):
     forward = lambda signum, _: os.killpg(child.pid, signum)
     for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
         signal.signal(signum, forward)
-    def finish(status):
-        record({'event': 'end', 'label': label, 'pool': 'quick', 'status': status,
-                'seconds': round(time.monotonic() - started, 1), 'load': [round(x, 2) for x in os.getloadavg()]})
-        sys.exit(status)
+    def finish(status, **extra):
+        sys.exit(record_end(label, 'quick', status, started, **extra))
     last = time.monotonic()
     while True:
         try:
-            status = child.wait(timeout=1)
-            finish(status if status >= 0 else 128 - status)
+            finish(child.wait(timeout=1))
         except subprocess.TimeoutExpired:
             pass
         now = time.monotonic()
@@ -487,7 +605,7 @@ def supervise_quick(label, command):
             except subprocess.TimeoutExpired:
                 os.killpg(child.pid, signal.SIGKILL)
                 child.wait()
-            finish(124)
+            finish(124, killed='time limit')
 
 
 def main(argv):

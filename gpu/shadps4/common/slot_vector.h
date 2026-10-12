@@ -120,7 +120,15 @@ public:
         return values[id.index].object;
     }
 
+    /// bbport: false for the invalid id (a default SlotId, e.g. an image without a linked
+    /// depth image); an index beyond the vector's capacity is not an id of this vector and stops.
+    /// (It read the storage bitset out of bounds: replay capture crash, 2026-10-11.)
     bool is_allocated(SlotId id) const {
+        if (!id) {
+            return false;
+        }
+        ASSERT_MSG(id.index < values_capacity, "slot id {} is beyond this vector's {} slots",
+                   id.index, values_capacity);
         return ReadStorageBit(id.index);
     }
 

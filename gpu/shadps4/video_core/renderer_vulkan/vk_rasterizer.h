@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <optional>
 #include "common/recursive_lock.h"
 #ifdef __APPLE__
 #include <condition_variable>
@@ -195,6 +196,22 @@ public:
 #endif
         scheduler.WaitDeferredSignals();
     }
+#ifdef __APPLE__
+    /// Waits until the first `through` completion labels are written; stage B first submits
+    /// the labels it batched (else it would wait for labels not submitted).
+    void WaitLabelsThrough(u64 through) {
+        if (DrawPipe::OnStageB()) {
+            scheduler.FlushLabels(true);
+        }
+        scheduler.WaitLabelsThrough(through);
+    }
+    [[nodiscard]] u64 LabelsIssued() const noexcept {
+        return scheduler.LabelsIssued();
+    }
+    BbWriteOrder::Barrier& WriteBarrier() noexcept {
+        return scheduler.write_barrier;
+    }
+#endif
     /// Runs `signal` after the guest memory copies issued so far, without waiting here.
     void SignalAfterHostCopies(std::function<void()> signal) {
         scheduler.SignalAfterHostCopies(std::move(signal));
@@ -282,6 +299,10 @@ private:
 
     void UpdateDynamicState(const GraphicsPipeline* pipeline, bool is_indexed) const;
     void UpdateViewportScissorState() const;
+    /// bbport: viewport 0 as UpdateViewportScissorState maps it, in render pixels without the
+    /// upscaler's jitter ({x scale, y scale, x offset, y offset}); nullopt with clipping disabled
+    /// or a zero scale (CameraMotion::OnGBufferViewport).
+    std::optional<std::array<float, 4>> SceneViewport() const;
     void UpdateDepthStencilState() const;
     void UpdatePrimitiveState(bool is_indexed) const;
     void UpdateRasterizationState() const;
@@ -347,8 +368,14 @@ private:
     /// returns the strip draw (vk_gs_emulation.cpp).
     GsEmulationDraw RecordGsEmulation(const GraphicsPipeline* pipeline, const AmdGpu::Regs& regs,
                                       bool is_indexed, u32 index_offset);
-    /// Point output: compacts the GS's index runs into the point draw (gs_point_compact.comp).
-    void RecordGsPointCompaction(const GsEmulationStages& stages);
+    /// Point output: compacts the GS's index runs into the point draw (gs_point_compact.comp);
+    /// for a stream-out draw also sizes the stream-out and advances so_state.
+    void RecordGsPointCompaction(const GsEmulationStages& stages, const AmdGpu::Regs& regs);
+    /// Stream-out draw: the copy shader's stream-out kernel over the compacted points.
+    void RecordGsStreamOut(const GsEmulationStages& stages, const AmdGpu::Regs& regs,
+                           vk::Buffer scratch, u64 scratch_offset);
+    /// Logs stream-out overflow (dropped vertices) the GPU has counted since the last report.
+    void CheckStreamOutOverflow();
     GsEmulationDraw RecordGsEmulationIndirect(const GraphicsPipeline* pipeline,
                                               const AmdGpu::Regs& regs, bool is_indexed,
                                               VAddr args, u32 stride, u32 max_count,
@@ -582,6 +609,11 @@ private:
     GsEmulationBinding gs_binding{};
     std::unique_ptr<VideoCore::StreamBuffer> gs_indirect_scratch; ///< indirect ES/GS draws
     std::unique_ptr<VideoCore::Buffer> gs_errors;                 ///< setup kernel reports
+    /// Stream-out state (vk_gs_emulation.h SoState): buffer offsets in dwords
+    /// (VGT_STRMOUT_BUFFER_OFFSET_0..3) and overflow counts, GPU-resident: offsets set by
+    /// STRMOUT_BUFFER_UPDATE in command order, advanced by each stream-out draw.
+    std::unique_ptr<VideoCore::Buffer> so_state;
+    u32 so_overflow_reported{}; ///< SoOverflowDraws last logged
     struct {
         std::atomic<u64> draws{0};
         std::atomic<u64> dispatches{0};

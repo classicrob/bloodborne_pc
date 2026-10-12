@@ -70,6 +70,10 @@ struct ShaderProgram {
         u32 num_user_regs : 5;
         u32 : 1;
         u32 oc_lds_en : 1;
+        // SPI_SHADER_PGM_RSRC2_VS: stream-out SGPRs after the user data (config and write index
+        // with so_en, then the base offset of each buffer whose so_base_en bit is set).
+        u32 so_base_en : 4;
+        u32 so_en : 1;
     } settings;
     UserData user_data;
 
@@ -238,6 +242,14 @@ static constexpr const BinaryInfo& SearchBinaryInfo(const u32* code) {
         }
     }
     UNREACHABLE_MSG("Shader binary info not found.");
+}
+
+/// bbport: the input usage slots (usage, API slot, start register, flags; one dword each) Gnm
+/// stores before a shader's binary info, chunk_usage_base_offset_in_dw dwords before it.
+inline std::span<const u32> InputUsageSlots(const u32* code) {
+    const auto& info = SearchBinaryInfo(code);
+    const u32* end = reinterpret_cast<const u32*>(&info) - info.chunk_usage_base_offset_in_dw;
+    return {end - info.num_input_usage_slots, info.num_input_usage_slots};
 }
 
 static constexpr Shader::ShaderParams GetParams(const auto& sh) {

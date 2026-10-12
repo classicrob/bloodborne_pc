@@ -100,6 +100,17 @@ enum class Attribute : u64 {
     BaseVertex = 98,
     BaseInstance = 99,
     IsHelperInvocation = 100,
+    // bbport (Apple): the VGT stream-out inputs of a GS copy shader run as GsEmulationRole::
+    // CopyStreamOut (the SGPRs after its user data): config (vertices of this wave that fit in
+    // bits 16-22, stream in 24-25), write index of the wave's first vertex, and the base offset
+    // (dwords) of each enabled stream-out buffer in buffer order.
+    GsStreamOutConfig = 101,
+    GsStreamOutWriteIndex = 102,
+    GsStreamOutOffset0 = 103,
+    GsStreamOutOffset1 = 104,
+    GsStreamOutOffset2 = 105,
+    GsStreamOutOffset3 = 106,
+    GsStreamOutLaneValid = 107, ///< U1: the VGT would launch this lane (its exec starts set)
     Max,
 };
 

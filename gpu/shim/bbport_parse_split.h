@@ -18,6 +18,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <string>
+#include <mach/mach.h>
+#include <pthread.h>
 #include <x86intrin.h>
 
 namespace BbSplit {
@@ -102,6 +104,8 @@ enum K : std::uint32_t {
     KEncRendering,   ///< recorder: vkCmdBeginRendering / vkCmdEndRendering
     KEncBarrier,     ///< recorder: pipeline barriers from Runtime::FlushBarriers
     KEncCopy,        ///< recorder: copies, fills, clears (Runtime)
+    KDeferredWriteData, ///< deferred-signal waits before an in-order WRITE_DATA (RunWriteData)
+    KDeferredFlip,      ///< deferred-signal waits before a flip's interrupt (SignalFlip)
     KCount
 };
 inline constexpr const char* k_names[KCount] = {
@@ -111,7 +115,100 @@ inline constexpr const char* k_names[KCount] = {
     "queue submit", "image refresh", "texel sync (image tiled to memory)", "pipeline build wait", "descriptor build",
     "dynamic state", "barrier flush", "render pass switch", "encode pipeline bind",
     "encode descriptors", "encode draws", "encode dispatches", "encode rendering begin/end",
-    "encode barriers", "encode copies"};
+    "encode barriers", "encode copies", "deferred signals before WRITE_DATA",
+    "deferred signals before a flip"};
+
+/// The scope kind WaitDeferredSignals charges on this thread (KDeferred unless a caller names
+/// its site).
+inline thread_local K deferred_site = KDeferred;
+
+/// Names the caller of the WaitDeferredSignals calls in its lifetime.
+class DeferredSite {
+public:
+    explicit DeferredSite(K site) : previous{deferred_site} {
+        deferred_site = site;
+    }
+    ~DeferredSite() {
+        deferred_site = previous;
+    }
+    DeferredSite(const DeferredSite&) = delete;
+    DeferredSite& operator=(const DeferredSite&) = delete;
+
+private:
+    K previous;
+};
+
+/// Why the draw scheduler submitted (Flush census, docs/macos/parse-split.md).
+enum F : std::uint32_t {
+    FFrameEnd,   ///< the frame end (Liverpool, after OnSubmit)
+    FLabel,      ///< a label not batched (stage A, or recording not deferred): one per label
+    FBatchIdle,  ///< stage B's batched labels, at a packet boundary with the draw pipe idle
+    FBatchAge,   ///< stage B's batched labels, the oldest older than LabelBatchAge
+    FFinish,     ///< Scheduler::Finish (a wait for the GPU)
+    FOther,
+    FCount
+};
+inline constexpr const char* f_names[FCount] = {
+    "frame end", "unbatched labels", "label batch at idle", "label batch at age", "Finish",
+    "other"};
+
+/// The reason the calling thread's next draw-scheduler Flush has (FOther unless set).
+inline thread_local F flush_reason = FOther;
+
+/// Sets this thread's flush reason for the life of the object.
+class FlushReason {
+public:
+    explicit FlushReason(F reason) : previous{flush_reason} {
+        flush_reason = reason;
+    }
+    ~FlushReason() {
+        flush_reason = previous;
+    }
+    FlushReason(const FlushReason&) = delete;
+    FlushReason& operator=(const FlushReason&) = delete;
+
+private:
+    F previous;
+};
+
+/// Submissions of the draw scheduler, any thread; read at reports.
+struct FlushCensus {
+    std::array<std::atomic<std::uint64_t>, FCount> by_reason{};
+    /// Labels at GPU completion written, their issue-to-write age (the label thread), and the
+    /// window's maximum (reset at each report).
+    std::atomic<std::uint64_t> labels_written{0}, label_age_ns{0}, label_age_window_max_ns{0};
+    std::atomic<std::uint64_t> ended_pass{0};       ///< a render pass was open (it ends)
+    std::atomic<std::uint64_t> batches{0}, batch_age_ns{0}, batch_age_max_ns{0};
+};
+inline FlushCensus flush_census;
+
+/// A draw-scheduler submission, with a render pass open or not.
+inline void NoteFlush(bool pass_open) {
+    flush_census.by_reason[flush_reason].fetch_add(1, std::memory_order_relaxed);
+    if (pass_open) {
+        flush_census.ended_pass.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+/// A label at GPU completion written `age_ns` after it was issued (the guest sees it then).
+inline void NoteLabelWritten(std::uint64_t age_ns) {
+    flush_census.labels_written.fetch_add(1, std::memory_order_relaxed);
+    flush_census.label_age_ns.fetch_add(age_ns, std::memory_order_relaxed);
+    std::uint64_t max = flush_census.label_age_window_max_ns.load(std::memory_order_relaxed);
+    while (age_ns > max && !flush_census.label_age_window_max_ns.compare_exchange_weak(
+                               max, age_ns, std::memory_order_relaxed)) {
+    }
+}
+
+/// A batch of stage B labels submitted after waiting `age_ns` (its oldest label).
+inline void NoteLabelBatch(std::uint64_t age_ns) {
+    flush_census.batches.fetch_add(1, std::memory_order_relaxed);
+    flush_census.batch_age_ns.fetch_add(age_ns, std::memory_order_relaxed);
+    std::uint64_t max = flush_census.batch_age_max_ns.load(std::memory_order_relaxed);
+    while (age_ns > max && !flush_census.batch_age_max_ns.compare_exchange_weak(
+                               max, age_ns, std::memory_order_relaxed)) {
+    }
+}
 
 constexpr std::uint32_t MaxBuckets = 16;
 constexpr std::uint32_t MaxDepth = 8; ///< nested scopes
@@ -125,6 +222,8 @@ struct Account {
     std::uint64_t last = 0;
     std::uint32_t open = 0, depth = 0;
     std::array<K, MaxDepth> stack{};
+    /// The thread's Mach port (Attach), for its on-CPU time at reports.
+    std::atomic<mach_port_t> thread{MACH_PORT_NULL};
 };
 
 inline Account stage_a, stage_b, recorder;
@@ -157,6 +256,7 @@ inline void Charge(Account& a, std::uint64_t now) {
 /// Starts accounting this thread in `account`, in `bucket`.
 inline void Attach(Account& account, std::uint32_t bucket) {
     current = &account;
+    account.thread.store(pthread_mach_thread_np(pthread_self()), std::memory_order_relaxed);
     account.last = __rdtsc();
     account.open = bucket;
     account.depth = 0;
@@ -319,7 +419,92 @@ inline std::string ScopeBy(const Account& a, Previous& previous, K kind, const c
 }
 
 inline Previous previous_a, previous_b, previous_r;
+inline std::array<std::uint64_t, FCount> previous_flushes{};
+inline std::uint64_t previous_ended_pass = 0, previous_batches = 0, previous_batch_age_ns = 0,
+                     previous_labels_written = 0, previous_label_age_ns = 0;
+
+/// "  Flushes …" for the window: per frame by reason, passes ended, label batch age.
+inline std::string FlushLine(double frames) {
+    std::string out;
+    char item[96];
+    std::uint64_t total = 0;
+    for (std::uint32_t r = 0; r < FCount; ++r) {
+        const std::uint64_t now = flush_census.by_reason[r].load(std::memory_order_relaxed);
+        const std::uint64_t delta = now - previous_flushes[r];
+        previous_flushes[r] = now;
+        total += delta;
+        std::snprintf(item, sizeof(item), "%s%s %.1f", r ? ", " : "", f_names[r],
+                      frames ? delta / frames : 0.0);
+        out += item;
+    }
+    const std::uint64_t ended = flush_census.ended_pass.load(std::memory_order_relaxed);
+    const std::uint64_t batches = flush_census.batches.load(std::memory_order_relaxed);
+    const std::uint64_t age = flush_census.batch_age_ns.load(std::memory_order_relaxed);
+    const std::uint64_t window_batches = batches - previous_batches;
+    char tail[256];
+    std::snprintf(tail, sizeof(tail),
+                  "; %.1f per frame ended an open render pass; label batches %.1f per frame, "
+                  "oldest label's age at submit %.0f us mean, %.0f us max (all so far)",
+                  frames ? (ended - previous_ended_pass) / frames : 0.0,
+                  frames ? window_batches / frames : 0.0,
+                  window_batches ? (age - previous_batch_age_ns) / 1e3 / window_batches : 0.0,
+                  flush_census.batch_age_max_ns.load(std::memory_order_relaxed) / 1e3);
+    previous_ended_pass = ended;
+    previous_batches = batches;
+    previous_batch_age_ns = age;
+    const std::uint64_t written = flush_census.labels_written.load(std::memory_order_relaxed);
+    const std::uint64_t written_age = flush_census.label_age_ns.load(std::memory_order_relaxed);
+    const std::uint64_t window_written = written - previous_labels_written;
+    const std::uint64_t window_max =
+        flush_census.label_age_window_max_ns.exchange(0, std::memory_order_relaxed);
+    char written_text[192];
+    std::snprintf(written_text, sizeof(written_text),
+                  "; labels written %.1f per frame, issue to write %.0f us mean, %.0f us max",
+                  frames ? window_written / frames : 0.0,
+                  window_written ? (written_age - previous_label_age_ns) / 1e3 / window_written
+                                 : 0.0,
+                  window_max / 1e3);
+    previous_labels_written = written;
+    previous_label_age_ns = written_age;
+    char head[96];
+    std::snprintf(head, sizeof(head), "  Flushes of the draw scheduler: %.1f per frame = ",
+                  frames ? total / frames : 0.0);
+    return head + out + tail + written_text;
+}
 inline std::uint64_t window_cycles = 0, window_frames = 0, window_draws = 0;
+/// The account's thread's user + system CPU time in ns (thread_info), or ~0 when unavailable
+/// (no thread attached yet, or the call failed).
+inline std::uint64_t CpuNs(const Account& a) {
+    const mach_port_t thread = a.thread.load(std::memory_order_relaxed);
+    if (thread == MACH_PORT_NULL) {
+        return ~0ull;
+    }
+    thread_basic_info_data_t info{};
+    mach_msg_type_number_t count = THREAD_BASIC_INFO_COUNT;
+    if (thread_info(thread, THREAD_BASIC_INFO, reinterpret_cast<thread_info_t>(&info), &count) !=
+        KERN_SUCCESS) {
+        return ~0ull;
+    }
+    const auto ns = [](const time_value_t& t) {
+        return std::uint64_t(t.seconds) * 1000000000ull + std::uint64_t(t.microseconds) * 1000ull;
+    };
+    return ns(info.user_time) + ns(info.system_time);
+}
+/// On-CPU ms per frame since the previous call ("n/a" when either reading is unavailable): wall
+/// time a thread spends neither blocked nor waiting for a core.
+inline std::string OnCpu(const Account& a, std::uint64_t& previous, double frames) {
+    const std::uint64_t now = CpuNs(a);
+    const bool known = now != ~0ull && previous != ~0ull && now >= previous && frames > 0;
+    char text[48];
+    if (known) {
+        std::snprintf(text, sizeof(text), "on CPU %.2f ms", double(now - previous) / 1e6 / frames);
+    } else {
+        std::snprintf(text, sizeof(text), "on CPU n/a");
+    }
+    previous = now;
+    return text;
+}
+inline std::uint64_t previous_cpu_a = ~0ull, previous_cpu_b = ~0ull, previous_cpu_r = ~0ull;
 inline std::chrono::steady_clock::time_point window_start{};
 } // namespace detail
 
@@ -338,6 +523,10 @@ inline void NoteFrameEnd(std::uint64_t draws) {
         Line(stage_a, previous_a, a_names, ACount, 0, 1, ignored);
         Line(stage_b, previous_b, b_names, BCount, 0, 1, ignored);
         Line(recorder, previous_r, r_names, RCount, 0, 1, ignored);
+        FlushLine(0);
+        OnCpu(stage_a, previous_cpu_a, 0);
+        OnCpu(stage_b, previous_cpu_b, 0);
+        OnCpu(recorder, previous_cpu_r, 0);
         for (std::uint32_t k = 0; k < KCount; ++k) {
             ScopeBy(stage_a, previous_a, static_cast<K>(k), a_names, ACount, 0, 1);
             ScopeBy(stage_b, previous_b, static_cast<K>(k), b_names, BCount, 0, 1);
@@ -353,6 +542,14 @@ inline void NoteFrameEnd(std::uint64_t draws) {
         std::chrono::duration<double, std::milli>(now - window_start).count();
     const double ms_per_cycle = wall_ms / double(now_cycles - window_cycles);
     const double frames = double(window_frames);
+    // Stage A's direct-draw time per draw (pipeline selection, packet build), before Line moves
+    // the baseline.
+    const std::uint64_t window_draw_count = draws - window_draws;
+    const double a_us_per_draw =
+        window_draw_count ? double(stage_a.bucket[ADraw].load(std::memory_order_relaxed) -
+                                   previous_a.bucket[ADraw]) *
+                                ms_per_cycle * 1000.0 / double(window_draw_count)
+                          : 0.0;
     std::uint64_t a_cycles = 0, b_cycles = 0, r_cycles = 0;
     const std::string a_line =
         Line(stage_a, previous_a, a_names, ACount, ms_per_cycle, frames, a_cycles);
@@ -373,18 +570,24 @@ inline void NoteFrameEnd(std::uint64_t draws) {
     const std::string r_line =
         Line(recorder, previous_r, r_names, RCount, ms_per_cycle, frames, r_cycles);
     const double frame_ms = wall_ms / frames;
+    const std::string flush_line = FlushLine(frames);
+    const std::string a_cpu = OnCpu(stage_a, previous_cpu_a, frames);
+    const std::string b_cpu = OnCpu(stage_b, previous_cpu_b, frames);
+    const std::string r_cpu = OnCpu(recorder, previous_cpu_r, frames);
     // Printed like the Stall lines: Info-level logging is filtered in perf runs.
-    std::printf("Parse split, last 600 frame ends: %.2f ms per frame, %.0f draws per frame; "
-                "ms per frame by thread (accounted / wall)\n"
-                "  stage A (GPU command thread, %.0f%%): %s\n"
+    std::printf("Parse split, last 600 frame ends: %.2f ms per frame, %.0f draws per frame "
+                "(stage A %.2f us per draw); ms per frame by thread (accounted / wall)\n"
+                "  stage A (GPU command thread, %.0f%%, %s per frame): %s\n"
                 "    deferred-signal waits during: %s\n"
                 "    stage B drains at other packets during: %s\n"
-                "  stage B (draw recording thread, %.0f%%): %s\n"
-                "  Vulkan recording thread (%.0f%%): %s\n",
-                frame_ms, double(draws - window_draws) / frames,
-                100.0 * a_cycles * ms_per_cycle / wall_ms, a_line.c_str(), a_deferred.c_str(),
-                a_drain.c_str(), 100.0 * b_cycles * ms_per_cycle / wall_ms, b_line.c_str(),
-                100.0 * r_cycles * ms_per_cycle / wall_ms, r_line.c_str());
+                "  stage B (draw recording thread, %.0f%%, %s per frame): %s\n"
+                "  Vulkan recording thread (%.0f%%, %s per frame): %s\n"
+                "%s\n",
+                frame_ms, double(window_draw_count) / frames, a_us_per_draw,
+                100.0 * a_cycles * ms_per_cycle / wall_ms, a_cpu.c_str(), a_line.c_str(),
+                a_deferred.c_str(), a_drain.c_str(), 100.0 * b_cycles * ms_per_cycle / wall_ms,
+                b_cpu.c_str(), b_line.c_str(), 100.0 * r_cycles * ms_per_cycle / wall_ms,
+                r_cpu.c_str(), r_line.c_str(), flush_line.c_str());
     std::fflush(stdout);
     window_cycles = now_cycles;
     window_start = now;

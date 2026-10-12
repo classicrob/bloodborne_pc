@@ -85,8 +85,9 @@ TITLE = ('title', [('wait_log', r'^Runtime: pad opened', 120), ('wait_draws', 14
                    ('capture', 'title', 0.2), ('check_user_cache',)])
 OFFLINE = ('offline', [('press', 'down'), ('press_screen', 'cross', TITLE_MENU_CHANGE, 3, 3), ('sleep', 1), ('capture', 'offline-menu', 0.2)])
 # Loading screens already draw the world behind them while pipelines compile, so "in the world"
-# means scene-sized draw counts in windows with no compiles.
-WORLD = ('world', [('wait_draws', 1000, 2, 1800, True), ('sleep', 5), ('capture', 'world', 0.05)])
+# means scene-sized draw counts in windows with no compiles. Observed: loading screens up to ~290
+# draws/frame (with compiles), clinic ~1500, Hunter's Dream 700-1060; the floor is not tuned to one area.
+WORLD = ('world', [('wait_draws', 300, 3, 1800, True), ('sleep', 5), ('capture', 'world', 0.05)])
 # New game: Options skips the opening movie (--movie plays it to the end for movie-path coverage).
 NEW_GAME = [
     TITLE, OFFLINE,
@@ -512,7 +513,7 @@ def supervise(run):
         info = manifest(run)
         heavy = info['heavy']
         env = dict(os.environ, **{k: v for k, v in heavy.items() if k.startswith('BB_HEAVY_')},
-                   BB_HEAVY_ANNOUNCE='1')
+                   BB_HEAVY_ANNOUNCE='1', BB_HEAVY_EXEC='1')  # the pid is the game's; exit.json records its end
         command = [str(ROOT / 'tools/macos/heavy.sh'), '--pool', 'playtest', f'game {run.name}', '--',
                    '/bin/bash', str(ROOT / 'run.sh')]  # heavy.sh runs games at nice 5, utility QoS
         p = subprocess.Popen(command, cwd=ROOT, stdout=log, stderr=subprocess.STDOUT,
@@ -630,10 +631,26 @@ def save_fixture(run, name):
     shutil.copytree(source, target / 'savedata')
     stages = [json.loads(l).get('stage') for l in (run / 'events.jsonl').read_text().splitlines()
               if json.loads(l).get('kind') == 'capture']
-    (target / 'fixture.json').write_text(json.dumps({
+    meta = {
         'name': name, 'saved': now(), 'run': str(run), 'last_capture': stages[-1] if stages else None,
         'artifacts': {k: v['sha256'] for k, v in info['artifacts'].items() if isinstance(v, dict) and 'sha256' in v},
-        'output': info.get('output')}, indent=2) + '\n')
+        'output': info.get('output')}
+    # The run's source fixture is kept verbatim, so the chain nests. A save that descends from an edited
+    # one (e.g. a position edit) stays marked edited, with what the edit left unverified: playing on
+    # from it does not make it a played-through save.
+    saves = info.get('saves')
+    parent = saves.get('from') if isinstance(saves, dict) else None
+    if parent is not None:
+        meta['parent'] = parent
+    ancestor = parent
+    while isinstance(ancestor, dict) and not ancestor.get('edited'):
+        ancestor = ancestor.get('parent')
+    if isinstance(ancestor, dict):
+        meta['edited'] = True
+        meta['edited_origin'] = ancestor.get('edited_origin', ancestor.get('name'))
+        if 'unverified' in ancestor:
+            meta['unverified'] = ancestor['unverified']
+    (target / 'fixture.json').write_text(json.dumps(meta, indent=2) + '\n')
     event(run, 'save-fixture', name=name, path=str(target))
     print(json.dumps({'fixture': name, 'path': str(target), 'last_capture': stages[-1] if stages else None}))
 

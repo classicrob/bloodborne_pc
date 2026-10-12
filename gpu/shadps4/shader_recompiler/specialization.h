@@ -3,7 +3,13 @@
 
 #pragma once
 
+#ifdef __APPLE__
+#include "bbport_compute_sh.h"
+#include "bbport_frame_marks.h"
+#endif
+#include <atomic>
 #include <bitset>
+#include <cstdio>
 #include <cstring>
 #include <string>
 
@@ -14,6 +20,17 @@
 #include "shader_recompiler/profile.h"
 
 namespace Shader {
+
+#ifdef __APPLE__
+/// A draw-preparation worker's speculative selection (vk_draw_prep.h) runs on register state the
+/// GPU thread re-checks before using anything from it. There, a descriptor with no number
+/// conversion abandons the preparation instead of stopping: the GPU thread's own selection of
+/// the same draw stays correct-or-loud.
+inline thread_local bool speculative_selection = false;
+struct SpeculativeDescriptorRejected {};
+/// Worker preparations abandoned this way (all so far), the first ones logged.
+inline std::atomic<std::uint64_t> speculative_rejections{0};
+#endif
 
 struct VsAttribSpecialization {
     bool is_null{};
@@ -104,11 +121,50 @@ struct StageSpecialization {
     // shader, the resource (its index in Info::buffers or Info::images, not a Vulkan binding) and
     // the descriptor's dwords (a real asset format and a stale or
     // corrupt descriptor look different there), instead of in MapNumberConversion.
+    /// Where each dword of a fetched descriptor came from: an immediate in the shader, a user-data
+    /// register (flat dword < 16) or the SRT walker's output (>= 16), with its value now.
+    template <typename T>
+    std::string DescribeFetch(const SharpFetch<T>& fetch) const {
+        const auto flat = info->FlatUserData();
+        std::string text = "; its dwords come from (flat inputs, before the post op):";
+        for (u32 i = 0; i < SharpFetch<T>::N; ++i) {
+            if (!((fetch.load_mask >> i) & 1)) {
+                text += fmt::format(" [{}] immediate {:#x}", i, fetch.immediates[i]);
+            } else if (fetch.offsets[i] == UNKNOWN_LOCATION || fetch.offsets[i] >= flat.size()) {
+                text += fmt::format(" [{}] flat dword {} (outside the {}-dword buffer)", i,
+                                    fetch.offsets[i], flat.size());
+            } else {
+                text += fmt::format(" [{}] {} {} = {:#x}", i,
+                                    fetch.offsets[i] < NUM_USER_DATA_REGS ? "user data s"
+                                                                       : "SRT walker output dword",
+                                    fetch.offsets[i], flat[fetch.offsets[i]]);
+            }
+        }
+        return text;
+    }
+
+    /// `fetch_source` is called only when the descriptor fails (it formats the stop text).
+    template <typename FetchSource>
     void CheckNumberConversion(const char* kind, u32 index, const void* sharp, size_t size,
-                               AmdGpu::NumberFormat num_fmt, AmdGpu::DataFormat data_fmt) const {
-        if (AmdGpu::HasNumberConversion(num_fmt, data_fmt)) {
+                               AmdGpu::NumberFormat num_fmt, AmdGpu::DataFormat data_fmt,
+                               FetchSource&& fetch_source) const {
+        if (AmdGpu::HasNumberConversion(num_fmt, data_fmt)) [[likely]] {
             return;
         }
+#ifdef __APPLE__
+        if (speculative_selection) {
+            if (speculative_rejections.fetch_add(1, std::memory_order_relaxed) < 8) {
+                std::printf("Draw preparation: a worker's speculative selection abandoned: %s "
+                            "shader %#llx %s %u has data format %u with number format %u (the GPU "
+                            "thread selects this draw itself)\n",
+                            fmt::format("{}", info->hw_stage).c_str(),
+                            static_cast<unsigned long long>(info->pgm_hash), kind, index,
+                            u32(data_fmt), u32(num_fmt));
+                std::fflush(stdout);
+            }
+            throw SpeculativeDescriptorRejected{};
+        }
+#endif
         std::string dwords;
         for (size_t i = 0; i < size / sizeof(u32); ++i) {
             u32 dword;
@@ -118,8 +174,23 @@ struct StageSpecialization {
 #ifdef __APPLE__
         // BB_CMD_DATA_CHECK: where the descriptor's table read came from (submitted command
         // memory, its chunk tail, or elsewhere).
-        const std::string source = BbCmdData::LastRead();
+        // The user-data words (s0..s15), for matching the dwords' sources and pointer pairs.
+        std::string user_data = "; user data now:";
+        const auto ud = info->UserData();
+        for (size_t i = 0; i < ud.size() && i < NUM_USER_DATA_REGS; ++i) {
+            user_data += fmt::format(" s{}={:#x}", i, ud[i]);
+        }
+        const std::string source = fetch_source() + user_data +
+                                   BbCmdData::UserDataOrigins(ud.data(),
+                                                              std::min<size_t>(ud.size(),
+                                                                               NUM_USER_DATA_REGS)) +
+                                   BbCmdData::LastRead() +
+                                   BbFrameMarks::Describe() + "; " + BbComputeSh::Describe() +
+                                   fmt::format("; draw-preparation selections abandoned on such "
+                                               "descriptors so far: {}",
+                                               speculative_rejections.load());
 #else
+        (void)fetch_source;
         const std::string source;
 #endif
         UNREACHABLE_MSG("{} shader {:#x}: {} {} (Info index) has data format {} with number format {}, "
@@ -169,7 +240,15 @@ struct StageSpecialization {
                          if (spec.is_formatted) {
                              CheckNumberConversion("buffer", u32(buffers.size() - 1), &sharp, sizeof(sharp),
                                                    AmdGpu::NumberFormat(sharp.num_format),
-                                                   AmdGpu::DataFormat(sharp.data_format));
+                                                   AmdGpu::DataFormat(sharp.data_format), [&] {
+#ifdef __APPLE__
+                                                       return DescribeFetch(desc.sharp_fetch) +
+                                                              fmt::format(" (post op {})",
+                                                                          u32(desc.post_op));
+#else
+                                                       return std::string{};
+#endif
+                                                   });
                              spec.data_format = static_cast<u32>(sharp.GetDataFmt());
                              spec.num_format = static_cast<u32>(sharp.GetNumberFmt());
                              spec.dst_select = sharp.DstSelect();
@@ -193,7 +272,15 @@ struct StageSpecialization {
                          }
                          CheckNumberConversion("image", u32(images.size() - 1), &sharp, sizeof(sharp),
                                                AmdGpu::NumberFormat(sharp.num_format),
-                                               AmdGpu::DataFormat(sharp.data_format));
+                                               AmdGpu::DataFormat(sharp.data_format), [&] {
+#ifdef __APPLE__
+                                                   return DescribeFetch(desc.sharp_fetch) +
+                                                          fmt::format(" (post op {})",
+                                                                      u32(desc.post_op));
+#else
+                                                   return std::string{};
+#endif
+                                               });
                          spec.num_conversion = sharp.GetNumberConversion();
                      });
         // bbport: every image's descriptor count as the emitter declares it (NumBindings),
@@ -225,6 +312,9 @@ struct StageSpecialization {
     void ForEachSharp(auto& spec_list, auto& desc_list, auto&& func) {
         for (const auto& desc : desc_list) {
             auto& spec = spec_list.emplace_back();
+#ifdef __APPLE__
+            BbCmdData::ForgetLastRead(); // a stop names only this descriptor's reads
+#endif
             const auto sharp = desc.GetSharp(*info);
             if (!sharp && !emulate_null_descriptors) {
                 continue;
@@ -236,6 +326,9 @@ struct StageSpecialization {
     void ForEachSharp(u32& binding, auto& spec_list, auto& desc_list, auto&& func) {
         for (const auto& desc : desc_list) {
             auto& spec = spec_list.emplace_back();
+#ifdef __APPLE__
+            BbCmdData::ForgetLastRead(); // a stop names only this descriptor's reads
+#endif
             const auto sharp = desc.GetSharp(*info);
             if (emulate_null_descriptors) {
                 if constexpr (std::is_same_v<std::remove_cvref_t<decltype(sharp)>, AmdGpu::Buffer>) {

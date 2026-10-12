@@ -62,7 +62,15 @@ void Scheduler::BeginRendering(const RenderState& new_state) {
         return;
     }
     BB_SPLIT_SCOPE(KRenderPassSwitch);
+#ifdef __APPLE__
+    EndRenderingFor(BbPassCensus::Why::TargetChange);
+    // A pass with exactly the state of the pass that ended just before it: a split the targets
+    // did not require (render_state still holds the ended pass's state).
+    BbPassCensus::NoteBegin(has_render_state && render_state == new_state);
+    has_render_state = true;
+#else
     EndRendering();
+#endif
     is_rendering = true;
     render_state = new_state;
 
@@ -131,9 +139,15 @@ void Scheduler::BeginRendering(const RenderState& new_state) {
 }
 
 void Scheduler::EndRendering() {
+#ifdef __APPLE__
+    const auto why = std::exchange(end_reason, BbPassCensus::Why::Other);
+#endif
     if (!is_rendering) {
         return;
     }
+#ifdef __APPLE__
+    BbPassCensus::NoteEnd(why, __builtin_return_address(0));
+#endif
     is_rendering = false;
     BB_SPLIT_SCOPE(KRenderPassSwitch);
     Record([](vk::CommandBuffer cmdbuf) {
@@ -239,13 +253,26 @@ void Scheduler::FlushLabels(bool idle) {
     if (!labels_unflushed.load(std::memory_order_relaxed)) {
         return;
     }
-    if (!idle && std::chrono::steady_clock::now() - unflushed_since < LabelBatchAge) {
+    const auto age = std::chrono::steady_clock::now() - unflushed_since;
+    if (!idle && age < LabelBatchAge) {
         return;
     }
+#ifdef __APPLE__
+    BbSplit::NoteLabelBatch(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(age).count());
+    BbSplit::FlushReason reason{idle ? BbSplit::FBatchIdle : BbSplit::FBatchAge};
+#endif
     Flush(); // asserts it signals unflushed_tick
 }
 
 void Scheduler::SignalAtGpuCompletion(std::function<void()> signal, bool batch) {
+    // Issue-to-write age, the delay the guest sees on a label (parse split's Flushes line).
+    signal = [issued = std::chrono::steady_clock::now(), signal = std::move(signal)] {
+        signal();
+        BbSplit::NoteLabelWritten(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                      std::chrono::steady_clock::now() - issued)
+                                      .count());
+    };
     const u64 tick = CurrentTick(); // the next submission signals this value
     // Issued now, in stream order; the writer takes labels only in this order, whichever
     // becomes ready first (deferred ones after the copy threads, direct ones at once).
@@ -257,6 +284,9 @@ void Scheduler::SignalAtGpuCompletion(std::function<void()> signal, bool batch) 
         label_thread = std::jthread([this](std::stop_token stoken) { LabelThread(stoken); });
     });
     if (!IsRecordingDeferred()) {
+#ifdef __APPLE__
+        BbSplit::FlushReason reason{BbSplit::FLabel};
+#endif
         const u64 submitted = Flush();
         ASSERT_MSG(submitted == tick,
                    "macOS: a label's submission signals timeline value {}, its writer waits for {}",
@@ -285,6 +315,9 @@ void Scheduler::SignalAtGpuCompletion(std::function<void()> signal, bool batch) 
                    unflushed_tick, tick);
         return;
     }
+#ifdef __APPLE__
+    BbSplit::FlushReason reason{BbSplit::FLabel};
+#endif
     const u64 submitted = Flush();
     // The writer waits for `tick`: it must be the submission holding the label and the work
     // recorded before it (no other submission came between).
@@ -367,6 +400,22 @@ bool Scheduler::WaitQuiescentForCapture(std::chrono::milliseconds limit, std::st
 }
 #endif
 
+#ifdef __APPLE__
+void Scheduler::WaitLabelsThrough(u64 through) {
+    // The label writer completes labels in issue order: a prefix (bbport_write_order.h).
+    if (completion_labels.CompleteThrough(through)) {
+        return;
+    }
+    BbStats::WaitTimer timer{BbStats::deferred_signals_wait_ns};
+    BbSplit::Scope split_scope{BbSplit::deferred_site};
+    KickRecording(true);
+    while (!completion_labels.CompleteThrough(through)) {
+        BbCopy::WaitAsync();
+        std::this_thread::yield();
+    }
+}
+#endif
+
 void Scheduler::WaitDeferredSignals() {
     const u64 issued = deferred_signals_issued.load(std::memory_order_relaxed);
     if (deferred_signals_done->load(std::memory_order_acquire) >= issued ||
@@ -374,7 +423,9 @@ void Scheduler::WaitDeferredSignals() {
         return;
     }
     BbStats::WaitTimer timer{BbStats::deferred_signals_wait_ns};
-    BB_SPLIT_SCOPE(KDeferred);
+#ifdef __APPLE__
+    BbSplit::Scope split_scope{BbSplit::deferred_site}; // by site (RunWriteData, SignalFlip)
+#endif
     KickRecording(true);
     while (deferred_signals_done->load(std::memory_order_acquire) < issued) {
         // Helps the copy threads the signals wait for.
@@ -534,6 +585,9 @@ void Scheduler::WaitBeforeNextSubmit(vk::Semaphore semaphore, u64 value) {
 
 void Scheduler::Finish() {
     // When finishing, we need to wait for the submission to have executed on the device.
+#ifdef __APPLE__
+    BbSplit::FlushReason reason{BbSplit::FFinish};
+#endif
     const u64 presubmit_tick = CurrentTick();
     SubmitInfo info{};
     SubmitExecution(info);
@@ -634,7 +688,16 @@ u64 Scheduler::SubmitExecution(SubmitInfo& info) {
     }
     next_submit_waits.clear();
 
+#ifdef __APPLE__
+    if (flush_census) {
+        // After on_submit's barrier flush: a pass still open is ended by this submission (the
+        // render pass census's "submit" enders).
+        BbSplit::NoteFlush(is_rendering);
+    }
+    EndRenderingFor(BbPassCensus::Why::Submit);
+#else
     EndRendering();
+#endif
     if (auto* profiler = GpuProfiler::Get(); profiler && profiler->Records(this)) {
         // Until the next submission's first timestamp: mostly the GPU waiting for it.
         profiler->Mark(0x5B317ull, [] { return std::string{"(between submissions: GPU idle)"}; });

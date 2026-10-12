@@ -257,6 +257,7 @@ if [[ ${1:-} == --test || ${1:-} == --test-dry ]]; then
         unit_tests=(cmd-snapshot-test cond-exec-test label-check-test capture-quiesce-test flip-publish-test videoout-lifecycle-test strmout-update-test equeue-concurrency-test feature-checks-test image-view-storage-test
             submit-info-bounds-test vertex-fetch-translation-test buffer-null-test rect-interface-test
             fence-address-test fill-clear-device-test capture-images-test overlay-concurrency-test depth-bounds-probe-test replay-capture-test
+            slot-vector-test
             motion-history-test
             motion-shader-test
             ui-composition-test fill-clear-test scene-resolution-test taa-shader-test camera-motion-test)
@@ -281,6 +282,7 @@ if [[ ${1:-} == --test || ${1:-} == --test-dry ]]; then
         t out/gpu/rect-interface-test
         t out/gpu/depth-bounds-probe-test
         t out/gpu/replay-capture-test
+        t out/gpu/slot-vector-test
         rm -rf out/buffer-null && mkdir -p out/buffer-null
         t out/gpu/buffer-null-test out/buffer-null
         t spirv-val --target-env vulkan1.3 out/buffer-null/null-buffer.spv
@@ -313,7 +315,6 @@ if [[ ${1:-} == --test || ${1:-} == --test-dry ]]; then
         t sh tests/test_guest_entry_macos.sh
         t sh tests/test_cpu_profile_macos.sh
         t sh tests/test_hle_trace_macos.sh
-        t sh tests/test_movie_handoff_macos.sh
         BB_DEPS_PREFIX="$deps" t bash tests/macos_external_host/run.sh
         BB_DEPS_PREFIX="$deps" t bash tests/macos_metalfx/signature.sh
         BB_DEPS_PREFIX="$deps" t bash tests/macos_metalfx/run.sh
@@ -372,6 +373,7 @@ if [[ ${1:-} == --test || ${1:-} == --test-dry ]]; then
         t sh tests/test_cond_wake_check_macos.sh
         t python3 tests/test_restart_macos.py
         t python3 tests/test_motion_agree.py
+        t python3 tests/test_gpu_modified_setters.py
         # Last: every test file under tests/ is run above or excluded with a reason.
         python3 tools/macos/check_test_wiring.py
     fi

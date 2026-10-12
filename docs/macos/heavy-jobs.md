@@ -97,8 +97,24 @@ the history. Games are not paused (the exclusive GPU hold already keeps them off
   kernel releases it when the last of them exits or is killed. There are no leases or stale locks.
 - Inside a slot (`BB_HEAVY_HELD` is set), nested calls run directly.
 - Every slot acquisition is appended to `~/bbport-deps/locks/history.jsonl`: label, pool,
-  slot, seconds waited, load average, and which slots were held. Quick jobs also record their
-  duration and exit status. This is the data for sizing the pools.
+  slot, seconds waited, load average, which slots were held, the scheduling, the command and the
+  directory it ran in. Every job also gets an end event: exit status, or the signal that killed
+  it, and its duration. For that, heavy.sh runs the command as its child and forwards
+  SIGINT/SIGTERM/SIGHUP to it. A launcher that needs the job's pid to be the command's sets
+  `BB_HEAVY_EXEC=1` and records the end itself (play_route.py: the game, in exit.json).
+- **One build/test job per worktree.** A build, quick or sweep job takes its git worktree's lock;
+  a second one there is refused at once, naming the holder. Games (the playtest pool, run from
+  copied artifacts) may share a worktree; `BB_HEAVY_SHARED_TREE=1` lets another read-only job
+  share it too. Never switch or edit a worktree's checkout while a job runs in it.
+- **INVALID results.** The start event records the worktree's HEAD and whether it has tracked
+  changes. At the end, if HEAD moved or tracked files were edited during the run, heavy.sh prints
+  "INVALID: …" and records it in the end event. A job that succeeded then exits 125, not 0, so no
+  caller takes it for a pass; a failing job keeps its own status. Untracked files (logs, out/)
+  and submodule content (build.sh patches FSR) do not count.
+- To stop a job, signal its heavy.sh pid with SIGTERM: it ends the command and records it.
+  SIGKILL to heavy.sh alone leaves the command running and holding the slot; `heavy.sh status`
+  then shows it as ORPHANED with the command's pid. Never kill by command-line pattern: it hits
+  other agents' jobs.
 
 Automatic: on macOS `build.sh` (the GPU build and `--test`) takes a build slot, a priority one
 with `BB_HEAVY_PRIORITY=1`. `play_route.py` runs each game in a playtest slot, and time spent

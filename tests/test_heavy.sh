@@ -10,6 +10,9 @@ dir=$(mktemp -d)
 trap 'rm -rf "$dir"; kill $(jobs -p) 2>/dev/null || true' EXIT
 # The user counts as active unless a case says otherwise (the real idle time varies).
 export BB_HEAVY_DIR=$dir BB_HEAVY_BUILD_SLOTS=1 BB_HEAVY_PLAYTEST_SLOTS=2 BB_HEAVY_QUICK_SLOTS=2 BB_HEAVY_SWEEP_SLOTS=1 BB_HEAVY_IDLE_SECONDS=0
+# The slot tests below run several jobs from this one checkout; the worktree rule has its own
+# section (in a scratch repository) near the end.
+export BB_HEAVY_SHARED_TREE=1
 unset BB_HEAVY_HELD
 fail() { echo "heavy test FAILED: $*" >&2; exit 1; }
 until_held() { for _ in $(seq 100); do "$heavy" status | grep -q "$1: held by $2" && return; sleep 0.1; done; fail "$1 never held by $2"; }
@@ -26,9 +29,9 @@ waited=$(( $(date +%s) - start ))
 wait "$holder"
 
 # Game runs have their own pool: two run while the build slot is busy, a third waits.
-"$heavy" --pool playtest G1 -- sleep 30 &
+BB_HEAVY_EXEC=1 "$heavy" --pool playtest G1 -- sleep 30 &
 g1=$!
-"$heavy" --pool playtest G2 -- sleep 30 &
+BB_HEAVY_EXEC=1 "$heavy" --pool playtest G2 -- sleep 30 &
 g2=$!
 until_held playtest0 G; until_held playtest1 G
 start=$(date +%s)
@@ -41,7 +44,7 @@ for _ in $(seq 50); do [[ -e $dir/g3 ]] && break; sleep 0.1; done
 kill -9 "$g2"; wait "$g2" 2>/dev/null || true
 
 # Quick jobs: their own two slots, the -j4 hint, and a hard time limit for the whole group.
-"$heavy" A2 -- sleep 30 &
+BB_HEAVY_EXEC=1 "$heavy" A2 -- sleep 30 &
 busy=$!
 until_held build0 A2
 out=$("$heavy" --pool quick Q1 -- sh -c 'echo "$BB_BUILD_JOBS $CMAKE_BUILD_PARALLEL_LEVEL $MAKEFLAGS"')
@@ -67,7 +70,7 @@ sleep 0.5
 kill -9 "$q2" "$busy"; wait "$q2" "$busy" 2>/dev/null || true
 
 # A priority job runs while an ordinary job holds the ordinary slot.
-"$heavy" C -- sleep 30 &
+BB_HEAVY_EXEC=1 "$heavy" C -- sleep 30 &
 holder=$!
 until_held build0 C
 start=$(date +%s)
@@ -162,7 +165,7 @@ echo "heavy.sh scheduling: niceness and parallelism checked; QoS $qos"
 
 # The sweep lane: a sweep runs while a long build job holds the build slot; a sweep started
 # inside a build job runs in that slot and says so.
-"$heavy" LONG -- sleep 30 &
+BB_HEAVY_EXEC=1 "$heavy" LONG -- sleep 30 &
 long=$!
 until_held build0 LONG
 start=$(date +%s)
@@ -176,7 +179,7 @@ err=$("$heavy" B9 -- "$heavy" --pool sweep SW2 -- true 2>&1 >/dev/null)
 # Idle-aware admission: while the user is idle (>= BB_HEAVY_IDLE_MINUTES), a second build job
 # runs (build-idle) at nice +5 with a utility clamp and says why; while active it waits, and a
 # job runs as background QoS and says why.
-"$heavy" LONG2 -- sleep 30 &
+BB_HEAVY_EXEC=1 "$heavy" LONG2 -- sleep 30 &
 long=$!
 until_held build0 LONG2
 start=$(date +%s)
@@ -240,6 +243,78 @@ if "$heavy" K2 -- "$heavy" --pool playtest --gpu exclusive --cpu-quiet K3 -- tru
     fail "--cpu-quiet inside a slot accepted"
 fi
 
+# Job records: a start event with the command and the directory; an end event for every pool with
+# the exit status, or the signal that killed it (SIGTERM to heavy.sh is forwarded to the command);
+# a job whose heavy.sh was SIGKILLed while its command runs on is shown as ORPHANED.
+"$heavy" R1 -- sh -c 'exit 7' 2>/dev/null || true
+"$heavy" R2 -- sleep 30 &
+r2=$!
+until_held build0 R2
+kill -TERM "$r2"; wait "$r2" 2>/dev/null || true
+for _ in $(seq 50); do "$heavy" status | grep -q '^build0: free' && break; sleep 0.1; done
+"$heavy" status | grep -q '^build0: free' || fail "SIGTERM to heavy.sh did not end its command"
+"$heavy" R3 -- sleep 30 &
+r3=$!
+until_held build0 R3
+kill -9 "$r3"; wait "$r3" 2>/dev/null || true
+"$heavy" status | grep -q '^build0: held by R3 .*ORPHANED' || fail "orphaned command not shown: $("$heavy" status | grep build0)"
+kill "$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["command_pid"])' "$dir/build0")"
+for _ in $(seq 50); do "$heavy" status | grep -q '^build0: free' && break; sleep 0.1; done
+python3 - "$dir/history.jsonl" "$PWD" <<'PY' || fail "job records in history.jsonl"
+import json, sys
+lines = [json.loads(l) for l in open(sys.argv[1])]
+start = {l['label']: l for l in lines if l['event'] == 'start'}
+end = {l['label']: l for l in lines if l['event'] == 'end'}
+assert start['R1']['command'].endswith("sh -c exit 7") and start['R1']['cwd'] == sys.argv[2], start['R1']
+assert end['R1']['status'] == 7 and end['R1']['pool'] == 'build' and 'seconds' in end['R1'], end['R1']
+assert end['R2']['signal'] == 'SIGTERM' and end['R2']['status'] == 128 + 15, end['R2']
+assert 'R3' not in end  # its heavy.sh was SIGKILLed: no end event, and status said ORPHANED
+assert start['G1']['end'].startswith('recorded by the caller'), start['G1']
+PY
+
+# One build/test job per worktree, and a job whose worktree changes during the run is INVALID
+# (exit 125 instead of 0, said on stderr and in its end event). Games may share a worktree.
+repo=$dir/repo
+git init -q "$repo" && git -C "$repo" config user.email t@t && git -C "$repo" config user.name t
+echo one > "$repo/f" && git -C "$repo" add f && git -C "$repo" commit -qm one
+heavy_abs=$PWD/$heavy
+(
+    cd "$repo"
+    heavy=$heavy_abs  # until_held calls "$heavy"
+    unset BB_HEAVY_SHARED_TREE
+    "$heavy_abs" W1 -- true || fail "an untouched worktree job failed"
+    set +e
+    "$heavy_abs" W2 -- sh -c 'echo two > f; git commit -qam two' 2> "$dir/w2.err"; w2=$?
+    "$heavy_abs" W3 -- sh -c 'echo edited >> f' 2> "$dir/w3.err"; w3=$?
+    git checkout -q f
+    "$heavy_abs" W4 -- sh -c 'echo three > f; git commit -qam three; exit 3' 2>/dev/null; w4=$?
+    set -e
+    (( w2 == 125 )) || fail "a job that moved HEAD exited $w2, expected 125"
+    grep -q 'W2: INVALID: HEAD of .* changed during the run' "$dir/w2.err" || fail "HEAD change not reported: $(cat "$dir/w2.err")"
+    (( w3 == 125 )) || fail "a job that edited tracked files exited $w3, expected 125"
+    grep -q 'W3: INVALID: tracked files in .* were edited during the run' "$dir/w3.err" || fail "edit not reported"
+    (( w4 == 3 )) || fail "a failing INVALID job must keep its own exit status ($w4)"
+    "$heavy_abs" --pool sweep W5 -- sleep 30 &
+    w5=$!
+    until_held sweep0 W5
+    set +e; out=$("$heavy_abs" --pool quick W6 -- true 2>&1); w6=$?; set -e
+    (( w6 == 2 )) && [[ $out == *"is busy with W5"* ]] || fail "a second job in a busy worktree was not refused ($w6: $out)"
+    BB_HEAVY_SHARED_TREE=1 "$heavy_abs" --pool quick W7 -- true || fail "BB_HEAVY_SHARED_TREE=1 job refused"
+    BB_HEAVY_EXEC=1 "$heavy_abs" --pool playtest W8 -- true || fail "a game was refused in a busy worktree"
+    kill -TERM "$w5"; wait "$w5" 2>/dev/null || true
+    "$heavy_abs" W9 -- true || fail "the worktree was not freed after its job ended"
+)
+python3 - "$dir/history.jsonl" <<'PY' || fail "worktree fields in history.jsonl"
+import json, sys
+lines = [json.loads(l) for l in open(sys.argv[1])]
+start = {l['label']: l for l in lines if l['event'] == 'start'}
+end = {l['label']: l for l in lines if l['event'] == 'end'}
+assert start['W1']['worktree'].endswith('/repo') and len(start['W1']['head']) == 40 and start['W1']['dirty'] is False, start['W1']
+assert 'invalid' not in end['W1'] and end['W1']['status'] == 0, end['W1']
+assert end['W2']['status'] == 125 and 'HEAD' in end['W2']['invalid'], end['W2']
+assert end['W4']['status'] == 3 and 'HEAD' in end['W4']['invalid'], end['W4']
+PY
+
 # Bad usage is an error, not a silent no-op.
 if "$heavy" G true 2>/dev/null; then fail "missing -- accepted"; fi
 if BB_HEAVY_BUILD_SLOTS=0 "$heavy" H -- true 2>/dev/null; then fail "zero slots accepted"; fi
@@ -256,4 +331,4 @@ assert any(l['label'] == 'B' and l['waited_s'] >= 1 for l in starts), 'B waited'
 assert all({'pool', 'slot', 'waited_s', 'load', 'held'} <= set(l) for l in starts)
 assert any(l['label'] == 'Q4' and l['status'] == 124 for l in ends), 'Q4 killed'
 PY
-echo "heavy.sh: history log, build/playtest/quick pools, quick hints and time limit, waiting, priority slot, GPU shared/exclusive lock with gate, start announcement, polite scheduling, idle-aware admission, CPU-quiet pause, sweep lane, release on SIGKILL, nesting, exit status, usage errors PASS"
+echo "heavy.sh: history log, build/playtest/quick pools, quick hints and time limit, waiting, priority slot, GPU shared/exclusive lock with gate, start announcement, polite scheduling, idle-aware admission, CPU-quiet pause, job records (command, directory, end status/signal, orphans), one job per worktree and INVALID on a changed tree, sweep lane, release on SIGKILL, nesting, exit status, usage errors PASS"

@@ -589,8 +589,7 @@ void Runtime::CopyDepthStencil(VideoCore::Image* src, VideoCore::Image* dst,
                          vk::ImageLayout::eTransferDstOptimal, region);
     });
 
-    dst->flags |= VideoCore::ImageFlagBits::GpuModified;
-    dst->flags &= ~VideoCore::ImageFlagBits::Dirty;
+    // The caller marks it GPU-written (TextureCache::MarkGpuWritten), which also tracks it.
 }
 
 void Runtime::ResolveImage(VideoCore::Image* src, VideoCore::Image* dst,
@@ -661,8 +660,7 @@ void Runtime::ResolveImage(VideoCore::Image* src, VideoCore::Image* dst,
         });
     }
 
-    dst->flags |= VideoCore::ImageFlagBits::GpuModified;
-    dst->flags &= ~VideoCore::ImageFlagBits::Dirty;
+    // The caller marks it GPU-written (TextureCache::MarkGpuWritten), which also tracks it.
 }
 
 void Runtime::ClearImage(VideoCore::Image* dst, const VideoCore::SubresourceRange& range,
@@ -689,8 +687,7 @@ void Runtime::ClearImage(VideoCore::Image* dst, const VideoCore::SubresourceRang
         cmdbuf.clearColorImage(image, vk::ImageLayout::eTransferDstOptimal, color, vk_range);
     });
 
-    dst->flags |= VideoCore::ImageFlagBits::GpuModified;
-    dst->flags &= ~VideoCore::ImageFlagBits::Dirty;
+    // The caller marks it GPU-written (TextureCache::MarkGpuWritten), which also tracks it.
 }
 
 void Runtime::SetBackingSamples(VideoCore::Image* image, u32 num_samples, bool copy_backing) {
@@ -859,7 +856,35 @@ void Runtime::FlushBarriers() {
     }
 
     BB_SPLIT_SCOPE(KBarrierFlush);
+#ifdef __APPLE__
+    if (scheduler.IsRendering()) {
+        // The pass census attributes the split: what the barrier waits for, and who flushed.
+        using namespace vk;
+        constexpr PipelineStageFlags2 transfer =
+            PipelineStageFlagBits2::eTransfer | PipelineStageFlagBits2::eCopy |
+            PipelineStageFlagBits2::eBlit | PipelineStageFlagBits2::eResolve |
+            PipelineStageFlagBits2::eClear;
+        constexpr PipelineStageFlags2 compute = PipelineStageFlagBits2::eComputeShader;
+        constexpr PipelineStageFlags2 graphics =
+            PipelineStageFlagBits2::eDrawIndirect | PipelineStageFlagBits2::eIndexInput |
+            PipelineStageFlagBits2::eVertexAttributeInput | PipelineStageFlagBits2::eVertexInput |
+            PipelineStageFlagBits2::eVertexShader | PipelineStageFlagBits2::eFragmentShader |
+            PipelineStageFlagBits2::eEarlyFragmentTests |
+            PipelineStageFlagBits2::eLateFragmentTests |
+            PipelineStageFlagBits2::eColorAttachmentOutput | PipelineStageFlagBits2::eAllGraphics;
+        const PipelineStageFlags2 src = memory_barrier.srcStageMask;
+        std::uint32_t sources = 0;
+        sources |= (src & transfer) ? BbPassCensus::SrcTransfer : 0;
+        sources |= (src & compute) ? BbPassCensus::SrcCompute : 0;
+        sources |= (src & graphics) ? BbPassCensus::SrcGraphics : 0;
+        sources |= (src & ~(transfer | compute | graphics)) ? BbPassCensus::SrcOther : 0;
+        sources |= image_barriers.empty() ? 0 : BbPassCensus::SrcImage;
+        BbPassCensus::NoteBarrierEnd(sources, __builtin_return_address(0));
+    }
+    scheduler.EndRenderingFor(BbPassCensus::Why::Barrier);
+#else
     scheduler.EndRendering();
+#endif
     scheduler.Record([memory = memory_barrier, has_memory = dep_info.memoryBarrierCount != 0,
                       images = scheduler.RecordData(std::span<const vk::ImageMemoryBarrier2>(
                           image_barriers.data(), image_barriers.size()))](vk::CommandBuffer cmdbuf) {

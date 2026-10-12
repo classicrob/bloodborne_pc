@@ -23,6 +23,7 @@
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/info.h"
 #include "shader_recompiler/recompiler.h"
+#include "shader_recompiler/stop_context.h"
 #include "shader_recompiler/runtime_info.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/cache_storage.h"
@@ -180,6 +181,16 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(PipelineSelection& se
     }
     case HwStage::Vertex: {
         BuildCommon(regs.vs_program);
+        if (sel.gs_stream_out_kernel) {
+            // The copy shader's stream-out as a compute kernel (GS-DESIGN 11.2): no rasterizer
+            // state, only the GSVS layout and its stream-out SGPRs (GsEmulationUnsupported
+            // admitted the configuration).
+            info.gs_role = Shader::GsEmulationRole::CopyStreamOut;
+            info.gs_max_vert_out = regs.vgt_gs_max_vert_out;
+            info.gs_vertex_dwords = regs.vgt_gs_vert_itemsize[0];
+            info.gs_so_buffers = regs.vs_program.settings.so_base_en;
+            break;
+        }
         info.hw.vs.user_clip_plane_mask = regs.clipper_control.user_clip_plane_enable;
         info.hw.vs.num_outputs = MapOutputs(info.hw.vs.outputs, regs.vs_output_control);
         info.hw.vs.emulate_depth_negative_one_to_one =
@@ -193,6 +204,11 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(PipelineSelection& se
             info.gs_role = Shader::GsEmulationRole::CopyVertex;
             info.gs_max_vert_out = regs.vgt_gs_max_vert_out;
             info.gs_vertex_dwords = regs.vgt_gs_vert_itemsize[0];
+            // A stream-out draw: its stream-out SGPRs (zero here: the kernel does the stream-out).
+            // GsEmulationUnsupported admitted the configuration (SO_EN, table at s[2:3]).
+            info.gs_so_buffers = regs.vgt_strmout_config.raw
+                                     ? u32(regs.vs_program.settings.so_base_en)
+                                     : 0u;
             // Rasterized GS points take PA_SU_POINT_SIZE (Vulkan would otherwise use 1 px).
             if (Shader::GsEmulation::PointOutput(regs.vgt_gs_out_prim_type.GetPrimitiveType(0)) &&
                 !regs.clipper_control.dx_rasterization_kill) {
@@ -579,6 +595,8 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
             auto stages = std::make_unique<GsEmulationStages>();
             stages->es = compute(sel.gs_es);
             stages->gs = compute(sel.gs_gs);
+            stages->so = sel.graphics_key.gs_so_hash ? compute(sel.gs_so) : nullptr;
+            stages->so_buffers = regs.vgt_strmout_buffer_config.stream_0_buf_en;
             stages->verts_per_prim = GsEmulationVerticesPerPrimitive(regs);
             stages->invocations = 1;
             stages->max_vert_out = regs.vgt_gs_max_vert_out;
@@ -982,6 +1000,7 @@ bool PipelineCache::RefreshGraphicsStages(PipelineSelection& sel) {
     sel.modules.fill(nullptr);
     sel.gs_es = {};
     sel.gs_gs = {};
+    sel.gs_so = {};
 
     bind_stage(HwStage::Fragment, SwStage::Fragment);
 
@@ -1002,16 +1021,17 @@ bool PipelineCache::RefreshGraphicsStages(PipelineSelection& sel) {
             const auto bind_compute = [&](HwStage stage_in, SwStage stage_out,
                                           PipelineSelection::GsEmulationProgram& out) {
                 const auto* pgm = regs.ProgramForStage(static_cast<u32>(stage_in));
+                const char* name = stage_in == HwStage::Export     ? "ES"
+                                   : stage_in == HwStage::Geometry ? "GS"
+                                                                   : "copy shader stream-out";
                 ASSERT_MSG(pgm && pgm->Address<u32*>(),
-                           "macOS geometry emulation: ES/GS draw without a{} program",
-                           stage_in == HwStage::Export ? "n ES" : " GS");
+                           "macOS geometry emulation: ES/GS draw without its {} program", name);
                 // Each compute pipeline has its own layout: bindings start at 0.
                 Shader::Backend::Bindings compute_binding{};
                 const auto program =
                     GetProgram(sel, stage_in, stage_out, AmdGpu::GetParams(*pgm), compute_binding);
                 out = {std::get<0>(program), std::get<1>(program), std::get<3>(program)};
-                ASSERT_MSG(out.info, "macOS geometry emulation: no {} program selected",
-                           stage_in == HwStage::Export ? "ES" : "GS");
+                ASSERT_MSG(out.info, "macOS geometry emulation: no {} program selected", name);
                 return true;
             };
             if (!bind_compute(HwStage::Export, SwStage::Vertex, sel.gs_es) ||
@@ -1020,6 +1040,18 @@ bool PipelineCache::RefreshGraphicsStages(PipelineSelection& sel) {
             }
             key.gs_es_hash = sel.gs_es.hash;
             key.gs_gs_hash = sel.gs_gs.hash;
+            key.gs_so_hash = 0;
+            if (regs.vgt_strmout_config.raw) {
+                // The copy shader again, as the stream-out kernel. Selected before the draw's
+                // vertex stage, which then rebuilds the vertex runtime info this one replaced.
+                sel.gs_stream_out_kernel = true;
+                const bool bound = bind_compute(HwStage::Vertex, SwStage::Vertex, sel.gs_so);
+                sel.gs_stream_out_kernel = false;
+                if (!bound) {
+                    return false;
+                }
+                key.gs_so_hash = sel.gs_so.hash;
+            }
             if (!bind_stage(HwStage::Vertex, SwStage::Vertex)) {
                 return false;
             }
@@ -1140,6 +1172,22 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
              perm_idx != 0 ? "(permutation)" : "");
     DumpShader(code, info.pgm_hash, info.hw_stage, perm_idx, "bin");
     CompileTimer timer{"shader translation", info.pgm_hash, true};
+    // For loud stops that need the game state (resource_patching_pass.cpp).
+    const Shader::CompileStopContext stop_context{[&] {
+        if (info.hw_stage == Shader::HwStage::Compute) {
+            const auto& cs = liverpool->GetCsRegs();
+            return fmt::format("a dispatch of {}x{}x{} groups of {}x{}x{} (CS at {:#x})",
+                               cs.dim_x, cs.dim_y, cs.dim_z, cs.num_thread_x.full,
+                               cs.num_thread_y.full, cs.num_thread_z.full, cs.Address<u64>());
+        }
+        if (!sel.regs) {
+            return std::string{"a draw (no registers)"};
+        }
+        const auto& regs = *sel.regs;
+        return fmt::format("a draw of {} indices x {} instances, primitive {}, stage enable {:#x}",
+                           regs.num_indices, regs.num_instances.NumInstances(),
+                           u32(regs.primitive_type), u32(regs.stage_enable.raw));
+    }()};
 
     const auto ir_program = Shader::TranslateProgram(code, pools, info, runtime_info, profile);
     auto spv = Shader::Backend::SPIRV::EmitSPIRV(profile, runtime_info, ir_program, binding);
@@ -1268,14 +1316,37 @@ PipelineCache::Result PipelineCache::GetProgram(PipelineSelection& sel, HwStage 
             if (sigsetjmp(recover, 0)) {
                 Shader::Info::num_ud_snapshots = saved_snapshots;
                 runtime_fault_recover = nullptr;
+#ifdef __APPLE__
+                Shader::speculative_selection = false;
+#endif
                 worker.failed = true;
                 return {};
             }
             runtime_fault_recover = &recover;
+#ifdef __APPLE__
+            // Speculative: a descriptor with no conversion abandons the preparation (the GPU
+            // thread selects the draw itself), instead of stopping the game from a worker.
+            bool matched = false;
+            Shader::speculative_selection = true;
+            try {
+                matched = matches_data(*module.info_template, module);
+            } catch (const Shader::SpeculativeDescriptorRejected&) {
+                Shader::speculative_selection = false;
+                runtime_fault_recover = nullptr;
+                worker.failed = true;
+                return {};
+            }
+            Shader::speculative_selection = false;
+            if (!matched) {
+                runtime_fault_recover = nullptr;
+                continue;
+            }
+#else
             if (!matches_data(*module.info_template, module)) {
                 runtime_fault_recover = nullptr;
                 continue;
             }
+#endif
             runtime_fault_recover = nullptr;
             auto it = worker.infos.try_emplace(module.info.get(), *module.info_template).first;
             auto& info = it->second;

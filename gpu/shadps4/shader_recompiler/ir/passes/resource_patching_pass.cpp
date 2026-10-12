@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <limits>
+#include "shader_recompiler/gs_emulation.h"
 #include "shader_recompiler/info.h"
 #include "shader_recompiler/ir/basic_block.h"
 #include "shader_recompiler/ir/breadth_first_search.h"
@@ -13,6 +14,8 @@
 #include "shader_recompiler/ir/program.h"
 #include "shader_recompiler/ir/reinterpret.h"
 #include "shader_recompiler/profile.h"
+#include "shader_recompiler/runtime_info.h"
+#include "shader_recompiler/stop_context.h"
 #include "video_core/amdgpu/resource.h"
 
 namespace Shader::Optimization {
@@ -567,6 +570,23 @@ void PatchGlobalDataShareAccess(IR::Inst& inst, Info& info, Descriptors& descrip
     }
 }
 
+// bbport (Apple): a V# for a loud stop: its four dwords as bound, and where they came from.
+std::string VSharpWords(const AmdGpu::Buffer& buffer) {
+    u32 words[4];
+    std::memcpy(words, &buffer, sizeof(words));
+    return fmt::format("{:08x} {:08x} {:08x} {:08x}", words[0], words[1], words[2], words[3]);
+}
+std::string VSharpLocation(const BufferResource& resource) {
+    const auto& fetch = resource.sharp_fetch;
+    std::string out;
+    for (u32 i = 0; i < 4; ++i) {
+        out += i ? "," : "";
+        out += (fetch.load_mask >> i) & 1 ? std::to_string(fetch.offsets[i])
+                                           : fmt::format("imm {:#x}", fetch.immediates[i]);
+    }
+    return out;
+}
+
 IR::U32 CalculateBufferAddress(IR::IREmitter& ir, const IR::Inst& inst, const Info& info,
                                const AmdGpu::Buffer& buffer, u32 stride) {
     const auto inst_info = inst.Flags<IR::BufferInstInfo>();
@@ -643,7 +663,8 @@ IR::U32 CalculateBufferAddress(IR::IREmitter& ir, const IR::Inst& inst, const In
     return buffer_offset;
 }
 
-void PatchBufferArgs(IR::Inst& inst, Info& info, const Profile& profile) {
+void PatchBufferArgs(IR::Inst& inst, Info& info, const Profile& profile,
+                     const RuntimeInfo& runtime_info) {
     const auto handle = inst.Arg(0);
     const auto buffer_res = info.buffers[handle.U32()];
     const auto buffer = buffer_res.GetSharp(info);
@@ -685,9 +706,12 @@ void PatchBufferArgs(IR::Inst& inst, Info& info, const Profile& profile) {
             ASSERT_MSG(!flags.voffset_enable || voffset.IsImmediate(),
                        "Apple structured offen-only dynamic offset needs a wider binding: "
                        "shader={:#x} base={:#x} stride={} num_records={} swizzle={} "
-                       "index_stride={} element_size={} flags={:#x}",
+                       "index_stride={} element_size={} flags={:#x}; V# {} from flat user data "
+                       "dwords {} (16+: through tables); compiled for {}",
                        info.pgm_hash, buffer.base_address, buffer.stride, buffer.num_records,
-                       buffer.swizzle_enable, buffer.GetIndexStride(), buffer.GetElementSize(), flags.raw);
+                       buffer.swizzle_enable, buffer.GetIndexStride(), buffer.GetElementSize(), flags.raw,
+                       VSharpWords(buffer), VSharpLocation(buffer_res),
+                       compile_stop_context.empty() ? "(no context)" : compile_stop_context);
             u64 span = formatted ? AmdGpu::NumBitsPerElement(format) / 8
                                  : 1ull << BufferAddressShift(inst, format);
             switch (inst.GetOpcode()) {
@@ -708,7 +732,35 @@ void PatchBufferArgs(IR::Inst& inst, Info& info, const Profile& profile) {
             auto& required = info.buffers[handle.U32()].required_binding_bytes;
             required = std::max(required, physical_offset + span);
         }
-        ASSERT_MSG(buffer.stride == 0 ||
+        // bbport: the stream-out stores of a CopyStreamOut kernel (proven stream-out by
+        // RingAccessElimination) add the VGT's buffer offset as soffset. The compaction kernel
+        // keeps soffset + (index + 1) * stride within VGT_STRMOUT_BUFFER_SIZE, which
+        // RecordGsStreamOut checks against each bound V# range.
+        const bool stream_out_store =
+            runtime_info.gs_role == GsEmulationRole::CopyStreamOut &&
+            IR::NameOf(inst.GetOpcode()).starts_with("StoreBuffer");
+        if (stream_out_store) {
+            // The address shape is proven (RingAccessElimination); each access stays within one
+            // vertex of the V# stride, unswizzled, and names its buffer for RecordGsStreamOut.
+            u32 bytes = formatted ? AmdGpu::NumBitsPerElement(format) / 8
+                                  : 1u << BufferAddressShift(inst, format);
+            const std::string_view op = IR::NameOf(inst.GetOpcode());
+            bytes = op.ends_with("x2") ? 8 : op.ends_with("x3") ? 12 : op.ends_with("x4") ? 16 : bytes;
+            const int so = GsEmulation::StreamOutOffsetBuffer(soffset);
+            ASSERT_MSG(so >= 0 && buffer.stride != 0 && !buffer.swizzle_enable &&
+                           u64(flags.inst_offset.Value()) + bytes <= buffer.stride,
+                       "Geometry emulation: stream-out store of shader {:#x} ({} bytes at offset {}) "
+                       "outside one vertex of its V# (stride {}, swizzle {})",
+                       info.pgm_hash, bytes, u32(flags.inst_offset.Value()), buffer.stride,
+                       buffer.swizzle_enable);
+            auto& named = info.buffers[handle.U32()].stream_out_buffer;
+            ASSERT_MSG(named == BufferResource::NoStreamOut || named == u32(so),
+                       "Geometry emulation: shader {:#x} stores to stream-out buffers {} and {} "
+                       "through one V#",
+                       info.pgm_hash, named, so);
+            named = u8(so);
+        }
+        ASSERT_MSG(buffer.stride == 0 || stream_out_store ||
                        (soffset.IsImmediate() && soffset.U32() == 0),
                    "Apple structured-buffer SGPR offset needs a wider binding: shader={:#x} "
                    "base={:#x} stride={} num_records={} swizzle={} index_stride={} "
@@ -1044,7 +1096,7 @@ void PatchImageArgs(IR::Inst& inst, Info& info) {
 }
 
 void ResourcePatchingPass(Shader::Info& info, const ResourceDiscoveryList& resources,
-                          const Profile& profile) {
+                          const Profile& profile, const RuntimeInfo& runtime_info) {
     // Iterate over discovered resources and patch them after finding the sharp.
     // Pass 1: Track resource sharps
     Descriptors descriptors{info};
@@ -1061,7 +1113,7 @@ void ResourcePatchingPass(Shader::Info& info, const ResourceDiscoveryList& resou
     for (const auto& usage : resources) {
         IR::Inst& inst = *usage.user;
         if (IsBufferInstruction(inst)) {
-            PatchBufferArgs(inst, info, profile);
+            PatchBufferArgs(inst, info, profile, runtime_info);
         } else if (IsImageInstruction(inst)) {
             PatchImageArgs(inst, info);
         } else if (IsDataRingInstruction(inst)) {
