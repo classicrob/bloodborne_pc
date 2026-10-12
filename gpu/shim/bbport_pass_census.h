@@ -171,7 +171,9 @@ inline void NoteBarrierEnd(std::uint32_t sources, const void* caller) {
     detail::barrier_caller = caller;
 }
 
-inline void NoteEnd(Why why, const void* caller) {
+/// A pass ends. Returns the ender it is attributed to: the EndRendering caller (Other), the
+/// FlushBarriers caller (Barrier), else nullptr.
+inline const void* NoteEnd(Why why, const void* caller) {
     std::scoped_lock lk{detail::mutex};
     ++detail::ends[std::size_t(why)];
     if (why == Why::Other) {
@@ -182,6 +184,7 @@ inline void NoteEnd(Why why, const void* caller) {
                           : why == Why::Barrier ? detail::barrier_caller
                                                 : nullptr;
     detail::barrier_caller = nullptr;
+    return detail::last_caller;
 }
 
 /// On stage A at each frame end: every 600, prints the census and starts a new window.

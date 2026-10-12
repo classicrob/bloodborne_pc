@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <bit>
 #include <xxhash.h>
 #ifdef __APPLE__
 #include <sys/stat.h>
@@ -41,6 +42,8 @@
 #include "video_core/texture_cache/image_view.h"
 #include "video_core/texture_cache/texture_cache.h"
 #include "bbport_parse_split.h"
+#include "bbport_pass_trace.h"
+#include <vulkan/vulkan_format_traits.hpp>
 #include <optional>
 #include <vk_mem_alloc.h>
 
@@ -1268,6 +1271,11 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     UpdateDynamicState(pipeline, is_indexed);
     MarkPass(pipeline, state);
     scheduler.BeginRendering(state);
+#ifdef __APPLE__
+    if (BbPassTrace::Enabled()) {
+        BbPassTrace::NoteDraw();
+    }
+#endif
 
     const auto& vs_info = pipeline->GetStage(Shader::SwStage::Vertex);
     const auto& fetch_shader = pipeline->GetFetchShader();
@@ -1531,6 +1539,11 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
     UpdateDynamicState(pipeline, is_indexed);
     MarkPass(pipeline, state);
     scheduler.BeginRendering(state);
+#ifdef __APPLE__
+    if (BbPassTrace::Enabled()) {
+        BbPassTrace::NoteDraw();
+    }
+#endif
 
 #ifdef __APPLE__
     if (gs_draw.indirect) {
@@ -3654,6 +3667,37 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
             db_desc.first ? &texture_cache.GetImage(db_desc.first).info : nullptr;
         FrameCapture::BeginPass(colors.data(), state.num_color_attachments, depth);
     }
+#ifdef __APPLE__
+    if (BbPassTrace::Enabled()) {
+        // The pass trace resolves this state's final views (redirected or proxies included) to
+        // their guest images. The object motion attachment below stays unknown.
+        const auto note = [&](vk::ImageView view, const VideoCore::Image& image,
+                              const VideoCore::SubresourceRange& range) {
+            const auto& info = image.info;
+            BbPassTrace::NoteView(std::bit_cast<u64>(view),
+                                  {
+                                      .uid = image.image_uid,
+                                      .format = u32(info.pixel_format),
+                                      .texel_bytes = vk::blockSize(info.pixel_format),
+                                      .width = std::max(info.size.width >> range.base.level, 1u),
+                                      .height = std::max(info.size.height >> range.base.level, 1u),
+                                      .layers = range.extent.layers,
+                                      .level = range.base.level,
+                                  });
+        };
+        for (u32 cb = 0; cb < state.num_color_attachments; ++cb) {
+            if (cb_descs[cb].first && state.color_attachments[cb].image_view) {
+                note(state.color_attachments[cb].image_view,
+                     texture_cache.GetImage(cb_descs[cb].first),
+                     cb_descs[cb].second.view_info.range);
+            }
+        }
+        if (db_desc.first && state.depth_stencil_attachment.image_view) {
+            note(state.depth_stencil_attachment.image_view, texture_cache.GetImage(db_desc.first),
+                 db_desc.second.view_info.range);
+        }
+    }
+#endif
     // bbport: object motion vector attachment of G-buffer pipelines.
     if (key.motion_vectors) {
         object_motion->Attach(state, state.width, state.height);
