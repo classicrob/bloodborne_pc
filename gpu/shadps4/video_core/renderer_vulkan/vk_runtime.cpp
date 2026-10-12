@@ -859,7 +859,11 @@ void Runtime::FlushBarriers() {
     }
 
     BB_SPLIT_SCOPE(KBarrierFlush);
+#ifdef __APPLE__
+    scheduler.EndRenderingFor(BbPassCensus::Why::Barrier);
+#else
     scheduler.EndRendering();
+#endif
     scheduler.Record([memory = memory_barrier, has_memory = dep_info.memoryBarrierCount != 0,
                       images = scheduler.RecordData(std::span<const vk::ImageMemoryBarrier2>(
                           image_barriers.data(), image_barriers.size()))](vk::CommandBuffer cmdbuf) {
