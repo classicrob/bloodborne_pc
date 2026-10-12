@@ -207,5 +207,87 @@ class WeaponFixtureChecks(unittest.TestCase):
             self.weapon.reverse(changed, operation)
 
 
+
+
+class CentralFixtureChecks(unittest.TestCase):
+    def setUp(self):
+        import struct
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.source = self.root / 'clinic-via-sickroom-lamp'
+        self.destination = self.root / 'central'
+        character = self.source / tool.CHARACTER
+        character.parent.mkdir(parents=True)
+        data = bytearray(b'Z' * tool.SOURCE_SIZE)
+        data[4:8] = struct.pack('<I', 0x18010000)
+        data[0x12548:0x1254c] = b'FACE'
+        data[0x3f7a1:0x3f7a5] = b'LCED'
+        data[0x3f7a9:0x3f7b5] = bytes.fromhex('ffffffff0000000000000000')
+        data[0x3f7b5:0x3f7c1] = struct.pack('<3f', -198.958, -50.64, 160.58)
+        character.write_bytes(data)
+        self.meta = {'name': self.source.name, 'run': 'synthetic', 'edited': True,
+                     'edited_origin': 'dream-location',
+                     'parent': {'name': 'weapons', 'edited': True},
+                     'unverified': ['lamps'],
+                     'verified': [{'item': 'pistol-fire', 'fixture': 'weapons', 'run': 'old'}]}
+        (self.source / 'fixture.json').write_text(json.dumps(self.meta))
+        (character.parent / 'backup0000').write_bytes(b'unchanged backup')
+        self.original = tool.inventory(self.source)
+        patcher = mock.patch.object(tool, 'CENTRAL_SOURCE_SHA256', tool.digest(data))
+        patcher.start(); self.addCleanup(patcher.stop)
+
+    def run_tool(self, dry=False):
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            result = tool.create(self.source, self.destination, dry, 'central-yharnam')
+        return result, output.getvalue()
+
+    def test_central_exact_position_and_reverse(self):
+        import struct
+        provenance, _ = self.run_tool()
+        before = (self.source / tool.CHARACTER).read_bytes()
+        after = (self.destination / tool.CHARACTER).read_bytes()
+        self.assertEqual(len(after), len(before))
+        self.assertEqual(after[:0x3f7b5], before[:0x3f7b5])
+        self.assertEqual(after[0x3f7c1:], before[0x3f7c1:])
+        self.assertEqual(after[0x3f7b5:0x3f7c1], struct.pack('<3f', -193.4, -28.646, 68.5))
+        self.assertEqual(tool.reverse(after, provenance['edits']), before)
+        self.assertEqual(tool.inventory(self.source), self.original)
+        meta = json.loads((self.destination / 'fixture.json').read_text())
+        self.assertEqual(meta['parent'], self.meta)
+        self.assertEqual(meta['verified'], self.meta['verified'])
+        self.assertTrue(meta['edited'])
+        self.assertEqual(meta['edited_origin'], 'dream-location')
+        self.assertEqual(meta['validation'], 'pending')
+
+    def test_central_dry_run(self):
+        _, output = self.run_tool(True)
+        self.assertIn('0x3f7b5', output)
+        self.assertIn('DRY RUN', output)
+        self.assertFalse(self.destination.exists())
+        self.assertEqual(tool.inventory(self.source), self.original)
+
+    def test_central_wrong_hash_or_profile(self):
+        with self.assertRaises(ValueError):
+            tool.plan(self.source, self.destination)
+        with self.assertRaises(ValueError):
+            tool.plan(self.source, self.destination, 'unknown')
+        path = self.source / tool.CHARACTER
+        data = bytearray(path.read_bytes()); data[-1] ^= 1; path.write_bytes(data)
+        with self.assertRaisesRegex(ValueError, 'SHA256'):
+            self.run_tool()
+
+    def test_central_guards_and_tampering(self):
+        path = self.source / tool.CHARACTER
+        data = bytearray(path.read_bytes()); data[4] ^= 1; path.write_bytes(data)
+        with mock.patch.object(tool, 'CENTRAL_SOURCE_SHA256', tool.digest(data)):
+            with self.assertRaisesRegex(ValueError, 'map/coordinate'):
+                self.run_tool()
+        data[4] ^= 1; path.write_bytes(data)
+        provenance, _ = self.run_tool(True)
+        with self.assertRaisesRegex(ValueError, 'no longer matches'):
+            tool.reverse(data, provenance['edits'])
+
+
 if __name__ == '__main__':
     unittest.main()
