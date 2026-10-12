@@ -12,3 +12,12 @@
 - **Skips:** `BB_TEST_SKIP=<substring>` skips matching tests under `--test-keep-going` only. They are listed in the summary and in `out/test-results.txt`. A run with skips exits 3 and prints `NOT A FULL GATE`: it never passes as the gate. A merge request or preview must list each skip and say why.
 - **What still stops a run:** a failing build or non-test step (compile, link, sign, the export gate, the wiring check) stops even `--test-keep-going`, with a non-zero exit and no summary.
 - **Where it runs:** in a heavy.sh build slot (build.sh takes one itself). Run it as one background job with a timeout of at least 2 h, and don't edit the tree while it runs.
+
+## Previews
+
+`tools/macos/preview.sh --stage DIR [--build-only] [--priority] [--skip SUBSTRING] NAME`, from a clean
+checkout of the commit to preview: builds, stages `bb-probe` and `gpu/libbbgpu.dylib` to
+`DIR/<short HEAD>-NAME/` with `SHA256SUMS` (signatures checked; never overwrites), smoke-tests in a
+heavy.sh quick slot, then runs the gate (`build.sh --test-keep-going`; a failure in a run paused by
+a perf run is rerun once with `--test-one`, both results kept). `PREVIEW.txt` in the stage
+directory holds every fact for the post. Exit 0 passed, 1 failed, 3 skips, 2 usage.
