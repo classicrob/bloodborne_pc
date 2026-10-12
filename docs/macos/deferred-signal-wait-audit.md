@@ -110,3 +110,62 @@ matched producer packet and retirement ticket, result and elapsed time.
 Keep unmatched writers explicit. That allows PM4 to select proven scratch
 dependencies and leaves CPU-visible waits intact. No extra game slot is
 requested by this note.
+
+## WRITE_DATA drain removal: guest-side review
+
+Follow-up against macos `941b0e2` and the same 01.09 image. No game run or
+runtime policy change. The existing captures do **not** establish a guest pair
+that requires every later WRITE_DATA to wait for every earlier EOP/EOS. They
+also do not contain enough operand-level producer/consumer records to prove
+that no such explicitly synchronized pair occurs.
+
+The concrete allocator pairs remain:
+
+- Arena nodes: EOP writes 4 at metadata N; CPU reclaimer accepts that label
+  before returning the payload to the free list. The audited direct retirement
+  path has no WRITE_DATA producer of 4.
+- Command chunks: EOP or RELEASE_MEM writes zero to the chunk-end status;
+  CPU CAS claims zero to one. The separate direct CPU resets are not WRITE_DATA.
+- Flip reuse: VideoOut publication/previous-buffer release supplies the gate,
+  not an identified WRITE_DATA retirement label.
+
+These observations do not justify a blanket drain at WRITE_DATA. However,
+the **explicit wait edge** is real: `0x26b08e0` emits EOS(L,1) then
+WAIT_REG_MEM(L == 1), and `0x26b09e0` does the equivalent with EOP. The latter
+is called at `0x26b989d` and `0x26b9901` inside the resource synchronization
+helper `0x26b9850`. A direct-call scan found no direct caller of the former;
+that does not exclude indirect use. No audited caller/capture yet proves a
+specific subsequent WRITE_DATA in these paths.
+
+There is nevertheless a concrete emulator composition hazard:
+
+```
+EOP/EOS(L, 1) -> WAIT_REG_MEM(L == 1) -> WRITE_DATA(D, value)
+```
+
+`ProcessGraphics` can bypass the wait when `PendingFenceValue` predicts 1
+before the recording thread reaches the label packet. It carries no completion
+dependency to the later host write. Currently `RunWriteData` waits for host
+copies and then all deferred signals; that second wait incidentally restores
+this explicit edge. Removing it unconditionally allows D to change before L
+is published. This concern applies even when D and L are disjoint. It is a
+source-level counterexample for the optimization's composition, **not proof
+that the clinic emits this three-packet sequence**.
+
+The distinction PM4's design must preserve is:
+
+| Sequence | Review requirement |
+| --- | --- |
+| EOP/EOS then WRITE_DATA, no intervening dependency | The audit supplies no reason for a blanket CPU completion drain |
+| EOP/EOS then an explicit matching WAIT_REG_MEM then WRITE_DATA | Preserve the wait's dependency at the host-visible write, or do not forward that completion wait |
+| WRITE_DATA then EOP/EOS | Preserve WRITE_DATA publication before issuing/publishing the later completion label; do not move the write into an unordered task |
+| Host copies/stream writes then WRITE_DATA | Removing the completion-label wait is not permission to remove `WaitHostCopies` or stream-write visibility bookkeeping |
+
+Recommended controls for lever (d): a held completion ticket with a following
+independent WRITE_DATA can advance; the same stream with the explicit wait
+cannot expose the write early; and a preceding WRITE_DATA is visible when a
+later completion label becomes visible. Exercise the pending-value forwarding
+branch, not only an already-published label. A known game triple still needs
+operand-level capture; the existing aggregate deferred-wait totals cannot
+answer that question. `wr_confirm` and engine/cache fields require their own
+packet semantics review and are not qualified by this guest-lifetime note.
