@@ -541,6 +541,36 @@ def press(run, tokens, seconds=0.12, gap=0.8):
     time.sleep(max(gap, hold))
 
 
+def goto(run, x, z, tol, timeout):
+    """Closed-loop walk to world (x, z) on the run's player-position file (BB_PLAYER_POS_FILE,
+    tools/macos/play_route_goto.py). The left stick is released on every exit path; any invalid,
+    stale or foreign sample, a map change, no progress or the timeout stops loudly."""
+    import importlib.util
+    pid = game_pid(run)
+    path = manifest(run).get('env', {}).get('BB_PLAYER_POS_FILE')
+    if not path:
+        die('goto needs a run launched with --diag-env BB_PLAYER_POS_FILE=<absolute path>')
+    spec = importlib.util.spec_from_file_location('play_route_goto', Path(__file__).with_name('play_route_goto.py'))
+    nav = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(nav)
+    pad = run / 'pad.txt'
+
+    def stick(lx, ly):
+        pad.write_text('\n' if lx is None else f'lx={lx} ly={ly}\n')
+
+    event(run, 'goto-start', target=[x, z], tol=tol)
+    try:
+        result = nav.goto(nav.PositionReader(path, pid), stick, (x, z), tol=tol, timeout_s=timeout)
+    except nav.GotoError as e:
+        pad.write_text('\n')
+        event(run, 'goto-stop', target=[x, z], error=str(e))
+        die(f'goto ({x}, {z}) stopped: {e}')
+    finally:
+        pad.write_text('\n')
+    event(run, 'goto-reached', target=[x, z], **result)
+    print(json.dumps(result))
+
+
 def snapshot(run, name):
     """A full-resolution window capture into <run>/tmp (for comparisons, not kept as evidence)."""
     pid = game_pid(run)
@@ -909,6 +939,11 @@ def main():
     p = sub.add_parser('press')
     p.add_argument('tokens')
     p.add_argument('seconds', type=float, nargs='?', default=0.12)
+    p = sub.add_parser('goto', help='walk to world X Z on the player-position file (closed loop)')
+    p.add_argument('x', type=float)
+    p.add_argument('z', type=float)
+    p.add_argument('--tol', type=float, default=1.0)
+    p.add_argument('--timeout', type=float, default=120.0)
     p = sub.add_parser('step')
     p.add_argument('name', choices=sorted(STEPS))
     p = sub.add_parser('capture')
@@ -956,6 +991,8 @@ def main():
         run = current_run(args.run)
         if args.command == 'press':
             press(run, args.tokens, args.seconds)
+        elif args.command == 'goto':
+            goto(run, args.x, args.z, args.tol, args.timeout)
         elif args.command == 'step':
             for token in STEPS[args.name]:
                 press(run, token)
