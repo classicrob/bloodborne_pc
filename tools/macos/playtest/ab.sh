@@ -20,6 +20,7 @@ for a in $ORDER; do
   R=$(ls -td out/macos_route/*-$L | head -1)
   { echo "##### arm $a: $(basename "$(build $a)"), run $(basename $R)"; grep -v "^heavy: .*waiting" $OUT/$L.txt
     echo "-- App Nap: $(grep -m1 'App Nap' $R/game.log)"; echo "-- WarmUp: $(grep -m2 'WarmUp' $R/game.log | tr '\n' ' ')"
+    echo "-- host (thermal, memory pressure, load; before and after):"; cat $R/host.txt 2>/dev/null || echo "MISSING host.txt"
     echo "-- BB_PERF:"; python3 "$HERE/perfsum.py" $R; } > $OUT/$L.sum
   cat $OUT/$L.sum
   [ -z "$first" ] && first=$R
