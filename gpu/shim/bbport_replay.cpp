@@ -91,8 +91,11 @@ struct Submission {
     struct Region {
         u64 guest;
         std::vector<u32> words;
+        bool top_level = false; ///< the submission's DCB or CCB (its address is in no packet)
+        bool from_copy = false; ///< outside guest memory here: submitted from `words`
     };
     std::vector<Region> regions;
+    s32 dcb_region = -1, ccb_region = -1;
 };
 
 struct Reset {
@@ -237,8 +240,11 @@ private:
                     sub.ccb = reinterpret_cast<const u32*>(rr.guest);
                     sub.ccb_bytes = rr.size_dw * 4;
                 }
+                region.top_level = s32(k) == s.dcb_region || s32(k) == s.ccb_region;
                 sub.regions.push_back(std::move(region));
             }
+            sub.dcb_region = s.dcb_region;
+            sub.ccb_region = s.ccb_region;
             submissions.push_back(std::move(sub));
         }
         if (submissions.empty()) {
@@ -309,7 +315,7 @@ struct Counters {
 
 /// Restores everything the frame starts from: the reset ranges, the command words and the
 /// Liverpool parse state. The GPU command thread is idle (waiting for a submission).
-bool Restore(AmdGpu::Liverpool& lp, const Capture& c, std::string& why) {
+bool Restore(AmdGpu::Liverpool& lp, Capture& c, std::string& why) {
     for (const auto& reset : c.resets) {
         if (reset.host) {
             // Host memory (an HLE object the frame's packets write): restored in place when this
@@ -339,13 +345,34 @@ bool Restore(AmdGpu::Liverpool& lp, const Capture& c, std::string& why) {
             return false;
         }
     }
-    for (const auto& sub : c.submissions) {
-        for (const auto& region : sub.regions) {
-            if (!runtime_memory_write_backing(region.guest, region.words.data(),
-                                              region.words.size() * 4)) {
-                why = fmt::format("command region {:#x} is not mapped", region.guest);
+    for (auto& sub : c.submissions) {
+        for (size_t k = 0; k < sub.regions.size(); ++k) {
+            auto& region = sub.regions[k];
+            if (region.from_copy ||
+                runtime_memory_write_backing(region.guest, region.words.data(),
+                                             region.words.size() * 4)) {
+                continue;
+            }
+            if (!region.top_level) {
+                // An indirect buffer's address is inside a packet: it must be where it was.
+                why = fmt::format("indirect buffer {:#x} ({} dwords) lies outside guest memory "
+                                  "here (an HLE-built buffer in host memory?)",
+                                  region.guest, region.words.size());
                 return false;
             }
+            // A DCB/CCB in host memory (an HLE-built buffer): only the submit call holds its
+            // address, so it is submitted from the capture's copy.
+            region.from_copy = true;
+            const u32* copy = region.words.data();
+            if (s32(k) == sub.dcb_region) {
+                sub.dcb = copy;
+            } else {
+                sub.ccb = copy;
+            }
+            fmt::print("Perf replay: {} {:#x} ({} dwords) lies outside guest memory here; submitted "
+                       "from the capture's copy\n",
+                       s32(k) == sub.dcb_region ? "DCB" : "CCB", region.guest,
+                       region.words.size());
         }
     }
     std::memcpy(&lp.regs, c.regs.get(), sizeof(lp.regs));
