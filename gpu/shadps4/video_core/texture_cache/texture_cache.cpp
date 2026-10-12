@@ -1363,6 +1363,14 @@ void TextureCache::DeleteImage(ImageId image_id) {
 }
 
 #ifdef __APPLE__
+void TextureCache::TrackGpuWritten(ImageId image_id) {
+    std::scoped_lock lock{mutex};
+    Image& image = slot_images[image_id];
+    TrackImage(image_id);
+    TouchImage(image);
+    std::ranges::fill(image.mip_hashes, 0);
+}
+
 void TextureCache::ReportGpuModifiedForCapture(std::vector<CaptureImageRecord>& out) {
     std::scoped_lock lock{mutex};
     for (Image& image : slot_images) {

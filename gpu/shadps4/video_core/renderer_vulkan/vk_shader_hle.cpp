@@ -507,11 +507,13 @@ bool FillAsImageClear(const Shader::Info& info, const AmdGpu::ComputeProgram& cs
     // Exactly one cached image, at exactly the buffer's range.
     auto& texture_cache = rasterizer.GetTextureCache();
     VideoCore::Image* image = nullptr;
+    VideoCore::ImageId image_id{};
     u32 overlapping = 0;
     texture_cache.ForEachImageInRegion(address, size,
-                                       [&](VideoCore::ImageId, VideoCore::Image& candidate) {
+                                       [&](VideoCore::ImageId id, VideoCore::Image& candidate) {
                                            ++overlapping;
                                            image = &candidate;
+                                           image_id = id;
                                        });
     if (overlapping == 0) {
         return fails(FillPath::NoImage);
@@ -567,6 +569,10 @@ bool FillAsImageClear(const Shader::Info& info, const AmdGpu::ComputeProgram& cs
     vk::ClearValue clear{};
     clear.color.float32 = value;
     runtime.ClearImage(image, VideoCore::SubresourceRange{}, clear);
+    // ClearImage leaves it GPU-modified and clean, i.e. trusted for write-backs: it must notice
+    // guest CPU writes from now on (the kernel path instead leaves it GPU-dirty, refreshed from
+    // memory at its next use).
+    texture_cache.TrackGpuWritten(image_id);
     CountFill(FillPath::Cleared);
     if (fill_verify) {
         VerifyFillClear(rasterizer, *image, address, size, *pattern, *texel, texel_bytes);

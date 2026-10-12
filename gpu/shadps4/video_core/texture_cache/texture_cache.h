@@ -123,6 +123,14 @@ public:
     /// (Rasterizer::QuiesceForCapture). Not const: the slot vector's const iteration is unusable.
     void ReportGpuModifiedForCapture(std::vector<CaptureImageRecord>& out);
 
+    /// bbport: `image_id` was just written on the GPU outside UpdateImage (the RT fill
+    /// replacement's clear, which leaves it GPU-modified and clean): tracked for guest CPU
+    /// writes from now on, as UpdateImage would track it, so a later CPU write marks it dirty
+    /// before any write-back (SynchronizeMemoryFromImage) or refresh trusts it. Its mip hashes
+    /// describe the bytes before the write, so they are reset: a later CPU-dirty refresh
+    /// uploads instead of matching an old hash.
+    void TrackGpuWritten(ImageId image_id);
+
     /// bbport (perf replay, capture_images.h): every GPU-modified image, texels and state, one
     /// at a time to `sink`, then the metadata surfaces. Call at a quiescent point
     /// (Rasterizer::QuiesceForCapture) on the GPU command thread. False with `why` (nothing
