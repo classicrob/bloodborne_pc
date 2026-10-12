@@ -103,6 +103,7 @@ for X in $(echo "$order" | fold -w1); do
     n=$((n + 1)); dir=$(arm_dir $X); tag=$n-$X
     [[ $X == A ]] && extra=$env_a || extra=$env_b
     log=$logs/run-$tag.log
+    rm -f "$logs/perf-$tag.jsonl" # BB_PERF_OUT must be a new file
     {
         echo "== host before run $tag ($(date -u +%FT%TZ))"
         echo "powermode: $(pmset -g custom | awk '/powermode/{print $2}' | tr '\n' ' ')"
@@ -116,7 +117,8 @@ for X in $(echo "$order" | fold -w1); do
         python3 tools/macos/replay_watch.py "$log" 60 300 -- env \
         VK_DRIVER_FILES="$deps/share/vulkan/icd.d/MoltenVK_icd.json" BB_CONFIG="$ini" BB_UPSCALER=none \
         BB_WINDOW_SIZE=320x180 BB_WINDOW_BACKGROUND=1 BB_WINDOW_POS=0,0 BB_FRAME_STATS=1 BB_GPU_LOG=info \
-        BB_REPLAY_GPU_WAIT=1 $env_both $extra BB_REPLAY_RUN="$capture" BB_REPLAY_ITERATIONS="$iters" \
+        BB_REPLAY_GPU_WAIT=1 BB_PERF=1 BB_PERF_OUT="$logs/perf-$tag.jsonl" $env_both $extra \
+        BB_REPLAY_RUN="$capture" BB_REPLAY_ITERATIONS="$iters" \
         "$dir/out/bb-probe" "$data/out/boot-linked.bin" --content-profile "$data/out/content.bin" \
         --patches "$data/out/patches.bin" --app0 "$game" --user "$logs/user" --timeout 900 \
         2> "$logs/heavy-$tag.err"
