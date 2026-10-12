@@ -719,6 +719,7 @@ static int probe_main(int argc, char **argv) {
     printf("Guest TCB loads redirected to the host TLS slot: %" PRIu64 "\n", patch_tcb_loads(segments, ns));
 #endif
 #ifdef __APPLE__
+    runtime_player_position_init((uintptr_t)image,size);
     const char *entry_error=entry_trace_install(getenv("BB_GUEST_ENTRY_TRACE"),image,segments,ns);
     entry_trace_require(entry_error);
     if (entry_trace_count) {

@@ -102,3 +102,47 @@ or warp is part of this tool. The likely implementation is one small runtime
 module plus startup/input integration and a fixture for read failures, changing
 chains, non-finite fields and atomic publication; it does not require renderer
 or GPU-library changes.
+
+## Implemented observer (qualification pending)
+
+Set `BB_PLAYER_POS_FILE` to an absolute output path. Startup checks six short
+1.09 code ranges after patches and before entry probes are installed. Each
+successful pad read calls the observer **after unlocking the pad mutex**. It
+samples at most every 100 ms; it does not create a timer or worker thread. File
+creation/write/close/rename runs on that caller, so this diagnostic can add I/O
+latency and is not recommended for performance captures.
+
+Each observation uses two complete non-faulting self reads and requires equal
+pointer chains, map and transform. This reduces inconsistent observations; it
+does not establish guest object lifetime, simulation advancement, or input
+controllability. Non-null unreadable pointers and non-finite XYZ/yaw publish
+invalid output and terminate with exit 23. Null chain members, map `0xffffffff`,
+and changing observations publish invalid output and a loud state-change line;
+these are expected during loads. Invalid records omit player/XYZ/yaw/map fields.
+File failure or code-guard mismatch also stops with exit 23. A failed write may
+leave the previous file intact, so consumers must enforce freshness/process
+identity regardless of the last record's validity.
+
+Schema version 1 uses `pid`, a random hex `run_id`, `started_monotonic_ns`,
+`sequence`, `sample_monotonic_ns`, `published_monotonic_ns`, `sample_age_ns`,
+`pad_reads`, `valid`, `reason`, and `source="pad-read-observation"`. Valid records
+add `player` (hex string), `xyz` (three floats), `player_yaw_rad`, and `map_raw`
+(unsigned integer). Times use host CLOCK_MONOTONIC nanoseconds; sample age is
+measured at formatting, before file I/O. `pad_reads` counts valid API calls, not
+simulation frames. Consumers compute current age from the sample timestamp;
+they must not treat a recent file mtime or repeated stationary XYZ as progress.
+
+Playtest's agreed `goto` design does not need camera telemetry: it calibrates
+left-stick forward against observed world displacement, keeps the right stick
+untouched, then refines the stick-to-world mapping from later movements. It
+must still detect camera auto-follow/collision effects through that feedback.
+`face` is dropped. The first run remains observation-only before automated
+steering is qualified. Camera-independent yaw sign calibration can be recorded
+in that same run but is not required by `goto`.
+
+The signed unit fixture exercises the production chain walk against fake
+memory, null members, failed/overflowing reads, changing observations, invalid
+map and non-finite values; JSON validity/field omission and sequence; loud
+refusals; real Mach reads over a fake mapped image and protected/unmapped pages;
+the rate cap and host/guest errno preservation. Its optional local image argument
+checks the positive code guards without storing game bytes in the repository.
