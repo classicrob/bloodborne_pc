@@ -207,6 +207,7 @@ if [[ ${1:-} == --test || ${1:-} == --test-dry || ${1:-} == --test-one ]]; then
     if [[ $1 == --test-dry ]]; then dry=1; fi
     if [[ $1 == --test-one ]]; then one=$2; fi
     one_ran=0 one_failed=0 one_last=0 one_seen=()
+    # --- test runner (tests/test_build_test_one.sh sources this block) ---
     names() {  # does an argument name the --test-one test?
         local arg
         for arg; do [[ $arg == "$one" || $arg == */"$one" ]] && return 0; done
@@ -221,7 +222,28 @@ if [[ ${1:-} == --test || ${1:-} == --test-dry || ${1:-} == --test-one ]]; then
         local target
         for target; do if want "out/gpu/$target"; then echo "$target"; fi; done
     }
-    unchecked() { [[ -n $dry ]] || [[ -n $one && $one_last == 0 ]]; }  # skip a check of outputs
+    # Skip a check of a test's outputs: --test-dry, or --test-one when that test was not selected
+    # or failed (its own exit is the failure; its missing outputs are not a second one).
+    unchecked() { [[ -n $dry ]] || [[ -n $one && $one_last == 0 ]]; }
+    fresh_dir() {  # fresh_dir TEST DIR: an empty output directory for TEST, if TEST runs
+        if want "$1"; then rm -rf "$2" && mkdir -p "$2"; fi
+    }
+    outputs_ok() {  # outputs_ok COUNT EXPECTED MESSAGE: the output count of the test just run
+        unchecked || (($1 == $2)) && return 0
+        echo "$3" >&2
+        [[ -n $one ]] || exit 1
+        echo "test-one: exit 1: output check: $3"
+        if ((!one_failed)); then one_failed=1; fi
+    }
+    test_one_summary() {  # --test-one's end: its runs, or the test commands when none was named
+        if ((!one_ran)); then
+            echo "test-one: no test command names '$one'. The test commands:" >&2
+            printf '  %s\n' "${one_seen[@]}" >&2
+            exit 1
+        fi
+        echo "test-one: $one: $one_ran run(s), exit $one_failed"
+        exit "$one_failed"
+    }
     t() {
         if [[ -n $one ]]; then
             if [[ $1 == spirv-val ]]; then
@@ -237,6 +259,7 @@ if [[ ${1:-} == --test || ${1:-} == --test-dry || ${1:-} == --test-one ]]; then
             ((++one_ran))
             echo "test-one: exit $rc: $*"
             if ((rc && !one_failed)); then one_failed=$rc; fi
+            if ((rc)) && [[ $1 != spirv-val ]]; then one_last=0; fi  # no checks of a failed test's outputs
             return 0
         fi
         if [[ -z $dry ]]; then "$@"; return; fi
@@ -253,6 +276,7 @@ if [[ ${1:-} == --test || ${1:-} == --test-dry || ${1:-} == --test-one ]]; then
         fi
         echo "test-dry: would run $*"
     }
+    # --- end test runner ---
     if [[ $(uname -s) == Darwin ]]; then
         # The GPU library has no default user directory on macOS: fixtures get a scratch one.
         export BB_GPU_USER_DIR="$PWD/out/gpu-test-user"
@@ -274,15 +298,15 @@ if [[ ${1:-} == --test || ${1:-} == --test-dry || ${1:-} == --test-one ]]; then
         t out/gpu/push-userdata-test out/push-userdata.spv
         t spirv-val --target-env vulkan1.3 out/push-userdata.spv
         # Depth-bounds emulation shaders: 8 permutations + 2 entry-phi cases, each validated.
-        rm -rf out/depth-bounds-shader && mkdir -p out/depth-bounds-shader
+        fresh_dir out/gpu/depth-bounds-shader-test out/depth-bounds-shader
         t out/gpu/depth-bounds-shader-test out/depth-bounds-shader
         depth_spv=(out/depth-bounds-shader/*.spv)
-        unchecked || [[ ${#depth_spv[@]} == 10 ]] || { echo "depth-bounds-shader-test wrote ${#depth_spv[@]} SPIR-V files, expected 10" >&2; exit 1; }
+        outputs_ok ${#depth_spv[@]} 10 "depth-bounds-shader-test wrote ${#depth_spv[@]} SPIR-V files, expected 10"
         for spv in "${depth_spv[@]}"; do t spirv-val --target-env vulkan1.3 "$spv"; done
-        rm -rf out/shader-inputs-modules && mkdir -p out/shader-inputs-modules
+        fresh_dir out/gpu/shader-inputs-test out/shader-inputs-modules
         t out/gpu/shader-inputs-test out/shader-inputs-modules
         input_spv=(out/shader-inputs-modules/*.spv)
-        unchecked || [[ ${#input_spv[@]} == 12 ]] || { echo "shader-inputs-test wrote ${#input_spv[@]} SPIR-V files, expected 12" >&2; exit 1; }
+        outputs_ok ${#input_spv[@]} 12 "shader-inputs-test wrote ${#input_spv[@]} SPIR-V files, expected 12"
         for spv in "${input_spv[@]}"; do t spirv-val --target-env vulkan1.3 "$spv"; done
         t out/gpu/flatten-base-shape-test
         # Default allocated descriptor sets only; --push reproduces a MoltenVK bug and exits 2.
@@ -331,12 +355,12 @@ if [[ ${1:-} == --test || ${1:-} == --test-dry || ${1:-} == --test-one ]]; then
         t out/gpu/depth-bounds-probe-test
         t out/gpu/replay-capture-test
         t out/gpu/slot-vector-test
-        rm -rf out/buffer-null && mkdir -p out/buffer-null
+        fresh_dir out/gpu/buffer-null-test out/buffer-null
         t out/gpu/buffer-null-test out/buffer-null
         t spirv-val --target-env vulkan1.3 out/buffer-null/null-buffer.spv
         t spirv-val --target-env vulkan1.3 out/buffer-null/valid-buffer.spv
         t out/gpu/motion-history-test
-        rm -rf out/motion-shaders && mkdir -p out/motion-shaders
+        fresh_dir out/gpu/motion-shader-test out/motion-shaders
         t out/gpu/motion-shader-test out/motion-shaders
         for spv in out/motion-shaders/*.spv; do t spirv-val --target-env vulkan1.3 "$spv"; done
         t out/gpu/ui-composition-test
@@ -431,6 +455,7 @@ if [[ ${1:-} == --test || ${1:-} == --test-dry || ${1:-} == --test-one ]]; then
         t sh tests/macos_spike/test_hle_stack.sh
         t bash tests/test_savedata_macos.sh
         t bash tests/test_heavy.sh
+        t bash tests/test_build_test_one.sh
         t sh tests/test_sync_diagnostics_macos.sh
         t sh tests/test_cond_wake_check_macos.sh
         t python3 tests/test_restart_macos.py
@@ -476,13 +501,5 @@ if [[ ${1:-} == --test || ${1:-} == --test-dry || ${1:-} == --test-one ]]; then
         # older --test cannot load the current libbbgpu, and stopped the run before the rebuild).
         t bash tests/run_python_tests.sh
     fi
-    if [[ -n $one ]]; then
-        if ((!one_ran)); then
-            echo "test-one: no test command names '$one'. The test commands:" >&2
-            printf '  %s\n' "${one_seen[@]}" >&2
-            exit 1
-        fi
-        echo "test-one: $one: $one_ran run(s), exit $one_failed"
-        exit "$one_failed"
-    fi
+    if [[ -n $one ]]; then test_one_summary; fi
 fi

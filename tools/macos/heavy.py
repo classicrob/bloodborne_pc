@@ -416,12 +416,12 @@ def start_quiet(label):
         print(f'heavy: {label}: CPU QUIET BOUND REACHED after {bound} s: resuming paused jobs while '
               f'this job still runs', file=sys.stderr, flush=True)
     for job, pids, root in paused:
+        note_pause(root, end=label)  # before resuming: a job that ends at once reads a closed pause
         for pid in reversed(pids):
             try:
                 os.kill(pid, signal.SIGCONT)
             except ProcessLookupError:
                 pass
-        note_pause(root, end=label)
         print(f'heavy: {label}: CPU quiet over: resumed {job}', file=sys.stderr, flush=True)
     record({'event': 'quiet-end', 'by': label, 'seconds': round(time.monotonic() - started, 1),
             'bound_reached': alive(target), 'resumed': [job for job, _, _ in paused]})

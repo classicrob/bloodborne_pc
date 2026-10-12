@@ -1,9 +1,10 @@
-/* test_alarm(seconds): alarm() for tests that counts only time the test is not stopped.
+/* test_alarm(seconds): alarm() for tests whose limit a SIGSTOP of the test does not use up.
  * heavy.sh --cpu-quiet SIGSTOPs build and test jobs for the length of a perf run; alarm() kept
  * counting through the stop and fired as soon as the test resumed (PREVIEW-25a: the fp16 probe's
  * alarm(45) after a 12-minute pause). A forked watchdog (no thread or mapping in the test's own
- * address space) counts monotonic time in steps of at most half a second, so a stop of any
- * length, which stops the watchdog too, costs at most one step. At the limit it sends the test
+ * address space) adds up monotonic time with each observed gap clamped to half a second: an
+ * approximation of running time, not a measurement of stopped time. A stop of any length, which
+ * stops the watchdog too, costs at most 0.5 s; so does any other stall longer than that. At the limit it sends the test
  * SIGALRM, as alarm() would; 0 cancels. Like alarm(), it is not inherited by fork children. */
 #pragma once
 #include <signal.h>

@@ -311,6 +311,22 @@ kill -CONT "$b13_loop"
 before=$(ticks "$dir/b13"); sleep 1
 (( $(ticks "$dir/b13") > before )) || fail "B13 did not run after its own pauser resumed it"
 kill "$b13" 2>/dev/null; wait "$b13" 2>/dev/null || true; pkill -f "$dir/b13" 2>/dev/null || true
+# A job that ends the moment it is resumed (its sleep ran out during the pause) still reads the
+# whole pause: the end is written before SIGCONT, and no pause file is left behind.
+"$heavy" --pool quick Q14 -- sleep 0.3 2> "$dir/q14.err" &
+q14=$!
+until_held 'quick[01]' Q14
+"$heavy" --pool playtest --gpu exclusive --cpu-quiet P13 -- sleep 2 2> /dev/null
+wait "$q14" || fail "Q14 failed"
+sleep 0.5
+python3 - "$dir/history.jsonl" "$dir" <<'PY' || fail "a job ending at once after its resume lost its pause: $(cat "$dir/q14.err")"
+import json, os, sys
+events = [json.loads(line) for line in open(sys.argv[1])]
+end = [e for e in events if e.get('event') == 'end' and e['label'] == 'Q14'][-1]
+pid = [e for e in events if e.get('event') == 'start' and e['label'] == 'Q14'][-1]['pid']
+assert end['paused_by'] == ['P13'] and end['paused_s'] >= 1.5, end
+assert not os.path.exists(os.path.join(sys.argv[2], f'paused-{pid}.jsonl')), 'pause file left behind'
+PY
 if "$heavy" --cpu-quiet K1 -- true 2>/dev/null; then fail "--cpu-quiet without --gpu exclusive accepted"; fi
 if "$heavy" K2 -- "$heavy" --pool playtest --gpu exclusive --cpu-quiet K3 -- true 2>/dev/null; then
     fail "--cpu-quiet inside a slot accepted"

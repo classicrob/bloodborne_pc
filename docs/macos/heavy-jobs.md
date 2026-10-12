@@ -107,9 +107,10 @@ carries `paused_s` and `paused_by`:
 
 A test's own `alarm()` kept counting through the stop and fired as soon as it resumed
 (PREVIEW-25a, the fp16 probe). Our tests use `test_alarm()` from `tests/test_alarm.h` instead:
-a forked watchdog that is paused with the test and counts at most half a second per step, so a
-pause does not use up the limit. A failure in a paused job gets one rerun, and both results are
-reported.
+a forked watchdog that is paused with the test and adds up time with each observed gap clamped
+to half a second, so a pause costs at most 0.5 s of the limit (an approximation: any longer stall
+is clamped too). Python tests that launch our binaries use `tests/running_time.py` the same way.
+A failure in a paused job gets one rerun, and both results are reported.
 
 - Slots are flocks under `~/bbport-deps/locks` (`BB_HEAVY_DIR`). A job waits for a free slot of
   its pool and prints who holds them every 30 s.

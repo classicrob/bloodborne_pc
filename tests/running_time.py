@@ -1,9 +1,10 @@
-"""run(): subprocess.run with a time limit that counts only time the test is running.
+"""run(): subprocess.run with a time limit that a SIGSTOP of the test does not use up.
 
 heavy.sh --cpu-quiet SIGSTOPs build and test jobs for the length of a perf run; a plain timeout
-kept counting through the stop and failed the test as soon as it resumed. Here time is counted in
-polls of at most half a second each, so a stop of any length (the test is stopped with the child)
-costs at most one step. Same arguments as subprocess.run (capture_output, text, input, check, env,
+kept counting through the stop and failed the test as soon as it resumed. Here monotonic time is
+added up per poll with each observed gap clamped to half a second: an approximation of running
+time, not a measurement of stopped time. A stop of any length (the test is stopped with the
+child) costs at most 0.5 s; so does any other stall longer than that. Same arguments as subprocess.run (capture_output, text, input, check, env,
 cwd, ...); raises subprocess.TimeoutExpired at the limit, after killing the child."""
 import subprocess
 import time
