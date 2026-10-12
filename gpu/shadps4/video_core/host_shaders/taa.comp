@@ -17,6 +17,7 @@ layout(push_constant) uniform Params {
     vec4 proj;
     vec4 prev_proj;
     vec4 previous_z;
+    vec4 viewport; // the scene pass's viewport, render pixels (camera_motion.comp)
 };
 
 vec4 fetchLinear(sampler2D tex, vec2 position) {
@@ -31,10 +32,10 @@ vec4 fetchLinear(sampler2D tex, vec2 position) {
 
 // Compare depths in the SAME camera, with tolerance proportional to view distance.
 // Raw device depth is nonlinear; a constant epsilon merges unrelated distant surfaces.
-float expectedPreviousDepth(float depth, vec2 source, ivec2 size) {
+float expectedPreviousDepth(float depth, vec2 source) {
     if (depth >= 1.0) return 1.0;
-    vec2 uv = (source + 0.5 - jitter) / vec2(size);
-    vec2 ndc = uv * 2.0 - 1.0; // view +y is down the screen (camera_motion.comp)
+    // The scene pass's own viewport inverted, as in camera_motion.comp (not a fixed y sign).
+    vec2 ndc = (source + 0.5 - jitter - viewport.zw) / viewport.xy;
     float z = proj.w / min(depth - proj.z, -1e-8);
     float prev_z = dot(previous_z, vec4(ndc * z / proj.xy, z, 1.0));
     if (prev_z <= 0.0) return -1.0;
@@ -145,7 +146,7 @@ void main() {
         if (!any(isnan(motion)) && !any(isinf(motion)) &&
             all(greaterThanEqual(previous_pos, vec2(0))) &&
             all(lessThanEqual(previous_pos, vec2(size - 1)))) {
-            float expected_depth = expectedPreviousDepth(depth, current_pos, size);
+            float expected_depth = expectedPreviousDepth(depth, current_pos);
             // Validate each bilinear tap separately: interpolating foreground/background
             // depth invents a surface and causes history rejection along thin edges.
             // Separate the integer pixel from the subpixel motion before interpolation.

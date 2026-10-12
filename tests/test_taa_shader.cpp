@@ -51,7 +51,7 @@ int main(int argc, char** argv) {
     auto descriptors = device.createDescriptorSetLayoutUnique({
         .flags=vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR,
         .bindingCount=u32(bindings.size()),.pBindings=bindings.data()},nullptr,d).value;
-    const vk::PushConstantRange push{vk::ShaderStageFlagBits::eCompute,0,64};
+    const vk::PushConstantRange push{vk::ShaderStageFlagBits::eCompute,0,80};
     auto layout = device.createPipelineLayoutUnique({.setLayoutCount=1,.pSetLayouts=&*descriptors,
         .pushConstantRangeCount=1,.pPushConstantRanges=&push},nullptr,d).value;
     std::vector<u32> override_code;
@@ -100,7 +100,8 @@ int main(int argc, char** argv) {
                          float jitter_x=0.f, bool edge=false, float depth_slope=0.f,
                          bool thin_edge=false, bool history_edge=false,
                          bool thin_history=false, u32 py=3, float previous_z_y=0.f,
-                         int verdict=-1) {
+                         int verdict=-1,
+                         std::array<float,4> viewport={W/2.f,H/2.f,W/2.f,H/2.f}) {
         // The sampled pixel (X, py) and its dark left neighbour; verdict 1/0: only whether the
         // history was accepted (blended towards 0.75) or rejected (the current 0.25).
         const u32 sampled=py*W+X;
@@ -151,9 +152,10 @@ int main(int argc, char** argv) {
         }
         struct Params {
             float x,y;u32 reset,pad;
-            std::array<float,4> proj,prev_proj,previous_z;
+            std::array<float,4> proj,prev_proj,previous_z,viewport;
         } params{jitter_x,0,reset,0,{1,1,1,-0.05f},{1,1,1,-0.05f},
-                 {0,previous_z_y,1,z_translation}};
+                 {0,previous_z_y,1,z_translation},viewport};
+        static_assert(sizeof(Params)==80);
         cmd.bindPipeline(vk::PipelineBindPoint::eCompute,*pipeline,d);
         cmd.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute,*layout,0,writes,d);
         cmd.pushConstants(*layout,vk::ShaderStageFlagBits::eCompute,0,sizeof(params),&params,d);
@@ -221,18 +223,40 @@ int main(int argc, char** argv) {
     run("tiny motion at large pixel coordinate",0,0.75f,0.5f,-0.00003f,1,0.739985f,
         false,0.5f,0,0,false,0,false,true);
     // Off-centre (row 1: view y != 0) with the previous depth depending on view y
-    // (previous_z.y = 0.5): expectedPreviousDepth's y reconstruction sign decides which history
-    // depth is the same surface. Reference, view +y down the rows: v = 1.5/7, ndc y = 2v - 1,
-    // z = 0.1 at depth 0.5, prev z = z + 0.5 * ndc_y * z, depth = 1 - 0.05 / prev z. Motion 2
-    // (>= 1 px) so that only the depth test decides (no keep-in-front rule).
+    // (previous_z.y = 0.5): expectedPreviousDepth's y reconstruction decides which history depth
+    // is the same surface. Reference, independent of the shader: ndc y inverts the scene
+    // viewport, (row + 0.5 - offset) / scale; z = 0.1 at depth 0.5, prev z = z + 0.5 * ndc_y * z,
+    // depth = 1 - 0.05 / prev z. Motion 2 (>= 1 px) so that only the depth test decides (no
+    // keep-in-front rule). Each viewport's matching depth is accepted and the depth another
+    // mapping predicts (the other y sign, or a full-frame centred viewport) rejected, so a shader
+    // that ignores the sign, the offset or the scale fails one of each pair.
     {
-        const float z=-0.05f/(0.5f-1.f), ndc_y=2.f*(1.5f/H)-1.f;
-        const float right=1.f-0.05f/(z+0.5f*ndc_y*z), wrong=1.f-0.05f/(z-0.5f*ndc_y*z);
-        assert(right>0.f && right<1.f && wrong>0.f && wrong<1.f && std::abs(right-wrong)>0.1f);
-        run("off-centre: matching previous depth (view y) accepted",0,0.75f,right,2,1,0,
-            false,0.5f,0,0,false,0,false,false,false,1,0.5f,1);
-        run("off-centre: y-flipped previous depth rejected",0,0.75f,wrong,2,1,0,
-            false,0.5f,0,0,false,0,false,false,false,1,0.5f,0);
+        const float z=-0.05f/(0.5f-1.f);
+        const auto reference=[&](const std::array<float,4>& viewport) {
+            const float ndc_y=(1.5f-viewport[3])/viewport[1];
+            return 1.f-0.05f/(z+0.5f*ndc_y*z);
+        };
+        const std::array<float,4> down{W/2.f,H/2.f,W/2.f,H/2.f}, up{W/2.f,-(H/2.f),W/2.f,H/2.f};
+        assert(up[1]==-3.5f); // W and H are unsigned: -H/2.f would be about +2.1e9
+        // Neither centred nor full-frame, y up: rows 1.5 to 4.5 of the 7 (sampled row 1 is at
+        // its top edge, ndc y 1).
+        const std::array<float,4> sub{W/2.f,-1.5f,W/2.f,3.f};
+        const float d_down=reference(down), d_up=reference(up), d_sub=reference(sub);
+        // Far apart against the rejection threshold (2% of 1 - depth, under 0.01 here).
+        assert(std::abs(d_down-d_up)>0.1f && std::abs(d_sub-d_up)>0.03f &&
+               std::abs(d_sub-d_down)>0.03f);
+        for (const float d : {d_down,d_up,d_sub}) assert(d>0.f && d<1.f);
+        const auto check=[&](const char* label,float depth,int verdict,
+                             const std::array<float,4>& viewport) {
+            run(label,0,0.75f,depth,2,1,0,false,0.5f,0,0,false,0,false,false,false,1,0.5f,
+                verdict,viewport);
+        };
+        check("off-centre, y down: matching previous depth accepted",d_down,1,down);
+        check("off-centre, y down: the y-up depth rejected",d_up,0,down);
+        check("off-centre, y up: matching previous depth accepted",d_up,1,up);
+        check("off-centre, y up: the y-down depth rejected",d_down,0,up);
+        check("offset, scaled viewport: matching previous depth accepted",d_sub,1,sub);
+        check("offset, scaled viewport: the full-frame y-up depth rejected",d_up,0,sub);
     }
     std::array<vk::DescriptorSetLayoutBinding,2> sharpen_bindings{};
     for (u32 i=0;i<2;++i) sharpen_bindings[i]={.binding=i,

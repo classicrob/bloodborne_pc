@@ -412,6 +412,11 @@ public:
         return properties.limits.maxComputeSharedMemorySize;
     }
 
+    /// Returns the maximum size of a pipeline's push constants.
+    u32 MaxPushConstantsSize() const {
+        return properties.limits.maxPushConstantsSize;
+    }
+
     /// Returns the maximum sampler LOD bias.
     float MaxSamplerLodBias() const {
         return properties.limits.maxSamplerLodBias;
