@@ -100,8 +100,10 @@ Every draw-scheduler submission is counted by reason, from a thread-local reason
 
 The census also counts how many submissions found a render pass open, and the age of the oldest
 label in each batch at submit. One line is printed in the parse-split block. Renderer's render
-pass census ("Render passes ...") attributes each pass end; its "submit" count should match
-"ended an open render pass" here.
+pass census ("Render passes ...") attributes each pass end. A pass counts as ended by a submission
+when it is still open after the submission's barrier flush, which can close passes itself
+(counted there as "barrier"). So "ended an open render pass" here equals that census's "submit"
+enders.
 
 ## Output
 
