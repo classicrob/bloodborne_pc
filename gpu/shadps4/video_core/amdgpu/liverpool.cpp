@@ -2174,9 +2174,6 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                                 r.WriteBarrier().AtForwardedWait(r.LabelsIssued());
                                 BbSplit::flush_census.forwarded_waits.fetch_add(
                                     1, std::memory_order_relaxed);
-                                // Its labels' submission goes out now (exact: earlier
-                                // submission, never an earlier write).
-                                r.FlushLabelsForWait();
                             },
                             nullptr, 0, BbToggle::PipelinedMemoryWrites);
                     }

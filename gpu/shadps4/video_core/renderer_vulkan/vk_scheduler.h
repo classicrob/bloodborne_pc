@@ -879,9 +879,6 @@ public:
     /// `idle` or once the oldest has waited LabelBatchAge.
     void FlushLabels(bool idle);
 #ifdef __APPLE__
-    /// Stage B (the scheduler's owner): submits the batched labels now if any, counted under
-    /// `reason` (a WAIT_REG_MEM met early).
-    void FlushLabelsFor(BbSplit::F reason);
 #endif
 
     /// Waits in slices until the GPU passed timeline value `tick` of this scheduler; false if
