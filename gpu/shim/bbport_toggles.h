@@ -15,6 +15,8 @@ extern "C" __attribute__((returns_twice)) int bb_setjmp(sigjmp_buf buffer);
 #endif
 
 extern "C" std::uint64_t runtime_disabled_optimizations;
+/// Word 2: the optional second number in BB_TOGGLE_FILE (runtime_memory.c).
+extern "C" std::uint64_t runtime_disabled_optimizations2;
 /// Recovery point for speculative guest memory reads on this thread (runtime_memory.c).
 extern "C" __thread sigjmp_buf* runtime_fault_recover;
 
@@ -103,6 +105,18 @@ enum : std::uint64_t {
 };
 inline bool Disabled(std::uint64_t bit) {
     return (__atomic_load_n(&runtime_disabled_optimizations, __ATOMIC_RELAXED) & bit) != 0;
+}
+// Word 2, the second number in BB_TOGGLE_FILE ("<mask> <mask2>"); the first 64 bits are all
+// taken. New toggles go here, from bit 0 up: Word2::Name = 1ull << n. A scoped type, so
+// Disabled(Word2::Name) reads word 2 and a word-2 bit cannot be passed as a word-1 number.
+enum class Word2 : std::uint64_t {
+};
+constexpr Word2 operator|(Word2 a, Word2 b) {
+    return Word2(std::uint64_t(a) | std::uint64_t(b));
+}
+inline bool Disabled(Word2 bit) {
+    return (__atomic_load_n(&runtime_disabled_optimizations2, __ATOMIC_RELAXED) &
+            std::uint64_t(bit)) != 0;
 }
 } // namespace BbToggle
 
