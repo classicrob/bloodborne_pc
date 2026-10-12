@@ -29,9 +29,12 @@ jobs at nice 5 under `taskpolicy -c utility`. The installed `taskpolicy(8)`
 manual describes this as a process QoS clamp inherited by children. Merely
 requesting user-interactive on a pthread is not evidence of escaping that
 clamp. GPU-exclusive timing jobs are exempt in the existing launcher. The
-DREAM-3 manifest has an empty `heavy` object and no per-thread QoS record,
-so launch-policy attribution for that particular run still needs the job
-history, rather than being inferred from its audio statistics alone.
+DREAM-3 manifest has an empty `heavy` object, but the heavy history closes
+its launch-policy gap: `~/bbport-deps/locks/history.jsonl`, start at
+2026-10-11T23:32:35, PID 87718, records `nice 5, utility QoS` and
+`taskpolicy -c utility .../run.sh`. R0 perf starts at 23:36:54 and
+2026-10-12T00:00:34 record `normal` under the exclusive GPU lane. These
+are actual launch records, not per-thread requested/effective QoS measurements.
 
 ## Opt-in experiment
 
