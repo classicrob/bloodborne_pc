@@ -2,10 +2,12 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <limits>
 #include <span>
+#include <unordered_set>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -152,6 +154,15 @@ public:
             generation = 1;
         }
     }
+    /// Calls f(key, value) for each entry of the current generation.
+    template <class F>
+    void ForEach(F&& f) const {
+        for (const auto& slot : slots) {
+            if (slot.generation == generation) {
+                f(slot.key, slot.value);
+            }
+        }
+    }
     void swap(FlatMap& other) noexcept {
         slots.swap(other.slots);
         std::swap(size, other.size);
@@ -229,25 +240,53 @@ public:
     };
     struct Stats {
         uint64_t draws{}, stored{}, loaded{}, unmatched{}, exhausted{}, invalid{}, still{};
+        /// Draws of a multi-instance mesh (see Prepare): no history loaded, camera vectors.
+        uint64_t multi{};
+        /// Provenance data for multi-instance meshes drawn in two consecutive frames: the set
+        /// of their palette buffer addresses equal to the previous frame's (and of those, in
+        /// another draw order) or not. Persistent per-instance addresses would show sets that
+        /// stay equal while the order changes.
+        uint64_t addresses_same{}, addresses_reordered{}, addresses_changed{};
     } stats;
 
     // A small skeleton (weapon, prop; most are static world pieces) only needs history
     // while its bone palette changes: with last frame's bones its motion is the camera's.
     // Checked before the index scan of Prepare, with a cheap identity. The first frame
     // of a change stores positions (nothing to load yet), the next one loads them.
+    // Copies of one mesh share the identity, and their draw order changes with culling. So a
+    // draw counts as still when its palette is ANY of last frame's palettes for the mesh (a
+    // set, not the copy at the same position in the order). This is a conservative eligibility
+    // decision for history (a still copy gets camera vectors), not proof that the instance is
+    // motionless or the same as last frame's.
     struct GateKey {
         uint64_t shader{}, geometry{}, indices{};
-        uint32_t index_count{}, instances{}, first_instance{}, occurrence{};
+        uint32_t index_count{}, instances{}, first_instance{};
+        uint32_t occurrence{}; ///< unused (kept for the callers' designated initializers)
         bool operator==(const GateKey&) const = default;
     };
     bool Moving(GateKey key, uint64_t palette) {
         key.occurrence = 0;
-        key.occurrence = gate_occurrences[key]++;
-        const auto* prev = gate_previous.find(key);
-        const bool moving = prev && *prev != palette;
-        gate_current.emplace(key, palette);
+        const bool seen = gate_previous_seen.find(key) != nullptr;
+        const bool moving = seen && gate_previous.find({key, palette}) == nullptr;
+        gate_current_seen.emplace(key, 1);
+        gate_current.emplace({key, palette}, 1);
         stats.still += moving ? 0 : 1;
         return moving;
+    }
+
+    /// Every draw of a mesh that can have object motion, eligible for history or not, before
+    /// the gate and Prepare: counts the mesh's copies this frame. `palette`: the address of its
+    /// palette buffer (0 if none), for the provenance counters only.
+    void NoteDraw(GateKey mesh, uint64_t palette) {
+        mesh.occurrence = 0;
+        auto& copies = mesh_current[mesh];
+        if (copies.count < MaxAddresses) {
+            copies.addresses[copies.count] = palette;
+        }
+        ++copies.count;
+    }
+    [[nodiscard]] size_t MultiInstanceMeshes() const {
+        return multi.size();
     }
 
     void NextFrame() {
@@ -256,7 +295,33 @@ public:
         occurrences.clear();
         gate_previous.swap(gate_current);
         gate_current.clear();
-        gate_occurrences.clear();
+        gate_previous_seen.swap(gate_current_seen);
+        gate_current_seen.clear();
+        mesh_current.ForEach([this](const GateKey& mesh, const Copies& copies) {
+            if (copies.count < 2) {
+                return;
+            }
+            multi.insert(mesh); // sticky for the run
+            const auto* before = mesh_previous.find(mesh);
+            if (!before || before->count < 2 || copies.count > MaxAddresses ||
+                before->count > MaxAddresses) {
+                return;
+            }
+            auto now = copies.addresses, then = before->addresses;
+            const bool same_order = copies.count == before->count &&
+                                    std::equal(now.begin(), now.begin() + copies.count,
+                                               then.begin());
+            std::sort(now.begin(), now.begin() + copies.count);
+            std::sort(then.begin(), then.begin() + before->count);
+            if (copies.count == before->count &&
+                std::equal(now.begin(), now.begin() + copies.count, then.begin())) {
+                ++(same_order ? stats.addresses_same : stats.addresses_reordered);
+            } else {
+                ++stats.addresses_changed;
+            }
+        });
+        mesh_previous.swap(mesh_current);
+        mesh_current.clear();
         ++frame;
         used = 0;
     }
@@ -271,10 +336,26 @@ public:
             ++stats.invalid;
             return {};
         }
+        // Copies of one mesh share this identity, and nothing here identifies an instance
+        // across frames (draw order changes with culling; loading by order gave another copy's
+        // positions, hundreds of pixels off). So a mesh seen with two or more copies in any
+        // frame (NoteDraw; sticky for the run) never loads history: camera vectors.
+        // Residual cases, not ruled out: (a) in the frame where a mesh first shows a second
+        // copy, a copy drawn before the second may already have loaded the previous frame's;
+        // (b) a lone visible instance replaced by another instance of the same mesh between two
+        // frames (one copy each frame) loads the other's history.
+        const GateKey mesh{.shader = draw.shader, .geometry = draw.geometry,
+                           .indices = draw.indices, .index_count = draw.index_count,
+                           .instances = draw.instances, .first_instance = draw.first_instance};
+        const auto* copies_now = mesh_current.find(mesh);
+        const bool multi_instance =
+            multi.contains(mesh) || (copies_now && copies_now->count >= 2) || key.occurrence > 0;
         const auto* prev = previous.find(key);
         Allocation result{0, 0, draw.vertices.count, draw.instances,
                           draw.vertices.first, draw.first_instance};
-        if (prev) {
+        if (multi_instance) {
+            ++stats.multi;
+        } else if (prev) {
             result.load = *prev;
             ++stats.loaded;
         } else {
@@ -322,8 +403,25 @@ private:
             return size_t(h);
         }
     };
-    FlatMap<GateKey, uint64_t, GateHash> gate_previous, gate_current;
-    FlatMap<GateKey, uint32_t, GateHash> gate_occurrences;
+    struct GatePalette {
+        GateKey key;
+        uint64_t palette{};
+        bool operator==(const GatePalette&) const = default;
+    };
+    struct GatePaletteHash {
+        size_t operator()(const GatePalette& p) const {
+            return GateHash{}(p.key) ^ size_t(p.palette * 0x9e3779b97f4a7c15ULL);
+        }
+    };
+    FlatMap<GatePalette, uint8_t, GatePaletteHash> gate_previous, gate_current;
+    FlatMap<GateKey, uint8_t, GateHash> gate_previous_seen, gate_current_seen;
+    static constexpr uint32_t MaxAddresses = 16;
+    struct Copies {
+        std::array<uint64_t, MaxAddresses> addresses{};
+        uint32_t count{};
+    };
+    FlatMap<GateKey, Copies, GateHash> mesh_previous, mesh_current;
+    std::unordered_set<GateKey, GateHash> multi; ///< meshes ever drawn twice in a frame
 };
 
 } // namespace Vulkan::Motion

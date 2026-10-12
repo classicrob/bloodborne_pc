@@ -329,8 +329,6 @@ if [[ ${1:-} == --test || ${1:-} == --test-dry ]]; then
         BB_GPU_BUILD="$PWD/out/gpu" t sh tests/macos_metalfx/library.sh
         # Scaled presets: tonemapped RGBA8 content in larger aligned textures, both output formats.
         BB_DEPS_PREFIX="$deps" t bash tests/macos_metalfx/run.sh --ldr-padded
-        # Every tests/test_*.py (a skipped test fails).
-        t bash tests/run_python_tests.sh
         # BB_PERF's GPU numbers rely on per-submission timestamps; qualify them on this device.
         # It takes the GPU exclusively (heavy.sh): it waits for running games instead of measuring
         # a shared GPU.
@@ -403,4 +401,10 @@ if [[ ${1:-} == --test || ${1:-} == --test-dry ]]; then
     "$CC" "${platform_flags[@]}" -std=c11 -D_GNU_SOURCE -O2 -g -Wall -Wextra -Werror -I. -Isrc tests/test_content.c src/runtime_content.c -o out/content-test
     sign_darwin out/content-test
     t out/content-test
+    if [[ $(uname -s) == Darwin ]]; then
+        # Every tests/test_*.py (a skipped test fails). Last: test_runtime.py and test_sema.py run
+        # out/runtime-test and out/sema-test, which must be this build's (a stale pair from an
+        # older --test cannot load the current libbbgpu, and stopped the run before the rebuild).
+        t bash tests/run_python_tests.sh
+    fi
 fi

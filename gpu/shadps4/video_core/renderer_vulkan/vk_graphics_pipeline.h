@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <array>
+#include <cstring>
 #include <memory>
 #include <boost/container/static_vector.hpp>
 #include <xxhash.h>
@@ -76,6 +78,22 @@ struct GraphicsPipelineKey {
 };
 
 struct GsEmulationStages;
+
+/// The fragment slot of a pipeline's runtime infos is read whether or not it has a fragment
+/// shader (depth-bounds layout, clip-distance emulation). Without one it must be the default:
+/// true when that holds.
+[[nodiscard]] inline bool FragmentInfoMatchesShader(
+    std::span<const Shader::RuntimeInfo, MaxShaderStages> runtime_infos,
+    std::span<const vk::ShaderModule> modules) {
+    const u32 fs = u32(Shader::SwStage::Fragment);
+    if (fs < modules.size() && modules[fs]) {
+        return true;
+    }
+    // All-zero, as PipelineSelection::ResetStages leaves it (RuntimeInfo has unions: compare the
+    // bytes, every one of them written by that reset).
+    static constexpr std::array<u8, sizeof(Shader::RuntimeInfo)> zero{};
+    return std::memcmp(&runtime_infos[fs], zero.data(), zero.size()) == 0;
+}
 
 class GraphicsPipeline : public Pipeline {
 public:

@@ -7,6 +7,9 @@
 #include <sys/resource.h>
 #endif
 #include "bbport_toggles.h"
+#ifdef __APPLE__
+#include "bbport_hot_thread_qos.h"
+#endif
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
@@ -286,6 +289,12 @@ static void StartProfileWriter() {
             std::printf("PGO: profile written\n");
         }
     }).detach();
+}
+#endif
+
+#ifdef __APPLE__
+extern "C" void bbgpu_apply_task_role(void) {
+    BbHotThreadQos::ApplyConfiguredRole();
 }
 #endif
 

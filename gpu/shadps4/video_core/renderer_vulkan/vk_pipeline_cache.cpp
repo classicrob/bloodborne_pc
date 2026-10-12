@@ -996,8 +996,7 @@ bool PipelineCache::RefreshGraphicsStages(PipelineSelection& sel) {
         return true;
     };
 
-    sel.infos.fill(nullptr);
-    sel.modules.fill(nullptr);
+    sel.ResetStages();
     sel.gs_es = {};
     sel.gs_gs = {};
     sel.gs_so = {};

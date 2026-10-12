@@ -22,7 +22,7 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "bbport_parse_split.h"
-#include "bbport_thread_report.h"
+#include "bbport_hot_thread_qos.h"
 #include "bbport_threads.h"
 
 namespace Vulkan {
@@ -630,7 +630,7 @@ void Scheduler::RecorderThread(std::stop_token stoken) {
     Common::SetCurrentThreadName("bb:VkRecorder");
 #ifdef __APPLE__
     recording_for = this; // this thread records for this scheduler (StopOnRecorderThread)
-    BbThreadReport::Report("Vulkan recording");
+    BbHotThreadQos::Start("Vulkan recording");
 #endif
 #ifdef __APPLE__
     BbSplit::Attach(BbSplit::recorder, BbSplit::RIdle);

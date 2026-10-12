@@ -1174,12 +1174,16 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
         }();
         bool gated = !all_motion;
         u64 palette = 0;
+        u64 palette_address = 0; ///< provenance counters only (Motion::History::NoteDraw)
         for (const auto& resource : vs.buffers) {
             if (resource.IsSpecial()) continue;
             const auto buffer = resource.GetSharp(vs);
             const u32 size = buffer.GetSize();
             if (!buffer.Valid() || buffer.GetStride() != 16) continue;
             const auto role = Motion::ClassifyBuffer(size);
+            if (role != Motion::BufferRole::Other && !palette_address) {
+                palette_address = buffer.base_address;
+            }
             if (role == Motion::BufferRole::Skeleton) {
                 gated = false;
                 break;
@@ -1193,6 +1197,13 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
             }
         }
         push_data.motion_param = 0;
+        object_motion->NoteDraw({.shader = vs.pgm_hash,
+                                 .geometry = motion_geometry,
+                                 .indices = index_address,
+                                 .index_count = regs.num_indices,
+                                 .instances = regs.num_instances.NumInstances(),
+                                 .first_instance = first_instance},
+                                palette_address);
         if (!gated || object_motion->Moving({.shader = vs.pgm_hash,
                                              .geometry = motion_geometry,
                                              .indices = index_address,
@@ -4038,7 +4049,13 @@ void Rasterizer::BindDepthBoundsSource(const GraphicsPipeline* pipeline) {
     if (!FeatureChecks::DepthBoundsUnsupported(
             regs.depth_control.depth_bounds_enable, regs.depth_buffer.DepthValid(),
             regs.depth_bounds_min, regs.depth_bounds_max, instance.IsDepthBoundsSupported())) {
-        ASSERT_MSG(!set_layout, "depth-bounds pipeline selected for a draw without the test");
+        ASSERT_MSG(!set_layout,
+                   "depth-bounds pipeline selected for a draw without the test: pipeline {:#x}, "
+                   "fragment shader {}, DB enable {}, depth valid {}, bounds [{}, {}]",
+                   std::hash<GraphicsPipelineKey>{}(pipeline->GetGraphicsKey()),
+                   pipeline->GetStages()[u32(Shader::SwStage::Fragment)] ? "present" : "absent",
+                   bool(regs.depth_control.depth_bounds_enable), regs.depth_buffer.DepthValid(),
+                   regs.depth_bounds_min, regs.depth_bounds_max);
         return;
     }
     // The fragment shader kills fragments whose stored depth lies outside the bounds. It reads
