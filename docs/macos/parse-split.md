@@ -138,3 +138,16 @@ How to read it:
   well as carry-out. Their accounted percentage is close to 100%, not exactly 100%.
 - Waits overlap across threads. For example, stage A waits in a drain while stage B waits on the
   recorder. Read each thread's line on its own.
+
+## Lock waits (gpu/shim/bbport_lock_wait.h)
+
+Scopes named "lock wait: <lock>" are contended acquisitions of our own locks, charged to the
+thread that waited:
+- the texture cache mutex and its samplers mutex;
+- the buffer cache's region locks and the page manager's range locks;
+- the staging pool mutex and the draw preparation mutex;
+- the pipeline programs lock (shared or exclusive).
+
+A lock tries first. Only a failed try opens the scope, for the time the thread blocks; the hold
+is not measured. The scheduler's mutexes are not wrapped: their waits are "recorder sync" and
+the related scopes. MoltenVK's internal locks are not visible here.
