@@ -10,13 +10,83 @@
 #include <cstdio>
 #include <string>
 #include <tuple>
+#include "video_core/renderer_vulkan/vk_camera_motion.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/texture_cache/image.h"
 #include "video_core/host_shaders/camera_motion_comp.h"
 #include <vk_mem_alloc.h>
 
+namespace {
+// The frame's scene viewport state machine and the readiness every camera-motion consumer
+// (motion pass, TAA, debug overlay) shares; host only.
+void LatchControls() {
+    using Latch=Vulkan::SceneViewportLatch;
+    using Note=Latch::Note;
+    const Latch::Viewport a{960,540,960,540}, b{960,-540,960,540};
+    const auto check=[](const char* label,bool ok) {
+        std::printf("Camera motion viewport latch: %s %s\n",label,ok ? "PASS" : "FAIL");
+        std::fflush(stdout);
+        assert(ok);
+    };
+    {
+        Latch l;
+        check("unset is not usable",!l.Usable() && l.Get()==Latch::State::Unset);
+        check("first viewport",l.Add(a)==Note::First && l.Usable() && l.Value()==a);
+        check("the same viewport again stays usable",l.Add(a)==Note::Same && l.Usable());
+    }
+    {
+        Latch l;
+        l.Add(a);
+        check("valid then none: unusable",l.Add(std::nullopt)==Note::Missing && !l.Usable());
+        check("  ... and a valid one after does not re-enable it",
+              l.Add(a)==Note::AlreadyUnusable && !l.Usable() && l.Value()==Latch::Viewport{});
+    }
+    {
+        Latch l;
+        check("none then valid: unusable",l.Add(std::nullopt)==Note::Missing &&
+              l.Add(a)==Note::AlreadyUnusable && !l.Usable());
+    }
+    {
+        Latch l;
+        l.Add(a);
+        check("two differing viewports: unusable",l.Add(b)==Note::Differs && !l.Usable());
+    }
+    for (const Latch::Viewport bad : {Latch::Viewport{0,540,960,540},Latch::Viewport{960,0,960,540},
+             Latch::Viewport{NAN,540,960,540},Latch::Viewport{960,540,INFINITY,540}}) {
+        Latch l;
+        check("a zero or non-finite scale or offset: unusable",
+              l.Add(bad)==Note::Invalid && !l.Usable());
+    }
+    {
+        Latch l;
+        l.Add(a);
+        l.Add(b);
+        l.Reset();
+        check("the next frame recovers (Reset)",l.Get()==Latch::State::Unset &&
+              l.Add(b)==Note::First && l.Usable());
+    }
+    {
+        Latch usable, unusable, unset;
+        usable.Add(a);
+        unusable.Add(std::nullopt);
+        check("ready: both cameras, both viewports, depth",
+              Vulkan::CameraMotionReady(true,true,usable,usable,true));
+        check("not ready: current viewport unusable",
+              !Vulkan::CameraMotionReady(true,true,unusable,usable,true));
+        check("not ready: previous viewport unusable",
+              !Vulkan::CameraMotionReady(true,true,usable,unusable,true));
+        check("not ready: current viewport unset",
+              !Vulkan::CameraMotionReady(true,true,unset,usable,true));
+        check("not ready: no depth",!Vulkan::CameraMotionReady(true,true,usable,usable,false));
+        check("not ready: no previous camera",
+              !Vulkan::CameraMotionReady(true,false,usable,usable,true));
+    }
+}
+} // namespace
+
 int main() {
+    LatchControls();
     Vulkan::Instance instance(0, false);
     static vk::detail::DynamicLoader loader;
     vk::detail::DispatchLoaderDynamic d;
@@ -46,14 +116,15 @@ int main() {
     auto descriptors=device.createDescriptorSetLayoutUnique({
         .flags=vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR,
         .bindingCount=3,.pBindings=bindings.data()},nullptr,d).value;
+    // The motion pass's push block (camera_motion.comp without DEBUG_OVERLAY): within Vulkan's
+    // guaranteed 128 bytes.
     struct Params {
         std::array<float,12> reproject;
-        std::array<float,4> proj,prev_proj,viewport,prev_viewport;
-        std::array<float,2> size,jitter,previous_jitter;
+        std::array<float,4> proj,viewport,prev_viewport;
+        std::array<float,2> prev_proj,size,jitter;
         u32 mode;
     };
-    static_assert(sizeof(Params)==140); // over 128: the device must offer it (CameraMotion)
-    assert(instance.MaxPushConstantsSize()>=sizeof(Params));
+    static_assert(sizeof(Params)==124);
     const vk::PushConstantRange push{vk::ShaderStageFlagBits::eCompute,0,sizeof(Params)};
     auto layout=device.createPipelineLayoutUnique({.setLayoutCount=1,.pSetLayouts=&*descriptors,
         .pushConstantRangeCount=1,.pPushConstantRanges=&push},nullptr,d).value;
@@ -132,8 +203,8 @@ int main() {
         }
         Params params{reproject ? *reproject :
             std::array<float,12>{1,0,rotation,translation,0,1,rotation_y,translation_y,0,0,1,0},
-            {1,1,1,-0.05f},{1,1,1,-0.05f},viewport,prev_viewport ? *prev_viewport : viewport,{W,H},
-            {jitter ? 0.37f : 0.f,jitter ? -0.29f : 0.f},{0,0},mode};
+            {1,1,1,-0.05f},viewport,prev_viewport ? *prev_viewport : viewport,{1,1},{W,H},
+            {jitter ? 0.37f : 0.f,jitter ? -0.29f : 0.f},mode};
         cmd.bindPipeline(vk::PipelineBindPoint::eCompute,*pipeline,d);
         cmd.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute,*layout,0,writes,d);
         cmd.pushConstants(*layout,vk::ShaderStageFlagBits::eCompute,0,sizeof(params),&params,d);

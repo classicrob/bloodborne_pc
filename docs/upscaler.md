@@ -132,9 +132,13 @@ The previous frame's matrices are not there; the port keeps them itself.
   toggles 1<<22 reprojected frame, 1<<23 error map): static geometry matches.
 - Camera motion and TAA's previous-depth check invert the scene (G-buffer) pass's own viewport
   (2026-10-12; supersedes 1c558d3): ndc = (pixel + 0.5 - jitter - offset) / scale on both axes,
-  with the enabled guest x/y scale and offset times the render-target scale, captured at the
-  first G-buffer draw of the frame (CameraMotion::OnGBufferViewport); the previous position is
-  projected with the previous frame's viewport. The dump meta (fNNN_meta.json) records both.
+  with the enabled guest x/y scale and offset times the render-target scale, from the frame's
+  G-buffer draws (CameraMotion::OnGBufferViewport, SceneViewportLatch); the previous position is
+  projected with the previous frame's viewport. A frame whose G-buffer draws have no viewport
+  (clip disabled), a zero or non-finite one, or two different ones has no camera motion (the
+  motion pass, TAA and the debug overlay share one readiness check), reported once. The motion
+  pass's push block stays within Vulkan's guaranteed 128 bytes; only BB_DEBUG_MOTION=1 needs
+  136. The dump meta (fNNN_meta.json) records both viewports.
   **For upstream watchers:** upstream (MaSieS4Fun/ARM_bloodborne_pc 2b705bb, 2026-10-06) fixed
   the reconstruction to a constant "view +y down" (2v - 1), measured against the object vectors
   on the Cathedral Ward stairs; the code before it used the constant 1 - 2v. Neither constant is

@@ -20,17 +20,21 @@ layout(binding = 2) uniform texture2D object_tex;
 layout(push_constant) uniform Constants {
     vec4 reproject[3]; // previous view * inverse current view, rows (3x4)
     vec4 proj;         // current: x scale, y scale, z scale, z offset
-    vec4 prev_proj;    // previous: x scale, y scale, z scale, z offset
     // The scene (G-buffer) pass's effective viewport in render pixels, without jitter:
     // pixel = offset + ndc * scale (x scale, y scale, x offset, y offset). Its signs are the
     // game's: a negative y scale puts ndc +y up the screen. Current and previous frame.
     vec4 viewport;
     vec4 prev_viewport;
+    vec2 prev_proj;    // previous: x scale, y scale
     vec2 size;         // pixels
     vec2 jitter;       // current viewport shift in render pixels (x right, y down)
-    vec2 previous_jitter;
     uint mode;         // motion: 1 = object motion vectors available; debug: 0 motion, 1 raw
                        // depth, 2 view z / 50, 3 reprojected previous frame, 4 |difference|
+#ifdef DEBUG_OVERLAY
+    // Beyond Vulkan's guaranteed 128 bytes: the overlay only (vk_camera_motion.cpp).
+    uint pad;
+    vec2 previous_jitter;
+#endif
 };
 
 void main() {
