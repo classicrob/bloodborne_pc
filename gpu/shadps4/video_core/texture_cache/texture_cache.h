@@ -42,6 +42,24 @@ namespace VideoCore {
 class BufferCache;
 class PageManager;
 
+/// ResolveOverlap's decision for a cached image at the requested image's guest address (before
+/// its depth-overlap check, which only follows DifferentShape's rejection): what to do with the
+/// cached image. `result_format` is the format of the image a view would come from (the merged
+/// image, else the cached one).
+enum class EqualAddressOverlap : u8 {
+    DifferentShape,   ///< other block dimensions or bits: a pool reuse, freed when stale
+    ExpandCompressed, ///< a compressed request over an uncompressed image: copy into a new one
+    Expand3D,         ///< the same size with a 3D side: copy into a new image
+    View,             ///< a view of the result image
+    Incompatible,     ///< a view would be needed but the formats are not view-compatible
+    ExpandResources,  ///< more levels or layers: copy into a larger image
+    TilingReuse,      ///< larger with another tiling: the address is reused, freed when stale
+    Unresolvable,
+};
+[[nodiscard]] EqualAddressOverlap ClassifyEqualAddressOverlap(const ImageInfo& request,
+                                                              const ImageInfo& cached,
+                                                              vk::Format result_format);
+
 class TextureCache {
     // Default values for garbage collection
     static constexpr s64 DEFAULT_PRESSURE_GC_MEMORY = 1_GB + 512_MB;

@@ -379,6 +379,44 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested_info, Bindi
     return cache_image_id;
 }
 
+EqualAddressOverlap ClassifyEqualAddressOverlap(const ImageInfo& request, const ImageInfo& cached,
+                                                vk::Format result_format) {
+    const u32 lhs_block_size = request.num_bits * request.num_samples;
+    const u32 rhs_block_size = cached.num_bits * cached.num_samples;
+    if (request.BlockDim() != cached.BlockDim() || lhs_block_size != rhs_block_size) {
+        return EqualAddressOverlap::DifferentShape;
+    }
+    // Compressed view of uncompressed image with same block size.
+    if (request.props.is_block && !cached.props.is_block) {
+        return EqualAddressOverlap::ExpandCompressed;
+    }
+    if (request.guest_size == cached.guest_size &&
+        (request.type == AmdGpu::ImageType::Color3D || cached.type == AmdGpu::ImageType::Color3D)) {
+        return EqualAddressOverlap::Expand3D;
+    }
+    const bool pow2_padding_only =
+        request.props.is_pow2 != cached.props.is_pow2 && request.tile_mode == cached.tile_mode &&
+        request.size == cached.size && request.pitch == cached.pitch &&
+        request.resources.levels == 1 && cached.resources.levels == 1 &&
+        request.resources.layers == 1 && cached.resources.layers == 1;
+    // Size and resources are less than or equal, use image view.
+    if (request.pixel_format != cached.pixel_format || request.guest_size <= cached.guest_size ||
+        pow2_padding_only) {
+        return IsVulkanFormatCompatible(result_format, request.pixel_format)
+                   ? EqualAddressOverlap::View
+                   : EqualAddressOverlap::Incompatible;
+    }
+    // Size and resources are greater, expand the image.
+    if (request.type == cached.type && request.resources > cached.resources) {
+        return EqualAddressOverlap::ExpandResources;
+    }
+    // Size is greater but resources are not, because the tiling mode is different.
+    if (request.tile_mode != cached.tile_mode) {
+        return EqualAddressOverlap::TilingReuse;
+    }
+    return EqualAddressOverlap::Unresolvable;
+}
+
 std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& image_info,
                                                            BindingType binding,
                                                            ImageId cache_image_id,
@@ -389,10 +427,10 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
 
     // Equal address
     if (image_info.guest_address == cache_image.info.guest_address) {
-        const u32 lhs_block_size = image_info.num_bits * image_info.num_samples;
-        const u32 rhs_block_size = cache_image.info.num_bits * cache_image.info.num_samples;
-        if (image_info.BlockDim() != cache_image.info.BlockDim() ||
-            lhs_block_size != rhs_block_size) {
+        const auto result_id = merged_image_id ? merged_image_id : cache_image_id;
+        const EqualAddressOverlap action = ClassifyEqualAddressOverlap(
+            image_info, cache_image.info, slot_images[result_id].info.pixel_format);
+        if (action == EqualAddressOverlap::DifferentShape) {
             // Very likely this kind of overlap is caused by allocation from a pool.
             if (safe_to_delete) {
                 FreeImage(cache_image_id);
@@ -404,48 +442,24 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
             return {depth_image_id, -1, -1};
         }
 
-        // Compressed view of uncompressed image with same block size.
-        if (image_info.props.is_block && !cache_image.info.props.is_block) {
+        switch (action) {
+        case EqualAddressOverlap::ExpandCompressed:
+        case EqualAddressOverlap::Expand3D:
+        case EqualAddressOverlap::ExpandResources:
             return {ExpandImage(image_info, cache_image_id), -1, -1};
-        }
-
-        if (image_info.guest_size == cache_image.info.guest_size &&
-            (image_info.type == AmdGpu::ImageType::Color3D ||
-             cache_image.info.type == AmdGpu::ImageType::Color3D)) {
-            return {ExpandImage(image_info, cache_image_id), -1, -1};
-        }
-
-        const bool pow2_padding_only =
-            image_info.props.is_pow2 != cache_image.info.props.is_pow2 &&
-            image_info.tile_mode == cache_image.info.tile_mode &&
-            image_info.size == cache_image.info.size &&
-            image_info.pitch == cache_image.info.pitch && image_info.resources.levels == 1 &&
-            cache_image.info.resources.levels == 1 && image_info.resources.layers == 1 &&
-            cache_image.info.resources.layers == 1;
-
-        // Size and resources are less than or equal, use image view.
-        if (image_info.pixel_format != cache_image.info.pixel_format ||
-            image_info.guest_size <= cache_image.info.guest_size || pow2_padding_only) {
-            auto result_id = merged_image_id ? merged_image_id : cache_image_id;
-            const auto& result_image = slot_images[result_id];
-            const bool is_compatible =
-                IsVulkanFormatCompatible(result_image.info.pixel_format, image_info.pixel_format);
-            return {is_compatible ? result_id : ImageId{}, -1, -1};
-        }
-
-        // Size and resources are greater, expand the image.
-        if (image_info.type == cache_image.info.type &&
-            image_info.resources > cache_image.info.resources) {
-            return {ExpandImage(image_info, cache_image_id), -1, -1};
-        }
-
-        // Size is greater but resources are not, because the tiling mode is different.
-        // Likely the address is reused for a image with a different tiling mode.
-        if (image_info.tile_mode != cache_image.info.tile_mode) {
+        case EqualAddressOverlap::View:
+            return {result_id, -1, -1};
+        case EqualAddressOverlap::Incompatible:
+            return {ImageId{}, -1, -1};
+        case EqualAddressOverlap::TilingReuse:
+            // Likely the address is reused for a image with a different tiling mode.
             if (safe_to_delete) {
                 FreeImage(cache_image_id);
             }
             return {merged_image_id, -1, -1};
+        case EqualAddressOverlap::DifferentShape:
+        case EqualAddressOverlap::Unresolvable:
+            break;
         }
 
         // Enhanced debug logging for unreachable case
