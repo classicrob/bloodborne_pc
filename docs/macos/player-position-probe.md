@@ -187,3 +187,33 @@ invalid/future timestamps, and latch the run ID and start timestamp in
 addition to PID. Test stale first use, a higher sequence with an old timestamp,
 same-PID process replacement, and a stalled sequence. Playtest owns that
 reader correction; this record does not claim it has landed.
+
+### Map transition and death observations
+
+Playtest subsequently qualified both on the same PREVIEW-28p artifact:
+
+- `20261012-122354-1080p-POSQUAL-5`: Dream headstone travel to the 1st Floor
+  Sickroom. Samples changed from valid map `0x15000000`, through
+  `absent-player-chain`, to valid map `0x18010000` at approximately
+  `(-199.74,-50.76,179.42)`, matching the sickroom lamp in captures.
+  The clinic and Central Yharnam share that map value; it is not an area-name
+  discriminator within the map.
+- `20261012-122807-1080p-POSQUAL-6`: enemy damage and death at the coffin
+  arch, then respawn at the lit Central Yharnam lamp. Samples became invalid
+  during the transition and returned at approximately `(-193.4,-28.65,68.5)`.
+  Valid coordinates returned while the loading tip was still visible.
+
+Independent inspection found 1050 and 1470 logged samples respectively,
+with increasing sequences. The largest sample-timestamp gaps were 4.135163 s
+in travel and 2.454132 s during the death run. Playtest observed the travel
+file remaining valid but unchanged during the white dissolve. Thus an invalid
+record is not guaranteed to arrive before a period of uncontrollability;
+read-time age and non-advancing sequence must stop steering independently.
+Do not relax the freshness threshold to span these transitions. After a stop,
+starting another route requires a fresh world-stage check and calibration.
+
+These observations qualify the publisher's observed spawn, motion, yaw,
+null-chain, map-transition and death/respawn behavior on the tested fixtures.
+They do not qualify closed-loop route accuracy, combat behavior, or all
+loading paths. Playtest owns the reader correction/tests and the subsequent
+goto qualification authorized by the orchestrator.
