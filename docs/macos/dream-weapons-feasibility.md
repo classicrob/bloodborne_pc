@@ -88,3 +88,69 @@ acceptance on a new marked fixture. No inventory or flags were edited here.
 Recommendation: the identified gift interaction is the smallest next test.
 Reserve inventory insertion for a demonstrated unavailable gift; do not infer
 missing clinic flags from the first short search.
+
+
+## Audited inventory fixture (01.09, dream-exited only)
+
+The inventory tool is now `tools/macos/save_weapon_fixture.py`. It accepts only
+this exact source character SHA256 and the `dream-exited` edited metadata.
+It adds Saw Cleaver 7000000 (durability 200), Hunter Pistol 14000000
+(durability 100), and 20 Quicksilver Bullets (good 900). It does not equip them,
+change gift flags, or replace the default/fist records. Load, equip, attack,
+fire, and save/reload remain Playtest acceptance tasks.
+
+The tail uncertainty above is resolved for this source by static analysis of
+its 01.09 serializer `0x156aa50` and loader `0x156b970` (image offsets):
+
+- The header is 0x54 bytes. `0x14ea560` writes the first subsection offsets
+  and sizes. The main serializer writes the remaining section starts/sizes.
+  Two new 60-byte equipment records replace two empty 8-byte records,
+  requiring 104 bytes. Header starts +0x1c/24/2c/34/3c/44/4c and containing
+  lengths +0x10/18 therefore increase by 104; all other header bytes stay.
+- The last header-indexed section ends at +0x4c + +0x50 = 0x5dbb4.
+  `0x175a4e0` writes an 8-byte header followed by its size field's 4096 bytes;
+  `0x175a6a0` reads the same structure and checks its size.
+- Version 0x41 then serializes 27 bytes: 1+4 (`0x156b549` onward),
+  1+4+4 (version >=0x35), 1 (>=0x37), and 12 (>=0x36).
+  The loader mirrors those reads at `0x156c36d` through `0x156c5aa`.
+  The active stream therefore ends at **0x5ebd7**, well before the fixed
+  0x140000-byte save-buffer capacity. No checksum or signature is added by
+  this serializer; this is not a statement about encrypted console containers.
+
+Only that active stream moves. Its new end is **0x5ec3f**. The file size stays
+0x140000; bytes from 0x5ec3f to EOF remain at their original offsets and are
+byte-for-byte identical. The 104 unused bytes consumed by expansion are saved
+verbatim in provenance, allowing exact full-file reversal. This does not use
+the reference editor's whole-file shift and EOF truncation.
+
+The parser walks all 4096 equipment records, finds the three empty inventory
+entries, validates the final blob and parses the output again. Every existing
+equipment/inventory record is preserved. Two inventory counters increase by
+three. Inventory entry index words are preserved, matching the reference
+format's empty-slot insertion; gameplay acceptance remains necessary.
+The weapon record layout is independently constructed from its documented
+fields; pinned reference-editor fixtures also contain pistol durability 100
+and cleaver durability 200 with five closed gem slots.
+
+The dry-run emits every changed 16-byte row plus semantic edits, relocation,
+source-file hashes and consumed slack. The new fixture retains `edited=true`,
+its complete parent metadata and source hash. Source and output trees are
+verified after copying. The tool refuses another source, existing/nested
+output, non-regular files, and unsupported layouts. No game runs are performed
+by the tool.
+
+```sh
+python3 tools/macos/save_fixture_check.py
+python3 tools/macos/save_weapon_fixture.py \
+  ~/bbport-game/saves/dream-exited ~/bbport-game/saves/dream-weapons-edited \
+  --dry-run > out/save-fixture-audit/weapon-dry-run.txt
+python3 tools/macos/save_weapon_fixture.py \
+  ~/bbport-game/saves/dream-exited ~/bbport-game/saves/dream-weapons-edited \
+  > out/save-fixture-audit/weapon-create.txt
+```
+
+Manual checks: 13 tests, covering the original location tool and the weapon
+fixture's dry-run, full-file reversal, unchanged tail, preserved ancestry,
+source-hash refusal, destination refusal, copy-failure cleanup and modified
+edit rejection. These are offline format/filesystem checks, not game-load
+acceptance.
