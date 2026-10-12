@@ -538,8 +538,9 @@ private:
             }
             return;
         }
-        case 0x40: // COPY_DATA: the parser logs it as unhandled and writes nothing; so does the
-                   // replay, so it is neither a reset nor a writer a wait can rely on.
+        case 0x40: // COPY_DATA: the parser stops on every form (none is implemented), so a
+                   // frame holding one cannot be replayed either.
+            Blocker("COPY_DATA, which the parser stops on");
             return;
         case 0x83: { // DUMP_CONST_RAM
             const auto* dump = static_cast<const AmdGpu::PM4DumpConstRam*>(raw);
