@@ -43,18 +43,58 @@ export BB_HEAVY_DIR=$dir BB_HEAVY_BUILD_SLOTS=1 BB_HEAVY_PLAYTEST_SLOTS=2 BB_HEA
 # section (in a scratch repository) near the end.
 export BB_HEAVY_SHARED_TREE=1
 fail() { echo "heavy test FAILED: $*" >&2; exit 1; }
-until_held() { for _ in $(seq 100); do "$heavy" status | grep -q "$1: held by $2" && return; sleep 0.1; done; fail "$1 never held by $2"; }
+# Robust under load and under a real perf run's pause (this whole test is then stopped): every wait
+# is on a condition with a generous ceiling (60 s), "did not wait" is shown by the history (a start
+# record lists the slots held at that moment; events are logged in the order they happen), and a
+# perf-run stand-in keeps its quiet until the test releases it. No check depends on how long
+# anything took. Every heavy.sh call's failure is a failure with a message.
+wait_for() {  # wait_for MESSAGE COMMAND...: until COMMAND succeeds, at most 60 s
+    local what=$1; shift
+    for _ in $(seq 600); do "$@" && return 0; sleep 0.1; done
+    fail "$what (not within 60 s)"
+}
+until_held() { wait_for "$1 never held by $2" held_by "$1" "$2"; }
+held_by() { "$heavy" status | grep -q "$1: held by $2"; }
+slot_free() { "$heavy" status | grep -q "^$1: free"; }
+# order EVENT:LABEL...: each event is in the history, each after the one before (a quiet run's events
+# carry its label as "by").
+order() { python3 - "$dir/history.jsonl" "$@" <<'PY' || fail "history order: $*"
+import json, sys
+lines = [json.loads(l) for l in open(sys.argv[1])]
+last = -1
+for spec in sys.argv[2:]:
+    event, label = spec.split(':', 1)
+    found = [i for i, e in enumerate(lines) if e.get('event') == event and label in (e.get('label'), e.get('by'))]
+    later = [i for i in found if i > last]
+    assert later, f'{spec}: at lines {found}, none after line {last}'
+    last = later[0]
+PY
+}
+# held_at_start LABEL SLOT: LABEL's start record lists SLOT as held then (it ran beside SLOT's job).
+held_at_start() { python3 - "$dir/history.jsonl" "$1" "$2" <<'PY' || fail "$1 did not start while $2 was held"
+import json, sys
+starts = [json.loads(l) for l in open(sys.argv[1])]
+starts = [e for e in starts if e.get('event') == 'start' and e.get('label') == sys.argv[2]]
+assert starts and sys.argv[3] in starts[-1]['held'], starts
+PY
+}
+ticks() { wc -l < "$1" | tr -d ' '; }
+grew() {  # grew FILE: FILE (a job's tick log) grows within 60 s
+    local before; before=$(ticks "$1")
+    for _ in $(seq 600); do (( $(ticks "$1") > before )) && return 0; sleep 0.1; done
+    return 1
+}
+# A perf-run stand-in: waits (at most 60 s) for CONDITION, then for the test's release file.
+hold() { echo "n=0; until $1; do n=\$((n + 1)); [ \$n -gt 600 ] && exit 9; sleep 0.1; done"; }
 
 # A holds the only ordinary slot (its child sleep inherits the lock).
 "$heavy" A -- sh -c 'sleep 3' &
 holder=$!
 until_held build0 A
 # B must wait until A ends.
-start=$(date +%s)
-"$heavy" B -- true 2>/dev/null
-waited=$(( $(date +%s) - start ))
-(( waited >= 1 )) || fail "B ran while A held the only slot (waited ${waited}s)"
-wait "$holder"
+"$heavy" B -- true 2>/dev/null || fail "B failed"
+wait "$holder" || fail "A failed"
+order end:A start:B
 
 # Game runs have their own pool: two run while the build slot is busy, a third waits.
 BB_HEAVY_EXEC=1 "$heavy" --pool playtest G1 -- sleep 30 &
@@ -62,13 +102,11 @@ g1=$!
 BB_HEAVY_EXEC=1 "$heavy" --pool playtest G2 -- sleep 30 &
 g2=$!
 until_held playtest0 G; until_held playtest1 G
-start=$(date +%s)
 ( "$heavy" --pool playtest G3 -- true 2>/dev/null; echo done > "$dir/g3" ) &
-sleep 2
+sleep 2  # (a lower bound only: under load G3 just starts later)
 [[ ! -e $dir/g3 ]] || fail "third game ran with two playtest slots held"
 kill -9 "$g1"; wait "$g1" 2>/dev/null || true
-for _ in $(seq 50); do [[ -e $dir/g3 ]] && break; sleep 0.1; done
-[[ -e $dir/g3 ]] || fail "third game did not get the freed playtest slot"
+wait_for "third game did not get the freed playtest slot" test -e "$dir/g3"
 kill -9 "$g2"; wait "$g2" 2>/dev/null || true
 
 # Quick jobs: their own two slots, the -j4 hint, and a hard time limit for the whole group.
@@ -80,9 +118,8 @@ out=$("$heavy" --pool quick Q1 -- sh -c 'echo "$BB_BUILD_JOBS $CMAKE_BUILD_PARAL
 "$heavy" --pool quick Q2 -- sleep 30 &
 q2=$!
 until_held quick0 Q2
-start=$(date +%s)
-"$heavy" --pool quick Q3 -- true
-(( $(date +%s) - start < 20 )) || fail "second quick slot not available"  # the holder sleeps 30 s
+"$heavy" --pool quick Q3 -- true || fail "Q3 failed"
+held_at_start Q3 quick0  # it ran beside Q2: the second quick slot
 marker=bbheavytest$$
 set +e
 BB_HEAVY_QUICK_WARN=1 BB_HEAVY_QUICK_LIMIT=2 "$heavy" --pool quick Q4 -- \
@@ -92,25 +129,23 @@ set -e
 (( status == 124 )) || fail "over-limit quick job exit status $status, expected 124"
 grep -q 'WARNING: quick job Q4' "$dir/q4.err" || fail "no warning before the quick limit"
 grep -q 'KILLED quick job Q4' "$dir/q4.err" || fail "quick limit kill not reported"
-sleep 0.5
-! pgrep -f "$marker" >/dev/null || fail "a child of the killed quick job survived"
-"$heavy" status | grep -qE '^quick[01]: free' || fail "quick slot not freed after the limit kill"
+no_marker() { ! pgrep -f "$marker" > /dev/null; }
+wait_for "a child of the killed quick job survived" no_marker
+wait_for "quick slot not freed after the limit kill" slot_free 'quick[01]'
 kill -9 "$q2" "$busy"; wait "$q2" "$busy" 2>/dev/null || true
 
 # A priority job runs while an ordinary job holds the ordinary slot.
 BB_HEAVY_EXEC=1 "$heavy" C -- sleep 30 &
 holder=$!
 until_held build0 C
-start=$(date +%s)
-"$heavy" --priority P -- true
-(( $(date +%s) - start < 20 )) || fail "priority job waited for the ordinary slot"  # the holder sleeps 30 s
+"$heavy" --priority P -- true || fail "P failed"
+held_at_start P build0  # it ran beside C
 # Ordinary jobs never take the priority slot.
 "$heavy" status | grep -q '^build-priority: free' || fail "priority slot not free after P"
 
 # Killing the holder frees the slot: no lease, no cleanup.
 kill -9 "$holder"; wait "$holder" 2>/dev/null || true
-for _ in $(seq 50); do "$heavy" status | grep -q '^build0: free' && break; sleep 0.1; done
-"$heavy" status | grep -q '^build0: free' || fail "build0 still held after SIGKILL of its holder"
+wait_for "build0 still held after SIGKILL of its holder" slot_free build0
 
 # Inside a slot, a nested call runs directly (build.sh under heavy.sh).
 "$heavy" D -- sh -c "$heavy E -- true" || fail "nested heavy.sh blocked or failed"
@@ -126,21 +161,29 @@ export BB_HEAVY_PLAYTEST_SLOTS=3
 g4=$!
 "$heavy" --pool playtest G5 -- sleep 3 &
 g5=$!
-for _ in $(seq 100); do "$heavy" status | grep -q '^gpu: shared' && break; sleep 0.1; done
-"$heavy" status | grep -q '^gpu: shared' || fail "games did not hold the GPU shared"
-start=$(date +%s)
+gpu_shared() { "$heavy" status | grep -q '^gpu: shared'; }
+wait_for "games did not hold the GPU shared" gpu_shared
 ( "$heavy" --pool quick --gpu exclusive T1 -- sh -c 'echo "$BB_HEAVY_GPU"; sleep 2' > "$dir/t1" ) &
 t1=$!
-sleep 1
-( "$heavy" --pool playtest G6 -- sh -c 'date +%s' > "$dir/g6" ) &
+# T1 holds the GPU gate (exclusive) while it waits for the games: a game asking now waits behind it.
+gate_taken() { python3 -c '
+import fcntl, os, sys
+fd = os.open(sys.argv[1], os.O_RDONLY)
+try:
+    fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+    sys.exit(1)
+except BlockingIOError:
+    sys.exit(0)' "$dir/gpu-gate" 2>/dev/null; }
+wait_for "T1 never took the GPU gate" gate_taken
+( "$heavy" --pool playtest G6 -- true ) &
 g6=$!
-wait "$t1"
-t1_done=$(date +%s)
+wait "$t1" || fail "T1 failed"
 [[ $(cat "$dir/t1") == exclusive ]] || fail "timing job did not hold the GPU exclusive"
-(( t1_done - start >= 4 )) || fail "exclusive GPU job ran while games held the GPU ($((t1_done - start)) s)"
-wait "$g6"
-(( $(cat "$dir/g6") >= t1_done - 1 )) || fail "a game started while an exclusive GPU job waited or ran"
-wait "$g4" "$g5"
+wait "$g6" || fail "G6 failed"
+wait "$g4" "$g5" || fail "G4/G5 failed"
+order end:G4 gpu:T1  # the exclusive job got the GPU after the games ended
+order end:G5 gpu:T1
+order end:T1 gpu:G6  # a game asking while it waited got the GPU after it
 out=$("$heavy" --pool quick --gpu exclusive T2 -- "$heavy" --pool playtest G7 -- sh -c 'echo "$BB_HEAVY_GPU"')
 [[ $out == exclusive ]] || fail "a game under an exclusive GPU job did not run directly ('$out')"
 if "$heavy" --pool playtest G8 -- "$heavy" --gpu exclusive T3 -- true 2>/dev/null; then
@@ -196,9 +239,8 @@ echo "heavy.sh scheduling: niceness and parallelism checked; QoS $qos"
 BB_HEAVY_EXEC=1 "$heavy" LONG -- sleep 30 &
 long=$!
 until_held build0 LONG
-start=$(date +%s)
-"$heavy" --pool sweep SW1 -- true
-(( $(date +%s) - start < 20 )) || fail "sweep waited for the build slot"  # the holder sleeps 30 s
+"$heavy" --pool sweep SW1 -- true || fail "SW1 failed"
+held_at_start SW1 build0  # it ran beside LONG
 "$heavy" status | grep -q '^sweep0: free' || fail "sweep slot not listed or not freed"
 kill -9 "$long"; wait "$long" 2>/dev/null || true
 err=$("$heavy" B9 -- "$heavy" --pool sweep SW2 -- true 2>&1 >/dev/null)
@@ -210,19 +252,18 @@ err=$("$heavy" B9 -- "$heavy" --pool sweep SW2 -- true 2>&1 >/dev/null)
 BB_HEAVY_EXEC=1 "$heavy" LONG2 -- sleep 30 &
 long=$!
 until_held build0 LONG2
-start=$(date +%s)
-out=$(BB_HEAVY_IDLE_SECONDS=4500 "$heavy" IDLE1 -- sh -c 'echo "$(ps -o pri= -p $$) $(ps -o nice= -p $$) $BB_BUILD_JOBS"' 2>"$dir/idle.err")
-(( $(date +%s) - start < 20 )) || fail "idle user: a second build job waited for build0"  # the holder sleeps 30 s
+out=$(BB_HEAVY_IDLE_SECONDS=4500 "$heavy" IDLE1 -- sh -c 'echo "$(ps -o pri= -p $$) $(ps -o nice= -p $$) $BB_BUILD_JOBS"' 2>"$dir/idle.err") ||
+    fail "IDLE1 failed: $(cat "$dir/idle.err")"
+held_at_start IDLE1 build0  # idle user: a second build job ran beside LONG2
 read -r ipri inic ijobs <<< "$out"
 [[ $inic == $(want 5) && $ijobs == 8 ]] || fail "idle admission not nice +5 with 8 jobs ('$out')"
 (( base_pri < 20 || ipri == 20 )) || fail "idle admission not utility QoS (priority $ipri)"
 grep -q 'IDLE1: user idle 75 min: nice 5, utility QoS, 8 jobs' "$dir/idle.err" || fail "idle decision not logged: $(cat "$dir/idle.err")"
 ( BB_HEAVY_IDLE_SECONDS=0 "$heavy" ACTIVE1 -- true 2>/dev/null; echo done > "$dir/active1" ) &
-sleep 3
+sleep 3  # (a lower bound only)
 [[ ! -e $dir/active1 ]] || fail "active user: a second build job ran while build0 was held"
 kill -9 "$long"; wait "$long" 2>/dev/null || true
-for _ in $(seq 100); do [[ -e $dir/active1 ]] && break; sleep 0.1; done
-[[ -e $dir/active1 ]] || fail "active user: the waiting build job never ran"
+wait_for "active user: the waiting build job never ran" test -e "$dir/active1"
 err=$(BB_HEAVY_IDLE_SECONDS=120 "$heavy" ACTIVE2 -- true 2>&1 >/dev/null)
 [[ $err == *'ACTIVE2: user active (idle 2 min): background QoS, 8 jobs'* ]] || fail "active decision not logged ('$err')"
 
@@ -230,36 +271,36 @@ err=$(BB_HEAVY_IDLE_SECONDS=120 "$heavy" ACTIVE2 -- true 2>&1 >/dev/null)
 # a new one waits, a quick job's time limit pauses too, the pause is bounded, and the flag needs
 # --gpu exclusive outside any slot. A paused job says so at its end, a failed one that a wall-clock
 # timeout may have fired on resume, and its end event carries paused_s and paused_by.
-ticks() { wc -l < "$1" | tr -d ' '; }
 "$heavy" B10 -- sh -c "while :; do echo t >> '$dir/b10'; sleep 0.2; done" &
 b10=$!
-for _ in $(seq 400); do  # Q2's orphaned sleep 30 (killed supervisor) may still hold a quick slot
-    [[ $("$heavy" status | grep -c '^quick[01]: free') == 2 ]] && break; sleep 0.1
-done
-BB_HEAVY_QUICK_LIMIT=4 "$heavy" --pool quick Q10 -- sh -c 'sleep 3' > /dev/null 2> "$dir/q10.err" &
+both_quick_free() { [[ $("$heavy" status | grep -c '^quick[01]: free') == 2 ]]; }
+wait_for "quick slots not free (Q2's killed job)" both_quick_free
+BB_HEAVY_QUICK_LIMIT=6 "$heavy" --pool quick Q10 -- sh -c 'sleep 3' > /dev/null 2> "$dir/q10.err" &
 q10=$!
 "$heavy" --pool quick Q11 -- sh -c 'sleep 3; exit 3' > /dev/null 2> "$dir/q11.err" &
 q11=$!
-for _ in $(seq 50); do [[ -s $dir/b10 ]] && break; sleep 0.1; done
-for _ in $(seq 100); do
-    held=$("$heavy" status)
-    [[ $held == *'held by Q10 '* && $held == *'held by Q11 '* ]] && break; sleep 0.1
-done
-[[ $held == *'held by Q10 '* && $held == *'held by Q11 '* ]] || fail "Q10/Q11 never started: $held"
-"$heavy" --pool playtest --gpu exclusive --cpu-quiet P10 -- sh -c "sleep 0.5; a=\$(wc -l < '$dir/b10'); sleep 2.5; b=\$(wc -l < '$dir/b10'); echo \$a \$b > '$dir/p10'" 2> "$dir/p10.err" &
+wait_for "B10 never ran" test -s "$dir/b10"
+both_quick_held() { local held; held=$("$heavy" status); [[ $held == *'held by Q10 '* && $held == *'held by Q11 '* ]]; }
+wait_for "Q10/Q11 never started" both_quick_held
+# P10 measures B10 once every job is paused, then keeps the quiet until released.
+"$heavy" --pool playtest --gpu exclusive --cpu-quiet P10 -- sh -c "
+    $(hold "grep -q 'paused Q11' '$dir/p10.err' && grep -q 'paused B10' '$dir/p10.err'")
+    a=\$(wc -l < '$dir/b10'); sleep 1.5; b=\$(wc -l < '$dir/b10'); echo \$a \$b > '$dir/p10'
+    $(hold "[ -e '$dir/p10-release' ]")" 2> "$dir/p10.err" &
 p10=$!
-sleep 1
-( "$heavy" --pool sweep B11 -- sh -c 'date +%s' > "$dir/b11" 2>/dev/null ) &  # its slot is free
+wait_for "P10 never measured: $(cat "$dir/p10.err" 2>/dev/null)" test -s "$dir/p10"
+( "$heavy" --pool sweep B11 -- true 2>/dev/null; echo done > "$dir/b11" ) &  # its slot is free, but the CPU is quiet
 b11=$!
-wait "$p10"
-p10_done=$(date +%s)
+# Q10's limit (6 s) must pause too: the quiet lasts well past it (at least 6 s more) before release.
+sleep 6
+touch "$dir/p10-release"
+wait "$p10" || fail "P10 failed: $(cat "$dir/p10.err")"
 read -r a b < "$dir/p10"
 (( a == b )) || fail "a build job kept running during a CPU-quiet perf run ($a -> $b ticks)"
 grep -q 'P10: CPU quiet: paused B10' "$dir/p10.err" || fail "pause not reported: $(cat "$dir/p10.err")"
 grep -q 'P10: CPU quiet: paused Q10' "$dir/p10.err" || fail "quick job pause not reported"
-before=$(ticks "$dir/b10"); sleep 2
-(( $(ticks "$dir/b10") > before )) || fail "a paused build job was not resumed"
-grep -q 'P10: CPU quiet over: resumed B10' "$dir/p10.err" || fail "resume not reported"
+grew "$dir/b10" || fail "a paused build job was not resumed"
+wait_for "resume not reported: $(cat "$dir/p10.err")" grep -q 'P10: CPU quiet over: resumed B10' "$dir/p10.err"
 set +e; wait "$q10"; q10_status=$?; set -e
 (( q10_status == 0 )) || fail "the quick job's time limit ran during the pause (exit $q10_status)"
 set +e; wait "$q11"; q11_status=$?; set -e
@@ -275,50 +316,50 @@ ends = {e['label']: e for e in events if e.get('event') == 'end'}
 pids = {e['label']: e['pid'] for e in events if e.get('event') == 'start'}
 for label, status in (('Q10', 0), ('Q11', 3)):
     e = ends[label]
-    assert e['status'] == status and e['paused_by'] == ['P10'] and 0 < e['paused_s'] <= 10, e  # duration: load-dependent
+    assert e['status'] == status and e['paused_by'] == ['P10'] and e['paused_s'] > 0, e
     assert not os.path.exists(os.path.join(sys.argv[2], f'paused-{pids[label]}.jsonl')), label
 PY
-wait "$b11"
-(( $(cat "$dir/b11") >= p10_done - 1 )) || fail "a build job started during a CPU-quiet perf run"
+wait "$b11" || true
+[[ -e $dir/b11 ]] || fail "B11 never ran"
+order quiet-end:P10 start:B11  # a job asking during the quiet started only after it
 kill "$b10" 2>/dev/null; wait "$b10" 2>/dev/null || true; pkill -f "$dir/b10" 2>/dev/null || true
 rm -f "$dir/b10"
 "$heavy" B12 -- sh -c "while :; do echo t >> '$dir/b12'; sleep 0.2; done" &
 b12=$!
-for _ in $(seq 50); do [[ -s $dir/b12 ]] && break; sleep 0.1; done
-BB_HEAVY_QUIET_MAX=2 "$heavy" --pool playtest --gpu exclusive --cpu-quiet P11 -- sleep 5 2> "$dir/p11.err" &
+wait_for "B12 never ran" test -s "$dir/b12"
+BB_HEAVY_QUIET_MAX=2 "$heavy" --pool playtest --gpu exclusive --cpu-quiet P11 -- sh -c "$(hold "[ -e '$dir/p11-release' ]")" 2> "$dir/p11.err" &
 p11=$!
-sleep 3.5
-before=$(ticks "$dir/b12"); sleep 1
-(( $(ticks "$dir/b12") > before )) || fail "the CPU-quiet bound did not resume the build job"
-grep -q 'CPU QUIET BOUND REACHED' "$dir/p11.err" || fail "bound not reported loudly"
-wait "$p11"
+wait_for "bound not reported loudly: $(cat "$dir/p11.err" 2>/dev/null)" grep -q 'CPU QUIET BOUND REACHED' "$dir/p11.err"
+grew "$dir/b12" || fail "the CPU-quiet bound did not resume the build job"
+touch "$dir/p11-release"
+wait "$p11" || fail "P11 failed: $(cat "$dir/p11.err")"
 kill "$b12" 2>/dev/null; wait "$b12" 2>/dev/null || true; pkill -f "$dir/b12" 2>/dev/null || true
 # A process another pause already stopped is left to it: a CPU-quiet run neither counts nor resumes it
 # (a real perf run pausing a full --test, then resuming everything, must not resume what this
 # test's own perf run paused).
 "$heavy" B13 -- sh -c "while :; do echo t >> '$dir/b13'; sleep 0.2; done" &
 b13=$!
-for _ in $(seq 50); do [[ -s $dir/b13 ]] && break; sleep 0.1; done
+wait_for "B13 never ran" test -s "$dir/b13"
 b13_loop=$(pgrep -f "^sh -c while :; do echo t >> '$dir/b13'" || true)
 [[ -n $b13_loop ]] || fail "B13's loop not found"
 kill -STOP "$b13_loop"
-"$heavy" --pool playtest --gpu exclusive --cpu-quiet P12 -- sleep 1 2> "$dir/p12.err"
-sleep 0.5
+"$heavy" --pool playtest --gpu exclusive --cpu-quiet P12 -- sh -c "$(hold "grep -q 'paused B13' '$dir/p12.err'")" \
+    2> "$dir/p12.err" || fail "P12 failed: $(cat "$dir/p12.err")"
+wait_for "P12's quiet never ended: $(cat "$dir/p12.err")" grep -q 'P12: CPU quiet over: resumed B13' "$dir/p12.err"
 [[ $(ps -o stat= -p "$b13_loop") == T* ]] || fail "a CPU-quiet run resumed a process another pause had stopped"
 grep -q 'P12: CPU quiet: paused B13 (build0, [0-9]* processes; 1 already stopped by another pause, left to it)' "$dir/p12.err" ||
     fail "already-stopped process not reported: $(cat "$dir/p12.err")"
 kill -CONT "$b13_loop"
-before=$(ticks "$dir/b13"); sleep 1
-(( $(ticks "$dir/b13") > before )) || fail "B13 did not run after its own pauser resumed it"
+grew "$dir/b13" || fail "B13 did not run after its own pauser resumed it"
 kill "$b13" 2>/dev/null; wait "$b13" 2>/dev/null || true; pkill -f "$dir/b13" 2>/dev/null || true
-# A job that ends the moment it is resumed (its sleep ran out during the pause) still reads the
-# whole pause: the end is written before SIGCONT, and no pause file is left behind.
-"$heavy" --pool quick Q14 -- sleep 0.3 2> "$dir/q14.err" &
+# A job that ends the moment it is resumed still reads the whole pause: the end is written before
+# SIGCONT, and no pause file is left behind. Q14 waits for a file P13 creates while Q14 is stopped.
+"$heavy" --pool quick Q14 -- sh -c "$(hold "[ -e '$dir/q14-go' ]")" 2> "$dir/q14.err" &
 q14=$!
 until_held 'quick[01]' Q14
-"$heavy" --pool playtest --gpu exclusive --cpu-quiet P13 -- sleep 2 2> /dev/null
-wait "$q14" || fail "Q14 failed"
-sleep 0.5
+"$heavy" --pool playtest --gpu exclusive --cpu-quiet P13 -- sh -c "$(hold "grep -q 'paused Q14' '$dir/p13.err'"); touch '$dir/q14-go'" \
+    2> "$dir/p13.err" || fail "P13 failed: $(cat "$dir/p13.err")"
+wait "$q14" || fail "Q14 failed: $(cat "$dir/q14.err")"
 python3 - "$dir/history.jsonl" "$dir" <<'PY' || fail "a job ending at once after its resume lost its pause: $(cat "$dir/q14.err")"
 import json, os, sys
 events = [json.loads(line) for line in open(sys.argv[1])]
@@ -332,9 +373,6 @@ if "$heavy" K2 -- "$heavy" --pool playtest --gpu exclusive --cpu-quiet K3 -- tru
     fail "--cpu-quiet inside a slot accepted"
 fi
 
-# (The waits above allow 20 s against a 30 s holder: at load 20-27, from perf A/Bs, starting the
-# heavy.sh calls took over 10 s.)
-
 # Job records: a start event with the command and the directory; an end event for every pool with
 # the exit status, or the signal that killed it (SIGTERM to heavy.sh is forwarded to the command);
 # a job whose heavy.sh was SIGKILLed while its command runs on is shown as ORPHANED.
@@ -343,21 +381,22 @@ fi
 r2=$!
 until_held build0 R2
 kill -TERM "$r2"; wait "$r2" 2>/dev/null || true
-for _ in $(seq 50); do "$heavy" status | grep -q '^build0: free' && break; sleep 0.1; done
-"$heavy" status | grep -q '^build0: free' || fail "SIGTERM to heavy.sh did not end its command"
+wait_for "SIGTERM to heavy.sh did not end its command" slot_free build0
 "$heavy" R3 -- sleep 30 &
 r3=$!
 until_held build0 R3
 kill -9 "$r3"; wait "$r3" 2>/dev/null || true
 "$heavy" status | grep -q '^build0: held by R3 .*ORPHANED' || fail "orphaned command not shown: $("$heavy" status | grep build0)"
 kill "$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["command_pid"])' "$dir/build0")"
-for _ in $(seq 50); do "$heavy" status | grep -q '^build0: free' && break; sleep 0.1; done
+wait_for "build0 not freed after the orphan ended" slot_free build0
 python3 - "$dir/history.jsonl" "$PWD" <<'PY' || fail "job records in history.jsonl"
-import json, sys
+import json, os, sys
 lines = [json.loads(l) for l in open(sys.argv[1])]
 start = {l['label']: l for l in lines if l['event'] == 'start'}
 end = {l['label']: l for l in lines if l['event'] == 'end'}
-assert start['R1']['command'].endswith("sh -c exit 7") and start['R1']['cwd'] == sys.argv[2], start['R1']
+# The directory as the kernel names it (a checkout under /tmp is /private/tmp to getcwd()).
+assert start['R1']['command'].endswith("sh -c exit 7") and \
+    os.path.realpath(start['R1']['cwd']) == os.path.realpath(sys.argv[2]), start['R1']
 assert end['R1']['status'] == 7 and end['R1']['pool'] == 'build' and 'seconds' in end['R1'], end['R1']
 assert end['R2']['signal'] == 'SIGTERM' and end['R2']['status'] == 128 + 15, end['R2']
 assert 'R3' not in end  # its heavy.sh was SIGKILLed: no end event, and status said ORPHANED
@@ -419,7 +458,7 @@ import json, sys
 lines = [json.loads(l) for l in open(sys.argv[1])]
 starts = [l for l in lines if l['event'] == 'start']
 ends = [l for l in lines if l['event'] == 'end']
-assert any(l['label'] == 'B' and l['waited_s'] >= 1 for l in starts), 'B waited'
+assert any(l['label'] == 'B' for l in starts), 'B started'  # after A ended: checked by order above
 assert all({'pool', 'slot', 'waited_s', 'load', 'held'} <= set(l) for l in starts)
 assert any(l['label'] == 'Q4' and l['status'] == 124 for l in ends), 'Q4 killed'
 PY
