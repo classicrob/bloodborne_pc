@@ -148,6 +148,17 @@ thread that waited:
 - the staging pool mutex and the draw preparation mutex;
 - the pipeline programs lock (shared or exclusive).
 
-A lock tries first. Only a failed try opens the scope, for the time the thread blocks; the hold
-is not measured. The scheduler's mutexes are not wrapped: their waits are "recorder sync" and
-the related scopes. MoltenVK's internal locks are not visible here.
+A lock tries first. Only a failed try opens the scope, for the time lock() / lock_shared()
+then takes: spinning and scheduling delay included, not necessarily sleeping. The hold is not
+measured.
+
+What it does not cover (read a zero line accordingly: it does not rule out all contention):
+- try_lock() / try_lock_shared() themselves are not timed. So the retries of Common::LockRange /
+  TryLockRange (the page manager's range locks) leave part of their acquisition outside the
+  scope.
+- Only threads attached to the parse split (stage A, stage B, the recording thread) contribute.
+- The scheduler's mutexes are not wrapped: their waits show partly as "recorder sync" and the
+  related scopes, not as every acquisition.
+- MoltenVK's internal locks are not visible here.
+
+A controlled held-lock test would pin the attribution if this diagnostic is extended.
