@@ -857,6 +857,30 @@ void Runtime::FlushBarriers() {
 
     BB_SPLIT_SCOPE(KBarrierFlush);
 #ifdef __APPLE__
+    if (scheduler.IsRendering()) {
+        // The pass census attributes the split: what the barrier waits for, and who flushed.
+        using namespace vk;
+        constexpr PipelineStageFlags2 transfer =
+            PipelineStageFlagBits2::eTransfer | PipelineStageFlagBits2::eCopy |
+            PipelineStageFlagBits2::eBlit | PipelineStageFlagBits2::eResolve |
+            PipelineStageFlagBits2::eClear;
+        constexpr PipelineStageFlags2 compute = PipelineStageFlagBits2::eComputeShader;
+        constexpr PipelineStageFlags2 graphics =
+            PipelineStageFlagBits2::eDrawIndirect | PipelineStageFlagBits2::eIndexInput |
+            PipelineStageFlagBits2::eVertexAttributeInput | PipelineStageFlagBits2::eVertexInput |
+            PipelineStageFlagBits2::eVertexShader | PipelineStageFlagBits2::eFragmentShader |
+            PipelineStageFlagBits2::eEarlyFragmentTests |
+            PipelineStageFlagBits2::eLateFragmentTests |
+            PipelineStageFlagBits2::eColorAttachmentOutput | PipelineStageFlagBits2::eAllGraphics;
+        const PipelineStageFlags2 src = memory_barrier.srcStageMask;
+        std::uint32_t sources = 0;
+        sources |= (src & transfer) ? BbPassCensus::SrcTransfer : 0;
+        sources |= (src & compute) ? BbPassCensus::SrcCompute : 0;
+        sources |= (src & graphics) ? BbPassCensus::SrcGraphics : 0;
+        sources |= (src & ~(transfer | compute | graphics)) ? BbPassCensus::SrcOther : 0;
+        sources |= image_barriers.empty() ? 0 : BbPassCensus::SrcImage;
+        BbPassCensus::NoteBarrierEnd(sources, __builtin_return_address(0));
+    }
     scheduler.EndRenderingFor(BbPassCensus::Why::Barrier);
 #else
     scheduler.EndRendering();

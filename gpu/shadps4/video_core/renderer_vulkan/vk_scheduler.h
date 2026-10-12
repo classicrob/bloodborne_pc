@@ -1048,6 +1048,7 @@ private:
     bool direct_mode = false; ///< the command buffer is recorded on the caller's thread
 #ifdef __APPLE__
     BbPassCensus::Why end_reason = BbPassCensus::Why::Other; ///< for the next EndRendering
+    bool has_render_state = false; ///< a pass has begun (render_state is a real pass's state)
 #endif
     u64 host_copies_issued = 0;
     std::atomic<u64> host_copies_done{0};
