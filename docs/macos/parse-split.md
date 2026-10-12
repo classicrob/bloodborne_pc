@@ -85,6 +85,24 @@ two per draw (descriptor build, dynamic state) plus the rare ones:
   "executing chunks". MoltenVK records Metal work in these calls or at queue submit (in "queue
   submit"); these scopes do not see the Metal driver after submission.
 
+## Flush census (the draw scheduler's submissions)
+
+With labels at GPU completion, a label is written once a Vulkan submission containing its work
+completes. That makes labels the main driver of submissions. Each submission also ends any open
+render pass and syncs the Vulkan recording thread.
+
+Every draw-scheduler submission is counted by reason, from a thread-local reason the caller sets:
+- frame end;
+- unbatched labels (one per label: stage A, or recording not deferred);
+- stage B's label batch, at an idle packet boundary or at LabelBatchAge (500 us);
+- Finish;
+- other.
+
+The census also counts how many submissions found a render pass open, and the age of the oldest
+label in each batch at submit. One line is printed in the parse-split block. Renderer's render
+pass census ("Render passes ...") attributes each pass end; its "submit" count should match
+"ended an open render pass" here.
+
 ## Output
 
 One block every 600 frame ends, printed from stage A:

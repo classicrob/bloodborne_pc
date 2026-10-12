@@ -562,6 +562,9 @@ void Liverpool::Process(std::stop_token stoken) {
             VideoCore::EndCapture();
             if (rasterizer) {
                 rasterizer->OnSubmit();
+#ifdef __APPLE__
+                BbSplit::FlushReason flush_reason{BbSplit::FFrameEnd};
+#endif
                 rasterizer->Flush();
             }
             submit_done = false;
