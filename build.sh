@@ -166,14 +166,14 @@ if [[ $(uname -s) == Darwin ]]; then
     # The debug map points at out/probe-obj; an old one-step build's bb-probe.dSYM would be stale.
     rm -rf out/probe-obj out/bb-probe.dSYM && mkdir -p out/probe-obj
     probe_objects=()
-    for source in src/probe.c "${runtime[@]}" src/vulkan_smoke.c; do
+    for source in src/probe.c "${runtime[@]}" src/vulkan_smoke.c src/macos_activity.c; do
         object=out/probe-obj/$(basename "${source%.c}").o
         "$CC" "${platform_flags[@]}" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread "${includes[@]}" -I. -Isrc \
             -c "$source" -o "$object"
         probe_objects+=("$object")
     done
     "$CC" "${platform_flags[@]}" -g -pthread "${probe_link_flags[@]}" "${probe_objects[@]}" out/libatrac9.a -lm \
-        "${gpu[@]}" "${libraries[@]}" -o out/bb-probe
+        "${gpu[@]}" "${libraries[@]}" -lobjc -framework Foundation -o out/bb-probe
 else
 "$CC" "${platform_flags[@]}" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread "${probe_link_flags[@]}" "${includes[@]}" -I. -Isrc src/probe.c "${runtime[@]}" src/vulkan_smoke.c out/libatrac9.a -lm "${gpu[@]}" "${libraries[@]}" -o out/bb-probe
 fi
@@ -305,6 +305,7 @@ if [[ ${1:-} == --test || ${1:-} == --test-dry ]]; then
             --out "$PWD/out/gcnconf" --label shared
         # Standalone qualification probes and runtime pieces.
         t sh tests/test_guest_alloc_macos.sh
+        t bash tests/test_macos_activity.sh
         t sh tests/test_memory_clamp.sh
         t sh tests/test_toggle_file.sh
         t sh tests/test_memory_cpu_alias_macos.sh

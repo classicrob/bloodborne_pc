@@ -126,6 +126,16 @@ Phase boundaries are `Rasterizer::NoteFrameStart` (scene), the upscaler's trigge
 (post), and `TemporalUpscaler::Run`/`RunScaled`, which mark the upscaler on entry and return to
 the previous phase on exit. The present scheduler is its own stream.
 
+## App Nap
+
+Scripted runs keep the game window in the background (`BB_WINDOW_BACKGROUND=1`), which makes the
+process a candidate for App Nap and QoS demotion. bb-probe begins an NSProcessInfo activity (user
+initiated, latency critical, reason "game running") at startup and holds it for the run. It says
+`Runtime: App Nap off: ...` on stdout, and the process shows a `"game running"` power assertion in
+`pmset -g assertions`. `BB_APP_NAP=allow` leaves the activity out for an A/B; any other value is
+an error. Builds before this change ran without the activity, so their numbers may include
+throttling.
+
 ## Running
 
 ```sh

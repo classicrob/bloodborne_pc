@@ -16,6 +16,7 @@
 #include <sys/mman.h>
 #ifdef __APPLE__
 #include "macos_ui.h"
+#include "macos_activity.h"
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
 #include <errno.h>
@@ -805,6 +806,7 @@ int main(int argc, char **argv) {
         return 1;
 #endif
     }
+    bb_macos_begin_game_activity();
     ProbeArguments args={argc,argv};
     return bb_macos_ui_run(probe_worker,&args);
 #else
