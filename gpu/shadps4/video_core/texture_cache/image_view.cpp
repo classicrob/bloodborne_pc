@@ -8,6 +8,9 @@
 #include "video_core/texture_cache/image.h"
 #include "video_core/texture_cache/image_view.h"
 #include "video_core/renderer_vulkan/vk_feature_checks.h"
+#ifdef __APPLE__
+#include "bbport_bind_context.h"
+#endif
 
 #include <magic_enum/magic_enum.hpp>
 
@@ -101,8 +104,16 @@ ImageView::ImageView(const Vulkan::Instance& instance, const ImageViewInfo& info
     // Image creation drops storage usage for formats that refuse it (image.cpp); a storage view
     // of such an image is invalid. See docs/macos/format-support.md.
     ASSERT_MSG(!StorageUsageMissing(info, image.usage_flags),
-               "macOS: storage view of format {} image at {:#x}, which cannot be a storage image",
-               vk::to_string(image.info.pixel_format), image.info.guest_address);
+               "macOS: storage view of format {} image at {:#x}, which cannot be a storage image. "
+               "Requested view: format {}, type {}, levels {}+{}, layers {}+{}. Backing: {}x{}x{}, "
+               "{} levels, {} layers, tiling {}, usage {}. Binding: {}",
+               vk::to_string(image.info.pixel_format), image.info.guest_address,
+               vk::to_string(info.format), magic_enum::enum_name(info.type),
+               info.range.base.level, info.range.extent.levels, info.range.base.layer,
+               info.range.extent.layers, image.info.size.width, image.info.size.height,
+               image.info.size.depth, image.info.resources.levels, image.info.resources.layers,
+               magic_enum::enum_name(image.info.tile_mode), vk::to_string(image.usage_flags),
+               BbBindContext::Text());
     ASSERT_MSG(!Vulkan::FeatureChecks::StorageMultisampleUnsupported(
                    info.is_storage, image.info.num_samples,
                    instance.IsStorageImageMultisampleSupported()),

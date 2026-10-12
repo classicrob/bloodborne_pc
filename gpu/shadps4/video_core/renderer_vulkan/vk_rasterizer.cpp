@@ -44,6 +44,7 @@
 #include "bbport_parse_split.h"
 #include "bbport_pass_trace.h"
 #include <vulkan/vulkan_format_traits.hpp>
+#include "bbport_bind_context.h"
 #include <optional>
 #include <vk_mem_alloc.h>
 
@@ -2839,6 +2840,58 @@ Rasterizer::ImageDescCacheEntry& Rasterizer::CachedImageDescEntry(const AmdGpu::
     return entry;
 }
 
+#ifdef __APPLE__
+namespace {
+/// A texture binding being resolved (BindTextures' second pass), for stop messages from the
+/// texture cache: described only when a stop prints.
+struct TextureBindingContext {
+    const Shader::Info* stage;
+    const PreparedStage* prepared;
+    u32 binding_index;
+    const boost::container::small_vector<u32, 8>* array_sizes; ///< bindings per image resource
+    const VideoCore::TextureCache::ImageDesc* desc;
+};
+
+std::string DescribeTextureBinding(const void* context) {
+    const auto& c = *static_cast<const TextureBindingContext*>(context);
+    u32 resource = 0;
+    for (u32 first = 0; resource < c.array_sizes->size(); ++resource) {
+        if (c.binding_index < first + (*c.array_sizes)[resource]) {
+            break;
+        }
+        first += (*c.array_sizes)[resource];
+    }
+    const auto& want = *c.desc;
+    std::string text = fmt::format(
+        "shader {:#x} ({}), binding {}, image resource {}; requested image: format {}, {}x{}x{}, "
+        "{} levels, {} layers, binding type {}",
+        c.stage->pgm_hash, magic_enum::enum_name(c.stage->hw_stage), c.binding_index, resource,
+        vk::to_string(want.info.pixel_format), want.info.size.width, want.info.size.height,
+        want.info.size.depth, want.info.resources.levels, want.info.resources.layers,
+        magic_enum::enum_name(want.type));
+    if (resource >= c.stage->images.size()) {
+        return text + " (no image resource for this binding)";
+    }
+    const auto& res = c.stage->images[resource];
+    const AmdGpu::Image sharp =
+        c.prepared ? c.prepared->image_sharps[resource] : res.GetSharp(*c.stage);
+    std::array<u32, sizeof(AmdGpu::Image) / 4> words{};
+    std::memcpy(words.data(), &sharp, sizeof(words));
+    text += fmt::format("; resource is_written {}, is_atomic {}, is_array {}, is_depth {}; T# "
+                        "data {} number {} {}x{} pitch {} levels {}..{} tiling {} raw",
+                        res.is_written, res.is_atomic, res.is_array, res.is_depth,
+                        magic_enum::enum_name(sharp.GetDataFmt()),
+                        magic_enum::enum_name(sharp.GetNumberFmt()), u32(sharp.width) + 1,
+                        u32(sharp.height) + 1, u32(sharp.pitch) + 1, u32(sharp.base_level),
+                        u32(sharp.last_level), u32(sharp.tiling_index));
+    for (const u32 word : words) {
+        text += fmt::format(" {:08x}", word);
+    }
+    return text;
+}
+} // namespace
+#endif
+
 void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* prepared,
                               Shader::Backend::Bindings& binding, u32& write_index,
                               bool& barrier, bool on_helper) {
@@ -3092,6 +3145,12 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
 
             bound_images.emplace_back(image_id);
 
+#ifdef __APPLE__
+            // A stop while resolving this binding names the shader, the resource and its T#.
+            const TextureBindingContext failure_context{
+                &stage, prepared, binding_index, &image_descriptor_array_sizes, &desc};
+            const BbBindContext::Scope context_scope{&failure_context, &DescribeTextureBinding};
+#endif
             auto& image = texture_cache.GetImage(image_id);
             auto& image_view = texture_cache.FindTexture(
                 image_id, desc, memo_entry ? &memo_entry->view_memo : nullptr, !on_helper);
