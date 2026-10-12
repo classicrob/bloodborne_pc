@@ -24,10 +24,18 @@ static int child(void (*body)(void), double stop) {
     int status; assert(waitpid(pid,&status,0)==pid);
     return status;
 }
-static void fires(void) { test_alarm(1); nap(5); _exit(3); }
+/* No wall clock in the children that must be ended by the alarm: they wait until it ends them (a pause
+ * of the whole test, a perf run's CPU quiet, would run out a wall-clock nap and end them first). */
+static void fires(void) { test_alarm(1); for (;;) pause(); }
 static void paused(void) { test_alarm(2); nap(1.2); }
 static void cancelled(void) { test_alarm(1); test_alarm(0); nap(1.8); }
-static void rearmed(void) { test_alarm(30); test_alarm(1); nap(5); _exit(3); }
+static void rearmed(void) {
+    test_alarm(30);
+    const pid_t first=test_alarm_watchdog;
+    test_alarm(1);
+    if (!first || kill(first,0)==0 || test_alarm_watchdog==first) _exit(4); /* the 30 s one is gone */
+    for (;;) pause();
+}
 static void pipes(void) {
     int p[2]; assert(!pipe(p));
     test_alarm(5);
@@ -35,10 +43,11 @@ static void pipes(void) {
     char c; assert(read(p[0],&c,1)==0); /* EOF: the watchdog holds no write end */
 }
 int main(void) {
+    test_alarm(120); /* this test's own limit: a child the alarm never ends */
     double start=now();
     int status=child(fires,0);
     assert(WIFSIGNALED(status) && WTERMSIG(status)==SIGALRM);
-    assert(now()-start>0.9 && now()-start<3);
+    assert(now()-start>0.9);
     puts("PASS fires after 1 s of running time (SIGALRM)");
     /* Stopped 3 s with a 2 s limit and 1.5 s of its own running: alarm() would have fired. */
     status=child(paused,3);
@@ -49,10 +58,9 @@ int main(void) {
     status=child(cancelled,0);
     assert(WIFEXITED(status) && !WEXITSTATUS(status));
     puts("PASS test_alarm(0) cancels");
-    start=now();
     status=child(rearmed,0);
-    assert(WIFSIGNALED(status) && WTERMSIG(status)==SIGALRM && now()-start<3);
-    puts("PASS re-arming replaces the limit");
+    assert(WIFSIGNALED(status) && WTERMSIG(status)==SIGALRM);
+    puts("PASS re-arming replaces the limit (the first watchdog is gone; the new one fires)");
     status=child(pipes,0);
     assert(WIFEXITED(status) && !WEXITSTATUS(status));
     puts("PASS the watchdog holds none of the test's descriptors");
