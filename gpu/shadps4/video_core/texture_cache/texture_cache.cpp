@@ -379,13 +379,13 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested_info, Bindi
     return cache_image_id;
 }
 
-EqualAddressOverlap ClassifyEqualAddressOverlap(const ImageInfo& request, const ImageInfo& cached,
-                                                vk::Format result_format) {
+bool EqualAddressDifferentShape(const ImageInfo& request, const ImageInfo& cached) {
     const u32 lhs_block_size = request.num_bits * request.num_samples;
     const u32 rhs_block_size = cached.num_bits * cached.num_samples;
-    if (request.BlockDim() != cached.BlockDim() || lhs_block_size != rhs_block_size) {
-        return EqualAddressOverlap::DifferentShape;
-    }
+    return request.BlockDim() != cached.BlockDim() || lhs_block_size != rhs_block_size;
+}
+
+EqualAddressOverlap ClassifyEqualAddressOverlap(const ImageInfo& request, const ImageInfo& cached) {
     // Compressed view of uncompressed image with same block size.
     if (request.props.is_block && !cached.props.is_block) {
         return EqualAddressOverlap::ExpandCompressed;
@@ -402,9 +402,7 @@ EqualAddressOverlap ClassifyEqualAddressOverlap(const ImageInfo& request, const 
     // Size and resources are less than or equal, use image view.
     if (request.pixel_format != cached.pixel_format || request.guest_size <= cached.guest_size ||
         pow2_padding_only) {
-        return IsVulkanFormatCompatible(result_format, request.pixel_format)
-                   ? EqualAddressOverlap::View
-                   : EqualAddressOverlap::Incompatible;
+        return EqualAddressOverlap::NeedsView;
     }
     // Size and resources are greater, expand the image.
     if (request.type == cached.type && request.resources > cached.resources) {
@@ -427,10 +425,7 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
 
     // Equal address
     if (image_info.guest_address == cache_image.info.guest_address) {
-        const auto result_id = merged_image_id ? merged_image_id : cache_image_id;
-        const EqualAddressOverlap action = ClassifyEqualAddressOverlap(
-            image_info, cache_image.info, slot_images[result_id].info.pixel_format);
-        if (action == EqualAddressOverlap::DifferentShape) {
+        if (EqualAddressDifferentShape(image_info, cache_image.info)) {
             // Very likely this kind of overlap is caused by allocation from a pool.
             if (safe_to_delete) {
                 FreeImage(cache_image_id);
@@ -442,22 +437,24 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
             return {depth_image_id, -1, -1};
         }
 
-        switch (action) {
+        switch (ClassifyEqualAddressOverlap(image_info, cache_image.info)) {
         case EqualAddressOverlap::ExpandCompressed:
         case EqualAddressOverlap::Expand3D:
         case EqualAddressOverlap::ExpandResources:
             return {ExpandImage(image_info, cache_image_id), -1, -1};
-        case EqualAddressOverlap::View:
-            return {result_id, -1, -1};
-        case EqualAddressOverlap::Incompatible:
-            return {ImageId{}, -1, -1};
+        case EqualAddressOverlap::NeedsView: {
+            auto result_id = merged_image_id ? merged_image_id : cache_image_id;
+            const auto& result_image = slot_images[result_id];
+            const bool is_compatible =
+                IsVulkanFormatCompatible(result_image.info.pixel_format, image_info.pixel_format);
+            return {is_compatible ? result_id : ImageId{}, -1, -1};
+        }
         case EqualAddressOverlap::TilingReuse:
             // Likely the address is reused for a image with a different tiling mode.
             if (safe_to_delete) {
                 FreeImage(cache_image_id);
             }
             return {merged_image_id, -1, -1};
-        case EqualAddressOverlap::DifferentShape:
         case EqualAddressOverlap::Unresolvable:
             break;
         }

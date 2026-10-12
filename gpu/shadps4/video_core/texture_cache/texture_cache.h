@@ -42,23 +42,23 @@ namespace VideoCore {
 class BufferCache;
 class PageManager;
 
-/// ResolveOverlap's decision for a cached image at the requested image's guest address (before
-/// its depth-overlap check, which only follows DifferentShape's rejection): what to do with the
-/// cached image. `result_format` is the format of the image a view would come from (the merged
-/// image, else the cached one).
+/// ResolveOverlap, a cached image at the requested image's guest address, in its order:
+/// 1. EqualAddressDifferentShape: other block dimensions or bits (a pool reuse, freed when stale);
+/// 2. its depth-overlap check (a member);
+/// 3. ClassifyEqualAddressOverlap: what to do with the cached image otherwise. For NeedsView,
+///    ResolveOverlap then looks up the result image (merged, else cached) and returns a view of
+///    it if its format is view-compatible with the request, else no image.
+[[nodiscard]] bool EqualAddressDifferentShape(const ImageInfo& request, const ImageInfo& cached);
 enum class EqualAddressOverlap : u8 {
-    DifferentShape,   ///< other block dimensions or bits: a pool reuse, freed when stale
     ExpandCompressed, ///< a compressed request over an uncompressed image: copy into a new one
     Expand3D,         ///< the same size with a 3D side: copy into a new image
-    View,             ///< a view of the result image
-    Incompatible,     ///< a view would be needed but the formats are not view-compatible
+    NeedsView,        ///< a view of the result image, if the formats are view-compatible
     ExpandResources,  ///< more levels or layers: copy into a larger image
     TilingReuse,      ///< larger with another tiling: the address is reused, freed when stale
     Unresolvable,
 };
 [[nodiscard]] EqualAddressOverlap ClassifyEqualAddressOverlap(const ImageInfo& request,
-                                                              const ImageInfo& cached,
-                                                              vk::Format result_format);
+                                                              const ImageInfo& cached);
 
 class TextureCache {
     // Default values for garbage collection

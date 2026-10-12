@@ -5,11 +5,16 @@
 //   - ImageInfo/ImageViewInfo built from the two T#s (as BindTextures' ImageDesc builds them);
 //   - ResolveOverlap's equal-address decision (ClassifyEqualAddressOverlap, which ResolveOverlap
 //     calls);
-//   - a BC4 VideoCore::Image created on the device (image creation drops its storage usage);
-//   - the storage view of it (Image::FindView, the ImageView constructor's stop), in a child.
-// FindImage's lookup itself needs guest memory (RefreshImage) and is not run here.
+//   - in a child forked before any Vulkan or thread initialization: a BC4 VideoCore::Image
+//     created on the device (image creation drops its storage usage), then the storage view of it
+//     (Image::FindView, the ImageView constructor's stop).
+// A synthetic reproduction of the route (an R32G32Uint T# over a BC4 image), not proof of the live
+// stopped T#. FindImage's lookup itself needs guest memory (RefreshImage) and is not run here.
+#include <poll.h>
+#include <signal.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <chrono>
 #include <cstdio>
 #include <string>
 #include "common/slot_vector.h"
@@ -31,7 +36,7 @@ void Expect(const std::string& what, bool ok) {
 }
 
 struct ChildResult {
-    bool forked = false, waited = false;
+    bool forked = false, waited = false, timed_out = false;
     int status = 0;
     std::string stderr_text;
 };
@@ -50,7 +55,9 @@ ChildResult RunChild(Body body) {
         return result;
     }
     if (child == 0) {
-        dup2(pipe_fds[1], STDERR_FILENO);
+        if (dup2(pipe_fds[1], STDERR_FILENO) != STDERR_FILENO) {
+            std::_Exit(98); // no stderr to report on
+        }
         close(pipe_fds[0]);
         close(pipe_fds[1]);
         body();
@@ -58,8 +65,23 @@ ChildResult RunChild(Body body) {
     }
     result.forked = true;
     close(pipe_fds[1]);
+    // Bounded: a child that neither stops nor exits within 120 s is killed and fails.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(120);
     char chunk[4096];
-    for (ssize_t n; (n = read(pipe_fds[0], chunk, sizeof(chunk))) > 0;) {
+    for (;;) {
+        const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
+                              deadline - std::chrono::steady_clock::now())
+                              .count();
+        pollfd fd{pipe_fds[0], POLLIN, 0};
+        if (left <= 0 || poll(&fd, 1, int(left)) <= 0) {
+            kill(child, SIGKILL);
+            result.timed_out = true;
+            break;
+        }
+        const ssize_t n = read(pipe_fds[0], chunk, sizeof(chunk));
+        if (n <= 0) {
+            break;
+        }
         result.stderr_text.append(chunk, size_t(n));
     }
     close(pipe_fds[0]);
@@ -116,35 +138,51 @@ int main() {
            cached.BlockDim() == request.BlockDim() && cached.num_bits == request.num_bits);
     Expect("BC4 and R32G32Uint are view-compatible formats",
            VideoCore::IsVulkanFormatCompatible(cached.pixel_format, request.pixel_format));
-    const auto action =
-        VideoCore::ClassifyEqualAddressOverlap(request, cached, cached.pixel_format);
-    Expect("ResolveOverlap's equal-address decision: a view of the BC4 image",
-           action == VideoCore::EqualAddressOverlap::View);
+    Expect("ResolveOverlap: not a different shape (no pool-reuse drop)",
+           !VideoCore::EqualAddressDifferentShape(request, cached));
+    Expect("ResolveOverlap's equal-address decision: a view (NeedsView)",
+           VideoCore::ClassifyEqualAddressOverlap(request, cached) ==
+               VideoCore::EqualAddressOverlap::NeedsView);
 
-    Vulkan::Instance instance(0, false);
-    Vulkan::Scheduler scheduler(instance, true);
-    Vulkan::Runtime runtime(instance, scheduler);
-    Common::SlotVector<VideoCore::ImageView> views;
-    VideoCore::Image image{instance, runtime, views, cached};
-    Expect("the BC4 image was created without storage usage",
-           !(image.usage_flags & vk::ImageUsageFlagBits::eStorage));
-    const VideoCore::ImageViewInfo view_info{grid, written};
-    Expect("the requested view is a storage view in R32G32Uint",
-           view_info.is_storage && view_info.format == vk::Format::eR32G32Uint);
-    Expect("StorageUsageMissing refuses it", VideoCore::StorageUsageMissing(view_info,
-                                                                            image.usage_flags));
-
-    const ChildResult stop = RunChild([&] { (void)image.FindView(view_info, false); });
+    // The device part runs in a child forked before any Vulkan or thread initialization: it
+    // reports its checks on stderr, then requests the storage view, which stops it.
+    const ChildResult stop = RunChild([&] {
+        Vulkan::Instance instance(0, false);
+        Vulkan::Scheduler scheduler(instance, true);
+        Vulkan::Runtime runtime(instance, scheduler);
+        Common::SlotVector<VideoCore::ImageView> views;
+        VideoCore::Image image{instance, runtime, views, cached};
+        const auto report = [](const char* name, bool ok) {
+            std::fprintf(stderr, "CHILD %s: %s\n", name, ok ? "ok" : "FAIL");
+        };
+        report("BC4 image without storage usage",
+               !(image.usage_flags & vk::ImageUsageFlagBits::eStorage));
+        const VideoCore::ImageViewInfo view_info{grid, written};
+        report("R32G32Uint storage view requested",
+               view_info.is_storage && view_info.format == vk::Format::eR32G32Uint);
+        report("StorageUsageMissing refuses it",
+               VideoCore::StorageUsageMissing(view_info, image.usage_flags));
+        std::fflush(stderr);
+        (void)image.FindView(view_info, false);
+    });
     std::printf("child stderr:\n%s", stop.stderr_text.c_str());
+    Expect("the child was forked, not timed out, and reaped",
+           stop.forked && !stop.timed_out && stop.waited);
+    Expect("the BC4 image was created without storage usage",
+           stop.stderr_text.find("CHILD BC4 image without storage usage: ok") != std::string::npos);
+    Expect("the requested view is a storage view in R32G32Uint",
+           stop.stderr_text.find("CHILD R32G32Uint storage view requested: ok") !=
+               std::string::npos);
+    Expect("StorageUsageMissing refuses it",
+           stop.stderr_text.find("CHILD StorageUsageMissing refuses it: ok") != std::string::npos);
     Expect("the storage view stops (exit 23), as in PREVIEW-28p",
-           stop.forked && stop.waited && WIFEXITED(stop.status) && WEXITSTATUS(stop.status) == 23);
+           WIFEXITED(stop.status) && WEXITSTATUS(stop.status) == 23);
     Expect("  naming the BC4 backing",
            stop.stderr_text.find("storage view of format Bc4UnormBlock image at 0x70e5c3af00") !=
                std::string::npos);
     Expect("  and the requested R32G32Uint storage view",
            stop.stderr_text.find("Requested view: format R32G32Uint") != std::string::npos);
 
-    scheduler.Finish();
     std::printf("%s: %u failure(s)\n", failures ? "FAIL" : "PASS", failures);
     return failures ? 1 : 0;
 }
