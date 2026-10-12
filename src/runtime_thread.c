@@ -17,6 +17,9 @@
 #include <setjmp.h>
 #include <errno.h>
 #include <unistd.h>
+#ifdef __APPLE__
+#include "runtime_audio_qos_mac.h"
+#endif
 #ifdef _WIN32
 #include <windows.h>
 #else
@@ -373,6 +376,9 @@ static void *host_start(void *p) {
     GuestThread *t=p;
     attach(t);
     set_host_name(t->name);
+#ifdef __APPLE__
+    audio_qos_start(t->name,t->attr.prio,&t->guest_errno);
+#endif
     if (!exit_setjmp(t)) t->result=t->entry(t->argument);
     runtime_thread_keys_cleanup();
     pthread_mutex_lock(&lock); t->finished=1; ++exited; pthread_mutex_unlock(&lock);

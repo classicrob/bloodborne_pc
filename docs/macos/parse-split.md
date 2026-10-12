@@ -105,6 +105,14 @@ later label flushing must keep this within about one submission's encode time. C
 mean and the maximum across arms over the same windows, and read the maximum over several windows,
 since one window's maximum is a single extreme.
 
+It counts the WAIT_REG_MEMs stage A met early (their in-order markers), and the in-order
+WRITE_DATAs behind one (the write barrier, gpu-idle.md):
+- how many submitted stage B's label batch before waiting. These submissions are counted under
+  "label batch at idle";
+- of those, how many batches held only labels after the ones the WRITE_DATA needs. Such a
+  submission does not order that WRITE_DATA; it only writes the later labels sooner;
+- how many then waited for labels, and the mean wait.
+
 One line is printed in the parse-split block. Renderer's render pass census ("Render passes ...")
 attributes each pass end. A pass counts as ended by a submission when it is still open after the
 submission's barrier flush, which can close passes itself (counted there as "barrier"). So "ended
@@ -115,7 +123,7 @@ an open render pass" here equals that census's "submit" enders.
 One block every 600 frame ends, printed from stage A:
 
 ```
-Parse split, last 600 frame ends: <ms> ms per frame, <n> draws per frame (stage A <us> us per draw); ms per frame by thread (accounted / wall)
+Parse split, last 600 frame ends: <ms> ms per frame, <n> draws per frame (stage A draw bucket <us> us wall per draw); ms per frame by thread (accounted / wall)
   stage A (GPU command thread, <accounted %>, on CPU <ms> per frame): <bucket ms, ...>; in scopes: <kind ms, ...>
     deferred-signal waits during: <stage A bucket ms, ...>
     stage B drains at other packets during: <stage A bucket ms, ...>
@@ -123,12 +131,21 @@ Parse split, last 600 frame ends: <ms> ms per frame, <n> draws per frame (stage 
   Vulkan recording thread (<%>, on CPU <ms> per frame): ...
 ```
 
-"stage A us per draw" is stage A's direct-draw bucket over the window's draws (arms with
-different draw counts compare per draw). "on CPU" is the thread's user + system CPU time
-(thread_info) per frame: against its accounted wall time it separates running from blocked or
-waiting for a core. A thread busy in a bucket for X ms but on CPU for much less was blocked (a
-lock) or not scheduled; on CPU for about X but slower per unit of work than another arm points
-at the core or cache it ran on. "n/a" when a thread had not attached or thread_info failed.
+"stage A draw bucket us wall per draw" is the wall time of stage A's direct-draw bucket
+(exclusive of named scopes) over the window's counted direct draws, so arms with different draw
+counts compare. It is not CPU time and not a draw's whole processing cost.
+
+"on CPU" is the WHOLE thread's user + system CPU time (thread_info) per frame over the window, not
+any one bucket's. Compare it with the thread's accounted wall time: well below it means the
+thread was blocked (a lock, a wait) or not scheduled for part of the window. About equal to it
+with slower draws does not by itself establish a slower core or cache misses: spinning, extra
+work or a different work mix fit too; attribute with scopes or a profiler.
+
+"n/a": the thread has not attached (for example no recording thread with threaded recording off,
+which is expected), thread_info failed, or the first window (the baseline is primed, nothing
+reported). The Mach port is the attached thread's while it lives; an account has no detach, so
+a replaced thread would need a fresh baseline (one lifetime per run today). Numeric samples are
+required only for threads that are running, after the baseline window.
 
 How to read it:
 - Stage A charges its open interval before each report, so its window is effectively closed (the

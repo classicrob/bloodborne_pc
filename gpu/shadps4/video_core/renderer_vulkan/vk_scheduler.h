@@ -21,6 +21,7 @@
 #include "bbport_deferred_counts.h"
 #include "bbport_label_sequencer.h"
 #include "bbport_write_order.h"
+#include "bbport_parse_split.h"
 #endif
 #include <thread>
 #include <queue>
@@ -877,6 +878,8 @@ public:
     /// Stage B, between packets: submits the labels recorded since the last submission when
     /// `idle` or once the oldest has waited LabelBatchAge.
     void FlushLabels(bool idle);
+#ifdef __APPLE__
+#endif
 
     /// Waits in slices until the GPU passed timeline value `tick` of this scheduler; false if
     /// `stoken` was stopped first. A failed wait (device loss) stops loudly.
@@ -912,6 +915,14 @@ public:
     /// Waits until the first `through` completion labels are written (their writer completes
     /// them in issue order). Labels batched by stage B must be submitted first (Rasterizer).
     void WaitLabelsThrough(u64 through);
+    /// Labels are batched and not yet submitted (FlushLabels would submit them), and whether
+    /// the batch holds one of the first `through` completion labels. The recording thread.
+    [[nodiscard]] bool LabelsBatched() const noexcept {
+        return labels_unflushed.load(std::memory_order_relaxed);
+    }
+    [[nodiscard]] bool LabelsBatchedThrough(u64 through) const noexcept {
+        return LabelsBatched() && unflushed_first_label <= through;
+    }
     /// In-order WRITE_DATA's barrier for WAIT_REG_MEMs met early (bbport_write_order.h).
     BbWriteOrder::Barrier write_barrier;
 #endif
@@ -1092,6 +1103,8 @@ private:
     /// and when the oldest was recorded. Set by the recording thread, cleared by a submission.
     std::atomic<bool> labels_unflushed{false};
     u64 unflushed_tick = 0;
+    /// The batch's first label, by completion-label issue count (1-based).
+    u64 unflushed_first_label = 0;
     /// Of deferred_signals_issued/done, by kind (bbport_deferred_counts.h): the recorder-side
     /// writes and the completion labels, each counted on its own.
     BbDeferred::Count recorder_signals;

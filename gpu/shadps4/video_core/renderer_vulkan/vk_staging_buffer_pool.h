@@ -58,6 +58,15 @@ public:
     /// its Request and here is a hard error.
     void Retire(const VideoCore::Buffer* buffer, u64 offset);
 
+    /// What the pool holds, per memory type (DeviceLocal, HostUncached, HostCached): ring
+    /// blocks and dedicated (large) buffers, their bytes, and the large ones held (requested
+    /// with deferred or retire and not released yet). Any thread (takes the pool mutex); the
+    /// perf replay prints it per iteration.
+    struct TypeTotals {
+        u64 ring_blocks{}, ring_bytes{}, large_buffers{}, large_bytes{}, large_held{};
+    };
+    [[nodiscard]] std::array<TypeTotals, 3> Totals();
+
     /// Releases idle memory.
     void TickFrame();
 

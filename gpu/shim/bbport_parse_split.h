@@ -159,7 +159,8 @@ enum F : std::uint32_t {
     FCount
 };
 inline constexpr const char* f_names[FCount] = {
-    "frame end", "unbatched labels", "label batch at idle", "label batch at age", "Finish",
+    "frame end", "unbatched labels", "label batch at idle", "label batch at age",
+    "Finish",
     "other"};
 
 /// The reason the calling thread's next draw-scheduler Flush has (FOther unless set).
@@ -187,6 +188,13 @@ struct FlushCensus {
     /// Labels at GPU completion written, their issue-to-write age (the label thread), and the
     /// window's maximum (reset at each report).
     std::atomic<std::uint64_t> labels_written{0}, label_age_ns{0}, label_age_window_max_ns{0};
+    /// WAIT_REG_MEMs stage A met early from a pending value (their in-order markers ran).
+    std::atomic<std::uint64_t> forwarded_waits{0};
+    /// In-order WRITE_DATAs behind such a WAIT (a nonzero barrier, bbport_write_order.h): those
+    /// whose stage B submitted the label batch first, of those the batches holding only labels
+    /// after the required ones, and those that then waited for labels, with the time waited.
+    std::atomic<std::uint64_t> ordered_writes{0}, ordered_writes_flushed{0},
+        ordered_writes_flushed_later_only{0}, ordered_writes_waited{0}, ordered_write_wait_ns{0};
     std::atomic<std::uint64_t> ended_pass{0};       ///< a render pass was open (it ends)
     std::atomic<std::uint64_t> batches{0}, batch_age_ns{0}, batch_age_max_ns{0};
 };
@@ -198,6 +206,24 @@ inline void NoteFlush(bool pass_open) {
     if (pass_open) {
         flush_census.ended_pass.fetch_add(1, std::memory_order_relaxed);
     }
+}
+
+/// An in-order WRITE_DATA behind a WAIT_REG_MEM met early: whether stage B submitted a label
+/// batch for it and whether that batch held a label it waits for.
+inline void NoteOrderedWrite(bool flushed_batch, bool batch_holds_required) {
+    flush_census.ordered_writes.fetch_add(1, std::memory_order_relaxed);
+    if (flushed_batch) {
+        flush_census.ordered_writes_flushed.fetch_add(1, std::memory_order_relaxed);
+        if (!batch_holds_required) {
+            flush_census.ordered_writes_flushed_later_only.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+}
+
+/// That WRITE_DATA waited `ns` for its labels to be written.
+inline void NoteOrderedWriteWaited(std::uint64_t ns) {
+    flush_census.ordered_writes_waited.fetch_add(1, std::memory_order_relaxed);
+    flush_census.ordered_write_wait_ns.fetch_add(ns, std::memory_order_relaxed);
 }
 
 /// A label at GPU completion written `age_ns` after it was issued (the guest sees it then).
@@ -431,7 +457,11 @@ inline std::string ScopeBy(const Account& a, Previous& previous, K kind, const c
 inline Previous previous_a, previous_b, previous_r;
 inline std::array<std::uint64_t, FCount> previous_flushes{};
 inline std::uint64_t previous_ended_pass = 0, previous_batches = 0, previous_batch_age_ns = 0,
-                     previous_labels_written = 0, previous_label_age_ns = 0;
+                     previous_labels_written = 0, previous_label_age_ns = 0,
+                     previous_forwarded_waits = 0, previous_ordered_writes = 0,
+                     previous_ordered_writes_flushed = 0,
+                     previous_ordered_writes_flushed_later_only = 0,
+                     previous_ordered_writes_waited = 0, previous_ordered_write_wait_ns = 0;
 
 /// "  Flushes …" for the window: per frame by reason, passes ended, label batch age.
 inline std::string FlushLine(double frames) {
@@ -467,19 +497,46 @@ inline std::string FlushLine(double frames) {
     const std::uint64_t window_written = written - previous_labels_written;
     const std::uint64_t window_max =
         flush_census.label_age_window_max_ns.exchange(0, std::memory_order_relaxed);
-    char written_text[192];
+    const std::uint64_t forwarded = flush_census.forwarded_waits.load(std::memory_order_relaxed);
+    const double forwarded_per_frame = frames ? (forwarded - previous_forwarded_waits) / frames : 0.0;
+    previous_forwarded_waits = forwarded;
+    char written_text[256];
     std::snprintf(written_text, sizeof(written_text),
-                  "; labels written %.1f per frame, issue to write %.0f us mean, %.0f us max",
-                  frames ? window_written / frames : 0.0,
+                  "; WAIT_REG_MEMs met early %.1f per frame; labels written %.1f per frame, issue "
+                  "to write %.0f us mean, %.0f us max",
+                  forwarded_per_frame, frames ? window_written / frames : 0.0,
                   window_written ? (written_age - previous_label_age_ns) / 1e3 / window_written
                                  : 0.0,
                   window_max / 1e3);
     previous_labels_written = written;
     previous_label_age_ns = written_age;
+    const auto window = [](const std::atomic<std::uint64_t>& counter, std::uint64_t& previous) {
+        const std::uint64_t now = counter.load(std::memory_order_relaxed);
+        const std::uint64_t delta = now - previous;
+        previous = now;
+        return delta;
+    };
+    const std::uint64_t ordered = window(flush_census.ordered_writes, previous_ordered_writes);
+    const std::uint64_t flushed =
+        window(flush_census.ordered_writes_flushed, previous_ordered_writes_flushed);
+    const std::uint64_t later_only = window(flush_census.ordered_writes_flushed_later_only,
+                                            previous_ordered_writes_flushed_later_only);
+    const std::uint64_t waited =
+        window(flush_census.ordered_writes_waited, previous_ordered_writes_waited);
+    const std::uint64_t wait_ns =
+        window(flush_census.ordered_write_wait_ns, previous_ordered_write_wait_ns);
+    char ordered_text[256];
+    std::snprintf(ordered_text, sizeof(ordered_text),
+                  "; WRITE_DATAs behind a met-early WAIT %.1f per frame: submitted the label "
+                  "batch %.1f (holding only later labels %.1f), waited for labels %.1f, %.0f us "
+                  "mean wait",
+                  frames ? ordered / frames : 0.0, frames ? flushed / frames : 0.0,
+                  frames ? later_only / frames : 0.0, frames ? waited / frames : 0.0,
+                  waited ? wait_ns / 1e3 / waited : 0.0);
     char head[96];
     std::snprintf(head, sizeof(head), "  Flushes of the draw scheduler: %.1f per frame = ",
                   frames ? total / frames : 0.0);
-    return head + out + tail + written_text;
+    return head + out + tail + written_text + ordered_text;
 }
 inline std::uint64_t window_cycles = 0, window_frames = 0, window_draws = 0;
 /// The account's thread's user + system CPU time in ns (thread_info), or ~0 when unavailable
@@ -552,8 +609,8 @@ inline void NoteFrameEnd(std::uint64_t draws) {
         std::chrono::duration<double, std::milli>(now - window_start).count();
     const double ms_per_cycle = wall_ms / double(now_cycles - window_cycles);
     const double frames = double(window_frames);
-    // Stage A's direct-draw time per draw (pipeline selection, packet build), before Line moves
-    // the baseline.
+    // Stage A's direct-draw bucket (wall time, exclusive of named scopes) per counted direct draw,
+    // before Line moves the baseline. Not CPU time, not a draw's whole processing cost.
     const std::uint64_t window_draw_count = draws - window_draws;
     const double a_us_per_draw =
         window_draw_count ? double(stage_a.bucket[ADraw].load(std::memory_order_relaxed) -
@@ -586,7 +643,7 @@ inline void NoteFrameEnd(std::uint64_t draws) {
     const std::string r_cpu = OnCpu(recorder, previous_cpu_r, frames);
     // Printed like the Stall lines: Info-level logging is filtered in perf runs.
     std::printf("Parse split, last 600 frame ends: %.2f ms per frame, %.0f draws per frame "
-                "(stage A %.2f us per draw); ms per frame by thread (accounted / wall)\n"
+                "(stage A draw bucket %.2f us wall per draw); ms per frame by thread (accounted / wall)\n"
                 "  stage A (GPU command thread, %.0f%%, %s per frame): %s\n"
                 "    deferred-signal waits during: %s\n"
                 "    stage B drains at other packets during: %s\n"
