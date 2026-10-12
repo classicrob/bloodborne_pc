@@ -289,5 +289,119 @@ class CentralFixtureChecks(unittest.TestCase):
             tool.reverse(data, provenance['edits'])
 
 
+class CombatFixtureChecks(unittest.TestCase):
+    def setUp(self):
+        import struct
+        import save_combat_fixture as combat
+        self.combat = combat
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        root = Path(self.temp.name)
+        self.source, self.destination = root / combat.SOURCE_NAME, root / 'combat'
+        character = self.source / tool.CHARACTER
+        character.parent.mkdir(parents=True)
+        data = bytearray(b'Z' * tool.SOURCE_SIZE)
+        data[:0x54] = bytes(0x54)
+        struct.pack_into('<2I', data, 0, 0x41, 0x18010000)
+        pos = 0x54
+        for i in range(4096):
+            size, kind = (60, 0x80) if i < 139 else ((40, 0xc0) if i < 150 else (8, 0))
+            data[pos:pos + size] = bytes(size)
+            data[pos + 3] = kind
+            pos += size
+        self.assertEqual(pos, 0x9df0)
+        data[0x12548:0x1254c] = b'FACE'
+        for i in range(1984):
+            struct.pack_into('<4I', data, 0xa050 + i*16,
+                             i+1 if i < 13 else 0, 100+i if i < 13 else 0xffffffff,
+                             1 if i < 13 else 0, i)
+        for _, offset, before, _ in combat.FIELDS:
+            struct.pack_into('<I', data, offset, before)
+        struct.pack_into('<2I', data, 0x4c, 0x3f805, 0x20004)
+        struct.pack_into('<2I', data, 0x5f809, 1, 4096)
+        character.write_bytes(data)
+        self.parent = {'name': combat.SOURCE_NAME, 'edited': True,
+                       'edited_origin': 'hunters-dream-edited',
+                       'parent': {'name': 'played'}, 'unverified': ['flags'],
+                       'unverified_history': [{'items': ['load'], 'reason': 'previous run'}],
+                       'verified': [{'item': 'load', 'fixture': 'ancestor', 'run': 'old-run'}]}
+        (self.source / 'fixture.json').write_text(json.dumps(self.parent))
+        (character.parent / 'backup0000').write_bytes(b'backup unchanged')
+        self.original = tool.inventory(self.source)
+        self.data = bytes(data)
+        patcher = mock.patch.object(combat, 'SOURCE_SHA256', tool.digest(data))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def run_tool(self, dry=False):
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            result = self.combat.create(self.source, self.destination, dry)
+        return result, output.getvalue()
+
+    def test_combat_dry_run(self):
+        _, output = self.run_tool(True)
+        self.assertIn('blood_vials_20 @0xa120', output)
+        self.assertIn('DRY RUN', output)
+        self.assertFalse(self.destination.exists())
+        self.assertEqual(self.original, tool.inventory(self.source))
+
+    def test_combat_roundtrip_bounded_changes_and_history(self):
+        p, _ = self.run_tool()
+        after = (self.destination / tool.CHARACTER).read_bytes()
+        self.assertEqual(tool.reverse(after, p['edits']), self.data)
+        allowed = set()
+        for c in p['edits']:
+            allowed.update(range(c['offset'], c['offset'] + len(bytes.fromhex(c['after_hex']))))
+        self.assertTrue(all(a == b or i in allowed for i, (a, b) in enumerate(zip(self.data, after))))
+        self.assertEqual(after[0xa12c:0xa130], self.data[0xa12c:0xa130])
+        self.assertEqual(self.original, tool.inventory(self.source))
+        self.assertNotEqual((self.source/tool.CHARACTER).stat().st_ino,
+                            (self.destination/tool.CHARACTER).stat().st_ino)
+        metadata = json.loads((self.destination/'fixture.json').read_text())
+        self.assertEqual(metadata['parent'], self.parent)
+        for k in ('verified', 'unverified_history', 'edited_origin'):
+            self.assertEqual(metadata[k], self.parent[k])
+        self.assertEqual(metadata['unverified'], ['flags'] + self.combat.PENDING)
+        self.assertEqual(metadata['validation'], 'pending')
+        self.assertTrue(metadata['edited'])
+
+    def test_combat_hash_and_ancestry_refusal(self):
+        with mock.patch.object(self.combat, 'SOURCE_SHA256', '0'*64):
+            with self.assertRaisesRegex(ValueError, 'SHA256'):
+                self.run_tool()
+        (self.source/'fixture.json').write_text('{"name":"wrong", "edited":true}')
+        with self.assertRaisesRegex(ValueError, 'ancestry'):
+            self.run_tool()
+        self.assertFalse(self.destination.exists())
+
+    def test_combat_rejects_occupied_slot_and_bad_stat_after_hash_gate(self):
+        for offset, reason in ((0xa120, 'vacant'), (0x9e70, 'level')):
+            changed = bytearray(self.data); changed[offset] ^= 1
+            with mock.patch.object(self.combat, 'SOURCE_SHA256', tool.digest(changed)):
+                with self.assertRaisesRegex(ValueError, reason):
+                    self.combat.edit_character(changed)
+
+    def test_combat_existing_nested_and_symlink_refusal(self):
+        for dest in (self.source, self.source/'child', self.source.parent):
+            with self.assertRaises(ValueError):
+                self.combat.create(self.source, dest)
+        (self.source/'link').symlink_to(self.source/tool.CHARACTER)
+        with self.assertRaisesRegex(ValueError, 'regular file'):
+            self.run_tool()
+
+    def test_combat_failed_copy_cleanup(self):
+        with mock.patch.object(self.combat.shutil, 'copytree', side_effect=OSError('injected')):
+            with self.assertRaises(OSError):
+                self.run_tool()
+        self.assertFalse(self.destination.exists())
+        self.assertEqual(self.original, tool.inventory(self.source))
+
+    def test_combat_reverse_rejects_tamper(self):
+        edited, edits = self.combat.edit_character(self.data)
+        changed = bytearray(edited); changed[0x9e20] ^= 1
+        with self.assertRaisesRegex(ValueError, 'no longer matches'):
+            tool.reverse(changed, edits)
+
+
 if __name__ == '__main__':
     unittest.main()
