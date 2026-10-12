@@ -569,10 +569,9 @@ bool FillAsImageClear(const Shader::Info& info, const AmdGpu::ComputeProgram& cs
     vk::ClearValue clear{};
     clear.color.float32 = value;
     runtime.ClearImage(image, VideoCore::SubresourceRange{}, clear);
-    // ClearImage leaves it GPU-modified and clean, i.e. trusted for write-backs: it must notice
-    // guest CPU writes from now on (the kernel path instead leaves it GPU-dirty, refreshed from
-    // memory at its next use).
-    texture_cache.TrackGpuWritten(image_id);
+    // GPU-authoritative from now on, and tracked for guest CPU writes (the kernel path instead
+    // leaves it GPU-dirty, refreshed from memory at its next use).
+    texture_cache.MarkGpuWritten(image_id);
     CountFill(FillPath::Cleared);
     if (fill_verify) {
         VerifyFillClear(rasterizer, *image, address, size, *pattern, *texel, texel_bytes);
