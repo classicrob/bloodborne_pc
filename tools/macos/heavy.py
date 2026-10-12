@@ -300,9 +300,20 @@ def alive(pid):
         return False
 
 
+def process_states(pids):
+    """{pid: ps state letters} for the pids still alive."""
+    if not pids:
+        return {}
+    out = subprocess.run(['ps', '-o', 'pid=,stat=', '-p', ','.join(map(str, pids))],
+                         capture_output=True, text=True).stdout
+    return {int(fields[0]): fields[1] for fields in (line.split() for line in out.splitlines()) if len(fields) == 2}
+
+
 def pause_quiet_pools(label):
     """SIGSTOPs every running build/quick/sweep job (its whole process tree; for a quick job the
-    command under its supervisor, so its time limit can pause). Returns [(job label, pids)]."""
+    command under its supervisor, so its time limit can pause). A process already stopped is left
+    out: another pause (a test's own heavy.sh, a nested perf run) stopped it and resumes it, so
+    this one must not. Returns [(job label, pids it stopped)]."""
     paused = []
     names = ['build-priority', 'build-idle'] + [n for pool in QUIET_POOLS for n in slot_names(pool)]
     for name in names:
@@ -314,21 +325,30 @@ def pause_quiet_pools(label):
         if not info.get('pid') or not alive(info['pid']):
             continue
         root = info['pid']
-        pids = [] if info.get('pool') == 'quick' else [root]
-        for _ in range(3):  # stop the tree; repeat for processes started while stopping it
-            new = [p for p in descendants(root) if p not in pids]
-            if not new and pids:
+        tree = [] if info.get('pool') == 'quick' else [root]
+        handled, pids, foreign = set(), [], []
+        for _ in range(4):  # stop the tree; again for processes started while stopping it
+            tree += [p for p in descendants(root) if p not in tree]
+            new = [p for p in tree if p not in handled]
+            if not new:
                 break
-            pids += new
-            for pid in pids:
+            states = process_states(new)
+            for pid in new:
+                handled.add(pid)
+                if states.get(pid, '').startswith('T'):
+                    foreign.append(pid)
+                    continue
                 try:
                     os.kill(pid, signal.SIGSTOP)
+                    pids.append(pid)
                 except ProcessLookupError:
                     pass
         paused.append((info.get('label', name), pids))
-        print(f'heavy: {label}: CPU quiet: paused {info.get("label", name)} ({name}, {len(pids)} processes)',
+        left = f'; {len(foreign)} already stopped by another pause, left to it' if foreign else ''
+        print(f'heavy: {label}: CPU quiet: paused {info.get("label", name)} ({name}, {len(pids)} processes{left})',
               file=sys.stderr, flush=True)
-        record({'event': 'quiet-pause', 'by': label, 'label': info.get('label'), 'slot': name, 'pids': len(pids)})
+        record({'event': 'quiet-pause', 'by': label, 'label': info.get('label'), 'slot': name, 'pids': len(pids),
+                **({'already_stopped': len(foreign)} if foreign else {})})
     if not paused:
         print(f'heavy: {label}: CPU quiet: no build, quick or sweep job was running', file=sys.stderr, flush=True)
     return paused
