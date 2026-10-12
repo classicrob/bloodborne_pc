@@ -236,7 +236,8 @@ int main(int argc, char** argv) {
             const float ndc_y=(1.5f-viewport[3])/viewport[1];
             return 1.f-0.05f/(z+0.5f*ndc_y*z);
         };
-        const std::array<float,4> down{W/2.f,H/2.f,W/2.f,H/2.f}, up{W/2.f,-H/2.f,W/2.f,H/2.f};
+        const std::array<float,4> down{W/2.f,H/2.f,W/2.f,H/2.f}, up{W/2.f,-(H/2.f),W/2.f,H/2.f};
+        assert(up[1]==-3.5f); // W and H are unsigned: -H/2.f would be about +2.1e9
         // Neither centred nor full-frame, y up: rows 1.5 to 4.5 of the 7 (sampled row 1 is at
         // its top edge, ndc y 1).
         const std::array<float,4> sub{W/2.f,-1.5f,W/2.f,3.f};

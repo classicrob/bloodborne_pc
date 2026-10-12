@@ -78,7 +78,8 @@ int main() {
     };
     using Viewport=std::array<float,4>; // x scale, y scale, x offset, y offset (pixels)
     // The full frame with view +y down the rows, and with +y up (a negative y scale).
-    const Viewport down{W/2.f,H/2.f,W/2.f,H/2.f}, up{W/2.f,-H/2.f,W/2.f,H/2.f};
+    const Viewport down{W/2.f,H/2.f,W/2.f,H/2.f}, up{W/2.f,-(H/2.f),W/2.f,H/2.f};
+    assert(up[1]==-3.5f); // W and H are unsigned: -H/2.f would be about +2.1e9
     // Reference, from the viewport contract only: pixel = offset + ndc * scale (Vulkan's viewport
     // transform, as the rasterizer sets it from the game's registers); ndc = proj.xy * view.xy /
     // view.z; view z from depth = proj.z + proj.w / z. Pixel centres, jitter removed.
