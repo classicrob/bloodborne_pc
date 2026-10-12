@@ -522,6 +522,7 @@ void DrawPreparation::WorkerLoop(std::stop_token stop, u32 index) {
 
 void DrawPreparation::Count(bool was_used) {
     ++(was_used ? used : unused);
+    ++(was_used ? total_used : total_unused);
     static const bool stats = std::getenv("BB_FRAME_STATS") != nullptr;
     // The clock is read every 1024 draws: per draw it was 8% of the GPU thread.
     if (!stats || ((used + unused) & 1023) != 0) {

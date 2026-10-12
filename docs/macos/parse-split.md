@@ -95,6 +95,7 @@ Every draw-scheduler submission is counted by reason, from a thread-local reason
 - frame end;
 - unbatched labels (one per label: stage A, or recording not deferred);
 - stage B's label batch, at an idle packet boundary or at LabelBatchAge (500 us);
+- stage B's label batch at a WAIT_REG_MEM met early (submitted at once);
 - Finish;
 - other.
 

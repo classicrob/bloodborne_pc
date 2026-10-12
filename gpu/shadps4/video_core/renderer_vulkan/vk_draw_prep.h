@@ -22,6 +22,7 @@
 #include <mutex>
 #include <span>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "common/types.h"
@@ -124,6 +125,12 @@ public:
     /// GPU thread: counts whether a prepared draw was used; prints every 5 s (BB_FRAME_STATS).
     void Count(bool used);
 
+    /// GPU thread: prepared draws used and not used since the start (monotonic; the 5 s report
+    /// does not reset them). The perf replay prints per-iteration deltas.
+    [[nodiscard]] std::pair<u64, u64> UsageTotals() const noexcept {
+        return {total_used, total_unused};
+    }
+
     struct Submission {
         u64 seq{};
         std::vector<u32> commands;
@@ -171,7 +178,8 @@ public:
 
 private:
     u32 current_draw = 0;
-    u64 used = 0, unused = 0;
+    u64 used = 0, unused = 0;             ///< since the last 5 s report
+    u64 total_used = 0, total_unused = 0; ///< since the start (UsageTotals)
     u32 worker_count = 0; ///< fixed before the worker threads start
     std::jthread scanner;
     std::vector<std::jthread> workers;
