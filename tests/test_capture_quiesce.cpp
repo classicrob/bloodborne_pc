@@ -6,6 +6,9 @@
 // 2. A label its writer has taken and not yet written (held before its write), with
 //    OrderedGuestWrites off, where WaitDeferredSignals returns at once.
 // Each must make the check fail while held and pass once released.
+// Also, on a scheduler recording on its own thread (where labels batch): whether the unsubmitted
+// label batch holds one of the first N labels, which the parse split's ordered-WRITE_DATA census
+// reports (bbport_parse_split.h).
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -96,6 +99,28 @@ int main() {
         Expect("written label: quiescent",
                scheduler.WaitQuiescentForCapture(std::chrono::seconds(2), why), why);
         __atomic_store_n(&runtime_disabled_optimizations, 0, __ATOMIC_RELEASE);
+    }
+
+    {
+        Vulkan::Scheduler threaded(instance, true);
+        std::atomic<int> written{0};
+        threaded.SignalAtGpuCompletion([&] { written.fetch_add(1); }, true); // label 1
+        const bool first = threaded.LabelsBatched() && threaded.LabelsBatchedThrough(1) &&
+                           !threaded.LabelsBatchedThrough(0);
+        threaded.FlushLabels(true);
+        const bool submitted = !threaded.LabelsBatched() && !threaded.LabelsBatchedThrough(1);
+        threaded.SignalAtGpuCompletion([&] { written.fetch_add(1); }, true); // label 2
+        const bool later_only = threaded.LabelsBatched() && !threaded.LabelsBatchedThrough(1) &&
+                                threaded.LabelsBatchedThrough(2);
+        threaded.FlushLabels(true);
+        threaded.Finish();
+        for (int i = 0; i < 5000 && written.load() < 2; ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        Expect("label batch: holds the first label once batched", first);
+        Expect("label batch: none after FlushLabels", submitted);
+        Expect("label batch: a new batch holds only the later label", later_only);
+        Expect("label batch: both labels written", written.load() == 2);
     }
 
     std::fprintf(stderr, "capture-quiesce-test: %s\n", failures ? "FAIL" : "PASS");

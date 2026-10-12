@@ -138,3 +138,56 @@ Every descendant must retain `edited=true` and the original edit provenance.
 Until a successful load/walk/normal-save/fresh-reload is recorded, the generated
 fixture remains pending. Weapon acquisition is through the in-game path;
 lamps and clinic events remain unverified.
+
+## Central Yharnam with equipped weapons
+
+Playtest's `20261012-010633-1080p-YHARNAM-1` demonstrated headstone travel from
+Dream to the 1st Floor Sickroom lamp, followed by normal save/quit. This
+qualifies **that one lamp**, not every lamp or the clinic's progression flags.
+The resulting `clinic-via-sickroom-lamp` retains the equipped weapons and
+edited ancestry. It is the source for the next candidate fixture.
+
+Its character SHA256 is
+`166cd3804f2a966bd49a5f68ca027d4c702f41b40ba0fbc1b186b0fc4b00fab2`,
+size 1,310,720. The map is already `0x18010000` (24,1). `FACE=0x12548`,
+`LCED=0x3f7a1`, coordinate marker at `0x3f7a9`, XYZ at `0x3f7b5`.
+The source position is approximately `(-198.9582,-50.6399,160.5806)`.
+The pinned editor's Central Yharnam preset from the sources above is
+`(-193.4,-28.646,68.5)`, in the same map. It is a candidate lamp-area position;
+its exact placement on our installed map has not been verified by a game run.
+
+`save_fixture.py --scene central-yharnam` accepts only that character hash,
+source metadata name and edited ancestry. It changes exactly the 12-byte XYZ
+field, not map, equipment, ammunition, respawn/lamp flags, events, backups or
+global save data. The edit manifest includes before/after bytes and a
+full-file reversal check. It nests all source metadata under `parent` and
+`source_metadata`, preserves edited origin, and copies historical verification
+records unchanged if present. New position/load/walk/lamp/save acceptance is
+pending. The default Dream profile keeps its existing source restriction.
+
+```sh
+python3 tools/macos/save_fixture_check.py
+python3 tools/macos/save_fixture.py \
+  ~/bbport-game/saves/clinic-via-sickroom-lamp \
+  ~/bbport-game/saves/central-yharnam-weapons-edited \
+  --scene central-yharnam --dry-run
+python3 tools/macos/save_fixture.py \
+  ~/bbport-game/saves/clinic-via-sickroom-lamp \
+  ~/bbport-game/saves/central-yharnam-weapons-edited \
+  --scene central-yharnam
+```
+
+Actual offline tests: 17 checks, exit 0. Central controls cover an unchanged
+prefix/suffix around XYZ, map and ancestry retention, full-file reversal,
+dry-run, source/profile refusal, guarded map/marker checks and modified edit
+refusal. The real dry-run prints:
+
+```
+position_xyz @0x3f7b5: 4df546c3388f4ac2a3942043 -> 666641c3022be5c100008942
+```
+
+Playtest must first check ground/geometry placement. If the character loads
+in air or inside geometry, record that result rather than qualify the preset;
+a different grounded preset is the fallback. Then walk, interact with the
+Central Yharnam lamp if available, attack/fire, save normally and reload in a
+fresh process. This position edit does not itself unlock that lamp.
