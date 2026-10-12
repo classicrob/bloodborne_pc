@@ -144,7 +144,7 @@ std::array<u32, 2> RingStore(u32 offset) {
             (0u) | (1u << 8) | (0u << 16) | (1u << 22) | (128u << 24)};
 }
 
-enum class Role { Es, Gs, Copy, CopyStreamOut, Hull };
+enum class Role { Es, Gs, Copy, CopyStreamOut, Hull, Compute };
 
 struct Negative {
     const char* name;
@@ -441,6 +441,12 @@ int RunNegatives(const std::string& self, const std::filesystem::path& dir,
     lane_id.Exp(12, true, 1);
     lane_id.SEndpgm();
     const auto lane_id_export = lane_id.words;
+    // A dynamic byte offset (v0) through a structured (stride 16) V# in user data s[0:3]: the
+    // loud stop names the bound V# words and where they came from.
+    GsAsm::Code offen;
+    offen.BufferStoreDwordOffen(1, 0, 0, GsAsm::Inline(0), 0);
+    offen.SEndpgm();
+    const auto offen_store = offen.words;
     const std::vector<Negative> cases = {
         {"ES s_barrier", Role::Es, {SBarrier, store[0], store[1], SEndpgm}, "uses s_barrier"},
         {"GS s_barrier", Role::Gs, {SBarrier, store[0], store[1], SEndpgm}, "uses s_barrier"},
@@ -484,6 +490,8 @@ int RunNegatives(const std::string& self, const std::filesystem::path& dir,
          "not one immediate"},
         {"hull: cp 0 misses a factor", Role::Hull, TracerHullProgram(TracerHull::NoCover),
          "does not write every factor"},
+        {"CS structured offen-only store", Role::Compute, offen_store,
+         "V# 10000000 00100000 00000040 00027fac from flat user data dwords 0,1,2,3"},
         {"GS copy: unknown SGPR + s_addk", Role::Gs, {store[0], store[1], SEndpgm},
          "GSVS load through SGPR 6 of unknown value", 0, unknown_offset_copy(false)},
         {"GS copy: unknown SGPR via s_mov", Role::Gs, {store[0], store[1], SEndpgm},
@@ -506,6 +514,25 @@ int RunNegatives(const std::string& self, const std::filesystem::path& dir,
             ud[3] = u32(at >> 32);
         }
         Shader::RuntimeInfo rt{};
+        if (c.role == Role::Compute) {
+            AmdGpu::Buffer sharp{};
+            sharp.base_address = 0x10000000;
+            sharp.stride = 16;
+            sharp.num_records = 64;
+            sharp.dst_sel_x = 4;
+            sharp.dst_sel_y = 5;
+            sharp.dst_sel_z = 6;
+            sharp.dst_sel_w = 7;
+            sharp.num_format = u32(AmdGpu::NumberFormat::Float);
+            sharp.data_format = u32(AmdGpu::DataFormat::Format32);
+            std::memcpy(ud.data(), &sharp, sizeof(sharp));
+            rt.Initialize(Shader::HwStage::Compute, Shader::SwStage::Compute);
+            rt.hw.cs.workgroup_size = {64, 1, 1};
+            rt.props.num_user_data = 4;
+            rt.props.num_allocated_vgprs = 64;
+            Compile("neg-cs", c.code, ud, 0x1234, rt, out);
+            return 0;
+        }
         if (c.role == Role::Hull) {
             Compile("neg-hull", c.code, TracerHullUserData(), 0x1234, TracerHullRuntime(), out);
             return 0;

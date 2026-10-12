@@ -15,6 +15,7 @@
 #include "shader_recompiler/ir/reinterpret.h"
 #include "shader_recompiler/profile.h"
 #include "shader_recompiler/runtime_info.h"
+#include "shader_recompiler/stop_context.h"
 #include "video_core/amdgpu/resource.h"
 
 namespace Shader::Optimization {
@@ -569,6 +570,23 @@ void PatchGlobalDataShareAccess(IR::Inst& inst, Info& info, Descriptors& descrip
     }
 }
 
+// bbport (Apple): a V# for a loud stop: its four dwords as bound, and where they came from.
+std::string VSharpWords(const AmdGpu::Buffer& buffer) {
+    u32 words[4];
+    std::memcpy(words, &buffer, sizeof(words));
+    return fmt::format("{:08x} {:08x} {:08x} {:08x}", words[0], words[1], words[2], words[3]);
+}
+std::string VSharpLocation(const BufferResource& resource) {
+    const auto& fetch = resource.sharp_fetch;
+    std::string out;
+    for (u32 i = 0; i < 4; ++i) {
+        out += i ? "," : "";
+        out += (fetch.load_mask >> i) & 1 ? std::to_string(fetch.offsets[i])
+                                           : fmt::format("imm {:#x}", fetch.immediates[i]);
+    }
+    return out;
+}
+
 IR::U32 CalculateBufferAddress(IR::IREmitter& ir, const IR::Inst& inst, const Info& info,
                                const AmdGpu::Buffer& buffer, u32 stride) {
     const auto inst_info = inst.Flags<IR::BufferInstInfo>();
@@ -688,9 +706,12 @@ void PatchBufferArgs(IR::Inst& inst, Info& info, const Profile& profile,
             ASSERT_MSG(!flags.voffset_enable || voffset.IsImmediate(),
                        "Apple structured offen-only dynamic offset needs a wider binding: "
                        "shader={:#x} base={:#x} stride={} num_records={} swizzle={} "
-                       "index_stride={} element_size={} flags={:#x}",
+                       "index_stride={} element_size={} flags={:#x}; V# {} from flat user data "
+                       "dwords {} (16+: through tables); compiled for {}",
                        info.pgm_hash, buffer.base_address, buffer.stride, buffer.num_records,
-                       buffer.swizzle_enable, buffer.GetIndexStride(), buffer.GetElementSize(), flags.raw);
+                       buffer.swizzle_enable, buffer.GetIndexStride(), buffer.GetElementSize(), flags.raw,
+                       VSharpWords(buffer), VSharpLocation(buffer_res),
+                       compile_stop_context.empty() ? "(no context)" : compile_stop_context);
             u64 span = formatted ? AmdGpu::NumBitsPerElement(format) / 8
                                  : 1ull << BufferAddressShift(inst, format);
             switch (inst.GetOpcode()) {

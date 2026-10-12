@@ -246,7 +246,7 @@ static constexpr const BinaryInfo& SearchBinaryInfo(const u32* code) {
 
 /// bbport: the input usage slots (usage, API slot, start register, flags; one dword each) Gnm
 /// stores before a shader's binary info, chunk_usage_base_offset_in_dw dwords before it.
-static std::span<const u32> InputUsageSlots(const u32* code) {
+inline std::span<const u32> InputUsageSlots(const u32* code) {
     const auto& info = SearchBinaryInfo(code);
     const u32* end = reinterpret_cast<const u32*>(&info) - info.chunk_usage_base_offset_in_dw;
     return {end - info.num_input_usage_slots, info.num_input_usage_slots};

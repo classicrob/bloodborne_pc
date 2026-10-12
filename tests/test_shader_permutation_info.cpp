@@ -239,11 +239,15 @@ int main() {
     regs.vgt_gs_max_vert_out = 3;
     regs.vgt_gs_vert_itemsize[0] = 4;
     regs.vgt_gs_out_prim_type.outprim_type = AmdGpu::GsOutputPrimitiveType::TriangleStrip;
+    // The value read through the user-data V# (s[4:7]) is exported, not stored: a GS copy shader
+    // only reads the GSVS ring, exports and stream-outs, and the copy-VS role stops on any other
+    // memory write (ring_access_elimination.cpp, CopyShaderAccesses). Position 0 is also ESGS
+    // record dwords 0-3 for the ES role (ring item size 4).
     GcnAsm::Code shared_shader;
     shared_shader.SBufferLoad(1, 12, 4, true, 0);
     shared_shader.SWaitcntAll();
     shared_shader.VMov(4, 12);
-    shared_shader.Mubuf(28, {.vdata=4, .srsrc=8});
+    shared_shader.Exp(12, 0xF, true, 4, 4, 4, 4);
     shared_shader.SEndpgm();
     std::array<u32, 16> es_ud{}, copy_ud{};
     std::memcpy(es_ud.data() + 4, table.data(), sizeof(table));
