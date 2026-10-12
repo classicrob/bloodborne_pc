@@ -90,6 +90,13 @@ public:
     vk::CommandBuffer Commit();
     /// bbport (Apple): command buffers in flight at most; a commit beyond waits for the GPU.
     static constexpr std::size_t MaxBuffers = 256;
+    /// bbport (Apple): MoltenVK's limit on Metal command buffers in flight on a queue, set at
+    /// instance creation (vk_platform.cpp). Above it, MoltenVK blocks inside vkQueueSubmit, under
+    /// the schedulers' shared submit mutex. It is set above every live pool's MaxBuffers together
+    /// plus MetalCommandBufferHeadroom (MoltenVK's own, e.g. presents), so the pool cap, which
+    /// waits outside that mutex, is the bound; a pool that would exceed it stops.
+    static constexpr std::size_t MaxActiveMetalCommandBuffers = 4096;
+    static constexpr std::size_t MetalCommandBufferHeadroom = 256;
     /// bbport: for the submission with timeline value `tick`.
     vk::CommandBuffer Commit(u64 tick);
 
@@ -97,6 +104,9 @@ private:
     const Instance& instance;
     vk::UniqueCommandPool cmd_pool;
     std::vector<vk::CommandBuffer> cmd_buffers;
+#ifdef __APPLE__
+    static inline std::atomic<std::size_t> live_command_pools{0};
+#endif
 };
 
 class DescriptorHeap final {

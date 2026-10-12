@@ -419,7 +419,10 @@ int main() {
     }
 
     {
-        // The pool cap: the GPU held on an external timeline semaphore.
+        // The pool cap: the GPU held on an external timeline semaphore. The cap is reachable only
+        // because the instance raises MoltenVK's Metal command buffers in flight above it
+        // (vk_platform.cpp); at MoltenVK's default of 64, vkQueueSubmit blocks first and the held
+        // command buffer ends in a Metal GPU timeout (device lost).
         const vk::Device device = instance.GetDevice();
         const vk::SemaphoreTypeCreateInfo timeline_type{
             .semaphoreType = vk::SemaphoreType::eTimeline, .initialValue = 0};

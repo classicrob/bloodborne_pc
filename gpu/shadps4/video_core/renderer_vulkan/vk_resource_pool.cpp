@@ -93,10 +93,19 @@ CommandPool::CommandPool(const Instance& instance, Semaphore* work_semaphore)
     SetObjectName(device, *cmd_pool, "CommandPool");
 #ifdef __APPLE__
     max_resources = MaxBuffers;
+    const std::size_t pools = live_command_pools.fetch_add(1) + 1;
+    ASSERT_MSG(pools * MaxBuffers + MetalCommandBufferHeadroom <= MaxActiveMetalCommandBuffers,
+               "{} command pools of {} buffers exceed MoltenVK's {} Metal command buffers in "
+               "flight: vkQueueSubmit would block under the submit mutex before the pool cap",
+               pools, MaxBuffers, MaxActiveMetalCommandBuffers);
 #endif
 }
 
-CommandPool::~CommandPool() = default;
+CommandPool::~CommandPool() {
+#ifdef __APPLE__
+    live_command_pools.fetch_sub(1);
+#endif
+}
 
 void CommandPool::Allocate(std::size_t begin, std::size_t end) {
     cmd_buffers.resize(end);

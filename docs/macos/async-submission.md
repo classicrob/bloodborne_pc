@@ -251,3 +251,28 @@ Controls added to scheduler-async-submit-test:
   buffers, then all fills land when it is signalled);
 - a Wait on the recording thread (stop);
 - an asynchronous scheduler waiting on another (stop).
+
+## Source review round 3 (Sol-2), as built
+
+- **The pool cap re-reads the GPU tick.** In `ResourcePool::CommitResource`, the search lambda
+  captured `gpu_tick` by value, so after waiting for the oldest buffer it still searched with the
+  stale tick and waited again forever. It now captures it by reference. Negative control: with
+  the by-value capture restored, the pool-cap control reports the hang.
+- **Recording-thread identity is a thread_local owner pointer.** `recording_for` is set by
+  RecorderThread to its scheduler. StopOnRecorderThread compares it with `this`, with no shared
+  `std::thread::id` written by one thread and read by another.
+- **The pool-cap control proves the cap.** The pool publishes its size and a count of waits at
+  the cap (atomics). The control waits for at least one wait at the cap, asserts exactly
+  MaxBuffers command buffers, releases the external GPU gate, then requires every submission to
+  complete within 20 s.
+- **MoltenVK's own limit is configured above the pool cap.** The first run of the fixed control
+  never reached the cap: MoltenVK 1.4.2 allows 64 Metal command buffers in flight per queue by
+  default and blocks inside vkQueueSubmit beyond that, on the recording thread, with the static
+  submit_mutex held (so every scheduler's submit waits). The held command buffer then ended in a
+  Metal GPU timeout (device lost). With MVK_CONFIG_MAX_ACTIVE_METAL_COMMAND_BUFFERS_PER_QUEUE=512
+  in the environment, the same binary reached exactly 256 and passed. The Apple instance now sets
+  it through VK_EXT_layer_settings (required, as the shelved prefill branch did) to
+  CommandPool::MaxActiveMetalCommandBuffers = 4096. A CommandPool stops at construction if the
+  live pools' caps plus 256 for MoltenVK's own buffers (presents) would exceed it. So the pool
+  cap, which waits outside submit_mutex, is the one bound. This changes game behavior only when
+  more than 64 Metal command buffers are in flight, and is part of the async A/B.
