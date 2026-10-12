@@ -46,6 +46,8 @@ std::uint64_t Addr(const void* p) {
 }
 } // namespace
 
+static int owner_origin_test = 0;
+
 int main() {
     using namespace BbLabelCheck;
     alignas(16) static std::uint64_t block[6] = {0, 0x1111, 0x2222, 0x3333, 0x4444, 0x5555};
@@ -434,6 +436,42 @@ int main() {
         Expect("  ... the stop names the guest mapping holding the read and its other views",
                named.find("guest mapping [0x7043000000, 0x704b000000) (131072 KiB), 1 other") !=
                    std::string::npos);
+        {
+            // A flat-buffer stop: every user-data word's writer and the pointer pairs' mappings.
+            static const std::uint32_t ud[4] = {0x10, 0x0, 0x437a72a0, 0x70}; // s[0:1] not an address
+            Register(
+                nullptr,
+                [](void*, const void* word, std::uint64_t, std::uint64_t, PointerOrigin& low,
+                   PointerOrigin& high, DumpOrigin&, std::uint64_t& flips_now) {
+                    const auto index =
+                        static_cast<std::uint64_t>(static_cast<const std::uint32_t*>(word) - ud);
+                    flips_now = 9;
+                    low = {true, index != 1, 0x7039500000 + index * 0x10, 50, 9 - index};
+                    high = low;
+                },
+                &owner_origin_test);
+            region_lookup.store([](std::uint64_t, std::uint64_t& lo, std::uint64_t& hi,
+                                   bool& mapped, long long& aliases) {
+                lo = 0x7043400040;
+                hi = 0x704d400040;
+                mapped = true;
+                aliases = 0;
+                return true;
+            });
+            const std::string origins = UserDataOrigins(ud, 4);
+            region_lookup.store(nullptr);
+            Unregister(&owner_origin_test);
+            Expect("  ... a flat-buffer stop names each user-data word's writer and where pointer "
+                   "pairs lie",
+                   origins.find("s0 gfx 0x7039500000 (submission 50) 0 flip(s) ago;") !=
+                           std::string::npos &&
+                       origins.find("s1 none tracked;") != std::string::npos &&
+                       origins.find("s3 gfx 0x7039500030 (submission 50) 3 flip(s) ago;") !=
+                           std::string::npos &&
+                       origins.find("s[2:3] 0x70437a72a0 lies in guest mapping [0x7043400040, "
+                                    "0x704d400040)") != std::string::npos &&
+                       origins.find("s[0:1]") == std::string::npos);
+        }
         ForgetLastRead();
         Expect("  ... after a new descriptor starts, a stop names no earlier read",
                LastRead().find("no instrumented read for this descriptor") != std::string::npos);

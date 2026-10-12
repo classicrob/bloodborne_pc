@@ -543,6 +543,64 @@ inline std::atomic<RegionFn> region_lookup{nullptr};
 
 /// For a stop: this thread's latest instrumented read for the current descriptor, as observed
 /// then, and the guest mapping holding it now. Empty when off.
+/// For a stop whose descriptor came from the flattened buffer (the SRT walker reads tables
+/// through user-data pointers that are not instrumented): every user-data word's last tracked
+/// SET_SH_REG writer, and for each 64-bit pair that looks like a guest address, the mapping
+/// holding it. `ud` is the stage's user data on the GPU command thread. Empty when off.
+inline std::string UserDataOrigins(const std::uint32_t* ud, std::size_t count) {
+    if (!Enabled() || !ud) {
+        return {};
+    }
+    std::string out = "; user-data writers:";
+    char item[224];
+    PointerOrigin low, high;
+    DumpOrigin dump;
+    std::uint64_t flips_now = 0;
+    for (std::size_t i = 0; i < count; ++i) {
+        low = {};
+        high = {};
+        LookupOrigin(&ud[i], 0, 0, low, high, dump, flips_now);
+        if (!low.in_register_file) {
+            out += " (not tracked graphics user-data registers)";
+            break;
+        }
+        if (!low.written) {
+            std::snprintf(item, sizeof(item), " s%zu none tracked;", i);
+        } else if (low.flips_parsed > flips_now) {
+            std::snprintf(item, sizeof(item), " s%zu %s %#llx after the sample;", i,
+                          low.compute_queue >= 0 ? "compute" : "gfx",
+                          static_cast<unsigned long long>(low.packet));
+        } else {
+            std::snprintf(item, sizeof(item), " s%zu %s %#llx (submission %llu) %llu flip(s) ago;",
+                          i, low.compute_queue >= 0 ? "compute" : "gfx",
+                          static_cast<unsigned long long>(low.packet),
+                          static_cast<unsigned long long>(low.submission),
+                          static_cast<unsigned long long>(flips_now - low.flips_parsed));
+        }
+        out += item;
+    }
+    // Pointer-like pairs (a 48-bit address with a nonzero high half) and their mappings now.
+    const RegionFn fn = region_lookup.load(std::memory_order_acquire);
+    for (std::size_t i = 0; fn && i + 1 < count; i += 2) {
+        const std::uint64_t address = ud[i] | std::uint64_t(ud[i + 1] & 0xffff) << 32;
+        if (!(ud[i + 1] & 0xffff) || (ud[i + 1] >> 16)) {
+            continue;
+        }
+        std::uint64_t start = 0, end = 0;
+        bool mapped = false;
+        long long aliases = -1;
+        if (fn(address, start, end, mapped, aliases)) {
+            std::snprintf(item, sizeof(item), "; s[%zu:%zu] %#llx lies in %s [%#llx, %#llx)", i,
+                          i + 1, static_cast<unsigned long long>(address),
+                          mapped ? "guest mapping" : "the unmapped gap",
+                          static_cast<unsigned long long>(start),
+                          static_cast<unsigned long long>(end));
+            out += item;
+        }
+    }
+    return out;
+}
+
 inline std::string LastRead() {
     if (!Enabled()) {
         return {};
