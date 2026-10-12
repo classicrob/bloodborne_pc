@@ -12,14 +12,22 @@
 // The GS emits count = p & 7 vertices of primitive p (divergent across lanes) and cuts after
 // vertex e when bit e of p >> 3 is set. Primitives share four rows (p & 3), so they overlap and
 // the blended image depends on their order.
+// Stream-out cases (points out): the copy shader also stores each vertex's param0 to stream-out
+// buffer 0 as Gnm's copy shaders do (V# from its s[2:3] table, lanes below the count in s4, index
+// s5 + lane by add_tid, base offset s6; raw dwords or typed xyzw). That runs as the CopyStreamOut
+// kernel after the compaction kernel's stream-out tail, as RecordGsStreamOut records it; the
+// buffer, the advanced offset, the overflow counts and SoCount are checked against a CPU model
+// (the leading vertices that fit, in output order).
 //
-//   conformance SPV_DIR [--only SUBSTRING] [--control base-vertex|reverse-order|rotate-provoking]
+//   conformance SPV_DIR [--only SUBSTRING]
+//               [--control base-vertex|reverse-order|rotate-provoking|so-lane]
 //   conformance SPV_DIR --provoking [--control provoking-last]
 //       the device's flat (provoking) vertex per topology (RunProvokingCase)
 // The controls perturb one side on purpose; every case that draws something must then FAIL,
 // showing that the data, order and provoking-vertex checks can fail.
 #define VK_ENABLE_BETA_EXTENSIONS // VK_KHR_portability_subset (triangle fans)
 #include <vulkan/vulkan.h>
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdio>
@@ -68,6 +76,9 @@ constexpr u32 BaseVertex = 7;
 constexpr float PointSizePx = 3.0f; // point output: PA_SU_POINT_SIZE (list.vert writes it too)
 
 enum class Index { None, U16, U32 };
+// RawBallot: Raw, stored only by lanes whose rank among the active lanes (v_mbcnt of exec read as
+// an SGPR pair: a 64-lane ballot across both Apple subgroups) equals their lane.
+enum class SoStore { None, Raw, Typed, RawBallot };
 
 struct Case {
     const char* name;
@@ -82,7 +93,16 @@ struct Case {
     // VkDraw[Indexed]IndirectCommand; indexed ones use firstIndex = IndirectFirst.
     bool indirect = false;
     bool overflow = false; // scratch too small: must draw nothing and report
+    // Stream-out to buffer 0 (points out only).
+    SoStore so_store = SoStore::None;
+    u32 so_room = 0;       // vertices that fit after so_start (VGT_STRMOUT_BUFFER_SIZE_0)
+    u32 so_start = 0;      // VGT_STRMOUT_BUFFER_OFFSET_0 (dwords) before the first draw
+    u32 so_draws = 1;      // the same draw this many times in a row (offset continuation)
+    bool so_reset = false; // STRMOUT_BUFFER_UPDATE of the offset to 0 between the draws
+    bool so_tight = false; // the V# and its binding end exactly at VGT_STRMOUT_BUFFER_SIZE
 };
+constexpr u32 SoStrideDw = 4; // VGT_STRMOUT_VTX_STRIDE_0: param0
+constexpr u32 SoCanary = 0xABABABABu;
 constexpr u32 IndirectFirst = 3;
 
 /// Push constants of gs_indirect_setup.comp (vk_gs_emulation.cpp SetupParams).
@@ -177,15 +197,45 @@ std::vector<u32> GsProgram(const Case& k) {
 
 std::vector<u32> CopyProgram(const Case& k) {
     using namespace GsAsm;
+    const bool so = k.so_store != SoStore::None;
     Code c;
     c.SMovLiteral(VCC_HI, 0); // the Gnm copy-shader signature (s_mov_b32 vcc_hi, #imm)
+    if (so) {
+        // As GXFlver_*_SO: the stream-out V# from the s[2:3] table, the base offset in bytes,
+        // the vertices of this wave that fit (s4 bits 16-22).
+        c.SLoadDwordx4(16, 2, 0);
+        c.SLshlB32(6, 6, Inline(2));
+        c.SBfeU32(11, 4, 16, 7);
+    }
+    const u32 soffset = so ? 8 : 4; // s4.. are the stream-out inputs
     for (u32 comp = 0; comp < OutDwords; ++comp) {
-        c.words.push_back(0xB0000000u | (4u << 16) | (comp * k.max_vert_out * 64)); // s_movk s4
-        c.RingDword(false, 1 + comp, 0, true, 0, 4);
+        c.words.push_back(0xB0000000u | (soffset << 16) | (comp * k.max_vert_out * 64)); // s_movk
+        c.RingDword(false, 1 + comp, 0, true, 0, soffset);
     }
     c.SWaitcnt();
     c.Exp(12, false, 1);  // pos0
     c.Exp(32, true, 5);   // param0
+    if (so) {
+        c.LaneId(40);
+        c.VMov(41, 11);
+        c.VCmpLtU32(Vgpr(40), 41); // lane < vertices that fit
+        c.SAndSaveexecB64(20, VCC_LO);
+        c.VMov(42, 5);             // write index; the V#'s add_tid adds the lane
+        if (k.so_store == SoStore::RawBallot) {
+            c.SMovB64(22, EXEC_LO);    // the wave's active lanes
+            c.MaskRank(43, 22);
+            c.VCmpEqU32(Vgpr(43), 40); // rank == lane: true for every active lane
+            c.SAndSaveexecB64(24, VCC_LO);
+        }
+        if (k.so_store != SoStore::Typed) {
+            for (u32 comp = 0; comp < 4; ++comp) {
+                c.BufferStoreDword(5 + comp, 42, true, comp * 4, 6, 16);
+            }
+        } else {
+            c.TBufferStore(7, 14, 7, 5, 42, true, 0, 6, 16); // xyzw, 32_32_32_32 float
+        }
+        c.SOrSaveexecB64(20, 20); // as GXFlver_*_SO: restore exec (s_or_saveexec_b64)
+    }
     c.SEndpgm();
     return c.words;
 }
@@ -193,8 +243,15 @@ std::vector<u32> CopyProgram(const Case& k) {
 // ---------------------------------------------------------------------------------------------
 // Production recompiler.
 
+/// VkPhysicalDeviceVulkan11Properties::subgroupSupportedStages, set by InitGpu: the production
+/// profile takes it from the device (MoltenVK has none in vertex functions), which decides
+/// whether a vertex stage's wave operations are lowered without subgroups.
+u32 g_subgroup_stages = 0;
+
 Shader::Profile AppleProfile() {
     Shader::Profile p{};
+    REQUIRE(g_subgroup_stages != 0); // InitGpu first
+    p.subgroup_supported_stages = g_subgroup_stages;
     p.max_viewport_width = 16384;
     p.max_viewport_height = 16384;
     p.max_shared_memory_size = 32768;
@@ -219,11 +276,12 @@ Shader::Profile AppleProfile() {
 struct Compiled {
     std::vector<u32> spv;
     std::vector<Shader::BufferType> buffers;
+    std::vector<u32> flat; ///< the flattened user data its Flatbuf binding holds
 };
 
-Compiled Compile(const std::vector<u32>& code, Shader::RuntimeInfo rt) {
+Compiled Compile(const std::vector<u32>& code, Shader::RuntimeInfo rt,
+                 const std::array<u32, 16>& ud = {}) {
     static Shader::Pools pools;
-    static const std::array<u32, 16> ud{};
     const auto profile = AppleProfile();
     const Shader::ShaderParams params{.user_data = std::span<const u32, 16>(ud),
                                       .code = std::span<const u32>(code),
@@ -231,7 +289,8 @@ Compiled Compile(const std::vector<u32>& code, Shader::RuntimeInfo rt) {
     Shader::Info info(rt.hw_stage, rt.sw_stage, params);
     Shader::Backend::Bindings binding{};
     const auto program = Shader::TranslateProgram(code, pools, info, rt, profile);
-    Compiled out{Shader::Backend::SPIRV::EmitSPIRV(profile, rt, program, binding), {}};
+    Compiled out{Shader::Backend::SPIRV::EmitSPIRV(profile, rt, program, binding), {},
+                 info.flattened_ud_buf};
     for (const auto& b : info.buffers) {
         out.buffers.push_back(b.buffer_type);
     }
@@ -377,6 +436,11 @@ void InitGpu() {
     vkEnumeratePhysicalDevices(g.instance, &count, &g.physical);
     vkGetPhysicalDeviceMemoryProperties(g.physical, &g.memory);
     vkGetPhysicalDeviceProperties(g.physical, &g.props);
+    VkPhysicalDeviceVulkan11Properties p11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_PROPERTIES};
+    VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &p11};
+    vkGetPhysicalDeviceProperties2(g.physical, &p2);
+    g_subgroup_stages = p11.subgroupSupportedStages;
+    std::printf("device subgroup stages %#x\n", g_subgroup_stages);
     // Enable everything the device has (the recompiler's capabilities follow the profile).
     VkPhysicalDeviceVulkan13Features f13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
     VkPhysicalDeviceVulkan12Features f12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &f13};
@@ -691,9 +755,45 @@ bool RunCase(const Case& k, const std::string& spv_dir) {
     if (GsEmu::PointOutput(k.out_prim)) {
         copy.hw.vs.point_size = PointSizePx; // as BuildRuntimeInfo sets it from PA_SU_POINT_SIZE
     }
+    // Stream-out: the copy shader's s[2:3] points at a table whose V# 0 is buffer 0 (16-byte
+    // vertices addressed by add_tid; its address only names the binding).
+    const bool so = k.so_store != SoStore::None;
+    REQUIRE(!so || GsEmu::PointOutput(k.out_prim));
+    const u32 so_size_dw = k.so_start + k.so_room * SoStrideDw;
+    const u32 so_capacity_dw = so_size_dw + 64 * SoStrideDw + 16; // canary past the size
+    alignas(16) static AmdGpu::Buffer so_table[1];
+    so_table[0] = {};
+    so_table[0].base_address = 0x10000000;
+    so_table[0].stride = SoStrideDw * 4;
+    so_table[0].num_records = (k.so_tight ? so_size_dw : so_capacity_dw) / SoStrideDw;
+    REQUIRE(!k.so_tight || so_size_dw % SoStrideDw == 0);
+    so_table[0].add_tid_enable = 1;
+    so_table[0].data_format = u32(AmdGpu::DataFormat::Format32_32_32_32);
+    so_table[0].num_format = u32(AmdGpu::NumberFormat::Float);
+    so_table[0].dst_sel_x = 4;
+    so_table[0].dst_sel_y = 5;
+    so_table[0].dst_sel_z = 6;
+    so_table[0].dst_sel_w = 7;
+    std::array<u32, 16> copy_ud{};
+    if (so) {
+        const u64 table = reinterpret_cast<u64>(&so_table[0]);
+        copy_ud[2] = u32(table);
+        copy_ud[3] = u32(table >> 32);
+        copy.gs_so_buffers = 1;
+    }
+    Shader::RuntimeInfo so_rt = copy;
+    so_rt.Initialize(Shader::HwStage::Vertex, Shader::SwStage::Vertex);
+    so_rt.gs_role = Shader::GsEmulationRole::CopyStreamOut;
+    so_rt.gs_max_vert_out = n;
+    so_rt.gs_vertex_dwords = OutDwords;
+    so_rt.gs_so_buffers = 1;
+    so_rt.props.num_user_data = 4;
+    so_rt.props.num_allocated_vgprs = 64;
+
     const auto es_spv = Compile(EsProgram(), es);
     const auto gs_spv = Compile(GsProgram(k), gs);
-    const auto copy_spv = Compile(copy_code, copy);
+    const auto copy_spv = Compile(copy_code, copy, copy_ud);
+    const auto so_spv = so ? Compile(copy_code, so_rt, copy_ud) : Compiled{};
 
     // Scratch, laid out as RecordGsEmulation does.
     const u64 slots = u64(prims) * k.instances;
@@ -739,6 +839,12 @@ bool RunCase(const Case& k, const std::string& spv_dir) {
                                                            : GsEmu::IndexKind::U32);
     header[GsEmu::FirstIndex] = k.index_skip_bytes / index_size;
     Buffer zero = MakeBuffer(4096);
+    Buffer so_buffer = MakeBuffer(u64(so_capacity_dw) * 4);
+    std::fill_n(reinterpret_cast<u32*>(so_buffer.data), so_capacity_dw, SoCanary);
+    Buffer so_state = MakeBuffer(32); // vk_gs_emulation.h SoState
+    std::memset(so_state.data, 0, 32);
+    reinterpret_cast<u32*>(so_state.data)[0] = k.so_start; // STRMOUT_BUFFER_UPDATE
+    std::vector<Buffer> flats;
 
     const auto ranges = [&](const Compiled& c) {
         std::vector<VkDescriptorBufferInfo> r;
@@ -754,8 +860,20 @@ bool RunCase(const Case& k, const std::string& spv_dir) {
                                                          (index_bytes + 3) / 4 * 4});
                 break;
             case Shader::BufferType::Flatbuf:
+                if (!c.flat.empty()) {
+                    flats.push_back(MakeBuffer(c.flat.size() * 4));
+                    std::memcpy(flats.back().data, c.flat.data(), c.flat.size() * 4);
+                    r.push_back({flats.back().buffer, 0, flats.back().size});
+                    break;
+                }
+                r.push_back({zero.buffer, 0, zero.size});
+                break;
             case Shader::BufferType::ClipPlanes:
                 r.push_back({zero.buffer, 0, zero.size});
+                break;
+            case Shader::BufferType::Guest:
+                REQUIRE(&c == &so_spv); // only the stream-out kernel binds a guest buffer
+                r.push_back({so_buffer.buffer, 0, k.so_tight ? u64(so_size_dw) * 4 : so_buffer.size});
                 break;
             default:
                 std::fprintf(stderr, "unexpected buffer type %u\n", u32(type));
@@ -768,6 +886,12 @@ bool RunCase(const Case& k, const std::string& spv_dir) {
     const auto gs_layout = MakeLayout(VK_SHADER_STAGE_COMPUTE_BIT, ranges(gs_spv));
     const auto draw_layout =
         MakeLayout(VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, ranges(copy_spv));
+    Layout so_layout{};
+    VkPipeline so_pipe = VK_NULL_HANDLE;
+    if (so) {
+        so_layout = MakeLayout(VK_SHADER_STAGE_COMPUTE_BIT, ranges(so_spv));
+        so_pipe = ComputePipeline(Module(so_spv.spv), so_layout.layout);
+    }
     const auto ref_layout = MakeLayout(VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, {});
     const VkShaderModule es_module = Module(es_spv.spv), gs_module = Module(gs_spv.spv),
                          copy_module = Module(copy_spv.spv),
@@ -791,7 +915,11 @@ bool RunCase(const Case& k, const std::string& spv_dir) {
     VkPipeline compact_pipe = VK_NULL_HANDLE;
     Layout compact_layout{};
     if (points) {
-        compact_layout = MakeLayout(VK_SHADER_STAGE_COMPUTE_BIT, {{scratch.buffer, 0, bytes}});
+        // Binding 1: the stream-out state (any buffer without stream-out), as recorded.
+        compact_layout = MakeLayout(VK_SHADER_STAGE_COMPUTE_BIT,
+                                    {{scratch.buffer, 0, bytes},
+                                     so ? VkDescriptorBufferInfo{so_state.buffer, 0, 32}
+                                        : VkDescriptorBufferInfo{scratch.buffer, 0, bytes}});
         compact_pipe = ComputePipeline(Module(ReadFile(spv_dir + "/gs_point_compact.comp.spv")),
                                        compact_layout.layout);
     }
@@ -865,27 +993,64 @@ bool RunCase(const Case& k, const std::string& spv_dir) {
     }
     Barrier(VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
-    vkCmdBindPipeline(g.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, gs_pipe);
-    vkCmdBindDescriptorSets(g.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, gs_layout.layout, 0, 1,
-                            &gs_layout.set, 0, nullptr);
-    vkCmdPushConstants(g.cmd, gs_layout.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
-    if (k.indirect) {
-        vkCmdDispatchIndirect(g.cmd, scratch.buffer, GsEmu::GsDispatch * 4);
-    } else if (prims) {
-        vkCmdDispatch(g.cmd, (prims + GsEmu::WorkgroupSize - 1) / GsEmu::WorkgroupSize, k.instances,
-                      1);
-    }
-    if (points) {
+    const auto gs_pass = [&] {
+        vkCmdBindPipeline(g.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, gs_pipe);
+        vkCmdBindDescriptorSets(g.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, gs_layout.layout, 0, 1,
+                                &gs_layout.set, 0, nullptr);
+        vkCmdPushConstants(g.cmd, gs_layout.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push),
+                           &push);
+        if (k.indirect) {
+            vkCmdDispatchIndirect(g.cmd, scratch.buffer, GsEmu::GsDispatch * 4);
+        } else if (prims) {
+            vkCmdDispatch(g.cmd, (prims + GsEmu::WorkgroupSize - 1) / GsEmu::WorkgroupSize,
+                          k.instances, 1);
+        }
+        if (!points) {
+            return;
+        }
         Barrier(VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
                 VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
                 VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
-        const u32 compact_params[2] = {1, run_length}; // invocations, run_length
+        // vk_gs_emulation.cpp CompactParams: invocations, run_length, stream-out buffers,
+        // VGT_STRMOUT_BUFFER_SIZE_0..3, VGT_STRMOUT_VTX_STRIDE_0..3.
+        const u32 compact_params[11] = {1, run_length, so ? 1u : 0u, so_size_dw, 0, 0, 0,
+                                        SoStrideDw, 0, 0, 0};
         vkCmdBindPipeline(g.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, compact_pipe);
         vkCmdBindDescriptorSets(g.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, compact_layout.layout, 0, 1,
                                 &compact_layout.set, 0, nullptr);
         vkCmdPushConstants(g.cmd, compact_layout.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
                            sizeof(compact_params), compact_params);
         vkCmdDispatch(g.cmd, 1, 1, 1);
+        if (!so) {
+            return;
+        }
+        // RecordGsStreamOut: the kernel over the compacted points, sized by the tail above.
+        Barrier(VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT,
+                VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT);
+        vkCmdBindPipeline(g.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, so_pipe);
+        vkCmdBindDescriptorSets(g.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, so_layout.layout, 0, 1,
+                                &so_layout.set, 0, nullptr);
+        vkCmdPushConstants(g.cmd, so_layout.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push),
+                           &push);
+        vkCmdDispatchIndirect(g.cmd, scratch.buffer, GsEmu::SoDispatch * 4);
+    };
+    gs_pass();
+    for (u32 d = 1; so && d < k.so_draws; ++d) {
+        // The same draw again: GS, compaction and stream-out after the previous ones.
+        Barrier(VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT |
+                    VK_ACCESS_2_TRANSFER_WRITE_BIT);
+        if (k.so_reset) {
+            const u32 zero_offset = 0; // Rasterizer::StreamOutUpdate
+            vkCmdUpdateBuffer(g.cmd, so_state.buffer, 0, 4, &zero_offset);
+            Barrier(VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                    VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                    VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+        }
+        gs_pass();
     }
     Barrier(VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
             VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_2_INDEX_INPUT_BIT |
@@ -981,6 +1146,61 @@ bool RunCase(const Case& k, const std::string& spv_dir) {
             }
         }
     }
+    u32 so_diffs = 0, so_written = 0;
+    if (so) {
+        // CPU model: per draw, the leading vertices (output order) that fit in buffer 0 from its
+        // offset, vertex i at offset + i * stride; the offset advances, overflow is counted.
+        std::vector<const Vertex*> by_record(slots * n, nullptr);
+        for (const auto& [record, v] : want.records) {
+            by_record[record] = &v;
+        }
+        std::vector<u32> want_so(so_capacity_dw, SoCanary);
+        const u32 total = u32(want.compact.size());
+        u32 offset = k.so_start, start = 0, count = 0, overflow_draws = 0, dropped = 0;
+        for (u32 d = 0; d < k.so_draws; ++d) {
+            offset = d > 0 && k.so_reset ? 0 : offset;
+            const u32 fit = so_size_dw > offset ? (so_size_dw - offset) / SoStrideDw : 0;
+            count = std::min(total, fit);
+            for (u32 i = 0; i < count; ++i) {
+                // Negative control: neighbouring lanes swapped.
+                const u32 at = offset + (g_control == "so-lane" ? i ^ 1 : i) * SoStrideDw;
+                for (u32 c = 0; c < 4 && at + c < so_capacity_dw; ++c) {
+                    std::memcpy(&want_so[at + c], &by_record[want.compact[i]]->data[4 + c], 4);
+                }
+            }
+            if (count < total) {
+                ++overflow_draws;
+                dropped += total - count;
+            }
+            start = offset;
+            offset += count * SoStrideDw;
+        }
+        so_written = count;
+        const u32* got_so = reinterpret_cast<const u32*>(so_buffer.data);
+        for (u32 i = 0; i < so_capacity_dw; ++i) {
+            if (got_so[i] != want_so[i] && so_diffs++ < 8) {
+                char line[160];
+                std::snprintf(line, sizeof line,
+                              "    stream-out dword %u (vertex %u): got %#x want %#x\n", i,
+                              (i - std::min(i, k.so_start)) / SoStrideDw, got_so[i], want_so[i]);
+                failures += line;
+            }
+        }
+        const u32* state = reinterpret_cast<const u32*>(so_state.data);
+        const u32* sx = reinterpret_cast<const u32*>(scratch.data);
+        if (state[0] != offset || state[4] != overflow_draws || state[5] != dropped ||
+            sx[GsEmu::SoCount] != count || sx[GsEmu::SoOffset0] != start ||
+            sx[GsEmu::SoDispatch] != (count + 63) / 64) {
+            char line[300];
+            std::snprintf(line, sizeof line,
+                          "    stream-out state: offset %u, %u overflowed draws, %u dropped; last "
+                          "draw count %u from %u, %u groups; want %u, %u, %u; %u from %u\n",
+                          state[0], state[4], state[5], sx[GsEmu::SoCount], sx[GsEmu::SoOffset0],
+                          sx[GsEmu::SoDispatch], offset, overflow_draws, dropped, count, start);
+            failures += line;
+            ++so_diffs;
+        }
+    }
     u32 record_diffs = 0;
     const float* gsvs = reinterpret_cast<const float*>(scratch.data) + gsvs_base;
     for (const auto& [record, v] : want.records) {
@@ -1027,15 +1247,23 @@ bool RunCase(const Case& k, const std::string& spv_dir) {
         }
     }
     const bool pass = failures.empty();
-    std::printf("%-58s %s  (%u slots, %zu emitted, %zu list vertices, %u px covered)\n", k.name,
+    std::printf("%-58s %s  (%u slots, %zu emitted, %zu list vertices, %u px covered", k.name,
                 pass ? "PASS" : "FAIL", u32(slots), want.records.size(), want.list.size(), covered);
+    if (so) {
+        std::printf(", %u streamed out", so_written);
+    }
+    std::printf(")\n");
     if (!pass) {
-        std::printf("    %u index-run, %u GSVS record, %u ESGS record, %u pixel differences\n%s",
-                    run_diffs, record_diffs, esgs_diffs, pixel_diffs, failures.c_str());
+        std::printf("    %u index-run, %u GSVS record, %u ESGS record, %u pixel, %u stream-out "
+                    "differences\n%s",
+                    run_diffs, record_diffs, esgs_diffs, pixel_diffs, so_diffs, failures.c_str());
     }
     for (Buffer* buf : {&scratch, &index_buffer, &zero, &vertices, &image, &ref_image, &args,
-                        &errors}) {
+                        &errors, &so_buffer, &so_state}) {
         FreeBuffer(*buf);
+    }
+    for (Buffer& buf : flats) {
+        FreeBuffer(buf);
     }
     return pass;
 }
@@ -1198,7 +1426,7 @@ int main(int argc, char** argv) {
     }
     using P = AmdGpu::PrimitiveType;
     using O = AmdGpu::GsOutputPrimitiveType;
-    const std::vector<Case> cases = {
+    std::vector<Case> cases = {
         {"points -> tri strips, N=8 (config-1 shape), 64 points", P::PointList, O::TriangleStrip, 8, 64, 1, Index::None, 0},
         {"points -> tri strips, N=6: emits past N dropped", P::PointList, O::TriangleStrip, 6, 64, 1, Index::None, 0},
         {"points -> tri strips, N=3", P::PointList, O::TriangleStrip, 3, 48, 1, Index::None, 0},
@@ -1222,6 +1450,37 @@ int main(int argc, char** argv) {
         {"points -> points, 5000: compaction over many chunks", P::PointList, O::PointList, 2, 5000, 1, Index::None, 0},
         {"indirect: points -> points, N=8, 3 instances", P::PointList, O::PointList, 8, 64, 3, Index::None, 0, true},
     };
+    // Stream-out: 64 points in, p & 7 points out each (224), so the count is the room until 224.
+    const auto so_case = [&](const char* name, SoStore store, u32 room, u32 start = 0,
+                             u32 draws = 1, bool reset = false, bool indirect = false,
+                             bool tight = false) {
+        Case k{name, P::PointList, O::PointList, 8, 64, 1, Index::None, 0, indirect};
+        k.so_store = store;
+        k.so_room = room;
+        k.so_start = start;
+        k.so_draws = draws;
+        k.so_reset = reset;
+        k.so_tight = tight;
+        cases.push_back(k);
+    };
+    so_case("stream-out raw: room 1 (overflow)", SoStore::Raw, 1);
+    so_case("stream-out raw: room 31", SoStore::Raw, 31);
+    so_case("stream-out raw: room 32", SoStore::Raw, 32);
+    so_case("stream-out raw: room 33 (second subgroup)", SoStore::Raw, 33);
+    so_case("stream-out raw: room 63", SoStore::Raw, 63);
+    so_case("stream-out raw: room 64 (one full wave)", SoStore::Raw, 64);
+    so_case("stream-out raw: room 65 (second wave)", SoStore::Raw, 65);
+    so_case("stream-out raw: all 224 fit, offset 6", SoStore::Raw, 300, 6);
+    so_case("stream-out ballot of exec: room 33", SoStore::RawBallot, 33);
+    so_case("stream-out ballot of exec: room 63", SoStore::RawBallot, 63);
+    so_case("stream-out typed xyzw: room 33", SoStore::Typed, 33);
+    so_case("stream-out typed xyzw: room 65", SoStore::Typed, 65);
+    so_case("stream-out typed xyzw: all 224 fit, offset 5", SoStore::Typed, 1000, 5);
+    so_case("stream-out: 2 draws append, second overflows", SoStore::Raw, 300, 0, 2);
+    so_case("stream-out: offset reset to 0 between 2 draws", SoStore::Typed, 300, 0, 2, true);
+    so_case("indirect: stream-out typed, room 100", SoStore::Typed, 100, 3, 1, false, true);
+    so_case("stream-out: offset 8, last record at the V# end", SoStore::Typed, 50, 8, 1, false,
+            false, true);
     InitGpu();
     if (provoking) {
         const auto list = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;

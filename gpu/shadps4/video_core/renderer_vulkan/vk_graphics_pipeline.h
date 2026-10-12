@@ -49,6 +49,7 @@ struct GraphicsPipelineKey {
     /// vertex stage of such a pipeline is the copy shader (vk_gs_emulation.h).
     size_t gs_es_hash;
     size_t gs_gs_hash;
+    size_t gs_so_hash; ///< the copy shader's stream-out kernel (stream-out draws); 0 otherwise
     struct {
         AmdGpu::DepthBuffer::ZFormat z_format : 2;
         AmdGpu::DepthBuffer::StencilFormat stencil_format : 1;

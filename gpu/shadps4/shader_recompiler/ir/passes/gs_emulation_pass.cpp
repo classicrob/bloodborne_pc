@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // bbport: geometry-stage emulation roles (shader_recompiler/gs_emulation.h): what the compute
-// roles cannot run, and the buffers of all three roles. Runs after the last dead-code elimination,
+// roles cannot run, and the buffers of all roles. Runs after the last dead-code elimination,
 // so only live operations are rejected.
 
 #include "common/assert.h"
@@ -22,11 +22,13 @@ void GsEmulationPass(IR::Program& program, const RuntimeInfo& runtime_info) {
         return;
     }
     Info& info = program.info;
-    if (runtime_info.gs_role != GsEmulationRole::CopyVertex) {
+    if (runtime_info.gs_role == GsEmulationRole::EsCompute ||
+        runtime_info.gs_role == GsEmulationRole::GsCompute) {
         // The compute roles run one invocation per vertex or primitive; invocations past the end
         // of the draw return first, so a workgroup barrier would not be reached by all of them.
         // On the PS4 the off-chip ES and GS have no LDS to share either. v_writelane is not lowered
         // for these stages (the graphics wave64 path rejects only reads of lanes >= 32).
+        // (CopyStreamOut runs as one compute wave, lowered by LowerWave64Compute.)
         const char* stage = runtime_info.gs_role == GsEmulationRole::EsCompute ? "ES" : "GS";
         for (IR::Block* block : program.blocks) {
             for (const IR::Inst& inst : block->Instructions()) {
@@ -49,7 +51,8 @@ void GsEmulationPass(IR::Program& program, const RuntimeInfo& runtime_info) {
     info.buffers.push_back(BufferResource{
         .used_types = IR::Type::U32,
         .buffer_type = BufferType::GsScratch,
-        .is_written = runtime_info.gs_role != GsEmulationRole::CopyVertex,
+        .is_written = runtime_info.gs_role == GsEmulationRole::EsCompute ||
+                      runtime_info.gs_role == GsEmulationRole::GsCompute,
     });
     if (runtime_info.gs_role == GsEmulationRole::EsCompute) {
         // Indexed draws: the guest index buffer; otherwise any valid range (not read).

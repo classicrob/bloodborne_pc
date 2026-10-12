@@ -12,6 +12,8 @@
 #include <sys/resource.h>
 #endif
 #include "common/assert.h"
+#include "bbport_flip_mode.h"
+#include "bbport_frame_marks.h"
 #include "bbport_toggles.h"
 #ifdef __APPLE__
 #include "bb_mac_compat.h"
@@ -73,6 +75,20 @@ constexpr u32 PixelFormatBpp(PixelFormat pixel_format) {
 }
 
 VideoOutDriver::VideoOutDriver(u32 width, u32 height) {
+#ifdef __APPLE__
+    // Read first, before any thread starts: a malformed BB_FLIP_AT_GPU_RETIRE stops here, not at
+    // the first flip.
+    flip_run_mode = BbFlip::ParseRunMode(std::getenv("BB_FLIP_AT_GPU_RETIRE"));
+    std::fprintf(stderr, "Flips: %s\n",
+                 flip_run_mode == BbFlip::RunMode::AtRetire
+                     ? "published at GPU retirement of their frame copy for the whole run "
+                       "(BB_FLIP_AT_GPU_RETIRE=1)"
+                 : flip_run_mode == BbFlip::RunMode::AtEnqueue
+                     ? "published when enqueued for the whole run (BB_FLIP_AT_GPU_RETIRE=0, "
+                       "diagnosis)"
+                     : "published at GPU retirement of their frame copy (default; toggle bit 60 "
+                       "publishes them when enqueued)");
+#endif
     main_port.resolution.full_width = width;
     main_port.resolution.full_height = height;
     main_port.resolution.pane_width = width;
@@ -592,20 +608,10 @@ void VideoOutDriver::Flip(const Request& req) {
 #ifdef __APPLE__
     // A flip tells the guest it may reuse the previous buffer. The presenter's last read of the
     // guest framebuffer is the frame copy PrepareFrame submitted (req.ready_tick; a blank frame's
-    // own submission). With FlipAtGpuRetire the flip is published once the GPU retired it; flips
-    // are published in order either way (BbFlip::Publisher).
-    static const bool whole_run = [] {
-        const char* env = std::getenv("BB_FLIP_AT_GPU_RETIRE");
-        return env && env[0] == '1';
-    }();
-    const bool at_retire = whole_run || BbToggle::Disabled(BbToggle::FlipAtGpuRetire);
-    if (at_retire) {
-        static std::once_flag announced;
-        std::call_once(announced, [] {
-            std::fprintf(stderr,
-                         "Flips are published once the GPU retired their frame copy\n");
-        });
-    }
+    // own submission). By default the flip is published once the GPU retired it; flips are
+    // published in order either way (BbFlip::Publisher). See bbport_flip_mode.h.
+    const bool at_retire =
+        BbFlip::AtRetire(flip_run_mode, BbToggle::Disabled(BbToggle::FlipAtEnqueue));
     publisher->Submit(req, req.ready_tick, at_retire);
 }
 
@@ -628,6 +634,7 @@ void VideoOutDriver::PublishFlip(const Request& req) {
                      static_cast<unsigned long long>(++dropped));
         return;
     }
+    BbFrameMarks::published.Note(req.flip_arg);
 #else
     {
         std::unique_lock lock{port->port_mutex};
@@ -685,6 +692,9 @@ s32 VideoOutDriver::SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg,
                                bool is_eop /*= false*/) {
     u64 generation = 0;
 #ifdef __APPLE__
+    if (!is_eop) {
+        BbFrameMarks::attempted.Note(flip_arg); // a CPU flip: called by the guest directly
+    }
     if (const s32 result = PortLifecycle::Admit(*port, index, is_eop, generation);
         result != ORBIS_OK) {
         return result;
@@ -720,6 +730,7 @@ void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_
                                         u64 generation) {
     Vulkan::Frame* frame;
 #ifdef __APPLE__
+    BbFrameMarks::prepared.Note(flip_arg);
     // A Close since the flip was admitted reset (or reopened) the port: drop the flip before
     // reading its buffers. Prepare from a copy taken under port_mutex. A buffer unregistered in
     // the same lifetime is fatal, as on the other platforms: the flip is counted pending and

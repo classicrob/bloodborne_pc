@@ -28,8 +28,11 @@ import threading
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-FIRST_OUTPUT_SECONDS = 60   # Rosetta rule: no output within 60 s is reported, not retried
-JOB_SECONDS = 120
+# Progress is the driver's @@ protocol lines only: library log lines (a background thread's
+# periodic warnings) must not keep a stalled driver alive.
+STARTUP_SECONDS = 300  # to the first @@PROFILE; a stalled launch is reported, never retried
+JOB_SECONDS = 120      # between @@ lines once jobs run
+KILL_GRACE_SECONDS = 15
 STAGE_NAMES = {'cs': 'compute', 'vs': 'vertex', 'ps': 'fragment', 'es': 'export (ES as compute)',
                'gs': 'geometry (GS as compute + copy VS)', 'hs': 'hull', 'ds': 'domain (VS after HS)',
                'ls': 'local (LS)'}
@@ -67,20 +70,32 @@ class Worker:
         process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
                                    env=self.env, text=True, errors='replace')
         lines, current, started = [], None, False
-        deadline = [time.monotonic() + FIRST_OUTPUT_SECONDS]
+        deadline = [time.monotonic() + STARTUP_SECONDS]
         timed_out = []
 
         def watchdog():
             while process.poll() is None:
                 if time.monotonic() > deadline[0]:
                     timed_out.append(True)
+                    if not started:
+                        print(f'shader-sweep: driver produced no output in {STARTUP_SECONDS // 60} '
+                              f'min (pid {process.pid}); stopping it', file=sys.stderr, flush=True)
                     process.kill()
+                    try:
+                        process.wait(KILL_GRACE_SECONDS)
+                    except subprocess.TimeoutExpired:
+                        # Unkillable (e.g. stuck in translation): leave loudly so the heavy.sh
+                        # slot is released rather than held by a blocked read.
+                        print(f'shader-sweep: driver pid {process.pid} survived SIGKILL for '
+                              f'{KILL_GRACE_SECONDS} s; exiting', file=sys.stderr, flush=True)
+                        os._exit(3)
                     return
                 time.sleep(1)
         threading.Thread(target=watchdog, daemon=True).start()
         for line in process.stderr:
             line = line.rstrip('\n')
-            deadline[0] = time.monotonic() + JOB_SECONDS
+            if line.startswith('@@'):
+                deadline[0] = time.monotonic() + JOB_SECONDS
             if line.startswith('@@PROFILE'):
                 started = True
                 with self.lock:
@@ -101,8 +116,10 @@ class Worker:
                 lines.append(line)
         process.wait()
         if not started:
-            raise SystemExit('shader-sweep: the driver %s before its first output (exit %s):\n%s' % (
-                'hung' if timed_out else 'stopped', process.returncode, '\n'.join(lines[-20:])))
+            raise SystemExit('shader-sweep: the driver %s before its first job output (exit %s); '
+                             'last log lines:\n%s' % (
+                'produced no output in %d min' % (STARTUP_SECONDS // 60) if timed_out else 'stopped',
+                process.returncode, '\n'.join(lines[-20:])))
         if current is None:
             if process.returncode != 0:
                 raise SystemExit(f'shader-sweep: driver exit {process.returncode} between jobs')

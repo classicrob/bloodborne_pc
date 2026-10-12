@@ -69,6 +69,8 @@ snapshots' own copies and reads no guest memory. Each read falls into one of the
   - The selected region is the current submission's, else the newest. The line says first
     whether the **selected** copy matches the read, then how many other held copies differ. This
     is a byte comparison, not an order: it does not say which copy was written last.
+  - A region not copied at submit (unreadable then; a valid stream never executes it) has no
+    copy of its own. It is located and named "not copied at submit", never compared.
   - A resubmitted chunk shows up as several copies. A difference shows that a held copy differs
     from the read, not by itself which submission's bytes the PS4 would have used.
 - **Straddling** a held region's boundary, when no held region contains the range (a containing
@@ -90,9 +92,65 @@ snapshots' own copies and reads no guest memory. Each read falls into one of the
   a candidate tail;
 - a summary every 65536 reads across all kinds, with counts per read kind and shader hash.
 
-The `CheckNumberConversion` stop appends this thread's latest instrumented read, **as observed
-then** (it never re-reads guest memory). That read is not necessarily the descriptor that stopped:
-it may have come from the uninstrumented flat buffer.
+The `CheckNumberConversion` stop appends this thread's latest instrumented read for the descriptor
+that stopped, **as observed then** (it never re-reads guest memory). The latest read is forgotten
+before each descriptor is read, so when that descriptor came from direct user data or the
+uninstrumented flat buffer, the stop says so instead of naming an earlier read.
+
+**A draw-preparation worker's selection does not stop on a descriptor with no number
+conversion.** (Other assertions on workers are unchanged.) A worker's selection is speculative: it runs on
+register state the scanner replayed, and the GPU thread re-checks it before using anything
+(vk_draw_prep.h). There, a descriptor with no number conversion abandons the preparation, and
+the GPU thread selects that draw itself, where the stop still applies. The first 8 are logged
+("Draw preparation: a worker's speculative selection abandoned ..."), and the stop line gives
+the count so far. PREVIEW-22's hunt stopped on a worker: the user data it read was not the GPU
+command thread's register file.
+
+The stop line also says:
+- **where the table pointer came from (with `BB_CMD_DATA_CHECK=1`):**
+  - The SET_SH_REG that last wrote its low user-data word: the graphics stream or a compute
+    queue, the packet's guest address, its submission, and how many flip packets the parser had
+    passed between that write and the read.
+  - The high word too, when it was written separately.
+  - Or: that no tracked SET_SH_REG wrote it since the check started; or that the word is not a
+    tracked graphics user-data register (a host snapshot such as stage B or draw preparation,
+    compute queue state, or a spilled slot; not by itself proof of a spill).
+  - "An EARLIER frame" makes retained state a candidate, not a defect: the game may keep a
+    pointer, and a current SET can also republish a stale one (Astra-2).
+  - The read's frame sample is taken under the lock origins are recorded under. An origin
+    newer than it is printed as such, not as an age.
+  - Our newest observed DUMP_CONST_RAM overlapping the table bytes (of the last 512). It is not
+    necessarily the bytes' last writer: CPU and other writes are not tracked.
+  - Liverpool records SET_SH_REG writes and dumps only while the check is on.
+- **compute-queue SET_SH_REG writes outside the compute program, always.**
+  - The parser applies them to the one shared register file, as upstream does, i.e. into the
+    graphics SH registers below 0x200. On the PS4 a compute ring has its own registers.
+  - They are counted in total, into graphics user data, and above the compute program, with the
+    latest write into graphics user data (queue, SH offset, words, first value).
+  - The first 8 of each kind are logged as they happen, and a "Compute SET_SH_REG" summary line
+    is printed every 600 frame ends once any occurred.
+- **for a descriptor from the flattened buffer (with `BB_CMD_DATA_CHECK=1`)**, where nothing
+  read is instrumented, because the SRT walker reads tables through user-data pointers:
+  - the source of each descriptor dword (immediate, user data sN, or walker dword k) and s0..s15;
+  - each user-data word's last tracked SET_SH_REG writer and its age in flips;
+  - for each pointer-like pair (a 48-bit address), the mapping holding it now.
+  The walker's own table offsets come from the shader (Sol-2's traces); for vs 0x9da6aacb the
+  bad descriptor is walker dwords 36..39 = s[6:7] + dwords 0..3.
+- **where the read lies at the stop:** the guest mapping holding it, `[start, end)` and size, or
+  the unmapped gap, and how many other guest mappings view the same backing. These come from
+  runtime_memory's mapping table, a query and not a guest memory read. Stop hunt #1 found every
+  table read outside command memory (20261011-192653-1080p-HUNT-1), so the mapping is the
+  lead.
+- **how far each side of the flip pipeline had got, always (even without `BB_CMD_DATA_CHECK`).**
+  These come from gpu/shim/bbport_frame_marks.h:
+  - guest flip API calls, counted at entry, before admission;
+  - flip packets parsed by the GPU command thread;
+  - flip preparation entered (on the draw recording thread for EOP flips);
+  - flip status published to the guest.
+
+  Each is a count, with the latest argument where known. These are approximate observations,
+  each sampled on its own. Judged against the guest's reuse gate, they show whether the guest
+  could already reuse the memory the parser was reading.
 
 **Limits:**
 - Supporting evidence only.

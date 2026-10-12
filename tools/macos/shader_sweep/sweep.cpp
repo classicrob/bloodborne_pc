@@ -15,6 +15,7 @@
 // "@@DONE <index>" follows it. A stop (assertion, exit 23) or a crash ends the process inside a
 // job; sweep.py records it and restarts at the next job. Sweep setup errors print "@@SETUP".
 #include <sys/mman.h>
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -156,6 +157,9 @@ AmdGpu::Buffer VSharp(u32 components, u64 address = SharedBacking()) {
     return sharp;
 }
 
+/// Stream-out vertex size of the synthesized stream-out buffers (V# stride, VGT vertex stride).
+constexpr u32 SoVertexBytes = 64;
+
 /// A 256x256 RGBA8 2D texture.
 AmdGpu::Image TSharp() {
     auto image = AmdGpu::Image::Null(false);
@@ -286,8 +290,19 @@ UserData SynthesizeUserData(const std::vector<u32>& slots, const std::vector<u32
             PutPointer(at, table);
             break;
         }
+        case 0x18: { // PtrSoBufferTable: stream-out V#s address their vertex by add_tid
+            u32* table = arena.Alloc(TableEntries * 16);
+            for (u32 i = 0; i < TableEntries; ++i) {
+                // A 64-byte vertex holds any copy shader's stores (SOPos: xyz at 0 and 12).
+                auto sharp = VSharp(4);
+                sharp.stride = SoVertexBytes;
+                sharp.add_tid_enable = 1;
+                Put(table + i * 4, sharp);
+            }
+            PutPointer(at, table);
+            break;
+        }
         case 0x16: // PtrConstBufferTable
-        case 0x18: // PtrSoBufferTable
         case 0x1A: { // PtrInternalGlobalTable (rings)
             u32* table = arena.Alloc(TableEntries * 16);
             for (u32 i = 0; i < TableEntries; ++i) {
@@ -567,6 +582,16 @@ struct Sweep {
         regs.vgt_gs_mode = {};
         regs.vgt_gs_mode.mode = AmdGpu::GsScenario::ScenarioG;
         regs.vgt_strmout_config.raw = job.Get("strmout_config");
+        // Stream-out: the file does not carry VGT_STRMOUT_BUFFER_CONFIG or the strides; take the
+        // buffers the copy shader has offsets for, and 4-dword vertices.
+        regs.vgt_strmout_buffer_config = {};
+        regs.vgt_strmout_buffer_config.stream_0_buf_en = regs.vs_program.settings.so_base_en;
+        for (u32 buffer = 0; buffer < 4; ++buffer) {
+            regs.vgt_strmout_buffers[buffer] = {.size_dw = 4096, .vtx_stride_dw = SoVertexBytes / 4};
+        }
+        // Rasterized GS points take PA_SU_POINT_SIZE: 1 px (half sizes in 12.4).
+        regs.point_size.half_width = 8;
+        regs.point_size.half_height = 8;
         regs.vgt_gs_out_prim_type.raw = job.Get("out_prim_type");
         regs.vgt_gs_instance_cnt.raw = job.Get("instance_cnt");
         regs.vgt_gs_max_vert_out = job.Get("max_vert_out");
@@ -583,6 +608,20 @@ struct Sweep {
             return;
         }
         Program(sel, HwStage::Geometry, SwStage::Geometry, code, ud, job.hash);
+        if (regs.vgt_strmout_config.raw) {
+            // The recompiler's stream-out store proof assumes Gnm's ABI: the stream-out buffer
+            // table (PtrSoBufferTable) at s[2:3].
+            const bool table_at_s2 = std::ranges::any_of(job.copy_slots, [](u32 slot) {
+                return (slot & 0xFF) == 0x18 && ((slot >> 16) & 0xFF) == 2;
+            });
+            if (!table_at_s2) {
+                Setup("stream-out copy shader without PtrSoBufferTable at s[2:3]");
+            }
+            // The copy shader's stream-out kernel (CopyStreamOut), as RefreshGraphicsStages.
+            sel.gs_stream_out_kernel = true;
+            Program(sel, HwStage::Vertex, SwStage::Vertex, copy, copy_ud, job.hash);
+            sel.gs_stream_out_kernel = false;
+        }
         Program(sel, HwStage::Vertex, SwStage::Vertex, copy, copy_ud, job.hash);
     }
 };

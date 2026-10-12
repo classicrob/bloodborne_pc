@@ -94,6 +94,9 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
         };
 #endif
     }
+#ifdef __APPLE__
+    scheduler.EnableFlushCensus(); // its submissions by reason, in the parse split block
+#endif
     // bbport: this thread joins the texture binding helper before it changes image state.
     runtime.SetImageAccessHook(&JoinBindHelper, this);
     scheduler.SetSubmitCallback([this](Vulkan::SubmitInfo& info) {
@@ -359,6 +362,7 @@ void Rasterizer::EliminateFastClear() {
     ScopeMarkerBegin(fmt::format("EliminateFastClear:MRT={:#x}:M={:#x}", col_buf.Address(),
                                  col_buf.CmaskAddress()));
     runtime.ClearImage(&image, desc.view_info.range, clear_value);
+    texture_cache.MarkGpuWritten(image_id);
     ScopeMarkerEnd();
 }
 
@@ -1091,6 +1095,9 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
         }
         gs_draw = RecordGsEmulation(pipeline, regs, is_indexed, index_offset);
         is_indexed = false; // the guest index buffer was read by the ES
+        if (gs_draw.skip_draw) {
+            return; // stream-out only: the rasterizer is killed
+        }
     }
 #endif
     bind_prepared = used_prepared;
@@ -1412,6 +1419,9 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
         gs_draw = RecordGsEmulationIndirect(pipeline, Regs(), is_indexed, indirect.args, stride,
                                             max_count, count_address);
         is_indexed = false; // the guest index buffer is read by the ES
+        if (gs_draw.skip_draw) {
+            return; // stream-out only: the rasterizer is killed
+        }
     }
     // Without the feature vkCmdDraw*IndirectCount is invalid. See docs/macos/feature-audit.md.
     if (!gs_draw.indirect && FeatureChecks::DrawIndirectCountUnsupported(count_address,
@@ -1820,8 +1830,10 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
     const bool gs_emulation_stage =
         pipeline->IsCompute() &&
         pipeline->GetStage(Shader::SwStage::Compute).hw_stage != Shader::HwStage::Compute;
-    if (!gs_emulation_stage && (IsComputeImageCopy(pipeline) || IsComputeMetaClear(pipeline) ||
-                                IsComputeImageClear(pipeline))) {
+    // IsComputeImageCopy and IsComputeImageClear are not taken: they skip the shader's
+    // guest-memory writes and were never shown to match them, so the shader runs (an exact
+    // version needs differential tests through these call sites, Sol-2's review of c7427cc).
+    if (!gs_emulation_stage && IsComputeMetaClear(pipeline)) {
         return false;
     }
 
@@ -2448,6 +2460,7 @@ bool Rasterizer::IsComputeImageClear(const Pipeline* pipeline) {
         .extent = image1.info.resources,
     };
     runtime.ClearImage(&image1, range, clear);
+    texture_cache.MarkGpuWritten(image1_id);
     return true;
 }
 
@@ -3543,13 +3556,15 @@ void Rasterizer::Resolve() {
     VideoCore::TextureCache::ImageDesc mrt0_desc{Regs().color_buffers[0], mrt0_hint};
     VideoCore::TextureCache::ImageDesc mrt1_desc{Regs().color_buffers[1], mrt1_hint};
     auto& mrt0_image = texture_cache.GetImage(texture_cache.FindImage(mrt0_desc, true));
-    auto& mrt1_image = texture_cache.GetImage(texture_cache.FindImage(mrt1_desc, true));
+    const auto mrt1_id = texture_cache.FindImage(mrt1_desc, true);
+    auto& mrt1_image = texture_cache.GetImage(mrt1_id);
 
     ScopeMarkerBegin(fmt::format("Resolve:MRT0={:#x}:MRT1={:#x}",
                                  Regs().color_buffers[0].Address(),
                                  Regs().color_buffers[1].Address()));
     runtime.ResolveImage(&mrt0_image, &mrt1_image, mrt0_desc.view_info.range,
                          mrt1_desc.view_info.range);
+    texture_cache.MarkGpuWritten(mrt1_id);
     ScopeMarkerEnd();
 }
 
@@ -3564,7 +3579,8 @@ void Rasterizer::DepthStencilCopy(bool is_depth, bool is_stencil) {
         regs.depth_htile_data_base.GetAddress(), DbExtent(), true);
 
     auto& read_image = texture_cache.GetImage(texture_cache.FindImage(read_desc));
-    auto& write_image = texture_cache.GetImage(texture_cache.FindImage(write_desc));
+    const auto write_id = texture_cache.FindImage(write_desc);
+    auto& write_image = texture_cache.GetImage(write_id);
 
     VideoCore::SubresourceRange sub_range;
     sub_range.base.layer = Regs().depth_view.slice_start;
@@ -3576,6 +3592,7 @@ void Rasterizer::DepthStencilCopy(bool is_depth, bool is_stencil) {
         regs.depth_buffer.StencilWriteAddress()));
 
     runtime.CopyDepthStencil(&read_image, &write_image, sub_range);
+    texture_cache.MarkGpuWritten(write_id);
 
     ScopeMarkerEnd();
 }
@@ -3604,11 +3621,47 @@ void Rasterizer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds
 #ifdef __APPLE__
 void Rasterizer::StreamOutUpdate(u32 buffer, AmdGpu::SourceSelect source, u64 value_or_address,
                                  u64 dst_or_0) {
-    // The GS emulation does not cover stream-out yet: its draws stop too ("does not cover
-    // stream-out"). The state and its ordering come with the copy kernels (GS-DESIGN section 11).
-    UNREACHABLE_MSG("macOS: stream-out state not implemented: buffer {}, source {}, value {:#x}, "
-                    "store to {:#x}",
-                    buffer, magic_enum::enum_name(source), value_or_address, dst_or_0);
+    // The form Gnm emits (liverpool.cpp): set a buffer's offset from the packet, store nothing.
+    // The offset lives on the GPU, where stream-out draws advance it, so it is written in
+    // command order (vk_gs_emulation.h SoState).
+    ASSERT_MSG(buffer < 4 && source == AmdGpu::SourceSelect::BufferOffset && dst_or_0 == 0,
+               "macOS: stream-out update of buffer {} from {} (value {:#x}, store to {:#x}) is "
+               "not modelled",
+               buffer, magic_enum::enum_name(source), value_or_address, dst_or_0);
+    DrainDrawPipe();
+    if (!so_state) {
+        // Host-visible for the overflow counts; zeroed before any command uses it.
+        so_state = std::make_unique<VideoCore::Buffer>(instance, 0, SoStateBytes,
+                                                       VideoCore::MemoryType::Stream,
+                                                       "GsStreamOutState");
+        ASSERT_MSG(!so_state->mapped_data.empty(), "macOS: stream-out state unmapped");
+        std::memset(so_state->mapped_data.data(), 0, SoStateBytes);
+    }
+    scheduler.EndRendering();
+    const u32 offset_dw = u32(value_or_address);
+    scheduler.Record([=, state = so_state->Handle()](vk::CommandBuffer cmdbuf) {
+        // After the compaction kernels of earlier stream-out draws, before later ones.
+        const vk::MemoryBarrier2 before{
+            .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+            .srcAccessMask = vk::AccessFlagBits2::eShaderStorageRead |
+                             vk::AccessFlagBits2::eShaderStorageWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+            .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
+        };
+        cmdbuf.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1,
+                                                   .pMemoryBarriers = &before});
+        cmdbuf.updateBuffer(state, (SoBufferOffset0 + buffer) * 4, sizeof(offset_dw),
+                            &offset_dw);
+        const vk::MemoryBarrier2 after{
+            .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
+            .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+            .dstAccessMask = vk::AccessFlagBits2::eShaderStorageRead |
+                             vk::AccessFlagBits2::eShaderStorageWrite,
+        };
+        cmdbuf.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1,
+                                                   .pMemoryBarriers = &after});
+    });
 }
 #endif
 

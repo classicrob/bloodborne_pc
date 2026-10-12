@@ -347,8 +347,14 @@ private:
     /// returns the strip draw (vk_gs_emulation.cpp).
     GsEmulationDraw RecordGsEmulation(const GraphicsPipeline* pipeline, const AmdGpu::Regs& regs,
                                       bool is_indexed, u32 index_offset);
-    /// Point output: compacts the GS's index runs into the point draw (gs_point_compact.comp).
-    void RecordGsPointCompaction(const GsEmulationStages& stages);
+    /// Point output: compacts the GS's index runs into the point draw (gs_point_compact.comp);
+    /// for a stream-out draw also sizes the stream-out and advances so_state.
+    void RecordGsPointCompaction(const GsEmulationStages& stages, const AmdGpu::Regs& regs);
+    /// Stream-out draw: the copy shader's stream-out kernel over the compacted points.
+    void RecordGsStreamOut(const GsEmulationStages& stages, const AmdGpu::Regs& regs,
+                           vk::Buffer scratch, u64 scratch_offset);
+    /// Logs stream-out overflow (dropped vertices) the GPU has counted since the last report.
+    void CheckStreamOutOverflow();
     GsEmulationDraw RecordGsEmulationIndirect(const GraphicsPipeline* pipeline,
                                               const AmdGpu::Regs& regs, bool is_indexed,
                                               VAddr args, u32 stride, u32 max_count,
@@ -582,6 +588,11 @@ private:
     GsEmulationBinding gs_binding{};
     std::unique_ptr<VideoCore::StreamBuffer> gs_indirect_scratch; ///< indirect ES/GS draws
     std::unique_ptr<VideoCore::Buffer> gs_errors;                 ///< setup kernel reports
+    /// Stream-out state (vk_gs_emulation.h SoState): buffer offsets in dwords
+    /// (VGT_STRMOUT_BUFFER_OFFSET_0..3) and overflow counts, GPU-resident: offsets set by
+    /// STRMOUT_BUFFER_UPDATE in command order, advanced by each stream-out draw.
+    std::unique_ptr<VideoCore::Buffer> so_state;
+    u32 so_overflow_reported{}; ///< SoOverflowDraws last logged
     struct {
         std::atomic<u64> draws{0};
         std::atomic<u64> dispatches{0};

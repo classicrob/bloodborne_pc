@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <string_view>
+
 #include "common/assert.h"
 #include "shader_recompiler/gs_emulation.h"
 #include "shader_recompiler/ir/ir_emitter.h"
@@ -52,10 +54,108 @@ static void CopyVertexRingLoads(const IR::Program& program, const RuntimeInfo& r
     }
 }
 
+/// bbport: the memory accesses of a copy shader (GS-DESIGN 11.2). With stream-out (SO_EN), Gnm's
+/// copy-shader ABI puts the stream-out buffer table (input usage PtrSoBufferTable) at s[2:3], one
+/// V# per buffer; the shader sweep checks that slot over the game's copy shaders. A buffer store
+/// is stream-out when its V# is exactly table entry b of an enabled buffer b: dwords 4b..4b+3,
+/// each a scalar load at that immediate offset through the s[2:3] pointer. The draw (CopyVertex)
+/// removes those stores and the stream-out kernel (CopyStreamOut) keeps them. Any other memory
+/// write would run in both, or not as the VGT orders it: it stops. The kernel also stops on
+/// guest LDS and barriers here, before the wave64 lowering adds its own.
+static void CopyShaderAccesses(const IR::Program& program, const RuntimeInfo& runtime_info) {
+    const auto is_sgpr = [](const IR::Value& value, IR::ScalarReg reg) {
+        const IR::Inst* inst = value.TryInst();
+        return inst && inst->GetOpcode() == IR::Opcode::GetUserData &&
+               inst->Arg(0).ScalarReg() == reg;
+    };
+    // The stream-out buffer whose table entry the V# is, or -1.
+    const auto so_buffer = [&](const IR::Value& handle) -> int {
+        const IR::Inst* vsharp = handle.TryInst();
+        if (!vsharp || vsharp->GetOpcode() != IR::Opcode::CompositeConstructU32x4) {
+            return -1;
+        }
+        int buffer = -1;
+        for (u32 i = 0; i < 4; ++i) {
+            const IR::Inst* load = vsharp->Arg(i).TryInst();
+            if (load && load->GetOpcode() == IR::Opcode::ReadFirstLane) {
+                load = load->Arg(0).TryInst();
+            }
+            if (!load || load->GetOpcode() != IR::Opcode::ReadConst || !load->Arg(1).IsImmediate()) {
+                return -1;
+            }
+            const IR::Inst* base = load->Arg(0).TryInst();
+            if (!base || base->GetOpcode() != IR::Opcode::CompositeConstructU32x2 ||
+                !is_sgpr(base->Arg(0), IR::ScalarReg::S2) ||
+                !is_sgpr(base->Arg(1), IR::ScalarReg::S3)) {
+                return -1;
+            }
+            const u32 offset = load->Arg(1).U32();
+            if (offset % 4 != i || offset >= 16 || (i > 0 && int(offset / 4) != buffer)) {
+                return -1;
+            }
+            buffer = int(offset / 4);
+        }
+        return buffer;
+    };
+    const bool kernel = runtime_info.gs_role == GsEmulationRole::CopyStreamOut;
+    for (IR::Block* block : program.blocks) {
+        for (IR::Inst& inst : block->Instructions()) {
+            const auto op = inst.GetOpcode();
+            const std::string_view name = IR::NameOf(op);
+            ASSERT_MSG(!kernel || (op != IR::Opcode::Barrier && !name.starts_with("LoadShared")),
+                       "Geometry emulation: copy shader {:#x} uses {}, which the stream-out "
+                       "kernel cannot run",
+                       program.info.pgm_hash, name);
+            const bool buffer_store = name.starts_with("StoreBuffer");
+            const bool other_write =
+                name.starts_with("BufferAtomic") || op == IR::Opcode::ImageWrite ||
+                name.starts_with("ImageAtomic") ||
+                name.starts_with("WriteShared") || name.starts_with("SharedAtomic") ||
+                op == IR::Opcode::DataAppend || op == IR::Opcode::DataConsume;
+            ASSERT_MSG(!other_write,
+                       "Geometry emulation: copy shader {:#x} writes memory with {}, which the "
+                       "draw and the stream-out kernel cannot split",
+                       program.info.pgm_hash, name);
+            if (!buffer_store) {
+                continue;
+            }
+            const int buffer = so_buffer(inst.Arg(0));
+            ASSERT_MSG(buffer >= 0,
+                       "Geometry emulation: copy shader {:#x} stores ({}) through a V# that is not "
+                       "a stream-out buffer of its s[2:3] table",
+                       program.info.pgm_hash, name);
+            ASSERT_MSG((runtime_info.gs_so_buffers >> buffer) & 1,
+                       "Geometry emulation: copy shader {:#x} stores to stream-out buffer {}, "
+                       "which the draw does not enable (buffers {:#x})",
+                       program.info.pgm_hash, buffer, runtime_info.gs_so_buffers);
+            if (!kernel) {
+                inst.Invalidate();
+                continue;
+            }
+            // The kernel keeps the store at the address the VGT ABI gives it: vertex index = the
+            // write index (+ the lane by add_tid), byte offset = buffer b's offset << 2, no
+            // VGPR offset. Resource patching bounds the instruction offset by the V# stride and
+            // RecordGsStreamOut the V# range by the VGT size.
+            const auto flags = inst.Flags<IR::BufferInstInfo>();
+            const IR::Inst* index = IR::GetBufferIndexArg(&inst).TryInst();
+            ASSERT_MSG(flags.index_enable && !flags.voffset_enable && index &&
+                           index->GetOpcode() == IR::Opcode::GetAttributeU32 &&
+                           index->Arg(0).Attribute() == IR::Attribute::GsStreamOutWriteIndex &&
+                           GsEmulation::StreamOutOffsetBuffer(IR::GetBufferSOffsetArg(&inst)) ==
+                               buffer,
+                       "Geometry emulation: copy shader {:#x} stores ({}) to stream-out buffer {} "
+                       "at an address other than write index + lane, offset << 2",
+                       program.info.pgm_hash, name, buffer);
+        }
+    }
+}
+
 void RingAccessElimination(const IR::Program& program, const RuntimeInfo& runtime_info) {
     auto& info = program.info;
-    if (runtime_info.gs_role == GsEmulationRole::CopyVertex) {
+    if (runtime_info.gs_role == GsEmulationRole::CopyVertex ||
+        runtime_info.gs_role == GsEmulationRole::CopyStreamOut) {
         CopyVertexRingLoads(program, runtime_info);
+        CopyShaderAccesses(program, runtime_info);
         return;
     }
 

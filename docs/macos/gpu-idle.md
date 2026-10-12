@@ -252,7 +252,7 @@ the two modes never reorder labels. The switch is logged as
 `Labels at GPU completion: ON|OFF at <UTC time> (switched; ...)`. One run can therefore alternate
 the modes, say every 60 s, and compare its halves under the same load, cache and location.
 
-## Flip publication at GPU retirement (`FlipAtGpuRetire`, toggle bit 60)
+## Flip publication at GPU retirement (the default on Apple)
 
 A flip tells the guest that its previous display buffer may be reused. That means the flip
 status (count, flip_arg, current buffer, pending counters), the flip events, and the previous
@@ -265,13 +265,23 @@ not guest memory. So that copy's GPU retirement is the exact point. The moment t
 actually on screen matters only for pacing, which vblank events model, and MoltenVK does not
 report it reliably.
 
-With bit 60 of `BB_TOGGLE_FILE` (or `BB_FLIP_AT_GPU_RETIRE=1` for the whole run), flips are
-published by `BbFlip::Publisher` (`gpu/shim/bbport_flip_publish.h`, test `flip-publish-test`):
+Flips are published at that point by default (`gpu/shim/bbport_flip_mode.h`). For diagnosis:
+- Bit 60 of `BB_TOGGLE_FILE` (`FlipAtEnqueue`, live) publishes them when enqueued, the old
+  behaviour.
+- `BB_FLIP_AT_GPU_RETIRE=0` does the same for the whole run, and `=1` keeps them at retirement
+  for the whole run. Either ignores bit 60. Any other value stops.
+- The startup line `Flips: ...` names the mode.
+
+Note the inversion: before this became the default, bit 60 set meant publishing at
+retirement. Masks from those A/Bs now mean the opposite.
+
+`BbFlip::Publisher` (`gpu/shim/bbport_flip_publish.h`, test `flip-publish-test`) does the
+publishing:
 - Each flip carries its frame copy's ready_tick, read in SubmitFlipInternal while the frame is
   still exclusively ours. A blank frame carries its own copy submission's tick.
 - It also carries the port generation, taken in SubmitFlip together with the pending count.
 - The publisher's thread waits for each tick in flip order, then publishes.
-- With the bit cleared, flips publish at once, unless publications are still queued. Then they
+- In the enqueue mode, flips publish at once, unless publications are still queued. Then they
   queue behind them, so order holds across a live switch.
 - The port's flip lifecycle is shared code (`core/libraries/videoout/port_lifecycle.h`, test
   `videoout-lifecycle-test`):

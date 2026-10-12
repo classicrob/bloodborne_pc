@@ -10,6 +10,7 @@
 #include <deque>
 #include <memory>
 #ifdef __APPLE__
+#include "bbport_flip_mode.h"
 #include "bbport_flip_publish.h"
 #endif
 #include <functional>
@@ -157,8 +158,10 @@ private:
     /// bbport: serializes a flip's publication (generation check and all its effects) against
     /// Close's whole reset of the port.
     std::mutex lifecycle_mutex;
-    /// Flips published at GPU retirement of their frame copy, in flip order (FlipAtGpuRetire).
+    /// Flips published at GPU retirement of their frame copy (the default; bbport_flip_mode.h), in
+    /// flip order.
     std::unique_ptr<BbFlip::Publisher<Request>> publisher;
+    BbFlip::RunMode flip_run_mode{}; ///< BB_FLIP_AT_GPU_RETIRE, read in the constructor
 #endif
     std::jthread present_thread;
     std::queue<Request> requests;

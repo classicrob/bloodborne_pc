@@ -1211,9 +1211,11 @@ void EmitContext::DefineSharedMemory() {
     if (num_types == 0) {
         return;
     }
-    ASSERT(info.hw_stage == HwStage::Compute);
+    // A stream-out copy kernel has no guest LDS, only the wave64 scratch (hw.cs is not its data).
+    const bool so_kernel = runtime_info.gs_role == GsEmulationRole::CopyStreamOut;
+    ASSERT(info.hw_stage == HwStage::Compute || so_kernel);
     const u32 shared_memory_size =
-        runtime_info.hw.cs.shared_memory_size + info.shared_memory_scratch_size;
+        (so_kernel ? 0u : runtime_info.hw.cs.shared_memory_size) + info.shared_memory_scratch_size;
 
     const auto make_type = [&](IR::Type type, Id element_type, u32 element_size,
                                std::string_view name) {

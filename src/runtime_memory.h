@@ -45,6 +45,9 @@ typedef struct {
     size_t total, copied; /* other guest VMAs mapping backing_byte */
     int truncated;
 } RuntimeMemoryAliasSnapshot;
+/* The region holding `address`: [start,end) mapped, or the gap between mappings; 0 past the
+ * last mapping. */
+int runtime_memory_region(uintptr_t address, uintptr_t *start, uintptr_t *end, int *mapped);
 /* Failure-path diagnostic: one VMA read lock, no allocation, GPU wait or logging.
  * Returns 1 for tracked committed memory (total==0 means no other guest alias),
  * 0 for a reservation/gap/untracked address, -1 for invalid output arguments.

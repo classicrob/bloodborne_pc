@@ -4,6 +4,9 @@
 // flip overtakes an earlier one; a blank flip (its own copy submission) waits for its tick too;
 // stopping reports the flips left. The GPU timeline is simulated here.
 #include <atomic>
+#include <csignal>
+#include <sys/wait.h>
+#include <unistd.h>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -11,6 +14,7 @@
 #include <mutex>
 #include <thread>
 #include <vector>
+#include "bbport_flip_mode.h"
 #include "bbport_flip_publish.h"
 
 namespace {
@@ -112,6 +116,33 @@ int main() {
         Settle();
         Expect("stop with flips pending: both reported, neither published",
                left == 2 && log.Get().size() == 5);
+    }
+    // When flips are published (bbport_flip_mode.h): at GPU retirement by default, toggle bit 60
+    // switches to at enqueue live, BB_FLIP_AT_GPU_RETIRE=0/1 fixes the mode for the run.
+    {
+        using BbFlip::RunMode;
+        const RunMode unset = BbFlip::ParseRunMode(nullptr);
+        const RunMode empty = BbFlip::ParseRunMode("");
+        const RunMode on = BbFlip::ParseRunMode("1");
+        const RunMode off = BbFlip::ParseRunMode("0");
+        Expect("flip mode: unset or empty is the default, 1 and 0 fix the run",
+               unset == RunMode::Default && empty == RunMode::Default &&
+                   on == RunMode::AtRetire && off == RunMode::AtEnqueue);
+        Expect("  ... default: at retirement, bit 60 set: at enqueue",
+               BbFlip::AtRetire(unset, false) && !BbFlip::AtRetire(unset, true));
+        Expect("  ... =1 and =0 ignore bit 60",
+               BbFlip::AtRetire(on, true) && BbFlip::AtRetire(on, false) &&
+                   !BbFlip::AtRetire(off, false) && !BbFlip::AtRetire(off, true));
+        std::fflush(stderr);
+        const pid_t child = fork();
+        if (child == 0) {
+            std::freopen("/dev/null", "w", stderr);
+            BbFlip::ParseRunMode("yes");
+            std::_Exit(0);
+        }
+        int status = 0;
+        waitpid(child, &status, 0);
+        Expect("  ... any other value stops", WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT);
     }
     std::fprintf(stderr, "%s: %u failures\n", failures ? "FAIL" : "PASS", failures);
     return failures ? 1 : 0;

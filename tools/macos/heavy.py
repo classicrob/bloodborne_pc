@@ -180,7 +180,11 @@ def busy_slots():
 
 
 def describe(info):
-    return f"{info.get('label', '?')} (pid {info.get('pid', '?')}, since {info.get('since', '?')})"
+    text = f"{info.get('label', '?')} (pid {info.get('pid', '?')}, since {info.get('since', '?')})"
+    pid, command_pid = info.get('pid'), info.get('command_pid')
+    if pid and command_pid and not alive(pid) and alive(command_pid):
+        text += f' ORPHANED: heavy.sh pid {pid} is gone, its command pid {command_pid} still holds the slot'
+    return text
 
 
 def status():
@@ -412,9 +416,12 @@ def run(pool, priority, gpu, label, command, pool_given=False, quiet=False):
             command, policy = polite(pool, priority, gpu, command, idle)
             if pool in ('build', 'quick', 'sweep') and not priority and policy != 'normal':
                 print(f'heavy: {label}: {policy}', file=sys.stderr, flush=True)
+            in_place = os.environ.pop('BB_HEAVY_EXEC', '') == '1'
             record({'event': 'start', 'label': label, 'pool': pool, 'slot': name, 'priority': priority,
                     'waited_s': round(waited, 1), 'load': [round(x, 2) for x in os.getloadavg()],
-                    'held': busy_slots(), 'pid': os.getpid(), 'policy': policy})
+                    'held': busy_slots(), 'pid': os.getpid(), 'policy': policy,
+                    'command': ' '.join(command)[:400], 'cwd': os.getcwd(),
+                    **({'end': 'recorded by the caller (exec in place)'} if in_place else {})})
             if waited >= 1:
                 print(f'heavy: {label}: got {name} after {waited:.0f} s', file=sys.stderr, flush=True)
             os.set_inheritable(fd, True)
@@ -426,6 +433,8 @@ def run(pool, priority, gpu, label, command, pool_given=False, quiet=False):
             announce(label)
             if pool == 'quick':
                 supervise_quick(label, command)
+            if not in_place:
+                supervise(label, pool, command, fd, info)
             try:
                 os.execvp(command[0], command)
             except OSError as error:
@@ -444,6 +453,43 @@ def seconds(variable, default):
     return int(value)
 
 
+def record_end(label, pool, status, started, **extra):
+    """The job's end event: exit status, or the signal that killed it, and its duration."""
+    event = {'event': 'end', 'label': label, 'pool': pool,
+             'seconds': round(time.monotonic() - started, 1), 'load': [round(x, 2) for x in os.getloadavg()]}
+    if status < 0:
+        event.update(status=128 - status, signal=signal.Signals(-status).name)
+    else:
+        event['status'] = status
+    record({**event, **extra})
+    return event['status']
+
+
+def supervise(label, pool, command, fd=None, info=None):
+    """Runs the job's command as a child in the same process group, forwards SIGINT/SIGTERM/SIGHUP
+    to it, records its end (exit status, or the signal that killed it, and the duration) and exits
+    with its status. A caller that needs the job's pid to be the command's (play_route.py: the
+    game) sets BB_HEAVY_EXEC=1 and records the end itself."""
+    started = time.monotonic()
+    try:
+        child = subprocess.Popen(command, close_fds=False)
+    except OSError as error:
+        record_end(label, pool, 127, started, error=str(error))
+        fail(f'cannot run {command[0]}: {error}', 127)
+    if fd is not None:  # the slot names the command too, so status can tell an orphan apart
+        info = {**info, 'command_pid': child.pid}
+        os.ftruncate(fd, 0)
+        os.pwrite(fd, json.dumps(info).encode(), 0)
+    def forward(signum, _):
+        try:
+            child.send_signal(signum)
+        except ProcessLookupError:
+            pass
+    for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(signum, forward)
+    sys.exit(record_end(label, pool, child.wait(), started))
+
+
 def supervise_quick(label, command):
     """Runs a quick job as a child in its own process group, enforcing the time limit; exits."""
     warn, limit = seconds('BB_HEAVY_QUICK_WARN', 300), seconds('BB_HEAVY_QUICK_LIMIT', 600)
@@ -458,15 +504,12 @@ def supervise_quick(label, command):
     forward = lambda signum, _: os.killpg(child.pid, signum)
     for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
         signal.signal(signum, forward)
-    def finish(status):
-        record({'event': 'end', 'label': label, 'pool': 'quick', 'status': status,
-                'seconds': round(time.monotonic() - started, 1), 'load': [round(x, 2) for x in os.getloadavg()]})
-        sys.exit(status)
+    def finish(status, **extra):
+        sys.exit(record_end(label, 'quick', status, started, **extra))
     last = time.monotonic()
     while True:
         try:
-            status = child.wait(timeout=1)
-            finish(status if status >= 0 else 128 - status)
+            finish(child.wait(timeout=1))
         except subprocess.TimeoutExpired:
             pass
         now = time.monotonic()
@@ -487,7 +530,7 @@ def supervise_quick(label, command):
             except subprocess.TimeoutExpired:
                 os.killpg(child.pid, signal.SIGKILL)
                 child.wait()
-            finish(124)
+            finish(124, killed='time limit')
 
 
 def main(argv):

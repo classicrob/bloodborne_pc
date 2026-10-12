@@ -15,6 +15,7 @@
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -64,6 +65,27 @@ void AddResourceBindings(spirv_cross::CompilerMSL& msl, spv::ExecutionModel mode
     for (const auto& r : resources.separate_images) add(r, {SPIRType::Image});
     for (const auto& r : resources.storage_images) add(r, {SPIRType::Image});
     for (const auto& r : resources.separate_samplers) add(r, {SPIRType::Sampler});
+    // The buffer-size constants (runtime array lengths) of each set get their own argument-buffer
+    // entry after the set's descriptors, as MoltenVK's layouts reserve one; without it
+    // SPIRV-Cross places them at index 0, on top of the first buffer.
+    std::set<uint32_t> sets;
+    for (const auto* list : {&resources.uniform_buffers, &resources.storage_buffers,
+                             &resources.sampled_images, &resources.separate_images,
+                             &resources.storage_images, &resources.separate_samplers}) {
+        for (const auto& r : *list) {
+            sets.insert(msl.get_decoration(r.id, spv::DecorationDescriptorSet));
+        }
+    }
+    for (const uint32_t set : sets) {
+        spirv_cross::MSLResourceBinding b;
+        b.stage = model;
+        b.basetype = SPIRType::UInt;
+        b.desc_set = set;
+        b.binding = spirv_cross::kBufferSizeBufferBinding;
+        b.count = 1;
+        b.msl_buffer = buffers++;
+        msl.add_msl_resource_binding(b);
+    }
 }
 
 std::string Convert(const std::string& path) {

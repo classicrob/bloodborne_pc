@@ -4,8 +4,10 @@
 // EsCompute and GsCompute keep their GCN stage for translation (the ES sees VertexId/InstanceId,
 // the GS its vertex offsets and primitive id) but are emitted as GLCompute shaders over the
 // draw's scratch binding. CopyVertex is an ordinary vertex shader whose GSVS reads come from the
-// scratch binding. Record dword d of a ring record is the IR attribute
-// GsEmulation::RecordAttribute(d) (Position0, Param0, ... component d % 4).
+// scratch binding. CopyStreamOut is the copy shader as a GLCompute kernel of one GCN wave per
+// workgroup over the draw's compacted vertices, which keeps only its stream-out stores. Record
+// dword d of a ring record is the IR attribute GsEmulation::RecordAttribute(d) (Position0, Param0,
+// ... component d % 4).
 
 #include "shader_recompiler/backend/spirv/emit_spirv_gs_emulation.h"
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
@@ -17,7 +19,8 @@ namespace GsEmu = Shader::GsEmulation;
 
 bool IsGsComputeRole(const RuntimeInfo& runtime_info) {
     return runtime_info.gs_role == GsEmulationRole::EsCompute ||
-           runtime_info.gs_role == GsEmulationRole::GsCompute;
+           runtime_info.gs_role == GsEmulationRole::GsCompute ||
+           runtime_info.gs_role == GsEmulationRole::CopyStreamOut;
 }
 
 namespace {
@@ -188,6 +191,31 @@ void GsPrologue(EmitContext& ctx) {
                        IMul(ctx, slot, ctx.ConstU32(run_length)));
 }
 
+/// CopyStreamOut: invocation g is lane g % 64 of wave g / 64 over the compacted vertex list. No
+/// lane returns (the guest's wave operations need all 64); lanes at or past SoCount are invalid:
+/// their exec starts clear (translator) and none of their vector buffer accesses happens
+/// (EmitBufferAddress). They still run scalar loads (uniform with the valid lanes) and read the
+/// GSVS record of the first vertex, which is in bounds.
+void CopyStreamOutPrologue(EmitContext& ctx) {
+    auto& gs = ctx.gs;
+    const Id g = ctx.OpCompositeExtract(ctx.U32[1], ctx.OpLoad(ctx.U32[3], gs.global_invocation_id),
+                                        0u);
+    const Id count = LoadScratch(ctx, ctx.ConstU32(u32(GsEmu::SoCount)));
+    gs.so_lane_valid = ctx.OpULessThan(ctx.U1[1], g, count);
+    const Id position = ctx.OpSelect(ctx.U32[1], gs.so_lane_valid, g, ctx.u32_zero_value);
+    gs.so_vertex = LoadScratch(ctx, IAdd(ctx, LoadHeader(ctx, GsEmu::CompactBase), position));
+    gs.gsvs_base = LoadHeader(ctx, GsEmu::GsvsBase);
+    // The VGT's stream-out SGPRs of this wave: the vertices that fit, min(64, count - first)
+    // (the dispatch covers exactly ceil(count / 64) waves), stream 0; the write index is
+    // relative to the buffer offsets of the draw's start.
+    const Id first = ctx.OpBitwiseAnd(ctx.U32[1], g, ctx.ConstU32(~(GsEmu::WorkgroupSize - 1)));
+    const Id remaining = ctx.OpSelect(ctx.U32[1], ctx.OpULessThan(ctx.U1[1], first, count),
+                                      ctx.OpISub(ctx.U32[1], count, first), ctx.u32_zero_value);
+    const Id fit = ctx.OpUMin(ctx.U32[1], remaining, ctx.ConstU32(GsEmu::WorkgroupSize));
+    gs.so_config = ctx.OpShiftLeftLogical(ctx.U32[1], fit, ctx.ConstU32(16u));
+    gs.so_write_index = first;
+}
+
 /// GSVS record of output vertex `vertex` of this invocation's slot.
 Id GsvsDword(EmitContext& ctx, Id vertex_in_slot, u32 dword) {
     const u32 out_dwords = ctx.runtime_info.gs_vertex_dwords;
@@ -203,6 +231,11 @@ void DefineGsEmulationInterface(EmitContext& ctx) {
     auto& gs = ctx.gs;
     gs.global_invocation_id = ctx.DefineVariable(ctx.U32[3], spv::BuiltIn::GlobalInvocationId,
                                                  spv::StorageClass::Input);
+    if (ctx.runtime_info.gs_role == GsEmulationRole::CopyStreamOut) {
+        // The lane of an add_tid address (EmitBufferAddress) and the wave64 lowering.
+        ctx.local_invocation_index = ctx.DefineVariable(
+            ctx.U32[1], spv::BuiltIn::LocalInvocationIndex, spv::StorageClass::Input);
+    }
     if (ctx.runtime_info.gs_role == GsEmulationRole::GsCompute) {
         gs.emitted = PrivateU32(ctx, "gs_emitted");
         gs.run_pos = PrivateU32(ctx, "gs_run_pos");
@@ -235,6 +268,9 @@ void EmitGsEmulationPrologue(EmitContext& ctx) {
             ctx.OpStore(ctx.output_point_size, ctx.ConstF32(ctx.runtime_info.hw.vs.point_size));
         }
         break;
+    case GsEmulationRole::CopyStreamOut:
+        CopyStreamOutPrologue(ctx);
+        break;
     default:
         UNREACHABLE();
     }
@@ -262,9 +298,13 @@ std::optional<Id> GsEmulationGetAttribute(EmitContext& ctx, IR::Attribute attr, 
                        IAdd(ctx, IMul(ctx, record, ctx.ConstU32(stride)), ctx.ConstU32(dword)));
         break;
     }
-    case GsEmulationRole::CopyVertex: {
-        // GSVS record of the drawn vertex (the index runs name records directly).
-        const Id vertex = ctx.OpLoad(ctx.U32[1], ctx.vertex_index);
+    case GsEmulationRole::CopyVertex:
+    case GsEmulationRole::CopyStreamOut: {
+        // GSVS record of the drawn vertex (the index runs name records directly) or of the
+        // kernel lane's compacted vertex.
+        const Id vertex = role == GsEmulationRole::CopyVertex
+                              ? ctx.OpLoad(ctx.U32[1], ctx.vertex_index)
+                              : ctx.gs.so_vertex;
         address = IAdd(ctx, ctx.gs.gsvs_base,
                        IAdd(ctx, IMul(ctx, vertex, ctx.ConstU32(ctx.runtime_info.gs_vertex_dwords)),
                             ctx.ConstU32(dword)));
@@ -301,15 +341,57 @@ std::optional<Id> GsEmulationGetAttributeU32(EmitContext& ctx, IR::Attribute att
         default:
             UNREACHABLE_MSG("Geometry emulation: GS reads attribute {}", IR::NameOf(attr));
         }
+    case GsEmulationRole::CopyStreamOut:
+        switch (attr) {
+        case IR::Attribute::VertexId:
+            return ctx.gs.so_vertex;
+        case IR::Attribute::GsStreamOutConfig:
+            return ctx.gs.so_config;
+        case IR::Attribute::GsStreamOutWriteIndex:
+            return ctx.gs.so_write_index;
+        case IR::Attribute::GsStreamOutOffset0:
+        case IR::Attribute::GsStreamOutOffset1:
+        case IR::Attribute::GsStreamOutOffset2:
+        case IR::Attribute::GsStreamOutOffset3: {
+            const u32 buffer = static_cast<u32>(attr) -
+                               static_cast<u32>(IR::Attribute::GsStreamOutOffset0);
+            return LoadScratch(ctx, ctx.ConstU32(GsEmu::SoOffset0 + buffer));
+        }
+        case IR::Attribute::LocalInvocationIndex:
+            return std::nullopt;
+        default:
+            UNREACHABLE_MSG("Geometry emulation: copy stream-out kernel reads attribute {}",
+                            IR::NameOf(attr));
+        }
     default:
         return std::nullopt;
     }
+}
+
+std::optional<Id> GsEmulationGetAttributeU1(EmitContext& ctx, IR::Attribute attr) {
+    if (attr != IR::Attribute::GsStreamOutLaneValid) {
+        return std::nullopt;
+    }
+    ASSERT_MSG(ctx.runtime_info.gs_role == GsEmulationRole::CopyStreamOut,
+               "Geometry emulation: {} outside the copy stream-out kernel", IR::NameOf(attr));
+    return ctx.gs.so_lane_valid;
+}
+
+Id GsEmulationGuardAccess(EmitContext& ctx, Id predicate) {
+    if (ctx.runtime_info.gs_role != GsEmulationRole::CopyStreamOut) {
+        return predicate;
+    }
+    return ctx.OpLogicalAnd(ctx.U1[1], predicate, ctx.gs.so_lane_valid);
 }
 
 bool GsEmulationSetAttribute(EmitContext& ctx, IR::Attribute attr, Id value, u32 comp) {
     const auto role = ctx.runtime_info.gs_role;
     if (!IsGsComputeRole(ctx.runtime_info)) {
         return false;
+    }
+    if (role == GsEmulationRole::CopyStreamOut) {
+        // The draw (CopyVertex) exports; the kernel only writes stream-out.
+        return true;
     }
     ASSERT_MSG(attr == IR::Attribute::Position0 || IR::IsParam(attr),
                "Geometry emulation: {} writes attribute {}", u32(role), IR::NameOf(attr));

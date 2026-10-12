@@ -100,6 +100,11 @@ struct BufferResource {
     u32 post_op_dw1_mask{};
     // Structured accesses without index bounds may need bytes past the descriptor size.
     u64 required_binding_bytes{};
+    /// bbport (Apple): the stream-out buffer a CopyStreamOut kernel's stores through this
+    /// descriptor write (their binding is checked against its VGT size at record time), or
+    /// NoStreamOut.
+    static constexpr u8 NoStreamOut = 0xFF;
+    u8 stream_out_buffer = NoStreamOut;
 
     bool IsSpecial() const noexcept {
         return buffer_type != BufferType::Guest;

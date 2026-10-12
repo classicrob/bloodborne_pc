@@ -117,11 +117,21 @@ public:
     /// Evicts any images that overlap the unmapped range.
     void UnmapMemory(VAddr cpu_addr, size_t size);
 
+    /// bbport: the one way to make an image GPU-authoritative outside the binding paths
+    /// (FindRenderTarget, FindDepthTarget, storage FindTexture, which go through UpdateImage):
+    /// after a GPU write recorded on it (a clear, resolve, copy), marks it GpuModified and clean
+    /// and tracks its pages for guest CPU writes, as UpdateImage would, so that a later CPU write
+    /// marks it dirty before any write-back (SynchronizeMemoryFromImage) or refresh trusts it.
+    /// Its mip hashes describe the bytes before the write and are reset, so a later CPU-dirty
+    /// refresh uploads instead of matching an old hash.
+    void MarkGpuWritten(ImageId image_id);
+
 #ifdef __APPLE__
     /// bbport (frame capture, docs/macos/capture-replay.md): one record per GPU-modified image,
     /// read-only (nothing is written back). Call at a quiescent point
     /// (Rasterizer::QuiesceForCapture). Not const: the slot vector's const iteration is unusable.
     void ReportGpuModifiedForCapture(std::vector<CaptureImageRecord>& out);
+
 
     /// bbport (perf replay, capture_images.h): every GPU-modified image, texels and state, one
     /// at a time to `sink`, then the metadata surfaces. Call at a quiescent point

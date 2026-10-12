@@ -274,6 +274,9 @@ enum class GsEmulationRole : u8 {
     EsCompute,  ///< HwStage::Export as a compute shader
     GsCompute,  ///< HwStage::Geometry as a compute shader
     CopyVertex, ///< the copy shader (HwStage::Vertex) of a GS draw
+    /// The copy shader's stream-out, as a 64-wide compute kernel over the draw's compacted GSVS
+    /// vertices (one workgroup = one GCN wave; GS-DESIGN section 11.2).
+    CopyStreamOut,
 };
 
 /**
@@ -287,6 +290,12 @@ struct RuntimeInfo {
     GsEmulationRole gs_role;
     u32 gs_max_vert_out;  ///< GsCompute, CopyVertex: VGT_GS_MAX_VERT_OUT (the GSVS ring layout)
     u32 gs_vertex_dwords; ///< GsCompute, CopyVertex: dwords per GSVS vertex record
+    /// CopyVertex, CopyStreamOut of a stream-out draw: the copy shader's SO_BASEn_EN bits (bit n =
+    /// buffer n; equal to VGT_STRMOUT_BUFFER_CONFIG stream 0). After the user data come the
+    /// stream-out config, the write index and these buffers' base offsets in buffer order.
+    /// Nonzero only once GsEmulationUnsupported has found the stream-out buffer table at s[2:3]
+    /// in the copy shader's input usage slots (GsEmulation::SoTableAtS2).
+    u32 gs_so_buffers;
     struct Properties {
         AmdGpu::FpDenormMode fp_denorm_mode32;
         AmdGpu::FpDenormMode fp_denorm_mode16_64;
@@ -325,6 +334,7 @@ struct RuntimeInfo {
                gs_role == other.gs_role &&
                gs_max_vert_out == other.gs_max_vert_out &&
                gs_vertex_dwords == other.gs_vertex_dwords &&
+               gs_so_buffers == other.gs_so_buffers &&
                props == other.props && HasSameSwInfo(other.sw) && HasSameHwInfo(other.hw);
     }
 

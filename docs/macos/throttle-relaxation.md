@@ -16,7 +16,8 @@ The GpuIdle throttle's wait has been 70-96% of the frame at the clinic pose. Thi
 1. states what the throttle does now;
 2. lists what it still protects, assuming labels at GPU completion are the default
    (46fe3e6, `bb/macos-opus-pm4-labels-default`) and flips publish at GPU retirement
-   (toggle bit 60, merged);
+   (the default on the flip-default branch; toggle bit 60, FlipAtEnqueue, restores publishing
+   at enqueue);
 3. proposes a measurement (R0) and an **explicitly unsafe opt-in experiment** (R1), plus later
    steps;
 4. says how to measure them.
@@ -230,7 +231,8 @@ Only after R1/R2 evidence and the lifetime RE.
 ## 4. Evidence
 
 **Zero-error list.** Each of these must stay at zero:
-- CMD-INTERLEAVE outside the known movie race (run with `BB_MOVIE_HANDOFF=1`);
+- CMD-INTERLEAVE outside the known movie race (the attract video at title idle; the handoff
+  that was meant to remove it is falsified and removed, docs/macos/movie-handoff.md);
 - parser stops and guest faults (run C's GetProgram/SRT-walker fault in particular);
 - `BB_LABEL_CHECK` reports;
 - Playtest's corruption detector.
@@ -271,7 +273,7 @@ changes on that context's ranges, and with the GPU ticks in flight at the time.
 
 **Arms**, alternated live every 60 s (6+6 periods), with bits 59 and 60 on throughout:
 - R0 vs R1, at the clinic idle pose and on a short walking route;
-- title idle with `BB_MOVIE_HANDOFF=1`, so the movie race doesn't confound.
+- title idle, counting the movie race's CMD-INTERLEAVE separately.
 
 **Per half:**
 - FPS and frame-time p50/p95/p99;

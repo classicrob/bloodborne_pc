@@ -589,8 +589,7 @@ void Runtime::CopyDepthStencil(VideoCore::Image* src, VideoCore::Image* dst,
                          vk::ImageLayout::eTransferDstOptimal, region);
     });
 
-    dst->flags |= VideoCore::ImageFlagBits::GpuModified;
-    dst->flags &= ~VideoCore::ImageFlagBits::Dirty;
+    // The caller marks it GPU-written (TextureCache::MarkGpuWritten), which also tracks it.
 }
 
 void Runtime::ResolveImage(VideoCore::Image* src, VideoCore::Image* dst,
@@ -661,8 +660,7 @@ void Runtime::ResolveImage(VideoCore::Image* src, VideoCore::Image* dst,
         });
     }
 
-    dst->flags |= VideoCore::ImageFlagBits::GpuModified;
-    dst->flags &= ~VideoCore::ImageFlagBits::Dirty;
+    // The caller marks it GPU-written (TextureCache::MarkGpuWritten), which also tracks it.
 }
 
 void Runtime::ClearImage(VideoCore::Image* dst, const VideoCore::SubresourceRange& range,
@@ -689,8 +687,7 @@ void Runtime::ClearImage(VideoCore::Image* dst, const VideoCore::SubresourceRang
         cmdbuf.clearColorImage(image, vk::ImageLayout::eTransferDstOptimal, color, vk_range);
     });
 
-    dst->flags |= VideoCore::ImageFlagBits::GpuModified;
-    dst->flags &= ~VideoCore::ImageFlagBits::Dirty;
+    // The caller marks it GPU-written (TextureCache::MarkGpuWritten), which also tracks it.
 }
 
 void Runtime::SetBackingSamples(VideoCore::Image* image, u32 num_samples, bool copy_backing) {
@@ -859,7 +856,11 @@ void Runtime::FlushBarriers() {
     }
 
     BB_SPLIT_SCOPE(KBarrierFlush);
+#ifdef __APPLE__
+    scheduler.EndRenderingFor(BbPassCensus::Why::Barrier);
+#else
     scheduler.EndRendering();
+#endif
     scheduler.Record([memory = memory_barrier, has_memory = dep_info.memoryBarrierCount != 0,
                       images = scheduler.RecordData(std::span<const vk::ImageMemoryBarrier2>(
                           image_barriers.data(), image_barriers.size()))](vk::CommandBuffer cmdbuf) {

@@ -35,7 +35,7 @@ layout(push_constant) uniform Params {
 // Header (gs_emulation.h)
 const uint RecordsPerInstance = 0, PrimsPerInstance = 1, Instances = 2, IndexKindField = 3,
            BaseVertex = 4, BaseInstance = 5, FirstIndex = 6, EsgsBase = 7, GsvsBase = 8,
-           IndexBase = 9, CompactBase = 10, EsDispatch = 16, GsDispatch = 19, StripDraw = 22, IndirectDwords = 32;
+           IndexBase = 9, CompactBase = 10, EsDispatch = 16, GsDispatch = 19, StripDraw = 22, IndirectDwords = 48;
 // errors[]: [0] reports, [1] largest scratch dwords asked for, [2] index overruns,
 // [3..4] guest address of the last reported draw's arguments
 const uint WorkgroupSize = 64;

@@ -233,7 +233,8 @@ struct Info : InfoPersistent {
         // A read through a user-data pointer (a descriptor table): where it lies relative to
         // the submitted command memory (BB_CMD_DATA_CHECK).
         if (ptr_index != IR::NumScalarRegs && BbCmdData::Enabled()) [[unlikely]] {
-            BbCmdData::NoteRead("ud table", pgm_hash, base + dword_offset, sizeof(T), &data);
+            BbCmdData::NoteRead("ud table", pgm_hash, base + dword_offset, sizeof(T), &data,
+                                &ud[ptr_index]);
         }
 #endif
         return data;

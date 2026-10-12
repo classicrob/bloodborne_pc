@@ -7,7 +7,7 @@
 
 namespace Shader::Backend::SPIRV {
 
-/// EsCompute and GsCompute are emitted as GLCompute shaders.
+/// EsCompute, GsCompute and CopyStreamOut are emitted as GLCompute shaders.
 bool IsGsComputeRole(const RuntimeInfo& runtime_info);
 
 /// Stage interface of the compute roles (replaces the vertex/geometry inputs and outputs).
@@ -24,7 +24,12 @@ std::optional<Id> GsEmulationGetAttribute(EmitContext& ctx, IR::Attribute attr, 
                                           u32 index);
 /// System values of the compute roles; nullopt without a compute role.
 std::optional<Id> GsEmulationGetAttributeU32(EmitContext& ctx, IR::Attribute attr);
-/// Ring record writes of the compute roles; false without one.
+/// CopyStreamOut's lane-valid bit; nullopt for other attributes.
+std::optional<Id> GsEmulationGetAttributeU1(EmitContext& ctx, IR::Attribute attr);
+/// A guest memory access predicate of this role: CopyStreamOut lanes the VGT would not launch
+/// access nothing.
+Id GsEmulationGuardAccess(EmitContext& ctx, Id predicate);
+/// Ring record writes of the compute roles (CopyStreamOut: exports dropped); false without one.
 bool GsEmulationSetAttribute(EmitContext& ctx, IR::Attribute attr, Id value, u32 comp);
 /// GsCompute s_sendmsg gs emit / cut.
 void GsEmulationEmitVertex(EmitContext& ctx);

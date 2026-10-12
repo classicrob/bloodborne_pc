@@ -126,6 +126,8 @@ void Translator::EmitScalarAlu(const GcnInst& inst) {
             return S_BITSET_B64(inst, 1);
         case Opcode::S_AND_SAVEEXEC_B64:
             return S_SAVEEXEC_B64(NegateMode::None, false, inst);
+        case Opcode::S_OR_SAVEEXEC_B64: // GS copy shaders' stream-out epilogue
+            return S_SAVEEXEC_B64(NegateMode::None, true, inst);
         case Opcode::S_ORN2_SAVEEXEC_B64:
             return S_SAVEEXEC_B64(NegateMode::Src1, true, inst);
         case Opcode::S_ABS_I32:
