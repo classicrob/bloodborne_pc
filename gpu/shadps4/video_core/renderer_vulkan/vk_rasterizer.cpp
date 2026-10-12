@@ -1246,6 +1246,9 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
         (regs.num_indices > 6 || regs.num_instances.NumInstances() > 1)) {
         draw_jitter = upscaler->Jitter();
     }
+    if (gbuffer_draw) {
+        camera_motion->OnGBufferViewport(SceneViewport());
+    }
     UpdateDynamicState(pipeline, is_indexed);
     MarkPass(pipeline, state);
     scheduler.BeginRendering(state);
@@ -1486,6 +1489,9 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
     draw_jitter = {};
     if (upscaler->Enabled() && db_desc.first && db_desc.first == camera_motion->Depth()) {
         draw_jitter = upscaler->Jitter();
+    }
+    if (gbuffer_draw) {
+        camera_motion->OnGBufferViewport(SceneViewport());
     }
     UpdateDynamicState(pipeline, is_indexed);
     MarkPass(pipeline, state);
@@ -3852,6 +3858,26 @@ void Rasterizer::UpdateDynamicState(const GraphicsPipeline* pipeline, const bool
                              instance.IsDynamicColorWriteMaskSupported(),
                              instance.IsAttachmentFeedbackLoopLayoutSupported(),
                              [&](auto&& command) { scheduler.Record(std::move(command)); });
+}
+
+std::optional<std::array<float, 4>> Rasterizer::SceneViewport() const {
+    const auto& regs = Regs();
+    const auto& vp_ctl = regs.viewport_control;
+    const auto& vp = regs.viewports[0];
+    if (regs.IsClipDisabled() || vp.xscale == 0) {
+        return std::nullopt;
+    }
+    const float xoffset = vp_ctl.xoffset_enable ? vp.xoffset : 0.f;
+    const float xscale = vp_ctl.xscale_enable ? vp.xscale : 1.f;
+    const float yoffset = vp_ctl.yoffset_enable ? vp.yoffset : 0.f;
+    const float yscale = vp_ctl.yscale_enable ? vp.yscale : 1.f;
+    if (yscale == 0) {
+        return std::nullopt;
+    }
+    // Host viewport x = (xoffset - xscale) * target_scale + jitter, width 2 * xscale *
+    // target_scale: pixel = xoffset * target_scale + ndc * xscale * target_scale + jitter.
+    return std::array<float, 4>{xscale * target_scale[0], yscale * target_scale[1],
+                                xoffset * target_scale[0], yoffset * target_scale[1]};
 }
 
 void Rasterizer::UpdateViewportScissorState() const {

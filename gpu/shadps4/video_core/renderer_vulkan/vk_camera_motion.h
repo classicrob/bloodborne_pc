@@ -6,6 +6,7 @@
 #pragma once
 
 #include <array>
+#include <optional>
 #include <vector>
 
 #include "common/types.h"
@@ -48,6 +49,8 @@ public:
         u32 mode = 0;              ///< 1: object vectors merged in; 0: camera vectors only
         bool camera_only = false;  ///< BB_MOTION_CAMERA_ONLY
         bool object_valid = false; ///< an object motion image was available
+        std::array<float, 4> viewport{};      ///< current scene viewport (see Viewport)
+        std::array<float, 4> prev_viewport{}; ///< previous frame's
     };
     [[nodiscard]] MotionRecord LastRecord() const noexcept {
         return last_record;
@@ -57,9 +60,10 @@ public:
         return debug_overlay || for_upscaler;
     }
 
-    /// Both cameras and the scene depth of the current frame are known.
+    /// Both cameras, their scene viewports and the scene depth of the current frame are known.
     [[nodiscard]] bool Ready() const noexcept {
-        return current.valid && previous.valid && depth_id;
+        return current.valid && previous.valid && current.viewport_valid &&
+               previous.viewport_valid && depth_id;
     }
     [[nodiscard]] VideoCore::ImageId Depth() const noexcept {
         return depth_id;
@@ -72,8 +76,9 @@ public:
     /// Vertical field of view and near/far planes of the current camera.
     [[nodiscard]] float VerticalFov() const noexcept;
     [[nodiscard]] float Near() const noexcept;
-    // Current projection, previous projection, and row Z of previous-view * inverse-view.
-    [[nodiscard]] std::array<std::array<float, 4>, 3> TaaDepthParameters() const noexcept;
+    // Current projection, previous projection, row Z of previous-view * inverse-view, and the
+    // current scene viewport.
+    [[nodiscard]] std::array<std::array<float, 4>, 4> TaaDepthParameters() const noexcept;
 
     /// Records the motion vector pass: `depth_view` (depth aspect, General layout) into
     /// `motion_view` (RG16F storage, General), pixels, previous minus current.
@@ -86,6 +91,13 @@ public:
     /// The G-buffer pass (5+ color targets): its depth is the scene depth.
     void OnGBufferPass(VideoCore::ImageId depth);
 
+    /// A G-buffer draw's effective viewport in render pixels, without the upscaler's jitter:
+    /// pixel = offset + ndc * scale, as {x scale, y scale, x offset, y offset}, signs as the game
+    /// set them; nullopt when the draw has none (clip disabled, a zero scale). The camera motion
+    /// inverts the first one of the frame (the object vectors use the same mapping).
+    using Viewport = std::array<float, 4>;
+    void OnGBufferViewport(const std::optional<Viewport>& viewport);
+
     /// The pass copying the finished frame (`frame`, the last target drawn) to the display: the
     /// frame's depth and camera are complete. Records the debug overlay, starts a new frame.
     void OnDisplayPass(VideoCore::ImageId frame);
@@ -96,6 +108,8 @@ private:
         std::array<float, 12> inv_view{}; ///< view to world, 3x4 rows
         std::array<float, 4> proj{};      ///< x scale, y scale, z scale, z offset
         bool valid = false;
+        Viewport viewport{}; ///< the frame's scene pass viewport (OnGBufferViewport)
+        bool viewport_valid = false;
     };
 
     void Overlay(VideoCore::ImageId frame);

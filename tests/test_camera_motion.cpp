@@ -1,11 +1,15 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Execute production camera motion SPIR-V: distant geometry, sky, stale object vectors, and
-// vertical motion (pitch, vertical translation) against a reference projection.
+// vertical motion (pitch, vertical translation) against a reference that inverts the scene
+// viewport (pixel = offset + ndc * scale), for both y signs, an offset and scaled viewport, and a
+// previous viewport that differs from the current one.
 #include <array>
 #include <cassert>
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <string>
+#include <tuple>
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/texture_cache/image.h"
@@ -44,10 +48,13 @@ int main() {
         .bindingCount=3,.pBindings=bindings.data()},nullptr,d).value;
     struct Params {
         std::array<float,12> reproject;
-        std::array<float,4> proj,prev_proj;
+        std::array<float,4> proj,prev_proj,viewport,prev_viewport;
         std::array<float,2> size,jitter,previous_jitter;
         u32 mode;
     };
+    static_assert(sizeof(Params)==140); // over 128: the device must offer it (CameraMotion)
+    assert(instance.GetPhysicalDevice().getProperties().limits.maxPushConstantsSize>=
+           sizeof(Params));
     const vk::PushConstantRange push{vk::ShaderStageFlagBits::eCompute,0,sizeof(Params)};
     auto layout=device.createPipelineLayoutUnique({.setLayoutCount=1,.pSetLayouts=&*descriptors,
         .pushConstantRangeCount=1,.pPushConstantRanges=&push},nullptr,d).value;
@@ -70,24 +77,30 @@ int main() {
                                   .dstStageMask=dst,.dstAccessMask=dst_access};
         cmd.pipelineBarrier2({.memoryBarrierCount=1,.pMemoryBarriers=&b},d);
     };
-    // Reference projection, written independently of the shader: the game's view space has +x
-    // right and +y DOWN the screen (pixel rows), Vulkan-style: pixel = (ndc * 0.5 + 0.5) * size,
-    // ndc = proj.xy * view.xy / view.z; view z from depth = proj.z + proj.w / z.
-    const auto reference_motion=[&](u32 px,u32 py,float depth,const std::array<float,12>& r) {
+    using Viewport=std::array<float,4>; // x scale, y scale, x offset, y offset (pixels)
+    // The full frame with view +y down the rows, and with +y up (a negative y scale).
+    const Viewport down{W/2.f,H/2.f,W/2.f,H/2.f}, up{W/2.f,-H/2.f,W/2.f,H/2.f};
+    // Reference, from the viewport contract only: pixel = offset + ndc * scale (Vulkan's viewport
+    // transform, as the rasterizer sets it from the game's registers); ndc = proj.xy * view.xy /
+    // view.z; view z from depth = proj.z + proj.w / z. Pixel centres, jitter removed.
+    const auto reference_motion=[&](u32 px,u32 py,float depth,const std::array<float,12>& r,
+                                    const Viewport& vp,const Viewport& prev_vp) {
         const float proj_x=1,proj_y=1,proj_z=1,proj_w=-0.05f;
-        const float u=(px+0.5f)/W,v=(py+0.5f)/H;
+        const float pos_x=px+0.5f,pos_y=py+0.5f;
         const float z=proj_w/(depth-proj_z);
-        const float x=(u*2-1)*z/proj_x,y=(v*2-1)*z/proj_y;
+        const float x=(pos_x-vp[2])/vp[0]*z/proj_x,y=(pos_y-vp[3])/vp[1]*z/proj_y;
         const float prev[3]={r[0]*x+r[1]*y+r[2]*z+r[3],r[4]*x+r[5]*y+r[6]*z+r[7],
                              r[8]*x+r[9]*y+r[10]*z+r[11]};
-        const float prev_u=(prev[0]*proj_x/prev[2])*0.5f+0.5f;
-        const float prev_v=(prev[1]*proj_y/prev[2])*0.5f+0.5f;
-        return std::array<float,2>{(prev_u-u)*W,(prev_v-v)*H};
+        const float prev_x=prev_vp[2]+prev[0]*proj_x/prev[2]*prev_vp[0];
+        const float prev_y=prev_vp[3]+prev[1]*proj_y/prev[2]*prev_vp[1];
+        return std::array<float,2>{prev_x-pos_x,prev_y-pos_y};
     };
     const auto run=[&](const char* label,float depth,float translation,float rotation,
                        float object_depth,u32 mode,float expected,bool jitter=false,
                        float rotation_y=0,float translation_y=0,float expected_y=0,
-                       const std::array<float,12>* reproject=nullptr,u32 py=3) {
+                       const std::array<float,12>* reproject=nullptr,u32 py=3,
+                       const Viewport& viewport=Viewport{W/2.f,H/2.f,W/2.f,H/2.f},
+                       const Viewport* prev_viewport=nullptr) {
         auto* pixels=static_cast<float*>(ai.pMappedData);
         for (u32 p=0;p<N;++p) {
             pixels[p*4]=depth;
@@ -119,7 +132,7 @@ int main() {
         }
         Params params{reproject ? *reproject :
             std::array<float,12>{1,0,rotation,translation,0,1,rotation_y,translation_y,0,0,1,0},
-            {1,1,1,-0.05f},{1,1,1,-0.05f},{W,H},
+            {1,1,1,-0.05f},{1,1,1,-0.05f},viewport,prev_viewport ? *prev_viewport : viewport,{W,H},
             {jitter ? 0.37f : 0.f,jitter ? -0.29f : 0.f},{0,0},mode};
         cmd.bindPipeline(vk::PipelineBindPoint::eCompute,*pipeline,d);
         cmd.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute,*layout,0,writes,d);
@@ -143,7 +156,7 @@ int main() {
         std::printf("Camera motion: %s measured (%.5f, %.5f), expected (%.5f, %.5f)\n",label,
                     half(result[0]),half(result[1]),expected,expected_y);
         std::fflush(stdout);
-        assert(std::abs(half(result[0])-expected)<0.002f);
+        assert(std::abs(half(result[0])-expected)<std::max(0.002f,std::abs(expected)*0.002f));
         assert(std::abs(half(result[1])-expected_y)<std::max(0.002f,std::abs(expected_y)*0.002f));
         std::printf("Camera motion: %s PASS (%.5f, %.5f)\n",label,half(result[0]),
                     half(result[1]));
@@ -155,36 +168,49 @@ int main() {
     run("static camera cancels jitter",distant,0,0,0,0,0,true);
     run("matching object vector",distant,0,0,distant,1,2);
     run("stale distant object vector",distant,0,0,0.9999f,1,0);
-    // Vertical motion: the sampled pixel (4,3) is the image centre, so the old y-up convention
-    // gives the opposite sign of the reference and fails these. View y' = y + pitch * z, or
-    // y + translation (both down the screen in the reference).
+    // Vertical motion, for each y sign of the viewport. Each case asserts that the other sign
+    // (or, for the offset viewport, the full-frame mapping) predicts a clearly different motion,
+    // so a shader that ignores the viewport's sign, offset or scale fails it. View y' = y +
+    // pitch * z, or y + translation.
     const float near=0.99f; // view z 5 (not sky: the reference uses a finite z)
-    {
-        const std::array<float,12> pitch{1,0,0,0,0,1,0.2f,0,0,0,1,0};
-        const auto expected=reference_motion(4,3,near,pitch);
-        assert(std::abs(expected[1])>0.1f); // a real vertical move, rows down
-        run("camera pitch moves rows",near,0,0,0,0,expected[0],false,0.2f,0,expected[1]);
-    }
-    {
-        const std::array<float,12> lift{1,0,0,0,0,1,0,0.5f,0,0,1,0};
-        const auto expected=reference_motion(4,3,near,lift);
-        assert(std::abs(expected[1])>0.1f);
-        run("vertical translation moves rows",near,0,0,0,0,expected[0],false,0,0.5f,expected[1]);
-    }
+    const auto vertical=[&](const char* label,const std::array<float,12>& r,u32 py,
+                            const Viewport& vp,const Viewport& other,
+                            const Viewport* prev_vp=nullptr) {
+        const auto expected=reference_motion(4,py,near,r,vp,prev_vp ? *prev_vp : vp);
+        const auto wrong=reference_motion(4,py,near,r,other,prev_vp ? *prev_vp : other);
+        std::printf("Camera motion: %s expects (%.5f, %.5f); the other mapping (%.5f, %.5f)\n",
+                    label,expected[0],expected[1],wrong[0],wrong[1]);
+        assert(std::abs(expected[0]-wrong[0])+std::abs(expected[1]-wrong[1])>0.1f);
+        run(label,near,0,0,0,0,expected[0],false,0,0,expected[1],&r,py,vp,prev_vp);
+    };
+    const std::array<float,12> pitch{1,0,0,0,0,1,0.2f,0,0,0,1,0};
+    const std::array<float,12> lift{1,0,0,0,0,1,0,0.5f,0,0,1,0};
     // Off-centre (row 1: view y != 0), view y feeding the previous x and z: the reconstruction's
-    // y sign matters on its own here, not only together with the projection's (at the centre
-    // row y is 0 and only the projection sign shows).
-    {
-        const std::array<float,12> y_to_xz{1,0.3f,0,0,0,1,0,0,0,0.5f,1,0};
-        const auto expected=reference_motion(4,1,near,y_to_xz);
-        assert(std::abs(expected[0])>0.05f && std::abs(expected[1])>0.05f);
-        run("off-centre: view y moves x and depth",near,0,0,0,0,expected[0],false,0,0,
-            expected[1],&y_to_xz,1);
+    // y sign matters on its own here, not only together with the projection's.
+    const std::array<float,12> y_to_xz{1,0.3f,0,0,0,1,0,0,0,0.5f,1,0};
+    for (const auto& [name,vp,other] : {std::tuple{"y down",down,up},
+                                        std::tuple{"y up",up,down}}) {
+        const std::string n{name};
+        vertical((n+": camera pitch moves rows").c_str(),pitch,3,vp,other);
+        vertical((n+": vertical translation moves rows").c_str(),lift,3,vp,other);
+        vertical((n+", off-centre: view y moves x and depth").c_str(),y_to_xz,1,vp,other);
+        vertical((n+", off-centre: camera pitch").c_str(),pitch,1,vp,other);
     }
+    // Neither centred nor full-frame, y up (a sub-rectangle of the target, rows 1 to 6, scaled).
+    const Viewport sub{3.f,-2.5f,5.f,3.5f};
+    vertical("offset, scaled viewport: camera pitch",pitch,1,sub,up);
+    vertical("offset, scaled viewport: view y moves x and depth",y_to_xz,1,sub,up);
+    // The previous frame's viewport projects the previous position (moved by a pixel here, with
+    // the camera still): a shader projecting with the current viewport gives zero.
     {
-        const std::array<float,12> pitch{1,0,0,0,0,1,0.2f,0,0,0,1,0};
-        const auto expected=reference_motion(4,1,near,pitch);
-        run("off-centre: camera pitch",near,0,0,0,0,expected[0],false,0,0,expected[1],&pitch,1);
+        const std::array<float,12> still{1,0,0,0,0,1,0,0,0,0,1,0};
+        const Viewport moved{sub[0],sub[1],sub[2]+1.f,sub[3]-1.f};
+        const auto expected=reference_motion(4,1,near,still,sub,moved);
+        assert(std::abs(expected[0]-1.f)<1e-5f && std::abs(expected[1]+1.f)<1e-5f);
+        run("previous viewport projects the previous position",near,0,0,0,0,expected[0],false,0,0,
+            expected[1],&still,1,sub,&moved);
     }
+    // Jitter cancels with an offset viewport too (static camera).
+    run("static camera cancels jitter, offset viewport",distant,0,0,0,0,0,true,0,0,0,nullptr,1,sub);
     vmaDestroyBuffer(instance.GetAllocator(),staging,allocation);
 }

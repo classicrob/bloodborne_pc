@@ -7,6 +7,7 @@
 #include <cstring>
 
 #include "bbport_toggles.h"
+#include "common/assert.h"
 
 #include "video_core/host_shaders/camera_motion_comp.h"
 #include "video_core/host_shaders/camera_motion_debug_comp.h"
@@ -25,6 +26,8 @@ struct PushConstants {
     std::array<float, 12> reproject;
     std::array<float, 4> proj;
     std::array<float, 4> prev_proj;
+    std::array<float, 4> viewport;
+    std::array<float, 4> prev_viewport;
     std::array<float, 2> size;
     std::array<float, 2> jitter;
     std::array<float, 2> previous_jitter;
@@ -64,6 +67,11 @@ CameraMotion::CameraMotion(const Instance& instance_, Scheduler& scheduler_,
     // unless BB_UPSCALER=none.
     for_upscaler = !(upscaler && std::strcmp(upscaler, "none") == 0);
     const auto device = instance.GetDevice();
+    // Above Vulkan's guaranteed 128 bytes (the two scene viewports).
+    const u32 max_push = instance.GetPhysicalDevice().getProperties().limits.maxPushConstantsSize;
+    ASSERT_MSG(max_push >= sizeof(PushConstants),
+               "camera motion needs {} bytes of push constants, the device offers {}",
+               sizeof(PushConstants), max_push);
     if (for_upscaler) {
         const std::array<vk::DescriptorSetLayoutBinding, 3> motion_bindings = {{
             {.binding = 0,
@@ -167,10 +175,10 @@ float CameraMotion::Near() const noexcept {
     return -current.proj[3] / current.proj[2];
 }
 
-std::array<std::array<float, 4>, 3> CameraMotion::TaaDepthParameters() const noexcept {
+std::array<std::array<float, 4>, 4> CameraMotion::TaaDepthParameters() const noexcept {
     const auto transform = Multiply(previous.view, current.inv_view);
     return {current.proj, previous.proj,
-            {transform[8], transform[9], transform[10], transform[11]}};
+            {transform[8], transform[9], transform[10], transform[11]}, current.viewport};
 }
 
 vk::ImageView CameraMotion::ObjectMotionView() const noexcept {
@@ -191,6 +199,8 @@ void CameraMotion::RecordMotion(vk::CommandBuffer cmdbuf, vk::ImageView depth_vi
         .reproject = Multiply(previous.view, current.inv_view),
         .proj = current.proj,
         .prev_proj = previous.proj,
+        .viewport = current.viewport,
+        .prev_viewport = previous.viewport,
         .size = {float(width), float(height)},
         .jitter = jitter,
         .previous_jitter = previous_jitter,
@@ -199,7 +209,8 @@ void CameraMotion::RecordMotion(vk::CommandBuffer cmdbuf, vk::ImageView depth_vi
         // (tools/macos/motion_agree.py). The upscaler then sees no object vectors.
         .mode = object_valid && !camera_only ? 1u : 0u,
     };
-    last_record = {push.proj[2], push.mode, camera_only, object_valid};
+    last_record = {push.proj[2], push.mode, camera_only, object_valid, push.viewport,
+                   push.prev_viewport};
     const vk::DescriptorImageInfo depth_info{.imageView = depth_view,
                                              .imageLayout = vk::ImageLayout::eGeneral};
     const vk::DescriptorImageInfo motion_info{.imageView = motion_view,
@@ -242,6 +253,7 @@ void CameraMotion::OnConstants(const float* data) {
     std::memcpy(current.inv_view.data(), data + 180, 12 * sizeof(float));
     current.proj = {data[52], data[57], data[62], data[63]};
     current.valid = current.proj[0] != 0.0f && current.proj[1] != 0.0f;
+    current.viewport_valid = false; // this frame's comes with its G-buffer pass
     const std::array<u32, 2> size{u32(data[4]), u32(data[5])};
     if (size != render_size) {
         std::printf("Camera motion: scene render size %ux%u\n", size[0], size[1]);
@@ -252,6 +264,37 @@ void CameraMotion::OnConstants(const float* data) {
 
 void CameraMotion::OnGBufferPass(VideoCore::ImageId depth) {
     depth_id = depth;
+}
+
+void CameraMotion::OnGBufferViewport(const std::optional<Viewport>& viewport) {
+    if (!viewport) {
+        static bool reported = false;
+        if (!reported) {
+            reported = true;
+            std::printf("Camera motion: a G-buffer draw has no usable viewport (clip disabled or "
+                        "a zero scale): no camera motion for its frame\n");
+        }
+        if (!current.viewport_valid) {
+            current.viewport = {};
+        }
+        return;
+    }
+    if (!current.viewport_valid) {
+        current.viewport = *viewport;
+        current.viewport_valid = true;
+        return;
+    }
+    if (*viewport != current.viewport) {
+        static bool reported = false;
+        if (!reported) {
+            reported = true;
+            const auto& v = *viewport;
+            const auto& c = current.viewport;
+            std::printf("Camera motion: G-buffer draws of one frame use different viewports "
+                        "(%g %g %g %g, first %g %g %g %g): the first is inverted\n",
+                        v[0], v[1], v[2], v[3], c[0], c[1], c[2], c[3]);
+        }
+    }
 }
 
 void CameraMotion::OnDisplayPass(VideoCore::ImageId frame) {
@@ -307,6 +350,8 @@ void CameraMotion::Overlay(VideoCore::ImageId frame) {
         .reproject = Multiply(previous.view, current.inv_view),
         .proj = current.proj,
         .prev_proj = previous.proj,
+        .viewport = current.viewport,
+        .prev_viewport = previous.viewport,
         .size = {float(color.info.size.width), float(color.info.size.height)},
         .jitter = jitter,
         .previous_jitter = previous_jitter,

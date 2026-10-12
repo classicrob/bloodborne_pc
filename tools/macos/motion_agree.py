@@ -139,10 +139,15 @@ def main():
                 ok = med[0] <= args.max_median and med[1] <= args.max_median
                 disagree += 0 if ok else 1
                 verdict = 'AGREE' if ok else 'DISAGREE'
+            # The scene viewports the camera vectors inverted (x/y scale, x/y offset), if the
+            # build records them.
+            viewports = (f'; viewport {meta["viewport"]} previous {meta["prev_viewport"]}'
+                         if 'viewport' in meta and 'prev_viewport' in meta
+                         else '; viewport not recorded (older build)')
             print(f'{prefix}: {count} px, object |dy| median {vertical:.2f}; |dx| median '
                   f'{med[0]:.3f} p90 {p90[0]:.3f}, |dy| median {med[1]:.3f} p90 {p90[1]:.3f}; '
-                  f'within 0.25 px {within:.1%}; camera y sign = object y sign {sign_agree:.1%}: '
-                  f'{verdict}')
+                  f'within 0.25 px {within:.1%}; camera y sign = object y sign {sign_agree:.1%}'
+                  f'{viewports}: {verdict}')
     except Unusable as error:
         print(f'unusable: {error}')
         return 3

@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <optional>
 #include "common/recursive_lock.h"
 #ifdef __APPLE__
 #include <condition_variable>
@@ -282,6 +283,10 @@ private:
 
     void UpdateDynamicState(const GraphicsPipeline* pipeline, bool is_indexed) const;
     void UpdateViewportScissorState() const;
+    /// bbport: viewport 0 as UpdateViewportScissorState maps it, in render pixels without the
+    /// upscaler's jitter ({x scale, y scale, x offset, y offset}); nullopt with clipping disabled
+    /// or a zero scale (CameraMotion::OnGBufferViewport).
+    std::optional<std::array<float, 4>> SceneViewport() const;
     void UpdateDepthStencilState() const;
     void UpdatePrimitiveState(bool is_indexed) const;
     void UpdateRasterizationState() const;

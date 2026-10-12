@@ -21,6 +21,11 @@ layout(push_constant) uniform Constants {
     vec4 reproject[3]; // previous view * inverse current view, rows (3x4)
     vec4 proj;         // current: x scale, y scale, z scale, z offset
     vec4 prev_proj;    // previous: x scale, y scale, z scale, z offset
+    // The scene (G-buffer) pass's effective viewport in render pixels, without jitter:
+    // pixel = offset + ndc * scale (x scale, y scale, x offset, y offset). Its signs are the
+    // game's: a negative y scale puts ndc +y up the screen. Current and previous frame.
+    vec4 viewport;
+    vec4 prev_viewport;
     vec2 size;         // pixels
     vec2 jitter;       // current viewport shift in render pixels (x right, y down)
     vec2 previous_jitter;
@@ -34,15 +39,15 @@ void main() {
         return;
     }
     const float depth = texelFetch(depth_tex, pixel, 0).r;
-    const vec2 uv = (vec2(pixel) + 0.5) / size;
-    // Depth was rasterised through a shifted viewport. Reconstruct its unjittered
-    // position, and keep jitter out of FSR's motion vectors (as for the object vectors).
-    const vec2 scene_uv = uv - jitter / size;
-    // bbport: view +y maps DOWN the screen (pixel rows), as upstream measured (ARM_bloodborne_pc
-    // 2026-10-06: against the GPU's own object vectors on static meshes, 13 frames up the
-    // Cathedral Ward stairs, within 0.05 px; y up was 1.3-3.7 px off, in pitch and vertical
-    // movement: FSR streaks or blur on stairs). Horizontal motion is the same either way.
-    const vec2 ndc = vec2(scene_uv.x * 2.0 - 1.0, scene_uv.y * 2.0 - 1.0);
+    // Depth was rasterised through a shifted viewport. Reconstruct its unjittered position,
+    // and keep jitter out of FSR's motion vectors (as for the object vectors).
+    const vec2 position = vec2(pixel) + 0.5 - jitter;
+    // bbport: invert the scene pass's own viewport (x and y, scale and offset), as the object
+    // vectors use it. Supersedes a fixed convention (uv * 2 - 1, "view +y down", upstream
+    // 2026-10-06; before it 1 - 2v): which one is right depends on the sign of the game's
+    // viewport y scale, which a fixed convention can only match in some scenes
+    // (docs/upscaler.md, camera motion).
+    const vec2 ndc = (position - viewport.zw) / viewport.xy;
 
     // Clip z = zs * z + zo, w = z; depth = zs + zo / z (zo < 0, depth < zs in front).
     const bool sky = depth >= 1.0;
@@ -55,14 +60,14 @@ void main() {
         vec3(dot(reproject[0], view), dot(reproject[1], view), dot(reproject[2], view));
     const vec2 prev_ndc =
         vec2(prev_view.x * prev_proj.x, prev_view.y * prev_proj.y) / max(prev_view.z, 1e-4);
-    const vec2 prev_uv = prev_ndc * 0.5 + 0.5;
-    const vec2 motion = (prev_uv - scene_uv) * size;
+    const vec2 prev_position = prev_viewport.zw + prev_ndc * prev_viewport.xy;
+    const vec2 motion = prev_position - position;
 
 #ifdef DEBUG_OVERLAY
     const vec4 current = imageLoad(color_img, pixel);
     next_frame[pixel.y * int(size.x) + pixel.x] = packUnorm4x8(current);
     if (mode == 3 || mode == 4) {
-        const ivec2 prev_pixel = ivec2(floor(uv * size + motion + previous_jitter - jitter));
+        const ivec2 prev_pixel = ivec2(floor(vec2(pixel) + 0.5 + motion + previous_jitter - jitter));
         vec4 prev = vec4(0.0, 0.0, 0.0, 1.0);
         if (all(greaterThanEqual(prev_pixel, ivec2(0))) && all(lessThan(prev_pixel, ivec2(size)))) {
             prev = unpackUnorm4x8(prev_frame[prev_pixel.y * int(size.x) + prev_pixel.x]);
