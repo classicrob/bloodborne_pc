@@ -120,6 +120,13 @@ The stop line also says:
     latest write into graphics user data (queue, SH offset, words, first value).
   - The first 8 of each kind are logged as they happen, and a "Compute SET_SH_REG" summary line
     is printed every 600 frame ends once any occurred.
+- **for a descriptor from the flattened buffer (with `BB_CMD_DATA_CHECK=1`)**, where nothing
+  read is instrumented, because the SRT walker reads tables through user-data pointers:
+  - the source of each descriptor dword (immediate, user data sN, or walker dword k) and s0..s15;
+  - each user-data word's last tracked SET_SH_REG writer and its age in flips;
+  - for each pointer-like pair (a 48-bit address), the mapping holding it now.
+  The walker's own table offsets come from the shader (Sol-2's traces); for vs 0x9da6aacb the
+  bad descriptor is walker dwords 36..39 = s[6:7] + dwords 0..3.
 - **where the read lies at the stop:** the guest mapping holding it, `[start, end)` and size, or
   the unmapped gap, and how many other guest mappings view the same backing. These come from
   runtime_memory's mapping table, a query and not a guest memory read. Stop hunt #1 found every
