@@ -11,6 +11,12 @@ fresh-process Continue **PASS** for the edited Dream fixture. Runs in its
 `parent`. This is location/save acceptance, not played-through progression.
 Weapons were not obtained; lamps and clinic events remain unverified.
 
+PREVIEW-25 `20261011-233235-1080p-DREAM-3-weapons` loads this fixture cleanly
+again. Playtest revisited the headstone and a nearby small gravestone, waiting
+25 seconds, but did not reach the workshop stairs. No weapon was obtained.
+That does not test the identified workshop-approach gift interaction or
+establish that its completion flags are set.
+
 ## Gift gates: retry the identified interaction before editing flags
 
 The vanilla event reconstruction and its named entity definitions identify:

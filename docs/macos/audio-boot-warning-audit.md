@@ -56,16 +56,26 @@ the next has 938 buffers and zero empty observations. This is recoverable
 queue starvation, not a latched audio shutdown. Those gaps were measured in
 an earlier run and cannot be assigned to the new Dream warning.
 
+The PREVIEW-25 Dream revisit, `20261011-233235-1080p-DREAM-3-weapons`,
+does enable `BB_AUDIO_STATS=1`. Reading its log gives 45 port-0 windows,
+845–944 buffers per nominal five seconds, maximum gap 119.79 ms, and two
+windows with an empty input queue (one observation each). Submission
+continues after the boot warning through the Dream visit. These are producer
+and input-queue measurements, not listening or device-output measurements.
+The stats sample the queue before pacing; the health warning samples it after
+pacing, so their empty-observation counts need not coincide. Also, a stats
+window ends on the first call at least five seconds later; its printed
+"/5s" is not an exact elapsed-time denominator.
+
 All run names above are under Playtest worktree
 `thr_8wif2jice3-1/bloodborne_pc/out/macos_route/`. No new game was launched.
 
 ## Next qualification and diagnostic wording
 
-Playtest has been asked to add `BB_AUDIO_STATS=1` to a future ordinary
-correctness run, retaining windows from boot through gameplay; no extra slot
-was requested. That establishes submission continuity and repeated empty
+The Dream revisit establishes submission continuity and repeated empty
 observations. The user's listening check is still needed for audibility,
-crackle/gaps and channel balance.
+crackle/gaps and channel balance. The next source-based experiment is the
+[audio thread QoS comparison](audio-thread-qos.md).
 
 Recommended diagnostic-only follow-up: name the line an input-queue/silence
 observation rather than a device “FAILURE”, print actual elapsed port time
