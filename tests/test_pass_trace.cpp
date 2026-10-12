@@ -26,7 +26,7 @@ struct State {
     std::uint32_t width = 100, height = 100, num_layers = 1;
 };
 
-constexpr std::uint64_t ColorView = 0x1000, DepthView = 0x2000, UnknownView = 0x3000;
+constexpr std::uint64_t ColorView = 0x1000, DepthView = 0x2000;
 constexpr std::uint32_t ColorAttachmentOptimal = 2, DepthStencilAttachmentOptimal = 3;
 constexpr std::uint32_t DepthReadOnlyOptimal = 1000241001;
 constexpr std::uint64_t SampledRead = 0x100000000ull, TransferWrite = 0x1000;
@@ -50,6 +50,19 @@ void Pass(const State& s, bool resumed, int draws, BbPassCensus::Why why, const 
 }
 
 void Ender() {}
+
+// The rasterizer notes the next pass's own guest-image views before it begins.
+void NoteViews(bool color, bool depth) {
+    BbPassTrace::ClearViews();
+    if (color) {
+        BbPassTrace::NoteView(ColorView, {.uid = 1, .format = 37, .texel_bytes = 4, .width = 100,
+                                          .height = 100, .layers = 1, .level = 0});
+    }
+    if (depth) {
+        BbPassTrace::NoteView(DepthView, {.uid = 2, .format = 130, .texel_bytes = 5,
+                                          .width = 100, .height = 100, .layers = 1, .level = 0});
+    }
+}
 } // namespace
 
 int main() {
@@ -59,26 +72,31 @@ int main() {
     }
     using Why = BbPassCensus::Why;
     const void* ender = reinterpret_cast<const void*>(&Ender);
-    // Views are noted before the trace starts, as the rasterizer notes them every time.
-    BbPassTrace::NoteView(ColorView, {.uid = 1, .format = 37, .texel_bytes = 4, .width = 100,
-                                      .height = 100, .layers = 1, .level = 0});
-    BbPassTrace::NoteView(DepthView, {.uid = 2, .format = 130, .texel_bytes = 5, .width = 100,
-                                      .height = 100, .layers = 1, .level = 0});
-    // Before the trace: nothing is recorded.
+    // Before the trace: nothing is recorded. The second pass is still open when it starts.
+    NoteViews(true, true);
     Pass(ColorDepth(false, false), false, 5, Why::TargetChange, nullptr);
     BbPassTrace::NoteUse(1, 0, SampledRead, StageFragment, true, false);
+    NoteViews(true, true);
+    BbPassTrace::NoteBegin(ColorDepth(false, false), false);
+    BbPassTrace::NoteDraw();
     BbPassTrace::NoteFrameEnd(); // frame end 1: the trace starts
+    BbPassTrace::NoteDraw();     // not counted: its pass began before the trace
+    BbPassTrace::NoteEnd(Why::Other, ender); // a partial end record
 
     // Frame 1. Pass 0: color loaded, depth cleared, 3 draws, ended by a barrier.
+    NoteViews(true, true);
     Pass(ColorDepth(false, true), false, 3, Why::Barrier, ender);
     BbPassTrace::NoteUse(1, 5, SampledRead, StageFragment, true, false); // pass 0's color: read
     // Pass 1 resumes it (same state as recorded by the scheduler): loads color and depth.
+    NoteViews(true, true);
     Pass(ColorDepth(false, false), true, 1, Why::Other, ender);
     BbPassTrace::NoteUse(2, 7, TransferWrite, StageClear, true, false); // pass 1's depth: dead
-    // Pass 2: read-only depth, no draw (empty), plus an unknown color view.
+    // Pass 2: read-only depth, no draw (empty). Its color view was not noted for it (a proxy, a
+    // redirect, or a stale handle noted for an earlier pass): unknown.
     State ro;
     ro.num_color_attachments = 1;
-    ro.color_attachments[0] = {{UnknownView}, ColorAttachmentOptimal, 0};
+    ro.color_attachments[0] = {{ColorView}, ColorAttachmentOptimal, 0};
+    NoteViews(false, true);
     ro.depth_stencil_attachment = {{DepthView}, DepthReadOnlyOptimal, true, false, false, false};
     Pass(ro, false, 0, Why::TargetChange, nullptr);
     BbPassTrace::NoteFrameEnd(); // frame end 2
@@ -87,10 +105,17 @@ int main() {
     State clear;
     clear.num_color_attachments = 1;
     clear.color_attachments[0] = {{ColorView}, ColorAttachmentOptimal, 1};
+    NoteViews(true, false);
     Pass(clear, false, 0, Why::Submit, nullptr);
+    // Pass 4: a helper pass (no views noted for it) reusing pass 3's view handle: unknown.
+    State helper;
+    helper.num_color_attachments = 1;
+    helper.color_attachments[0] = {{ColorView}, ColorAttachmentOptimal, 0};
+    Pass(helper, false, 0, Why::TargetChange, nullptr);
     BbPassTrace::NoteFrameEnd(); // frame end 3: the trace ends
 
     // After the trace: nothing is recorded.
+    NoteViews(true, true);
     Pass(ColorDepth(false, false), false, 2, Why::TargetChange, nullptr);
     BbPassTrace::NoteFrameEnd();
     std::printf("pass-trace driver: done\n");

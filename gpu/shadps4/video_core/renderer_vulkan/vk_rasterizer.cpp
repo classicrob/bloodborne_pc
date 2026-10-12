@@ -3355,6 +3355,12 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
     bool color_redirected = false, depth_redirected = false;
     std::pair<u32, u32> guest_extent{1, 1};
     std::pair<vk::ImageView, vk::ImageLayout> original_color{};
+#ifdef __APPLE__
+    // The pass trace: each target's own view of its guest image (a final view that differs is a
+    // redirect or proxy, other storage).
+    std::array<vk::ImageView, AmdGpu::NUM_COLOR_BUFFERS> native_color{};
+    vk::ImageView native_depth{};
+#endif
     const auto& regs = Regs();
     const auto& key = pipeline->GetGraphicsKey();
     if (std::popcount(key.mrt_mask & 0x7f) >= 5 && db_desc.first &&
@@ -3481,6 +3487,9 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
         auto& attachment = state.color_attachments[cb];
         attachment.image_view = *image_view.image_view;
         attachment.image_layout = image->backing->state.layout;
+#ifdef __APPLE__
+        native_color[cb] = attachment.image_view;
+#endif
         attachment.clear_value = clear_value.color.uint32;
         attachment.is_clear = is_clear;
 
@@ -3553,6 +3562,9 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
         auto& attachment = state.depth_stencil_attachment;
         attachment.image_view = *image_view.image_view;
         attachment.image_layout = image.backing->state.layout;
+#ifdef __APPLE__
+        native_depth = attachment.image_view;
+#endif
         attachment.clear_value = {};
         attachment.is_clear = 0;
 
@@ -3669,8 +3681,10 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
     }
 #ifdef __APPLE__
     if (BbPassTrace::Enabled()) {
-        // The pass trace resolves this state's final views (redirected or proxies included) to
-        // their guest images. The object motion attachment below stays unknown.
+        // The pass trace resolves the next pass's attachments that are their guest image's own
+        // view; redirected and proxy views (other storage) and the object motion attachment
+        // below stay unknown.
+        BbPassTrace::ClearViews();
         const auto note = [&](vk::ImageView view, const VideoCore::Image& image,
                               const VideoCore::SubresourceRange& range) {
             const auto& info = image.info;
@@ -3686,13 +3700,15 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
                                   });
         };
         for (u32 cb = 0; cb < state.num_color_attachments; ++cb) {
-            if (cb_descs[cb].first && state.color_attachments[cb].image_view) {
+            if (cb_descs[cb].first && state.color_attachments[cb].image_view &&
+                state.color_attachments[cb].image_view == native_color[cb]) {
                 note(state.color_attachments[cb].image_view,
                      texture_cache.GetImage(cb_descs[cb].first),
                      cb_descs[cb].second.view_info.range);
             }
         }
-        if (db_desc.first && state.depth_stencil_attachment.image_view) {
+        if (db_desc.first && state.depth_stencil_attachment.image_view &&
+            state.depth_stencil_attachment.image_view == native_depth) {
             note(state.depth_stencil_attachment.image_view, texture_cache.GetImage(db_desc.first),
                  db_desc.second.view_info.range);
         }

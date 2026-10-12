@@ -7,9 +7,12 @@ frames):
     targets with other layouts or clears, or new targets; resumes by what ended the pass before;
   - passes by draws in them (and passes with no draw: clear-only or empty);
   - attachment traffic: bytes loaded (LOAD) and stored (every attachment is stored), by aspect;
-  - the fate of every store: read later (sampled, copied, loaded by a later pass), dead (the next
-    use clears it or overwrites the whole image), read-only (the pass could not change it), or
-    unused until the trace ends (may be read in a later frame: not counted as dead);
+  - the fate of every store: read later (sampled, copied, loaded by a later pass), a dead
+    candidate (the next recorded use clears it), a read-only candidate (the pass's layout could
+    not change it), or unused until the trace ends (may be read in a later frame: not dead).
+    Candidates only: uses are the accesses requested through Runtime::Transit, so an image use
+    recorded without it (a direct command) between the store and the clear is not seen;
+  - attachments of unknown views (redirects, proxies, helpers) are counted but carry no bytes;
   - a model: traffic over a bandwidth plus a cost per pass, against the measured GPU busy, and
     what merging resumes, skipping read-only stores and dead stores, and dropping empty passes
     would save.
@@ -95,6 +98,7 @@ def analyse(events):
     open_pass = None
     last_end = None   # the end record before the current begin
     begin_kinds = collections.Counter()
+    partial_ends = 0
     resume_after = collections.Counter()      # (why, ender) of the end before a resume
     same_targets_after = collections.Counter()
 
@@ -125,8 +129,12 @@ def analyse(events):
                     decide(att["uid"], "loaded by a resume" if e["resumed"] else "loaded")
                     passes[p]["loaded"] += aspect_bytes(att, e["width"], e["height"], e["layers"])
                 else:
-                    decide(att["uid"], "dead: cleared by a later pass")
+                    decide(att["uid"], "dead candidate: cleared by a later pass")
         elif kind == "end":
+            if e.get("partial"):
+                partial_ends += 1  # began before the trace: attachments and draws unknown
+                last_end = e
+                continue
             p = e["pass"]
             if p not in passes:
                 continue  # began before the trace
@@ -140,7 +148,7 @@ def analyse(events):
                 passes[p]["stored"] += nbytes
                 stores.append(s)
                 if s.read_only:
-                    s.fate = "read-only (unchanged)"
+                    s.fate = "read-only candidate (unchanged)"
                 else:
                     pending.setdefault(att["uid"], []).append(s)
             open_pass = None
@@ -152,13 +160,13 @@ def analyse(events):
             if access & READ_BITS:
                 decide(uid, "read (sampled, copied or loaded)")
             elif (stage & STAGE_CLEAR) and e["whole"]:
-                decide(uid, "dead: whole image cleared")
+                decide(uid, "dead candidate: whole image cleared")
             else:
                 decide(uid, "written first (partial or unknown extent)")
     for s in stores:
         if s.fate is None:
             s.fate = "unused until the trace ends"
-    return frames, passes, stores, begin_kinds, resume_after, same_targets_after
+    return frames, passes, stores, begin_kinds, resume_after, same_targets_after, partial_ends
 
 
 def symbolicate(lib, enders):
@@ -196,7 +204,8 @@ def main():
     pass_costs = args.pass_cost_us or [0.0, 10.0, 30.0]
 
     events = load(args.trace)
-    frames, passes, stores, begin_kinds, resume_after, same_targets_after = analyse(events)
+    (frames, passes, stores, begin_kinds, resume_after, same_targets_after,
+     partial_ends) = analyse(events)
     nf = len(frames)
     ended = [p for p in passes.values() if p["end"]]
     unknown = sum(1 for p in passes.values() for a in p["begin"]["attachments"]
@@ -211,7 +220,9 @@ def main():
     print(f"Pass trace: {nf} frame(s); per frame: {len(passes) / nf:.1f} passes, "
           f"{sum(f['draws'] for f in frames) / nf:.0f} draws, "
           f"{sum(f['uses'] for f in frames) / nf:.0f} image accesses"
-          + (f"; {unknown / nf:.1f} attachments of unknown views" if unknown else ""))
+          + (f"; {unknown / nf:.1f} attachments of unknown views" if unknown else "")
+          + (f"; {partial_ends} pass(es) begun before the trace (not counted)"
+             if partial_ends else ""))
 
     print("\nPasses per frame by how they began:")
     for k, v in begin_kinds.most_common():
@@ -279,12 +290,12 @@ def main():
         prev = passes.get(p["begin"]["pass"] - 1)
         if prev and prev["end"]:
             merge_bytes += prev["stored"]
-    ro_bytes = fates["read-only (unchanged)"][1]
-    dead_bytes = sum(v[1] for k, v in fates.items() if k.startswith("dead"))
+    ro_bytes = fates["read-only candidate (unchanged)"][1]
+    dead_bytes = sum(v[1] for k, v in fates.items() if k.startswith("dead candidate"))
     levers = [
         ("merge resumes", merge_bytes, len(resumed)),
-        ("no store of read-only aspects", ro_bytes, 0),
-        ("no store of dead stores", dead_bytes, 0),
+        ("no store of read-only candidates", ro_bytes, 0),
+        ("no store of dead candidates", dead_bytes, 0),
         ("drop empty passes", empty_bytes, empty),
     ]
     print("\nModel per frame (traffic / bandwidth + passes x cost per pass):")
@@ -304,7 +315,7 @@ def main():
 
     if args.json:
         print(json.dumps({
-            "frames": nf, "passes_per_frame": len(passes) / nf,
+            "frames": nf, "passes_per_frame": len(passes) / nf, "partial_ends": partial_ends,
             "begin_kinds": {k: v / nf for k, v in begin_kinds.items()},
             "loaded_mib": mib(loaded) / nf, "stored_mib": mib(stored) / nf,
             "fates_mib": {k: mib(v[1]) / nf for k, v in fates.items()},

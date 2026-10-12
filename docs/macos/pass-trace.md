@@ -27,14 +27,21 @@ iterations 11 to 13. "Pass trace: frames ... written to ..." marks the end.
 - `end`: the census's cause (`target change`, `submit`, `barrier`, `other`), the attributed ender
   as `lib+0x...` (the FlushBarriers caller for barriers, else the EndRendering caller), and the
   rasterizer draws in the pass.
-- `use`: every image access through `Runtime::Transit`. It lists uid, layout, VkAccessFlags2,
-  VkPipelineStageFlags2, whether it covers the whole image, and whether a pass was open.
+- `use`: every access requested through `Runtime::Transit`. It lists uid, layout,
+  VkAccessFlags2, VkPipelineStageFlags2, whether it covers the whole image, and
+  `requested_in_pass`. Requests are recorded before the barrier flush that may end the open pass,
+  so `requested_in_pass` does not prove the access ran inside that pass. Image uses recorded
+  straight into command buffers without `Runtime::Transit` are not seen.
+- `end` with `partial`: the pass was open when the trace started. Its attachments and earlier
+  draws are unknown, and the report does not count it.
 - `frame`: the passes, draws and accesses of the frame.
 
-Views are resolved to images when the rasterizer builds a render state. That includes the final
-views of upscaler redirects and scene proxies, which are listed as their guest image. The blit
-helper's MSAA copies and the object motion attachment are listed as unknown. Only the rasterizer's
-draws are counted.
+Attachments are resolved only for the next pass. The rasterizer notes its full render state's
+targets just before the pass begins, and the list is cleared at every begin, so a view handle
+noted earlier and reused cannot inherit stale metadata. A target is resolved only if the pass uses
+the guest image's own view. Upscaler redirects, scene proxies (other storage, other extent), the
+blit helper's MSAA copies and the object motion attachment are unknown. The report counts them
+but gives them no bytes. Only the rasterizer's draws are counted.
 
 ## Report
 
@@ -52,17 +59,21 @@ The report gives, per frame:
 The fates are:
 - read later (sampled, copied, or loaded by a later pass);
 - loaded by a resume;
-- dead (the next use clears it, as a pass's clear load or a whole-image clear);
-- read-only (the pass's layout could not change it);
+- dead candidate (the next recorded use clears it, as a pass's clear load or a whole-image
+  clear);
+- read-only candidate (the pass's layout could not change it);
 - written first, partially or with unknown extent;
 - unused until the trace ends (possibly read next frame: not counted as dead).
+
+Dead and read-only are candidates, not proofs. A use recorded without `Runtime::Transit` between
+the store and the clear would not be seen. Before acting on a lever, confirm its images.
 
 The model compares traffic over a bandwidth, plus a cost per pass, with the measured GPU busy. It
 lists four levers, each an upper bound:
 - merging resumes (the resumed pass's loads plus the previous pass's stores, if the op between
   does not touch the attachments);
-- not storing read-only aspects (STORE_OP_NONE);
-- not storing dead stores (DONT_CARE);
+- not storing read-only candidates (STORE_OP_NONE);
+- not storing dead candidates (DONT_CARE);
 - dropping empty passes.
 
 Depth/stencil bytes are per aspect (Metal keeps them apart; D24S8 is D32S8 on Apple GPUs).
