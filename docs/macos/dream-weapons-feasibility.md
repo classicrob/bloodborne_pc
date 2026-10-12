@@ -154,3 +154,48 @@ fixture's dry-run, full-file reversal, unchanged tail, preserved ancestry,
 source-hash refusal, destination refusal, copy-failure cleanup and modified
 edit rejection. These are offline format/filesystem checks, not game-load
 acceptance.
+
+
+## Gameplay acceptance and verification metadata
+
+Playtest qualified `dream-weapons-edited` on PREVIEW-26. Its runs are
+`20261012-005806-1080p-WEAPONS-1` and
+`20261012-010415-1080p-WEAPONS-2-reload`, under the Playtest worktree's
+`out/macos_route/`.
+
+- Dream load and equipment-menu selection passed for both weapons. Reported
+  durability was 200 for the Cleaver and 100 for the Pistol.
+- Cleaver attack spent stamina; its trick transformation worked.
+- Pistol fire consumed a bullet, 20 to 19.
+- Normal in-game save/quit passed. A fresh process loaded the exported
+  `dream-weapons-equipped` at the lantern with both weapons equipped and
+  19 bullets. No STOP or guest fault was reported; rendering was clean in
+  the captures. The known boot audio warning remained.
+
+The pinned binary SHA256 values, read from both run manifests, are:
+
+- bb-probe: `f7ffed0127cb31f5a48e5b7a47078881461663495e87e0aa30286b753af3e53f`
+- libbbgpu: `8ed45f2661112b65a855e05aa2f9313172928f46a99e2cc9c313c03b8ba0f50c`
+
+This is acceptance of the edited inventory fixture. It does not establish
+messenger gifts, clinic progression flags, unlocked lamps, or combat against
+an enemy. Earlier pending statements above describe the pre-test state.
+
+Fixture metadata records these observations as an additive `verified` array.
+Each entry contains `item`, `fixture`, `character_sha256`, `run`, `build`,
+`artifacts` (binary hashes), and `evidence` (capture/action). Items are narrow:
+`load`, `equip-cleaver`, `equip-pistol`, `cleaver-attack`, `cleaver-transform`,
+`pistol-fire`, `normal-save-quit`, and `fresh-process-reload`. Fixture and
+character hash identify the input tested in that run. Run 1 tests
+`dream-weapons-edited`; run 2 directly tests `dream-weapons-equipped`.
+
+Descendants inherit those entries verbatim, retaining the tested subject;
+an inherited record is historical evidence, not a claim that the descendant
+was retested. A binary build label is accompanied by artifact hashes, since
+a manifest's launcher-checkout HEAD need not identify its pinned binaries.
+`parent` and `edit_provenance` remain unchanged, as do `edited=true` and the
+edited origin. Before narrowing top-level `unverified`, retain the previous
+list in `unverified_history` entries with `items`, `reason`, and `runs`.
+Use `validation=partial`: lamps, clinic events and messenger gifts remain
+unverified. Playtest owns the route-tool implementation and fixture metadata
+annotation; this document does not claim those updates have executed yet.
