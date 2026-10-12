@@ -98,10 +98,16 @@ void ObjectMotion::OnFrameStart() {
     if (BbStats::enabled && (frame % 600) == 0 && history.stats.draws) {
         const auto& s = history.stats;
         std::printf("Object motion: %llu draws, %llu stored, %llu with history, %llu unmatched, "
+                    "%llu of multi-instance meshes without history (%zu meshes); palette "
+                    "addresses of multi-instance meshes vs the previous frame: %llu same, "
+                    "%llu same set reordered, %llu changed; "
                     "%llu capacity skips, %llu invalid, %llu still (600 frames); last frame %u/%u vertices; "
                     "index ranges %llu reused, %llu scanned (%llu found changed), %zu cached\n",
                     (unsigned long long)s.draws, (unsigned long long)s.stored,
                     (unsigned long long)s.loaded, (unsigned long long)s.unmatched,
+                    (unsigned long long)s.multi, history.MultiInstanceMeshes(),
+                    (unsigned long long)s.addresses_same, (unsigned long long)s.addresses_reordered,
+                    (unsigned long long)s.addresses_changed,
                     (unsigned long long)s.exhausted, (unsigned long long)s.invalid,
                     (unsigned long long)s.still,
                     history.Used(), PositionsPerFrame, (unsigned long long)index_ranges.stats.hits,
