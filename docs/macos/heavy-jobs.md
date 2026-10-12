@@ -111,8 +111,13 @@ they start meanwhile, including ninja's compiles, inherit it. New jobs start at 
 inherited it from them, are restored; a job started in the background stays there. A job that ran
 at E-core QoS says so at its end (`ran N s at E-core QoS for perf runs (...)`; `ecore_s`,
 `ecore_by` in its end event). Every job's command runs in its own session (its own process group): stop and ecore act on the
-job's tree and on every member of that group, so a process whose parent exited (re-parented to
-launchd) is paused or demoted too, and SIGINT/SIGTERM/SIGHUP reach the whole group.
+job's tree and on every member of that group, so a process whose intermediate parent exited
+(re-parented to launchd) is paused or demoted too, and SIGINT/SIGTERM/SIGHUP reach the whole
+group. Limits: the group is used only while the command (its leader) and the slot holder are
+alive; a group left behind after they exit is not covered, and neither is a process in a group of
+its own (ninja starts each command in one: covered while ninja is its parent). Processes are
+remembered as (pid, start time from the kernel), so a pid reused by another process is never
+resumed or restored.
 
 `--settle LOAD,SECONDS` (with `--cpu-quiet` only): after the other jobs are paused or demoted
 and before the perf run starts, wait until the 1-minute load average is below LOAD; past SECONDS

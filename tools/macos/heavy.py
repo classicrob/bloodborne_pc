@@ -36,6 +36,8 @@ them exits or is killed. There is no lease to expire and nothing to clean up. A 
 inside a slot (BB_HEAVY_HELD is set) runs directly, so build.sh under heavy.sh does not wait for
 itself.
 """
+import ctypes
+import ctypes.util
 import datetime
 import fcntl
 import hashlib
@@ -43,6 +45,7 @@ import json
 import os
 import re
 import signal
+import struct
 import subprocess
 import sys
 import time
@@ -330,6 +333,25 @@ def alive(pid):
         return False
 
 
+_libc = ctypes.CDLL(ctypes.util.find_library('c'), use_errno=True)
+
+
+def process_start(pid):
+    """The process's start time (seconds, microseconds) from the kernel (sysctl KERN_PROC_PID:
+    kinfo_proc begins with it), or None when no such process exists. With the pid it names one
+    process: a pid reused by a later process has another start, so CPU quiet never resumes or
+    restores a stranger that inherited a pid it remembered."""
+    mib = (ctypes.c_int * 4)(1, 14, 1, pid)  # CTL_KERN, KERN_PROC, KERN_PROC_PID
+    buffer = ctypes.create_string_buffer(1024)
+    size = ctypes.c_size_t(len(buffer))
+    if _libc.sysctl(mib, 4, buffer, ctypes.byref(size), None, 0) != 0:
+        error = ctypes.get_errno()
+        fail(f'sysctl KERN_PROC_PID {pid}: {os.strerror(error)}')
+    if size.value == 0:
+        return None
+    return struct.unpack_from('qi', buffer.raw, 0)
+
+
 def process_states(pids):
     """{pid: ps state letters} for the pids still alive."""
     if not pids:
@@ -409,9 +431,12 @@ def pause_quiet_pools(label):
                 if states.get(pid, '').startswith('T'):
                     foreign.append(pid)
                     continue
+                start = process_start(pid)
+                if start is None:
+                    continue
                 try:
                     os.kill(pid, signal.SIGSTOP)
-                    pids.append(pid)
+                    pids.append((pid, start))
                 except ProcessLookupError:
                     pass
         note_pause(root, start=label)
@@ -463,20 +488,23 @@ def demote_quiet_pools(label, demoted, seen, noted):
     setpriority(PRIO_DARWIN_PROCESS, PRIO_DARWIN_BG), as taskpolicy -b does. Children forked
     later inherit it. demoted: pid -> slot holder, the processes this run demoted or that inherited
     it from them (it restores those). A process already in the background (a job started with
-    taskpolicy -b) is left alone and not restored."""
+    taskpolicy -b) is left alone and not restored. Processes are kept as (pid, start time), so a
+    reused pid is a new process, never one remembered (process_start)."""
     for name, job, root, info in quiet_jobs():
         tree = [root] + job_processes(root, info)
-        table = process_table([p for p in tree if p not in seen])
+        starts = {pid: process_start(pid) for pid in tree}
+        table = process_table([p for p in tree if starts[p] and (p, starts[p]) not in seen])
         count = 0
         for pid, (ppid, priority) in table.items():
-            seen.add(pid)
+            seen.add((pid, starts[pid]))
             if priority <= BACKGROUND_PRIORITY:
-                if ppid in demoted:
-                    demoted[pid] = root  # inherited from a process this run demoted
+                parent = demoted.get(ppid)
+                if parent and process_start(ppid) == parent[1]:
+                    demoted[pid] = (root, starts[pid])  # inherited from a process this run demoted
                 continue
             try:
                 os.setpriority(PRIO_DARWIN_PROCESS, pid, PRIO_DARWIN_BG)
-                demoted[pid] = root
+                demoted[pid] = (root, starts[pid])
                 count += 1
             except (ProcessLookupError, PermissionError):
                 pass
@@ -492,7 +520,9 @@ def restore_demoted(label, demoted, noted):
     """The end of --cpu-quiet=ecore: the jobs' records first, then each demoted process back."""
     for root, job in noted.items():
         note_pause(root, 'ecore', end=label)
-    for pid in demoted:
+    for pid, (_, start) in demoted.items():
+        if process_start(pid) != start:
+            continue  # gone, or the pid now names another process
         try:
             os.setpriority(PRIO_DARWIN_PROCESS, pid, 0)
         except (ProcessLookupError, PermissionError):
@@ -539,6 +569,21 @@ def settle(label, limit, bound):
           f'(was {first:.1f})', file=sys.stderr, flush=True)
 
 
+def resume_paused(label, paused):
+    """The end of a stop-mode quiet: each job's pause record first (a job that ends at once reads
+    a closed pause), then SIGCONT to each process it stopped that is still the same process."""
+    for job, pids, root in paused:
+        note_pause(root, end=label)
+        for pid, start in reversed(pids):
+            if process_start(pid) != start:
+                continue  # gone, or the pid now names another process
+            try:
+                os.kill(pid, signal.SIGCONT)
+            except ProcessLookupError:
+                pass
+        print(f'heavy: {label}: CPU quiet over: resumed {job}', file=sys.stderr, flush=True)
+
+
 def start_quiet(label, mode='stop'):
     """--cpu-quiet: until this job ends (at most BB_HEAVY_QUIET_MAX seconds), no build, quick or
     sweep job is admitted and the running ones are paused. A forked watcher holds
@@ -582,14 +627,7 @@ def start_quiet(label, mode='stop'):
     if alive(target):
         print(f'heavy: {label}: CPU QUIET BOUND REACHED after {bound} s: resuming paused jobs while '
               f'this job still runs', file=sys.stderr, flush=True)
-    for job, pids, root in paused:
-        note_pause(root, end=label)  # before resuming: a job that ends at once reads a closed pause
-        for pid in reversed(pids):
-            try:
-                os.kill(pid, signal.SIGCONT)
-            except ProcessLookupError:
-                pass
-        print(f'heavy: {label}: CPU quiet over: resumed {job}', file=sys.stderr, flush=True)
+    resume_paused(label, paused)
     record({'event': 'quiet-end', 'by': label, 'seconds': round(time.monotonic() - started, 1),
             'bound_reached': alive(target), 'resumed': [job for job, _, _ in paused]})
     os._exit(0)
