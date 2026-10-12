@@ -99,6 +99,45 @@ The pause is bounded by `BB_HEAVY_QUIET_MAX` (1200 s); past that the jobs resume
 "CPU QUIET BOUND REACHED". Each pause and resume is printed in the run's output and recorded in
 the history. Games are not paused (the exclusive GPU hold already keeps them off).
 
+`--cpu-quiet=ecore` is **not for perf A/Bs; correctness runs only**. Measured 2026-10-12 (replay,
+clinic, 100 iterations, A/B/A with stop mode): median +2.1%, p90 +2.7%, and one 72.7 ms
+iteration against about 43.6 in both stop arms. Perf runs keep `--cpu-quiet` (stop). What it does
+(an option; `--cpu-quiet` and `--cpu-quiet=stop` stay as above): it does not
+pause anything. While the run lasts, the watcher moves each running build, quick and sweep process
+to darwin background QoS every second (`setpriority(PRIO_DARWIN_PROCESS, PRIO_DARWIN_BG)`, as
+`taskpolicy -b`: efficiency cores, low CPU and I/O priority; `ps -o pri` shows 4), and processes
+they start meanwhile, including ninja's compiles, inherit it. New jobs start at once, under
+`taskpolicy -b`, instead of waiting. At the end, the processes it demoted, and those that
+inherited it from them, are restored; a job started in the background stays there. A job that ran
+at E-core QoS says so at its end (`ran N s at E-core QoS for perf runs (...)`; `ecore_s`,
+`ecore_by` in its end event). Every job's command runs in its own session (its own process group) under a reaper (`heavy.py
+--reap-for`), the group's leader: it waits for the command, and when heavy.sh dies for any reason
+(a SIGKILL to the caller's group, a stopped task) it SIGKILLs the job's group, so a job never
+outlives the slot it holds. Only if the reaper dies too does a process of the job keep the slot;
+status then says ORPHANED. Each job therefore has one more python3 process (the reaper, a
+0.1 s poll). Stop and ecore act on the job's tree and on every member of its group
+(also after an intermediate parent exited, re-parented to launchd, and after the leader exited:
+a pid is not reused while its group lives), and SIGINT/SIGTERM/SIGHUP reach the whole group. The
+leader is recorded with its start time; a live leader pid with another start is a stranger (tree
+only). Limits: a group left behind after the job ends is not covered, and neither is a process
+in a group of its own (ninja starts each command in one: covered while ninja is its parent). Under
+ecore, a child forked by a demoted process whose parent already exited is not known as inherited
+and stays at background QoS after the quiet (until it ends); a job admitted during an ecore quiet
+runs under taskpolicy -b for its whole life, also after the quiet. A process whose identity the
+kernel will not give is skipped and reported (`quiet-problem`), never left half-handled for the
+others. Processes are
+remembered as (pid, start time from the kernel), so a pid reused by another process is never
+resumed or restored.
+
+`--settle LOAD,SECONDS` (with `--cpu-quiet` only): after the other jobs are paused or demoted
+and before the perf run starts, wait until the 1-minute load average is below LOAD; past SECONDS
+the run is refused (exit 75) with the load and the top CPU processes. Every quiet start records
+the top 5 CPU processes in the history (`quiet-start`, `top`: CPU, pid, process group, command,
+working directory), so a stray hog shows there with its owner. A job that has to wait records a `queued` event once
+(reason, command, directory), so one that vanishes while waiting still shows. GPU
+lock requests are recorded too (`gpu-request` before the `gpu` grant): a job that ended while
+waiting has a request and no grant.
+
 A paused job says so when it ends, with its exit status, and its end event in the history
 carries `paused_s` and `paused_by`:
 
