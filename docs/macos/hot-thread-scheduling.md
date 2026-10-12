@@ -3,9 +3,10 @@
 The hot GPU-side threads are stage A (GPU command), stage B (draw recording) and the Vulkan
 recording threads. In the verifier's replay they moved from P-cores to E-cores after about
 1-1.5 s of sustained load as an accessory app (task role 6). A regular app (role 2) stayed on
-P-cores but slowed as well, with falling clocks and rising GPU time, so the cause is probably an
-SoC power budget (Low Power Mode is under investigation). The two settings below are diagnostic
-A/B arms. Neither is on by default.
+P-cores but slowed as well, with falling clocks and rising GPU time. The Mac was in Low Power
+Mode then (set to Automatic on 2026-10-12, ~05:50 UTC), so those runs say nothing about the
+scheduling of a normally powered game. The two settings below are diagnostic A/B arms. Neither
+is on by default.
 
 Both are read once from the environment (gpu/shim/bbport_hot_thread_qos.h):
 - `BB_HOT_THREAD_QOS=user-interactive|user-initiated|default` sets the thread's QoS class at the
