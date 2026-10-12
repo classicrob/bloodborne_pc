@@ -201,18 +201,20 @@ native game render target before host upscaling, clearly label that output bound
 and retain the game's real rendering commands. Reproducing the presented frame needs
 host temporal-state capture or a warm-up prefix as well.
 
-### Perf replay v0 (approved 2026-10-11, in progress)
+### Perf replay v0 (approved 2026-10-11, implemented)
 
 Purpose: a fast loop for the stage A/B CPU cost (R0: the frame is bound by it). It replays
 one held frame's submissions through the real Liverpool and renderer N times in a process
 without a guest. **Pixel output is not qualified**, and the report says so. The inventory
-run's image rejections don't block it: v0 restores no images. Iteration 1 creates the
+run's image rejections don't block it: the texture cache's images are captured
+(`images.bin`, `image_metadata.bin`) and restored, and the replay's first step checks that
+capture -> restore -> capture again is exact. Iteration 1 creates the
 texture- and buffer-cache state that live frames inherit, and is reported as warm-up.
 Steady state means iterations 2..N agree within noise, on times and on the "images
 registered" / "image uploads" counters.
 
 Capture (`BB_REPLAY_CAPTURE=perf:<frames>`, trigger as for inventory), at the end of the hold,
-after the inventory, into `out/replay/<id>/`. The capture refuses to start unless at least 40 GiB
+after the inventory, into `out/replay/<id>/` (`BB_REPLAY_DIR` overrides the base). The capture refuses to start unless at least 40 GiB
 (the team's disk floor) would stay free after its estimated size; keep one capture at a time.
 - `manifest.json`: version, frame, settings, the sizes and checksums of every file, and
   "perf replay: pixel output not qualified".
@@ -240,12 +242,27 @@ Replay (`BB_REPLAY_RUN=<dir>`, bb-probe):
    restore the reset ranges, `liverpool.bin` and the command words; submit the frame's
    submissions and its frame end; wait for GpuIdle.
 3. Report per iteration: wall time, stage A/B counters (the "Parse split" fields), images
-   registered, image uploads.
+   registered, image uploads, prepared draws used, the staging pool's contents, and where
+   the CPU time ran (process faults, context switches, footprint, host paging; P-core share,
+   CPU time by QoS class, effective clock, task role).
+
+Replay settings: `BB_REPLAY_ITERATIONS` (1..10000), `BB_REPLAY_GPU_WAIT=1` (also wait for each
+iteration's GPU work and report submit -> GPU done), `BB_SPLIT_WINDOW` (the replay sets 1: a
+"Parse split" block per iteration), and with `BB_PERF=1` the GPU busy time of each iteration
+(per-submission timestamps). State the power mode (`pmset -g custom`) with any timing.
+
+Capture tools (`tools/macos/`, read a capture directory; no replay run): `pm4find.py` (the
+WRITE_DATA packets covering an address, with context, and the view holding it), `pm4dump.py`
+(the packets around a guest address), `frameseg.py` (per captured command buffer: draws,
+dispatches, writes, waits), `drainseg.py` (one command buffer split at its self-polling
+WAIT_REG_MEMs).
 
 Not handled in v0, and stated rather than solved:
 - guest CPU/HLE writers (none run);
 - flips (a flip submission is replayed without presenting);
-- low/untracked memory outside the views and the eboot image (an access faults loudly);
+- low/untracked memory outside the views and the eboot image (an access faults loudly),
+  except reset ranges in host objects of the low arena, which are restored in place when the
+  replay process has them writable (it makes the same allocations in the same order);
 - asynchronous compute (a frame with any is refused).
 
 ## Dependencies without a guest CPU
