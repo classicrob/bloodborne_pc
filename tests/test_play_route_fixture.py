@@ -122,6 +122,20 @@ class VerifyFixture(unittest.TestCase):
             self.verify(['load'], 'e', ['save/reload'], None)
         self.assertNotIn('verified', self.meta())
 
+    def test_add_unverified_records_an_open_question(self):
+        self.verify([], None, [], 'not checked after reload', ['lamp-lit persistence'])
+        meta = self.meta()
+        self.assertEqual(meta['unverified'], self.dream['unverified'] + ['lamp-lit persistence'])
+        self.assertEqual(meta['unverified_history'][-1]['items'], self.dream['unverified'])
+        self.assertEqual(meta['unverified_history'][-1]['reason'], 'not checked after reload')
+        self.assertNotIn('verified', meta)
+        with self.assertRaises(SystemExit):
+            self.verify([], None, [], 'again', ['lamp-lit persistence'])
+        with self.assertRaises(SystemExit):
+            self.verify([], None, [], None, ['enemy combat'])
+        with self.assertRaises(SystemExit):
+            self.verify(['load'], None, [], None)
+
     def test_descendant_inherits_records_verbatim(self):
         self.verify(['pistol-fire'], 'bullets 20 -> 19', ['save/reload'], 'passed')
         dream = self.meta()

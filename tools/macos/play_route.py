@@ -658,10 +658,11 @@ def save_fixture(run, name):
     print(json.dumps({'fixture': name, 'path': str(target), 'last_capture': stages[-1] if stages else None}))
 
 
-def verify_fixture(name, run, items, evidence, retire, reason):
+def verify_fixture(name, run, items, evidence, retire, reason, add=()):
     """Adds "verified" records to fixture NAME for capabilities a stopped run showed (one per item).
     A record names the fixture that run loaded, its character file hash, the run, the build and its
-    artifact hashes. Retiring "unverified" entries first stores the current list in "unverified_history"."""
+    artifact hashes. Retiring or adding "unverified" entries first stores the current list in
+    "unverified_history"; adding records an open question so it is not forgotten."""
     path = FIXTURES / name / 'fixture.json'
     if not path.exists():
         die(f'no fixture {name} ({path})')
@@ -679,8 +680,15 @@ def verify_fixture(name, run, items, evidence, retire, reason):
     unknown = [r for r in retire if r not in meta.get('unverified', [])]
     if unknown:
         die(f'not in the unverified list of {name}: {unknown}')
-    if retire and not reason:
-        die('--retire needs --reason')
+    if (retire or add) and not reason:
+        die('--retire and --add-unverified need --reason')
+    if not (items or retire or add):
+        die('nothing to record: give --item, --retire or --add-unverified')
+    if items and not evidence:
+        die('--item needs --evidence')
+    already = [a for a in add if a in meta.get('unverified', [])]
+    if already:
+        die(f'already unverified in {name}: {already}')
     probe = info['artifacts']['bb-probe']
     for item in items:
         meta.setdefault('verified', []).append({
@@ -689,14 +697,15 @@ def verify_fixture(name, run, items, evidence, retire, reason):
             'run': run.name, 'build': Path(probe['path']).parent.name,
             'artifacts': {k: v['sha256'] for k, v in info['artifacts'].items() if isinstance(v, dict) and 'sha256' in v},
             'evidence': evidence})
-    if retire:
+    if retire or add:
         meta.setdefault('unverified_history', []).append(
-            {'items': meta['unverified'], 'reason': reason, 'runs': [run.name]})
-        meta['unverified'] = [u for u in meta['unverified'] if u not in retire]
+            {'items': meta.get('unverified', []), 'reason': reason, 'runs': [run.name]})
+        meta['unverified'] = [u for u in meta.get('unverified', []) if u not in retire] + list(add)
     if meta.get('verified') and meta.get('validation') != 'verified':
         meta['validation'] = 'partial'
     path.write_text(json.dumps(meta, indent=2) + '\n')
-    print(json.dumps({'fixture': name, 'verified': items, 'retired': retire, 'unverified': meta.get('unverified')}))
+    print(json.dumps({'fixture': name, 'verified': items, 'retired': retire, 'added': list(add),
+                      'unverified': meta.get('unverified')}))
 
 
 def save_cache(run, name):
@@ -913,10 +922,12 @@ def main():
     p.add_argument('name')
     p = sub.add_parser('verify-fixture', help='record capabilities this stopped run verified on fixture NAME')
     p.add_argument('name')
-    p.add_argument('--item', action='append', required=True, help='one narrow capability, e.g. pistol-fire')
-    p.add_argument('--evidence', required=True, help='shots and actions, e.g. "shots 15-16: bullets 20 -> 19"')
+    p.add_argument('--item', action='append', default=[], help='one narrow capability, e.g. pistol-fire')
+    p.add_argument('--evidence', help='shots and actions, e.g. "shots 15-16: bullets 20 -> 19" (needed with --item)')
     p.add_argument('--retire', action='append', default=[], help='an "unverified" entry these records settle')
-    p.add_argument('--reason', help='why the retired entries are settled (stored in unverified_history)')
+    p.add_argument('--add-unverified', action='append', default=[], dest='add_unverified',
+                   help='an open question to record in "unverified" (needs --reason)')
+    p.add_argument('--reason', help='why entries are retired or added (stored in unverified_history)')
     p = sub.add_parser('save-cache')
     p.add_argument('name')
     sub.add_parser('stop')
@@ -966,7 +977,7 @@ def main():
         elif args.command == 'save-fixture':
             save_fixture(run, args.name)
         elif args.command == 'verify-fixture':
-            verify_fixture(args.name, run, args.item, args.evidence, args.retire, args.reason)
+            verify_fixture(args.name, run, args.item, args.evidence, args.retire, args.reason, args.add_unverified)
         elif args.command == 'save-cache':
             save_cache(run, args.name)
         elif args.command == 'stop':
