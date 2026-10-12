@@ -144,14 +144,12 @@ enum F : std::uint32_t {
     FLabel,      ///< a label not batched (stage A, or recording not deferred): one per label
     FBatchIdle,  ///< stage B's batched labels, at a packet boundary with the draw pipe idle
     FBatchAge,   ///< stage B's batched labels, the oldest older than LabelBatchAge
-    FBatchForWait, ///< stage B's batched labels, at a WAIT_REG_MEM stage A met early
     FFinish,     ///< Scheduler::Finish (a wait for the GPU)
     FOther,
     FCount
 };
 inline constexpr const char* f_names[FCount] = {
     "frame end", "unbatched labels", "label batch at idle", "label batch at age",
-    "label batch at a WAIT met early",
     "Finish",
     "other"};
 
