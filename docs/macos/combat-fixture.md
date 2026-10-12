@@ -40,11 +40,22 @@ The same source's `items.json` identifies Blood Vial as item 1000, and
 The existing independent equipment/inventory parser checks the serialized
 layout and reads the resulting vial entry back. No upstream editor is run.
 
+The first word is the goods handle: `0xb0000000 | (item & 0x0fffffff)`.
+For item 1000 (`0x3e8`) this gives `0xb00003e8`. GS independently checked
+the source's two existing goods entries against that rule and found no
+colliding vial handle among all 1984 entries. This is a small observed sample;
+the pending game acceptance must confirm the inserted item's behavior.
+
 The [Vitality table](https://www.bloodborne-wiki.com/2015/05/vitality.html)
 lists 1100 HP at vitality 30. This is a researched preset, not a local
 game-parameter extraction. Setting all three stored health values equal
 requests full health; Playtest must confirm the loaded status/HP display,
 healing and persistence rather than treating the offline values as proof.
+The format checks do not establish whether the game recomputes maximum HP
+from vitality or trusts the saved triple, or whether its inventory counters
+must equal a scan of occupied entries. The vial occupies an existing vacant
+slot, rather than extending the inventory. Load, item display/consumption,
+and fresh-process reload remain the acceptance tests for those assumptions.
 
 ## Creation and verification
 
