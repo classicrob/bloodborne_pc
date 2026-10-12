@@ -1164,6 +1164,7 @@ private:
     bool closing = false; ///< Close() submits the last command buffer: open no new one
     bool closed = false;  ///< Close() submitted it: recording is sealed
     bool recorded_since_begin = false; ///< the open command buffer has a recorded command
+    bool has_render_state = false; ///< a pass has begun (render_state is a real pass's state)
 #endif
     u64 host_copies_issued = 0;
     std::atomic<u64> host_copies_done{0};

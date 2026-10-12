@@ -85,8 +85,9 @@ TITLE = ('title', [('wait_log', r'^Runtime: pad opened', 120), ('wait_draws', 14
                    ('capture', 'title', 0.2), ('check_user_cache',)])
 OFFLINE = ('offline', [('press', 'down'), ('press_screen', 'cross', TITLE_MENU_CHANGE, 3, 3), ('sleep', 1), ('capture', 'offline-menu', 0.2)])
 # Loading screens already draw the world behind them while pipelines compile, so "in the world"
-# means scene-sized draw counts in windows with no compiles.
-WORLD = ('world', [('wait_draws', 1000, 2, 1800, True), ('sleep', 5), ('capture', 'world', 0.05)])
+# means scene-sized draw counts in windows with no compiles. Observed: loading screens up to ~290
+# draws/frame (with compiles), clinic ~1500, Hunter's Dream 700-1060; the floor is not tuned to one area.
+WORLD = ('world', [('wait_draws', 300, 3, 1800, True), ('sleep', 5), ('capture', 'world', 0.05)])
 # New game: Options skips the opening movie (--movie plays it to the end for movie-path coverage).
 NEW_GAME = [
     TITLE, OFFLINE,
