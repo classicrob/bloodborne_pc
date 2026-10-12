@@ -97,7 +97,8 @@ that stopped, **as observed then** (it never re-reads guest memory). The latest 
 before each descriptor is read, so when that descriptor came from direct user data or the
 uninstrumented flat buffer, the stop says so instead of naming an earlier read.
 
-**Draw-preparation workers do not stop.** A worker's selection is speculative: it runs on
+**A draw-preparation worker's selection does not stop on a descriptor with no number
+conversion.** (Other assertions on workers are unchanged.) A worker's selection is speculative: it runs on
 register state the scanner replayed, and the GPU thread re-checks it before using anything
 (vk_draw_prep.h). There, a descriptor with no number conversion abandons the preparation, and
 the GPU thread selects that draw itself, where the stop still applies. The first 8 are logged
