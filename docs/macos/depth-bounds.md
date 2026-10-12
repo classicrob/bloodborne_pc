@@ -55,8 +55,12 @@ was cached under the FS-less key, and the next FS-less draw without the test sto
 Fixes:
 - PipelineSelection::ResetStages clears the runtime infos too.
 - The pipeline constructor refuses a fragment runtime info without a fragment shader
-  (FragmentInfoMatchesShader): a stop for a live selection. For a pipeline preloaded from a
-  cache written before the fix, the slot is reset and counted ("Pipeline cache: N preloaded
-  pipeline(s) ... reset").
+  (FragmentInfoMatchesShader): a stop for a live selection. For a preloaded pipeline the slot
+  is reset and counted ("Pipeline cache: N preloaded pipeline(s) ... reset"). This is a
+  defensive invariant repair, not a migration of old caches: the serialized record does not
+  save the runtime infos of stages without a hash (LoadGraphicsPipeline resets the preload
+  selection), so a stale slot is not expected from disk (Sol-2).
+- The source proves a defect matching the stop. That it caused the two Central Yharnam stops
+  is confirmed only by the arch route on a build with the fix.
 - A real depth-bounds draw without a fragment shader still stops in BindDepthBoundsSource. That
   stop now names the pipeline, whether it has a fragment shader, and the draw's DB registers.
