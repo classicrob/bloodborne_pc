@@ -3,8 +3,37 @@
 # second build job waits for the first, a priority build does not, the playtest pool is separate,
 # a killed holder (and its children) frees the slot, a nested call runs directly, and bad usage is
 # an error.
+# Hermetic: its own lock directory, slots and settings; nothing from the job running it (a full
+# --test holds a real slot) or from real heavy.sh jobs is seen, paused or resumed.
 set -euo pipefail
+if [[ -z ${BB_HEAVY_TEST_INNER:-} ]]; then
+    # A real perf run's --cpu-quiet stops this whole test with the job running it, which breaks its
+    # timing (a pause looks like a job that never ran). A sampler sees such a stop as a gap; a failed
+    # run with one is rerun once, and both results are said.
+    self=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
+    for attempt in 1 2; do
+        gaps=$(mktemp)
+        ( last=$EPOCHREALTIME
+          while :; do sleep 0.2; now=$EPOCHREALTIME
+              awk -v a="$last" -v b="$now" 'BEGIN { if (b - a > 1.5) printf "%.1f\n", b - a }' >> "$gaps"
+              last=$now; done ) &
+        sampler=$!
+        status=0
+        BB_HEAVY_TEST_INNER=1 bash "$self" || status=$?
+        kill "$sampler"; wait "$sampler" 2>/dev/null || true
+        stopped=$(awk '{ s += $1 } END { printf "%.0f", s }' "$gaps"); rm -f "$gaps"
+        if (( status == 0 )); then
+            (( attempt == 1 )) || echo "heavy test: PASS on the rerun (the first run failed after an outside pause)" >&2
+            exit 0
+        fi
+        if (( attempt == 2 || stopped == 0 )); then exit "$status"; fi
+        echo "heavy test: FAILED (exit $status) after an outside pause of ${stopped} s (a real perf run's" \
+            "CPU quiet stops this test); rerunning once" >&2
+    done
+fi
 cd "$(dirname "$0")/.."
+# Nothing inherited: the slot and settings of the job running this test, its parallelism hints.
+unset ${!BB_HEAVY_@} BB_BUILD_JOBS CMAKE_BUILD_PARALLEL_LEVEL MAKEFLAGS
 heavy=tools/macos/heavy.sh
 dir=$(mktemp -d)
 trap 'rm -rf "$dir"; kill $(jobs -p) 2>/dev/null || true' EXIT
@@ -13,7 +42,6 @@ export BB_HEAVY_DIR=$dir BB_HEAVY_BUILD_SLOTS=1 BB_HEAVY_PLAYTEST_SLOTS=2 BB_HEA
 # The slot tests below run several jobs from this one checkout; the worktree rule has its own
 # section (in a scratch repository) near the end.
 export BB_HEAVY_SHARED_TREE=1
-unset BB_HEAVY_HELD
 fail() { echo "heavy test FAILED: $*" >&2; exit 1; }
 until_held() { for _ in $(seq 100); do "$heavy" status | grep -q "$1: held by $2" && return; sleep 0.1; done; fail "$1 never held by $2"; }
 
@@ -238,6 +266,24 @@ before=$(ticks "$dir/b12"); sleep 1
 grep -q 'CPU QUIET BOUND REACHED' "$dir/p11.err" || fail "bound not reported loudly"
 wait "$p11"
 kill "$b12" 2>/dev/null; wait "$b12" 2>/dev/null || true; pkill -f "$dir/b12" 2>/dev/null || true
+# A process another pause already stopped is left to it: a CPU-quiet run neither counts nor resumes it
+# (a real perf run pausing a full --test, then resuming everything, must not resume what this
+# test's own perf run paused).
+"$heavy" B13 -- sh -c "while :; do echo t >> '$dir/b13'; sleep 0.2; done" &
+b13=$!
+for _ in $(seq 50); do [[ -s $dir/b13 ]] && break; sleep 0.1; done
+b13_loop=$(pgrep -f "^sh -c while :; do echo t >> '$dir/b13'" || true)
+[[ -n $b13_loop ]] || fail "B13's loop not found"
+kill -STOP "$b13_loop"
+"$heavy" --pool playtest --gpu exclusive --cpu-quiet P12 -- sleep 1 2> "$dir/p12.err"
+sleep 0.5
+[[ $(ps -o stat= -p "$b13_loop") == T* ]] || fail "a CPU-quiet run resumed a process another pause had stopped"
+grep -q 'P12: CPU quiet: paused B13 (build0, [0-9]* processes; 1 already stopped by another pause, left to it)' "$dir/p12.err" ||
+    fail "already-stopped process not reported: $(cat "$dir/p12.err")"
+kill -CONT "$b13_loop"
+before=$(ticks "$dir/b13"); sleep 1
+(( $(ticks "$dir/b13") > before )) || fail "B13 did not run after its own pauser resumed it"
+kill "$b13" 2>/dev/null; wait "$b13" 2>/dev/null || true; pkill -f "$dir/b13" 2>/dev/null || true
 if "$heavy" --cpu-quiet K1 -- true 2>/dev/null; then fail "--cpu-quiet without --gpu exclusive accepted"; fi
 if "$heavy" K2 -- "$heavy" --pool playtest --gpu exclusive --cpu-quiet K3 -- true 2>/dev/null; then
     fail "--cpu-quiet inside a slot accepted"
@@ -331,4 +377,4 @@ assert any(l['label'] == 'B' and l['waited_s'] >= 1 for l in starts), 'B waited'
 assert all({'pool', 'slot', 'waited_s', 'load', 'held'} <= set(l) for l in starts)
 assert any(l['label'] == 'Q4' and l['status'] == 124 for l in ends), 'Q4 killed'
 PY
-echo "heavy.sh: history log, build/playtest/quick pools, quick hints and time limit, waiting, priority slot, GPU shared/exclusive lock with gate, start announcement, polite scheduling, idle-aware admission, CPU-quiet pause, job records (command, directory, end status/signal, orphans), one job per worktree and INVALID on a changed tree, sweep lane, release on SIGKILL, nesting, exit status, usage errors PASS"
+echo "heavy.sh: history log, build/playtest/quick pools, quick hints and time limit, waiting, priority slot, GPU shared/exclusive lock with gate, start announcement, polite scheduling, idle-aware admission, CPU-quiet pause (leaving another pause's processes stopped), job records (command, directory, end status/signal, orphans), one job per worktree and INVALID on a changed tree, sweep lane, release on SIGKILL, nesting, exit status, usage errors PASS"
