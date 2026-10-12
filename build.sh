@@ -389,6 +389,7 @@ if [[ ${1:-} == --test || ${1:-} == --test-dry || ${1:-} == --test-one ]]; then
         t sh tests/test_memory_inventory_macos.sh
         t sh tests/test_audio_macos.sh
         t sh tests/test_audio_qos_macos.sh
+        t sh tests/test_player_position_macos.sh
         t sh tests/test_guest_heap_lock_macos.sh
         t sh tests/test_low_map_trace_macos.sh
         t sh tests/test_perf_summary.sh
