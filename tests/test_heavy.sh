@@ -275,9 +275,11 @@ err=$(BB_HEAVY_IDLE_SECONDS=120 "$heavy" ACTIVE2 -- true 2>&1 >/dev/null)
 b10=$!
 both_quick_free() { [[ $("$heavy" status | grep -c '^quick[01]: free') == 2 ]]; }
 wait_for "quick slots not free (Q2's killed job)" both_quick_free
-BB_HEAVY_QUICK_LIMIT=6 "$heavy" --pool quick Q10 -- sh -c 'sleep 3' > /dev/null 2> "$dir/q10.err" &
+# Q10/Q11 wait for a go-file the test creates while they are stopped: they are paused for sure, and
+# end as soon as they are resumed. Q10's 20 s limit must not count the quiet (held over 22 s).
+BB_HEAVY_QUICK_LIMIT=20 "$heavy" --pool quick Q10 -- sh -c "$(hold "[ -e '$dir/q-go' ]")" > /dev/null 2> "$dir/q10.err" &
 q10=$!
-"$heavy" --pool quick Q11 -- sh -c 'sleep 3; exit 3' > /dev/null 2> "$dir/q11.err" &
+"$heavy" --pool quick Q11 -- sh -c "$(hold "[ -e '$dir/q-go' ]"); exit 3" > /dev/null 2> "$dir/q11.err" &
 q11=$!
 wait_for "B10 never ran" test -s "$dir/b10"
 both_quick_held() { local held; held=$("$heavy" status); [[ $held == *'held by Q10 '* && $held == *'held by Q11 '* ]]; }
@@ -291,9 +293,9 @@ p10=$!
 wait_for "P10 never measured: $(cat "$dir/p10.err" 2>/dev/null)" test -s "$dir/p10"
 ( "$heavy" --pool sweep B11 -- true 2>/dev/null; echo done > "$dir/b11" ) &  # its slot is free, but the CPU is quiet
 b11=$!
-# Q10's limit (6 s) must pause too: the quiet lasts well past it (at least 6 s more) before release.
-sleep 6
-touch "$dir/p10-release"
+# The quiet outlasts Q10's 20 s limit (a lower bound: 22 s more); Q10/Q11 get their go-file while stopped.
+sleep 22
+touch "$dir/q-go" "$dir/p10-release"
 wait "$p10" || fail "P10 failed: $(cat "$dir/p10.err")"
 read -r a b < "$dir/p10"
 (( a == b )) || fail "a build job kept running during a CPU-quiet perf run ($a -> $b ticks)"
