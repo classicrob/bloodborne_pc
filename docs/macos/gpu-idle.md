@@ -266,10 +266,20 @@ Now, with labels at GPU completion, a WRITE_DATA waits for what is ordered befor
 - **and the labels behind any WAIT_REG_MEM that stage A met early** from a pending fence value
   (PendingFenceValue). On the PS4 that WAIT would have blocked the CP until the label landed, so a
   later WRITE_DATA must not pass it. The guest has such pairs (EOS/EOP L=1 then WAIT_REG_MEM L==1,
-  0x26b08e0 / 0x26b09e0, Astra-2's deferred-signal audit). Stage A records the deferred signals
-  issued at each such wait (gpu/shim/bbport_write_order.h); a WRITE_DATA waits through that count.
-  The count only rises, so a WRITE_DATA may wait for a later barrier than its own position needed:
-  longer, never shorter.
+  0x26b08e0 / 0x26b09e0, Astra-2's deferred-signal audit).
+  - The dependency is taken **at the WAIT's position in the stream**: stage A puts an in-order
+    marker there, which runs after the producing EOP/EOS has issued its label. A value sampled on
+    stage A at parse could predate that label (Astra-2, Sol-2).
+  - It counts **completion labels only**. Their one writer completes them in issue order, so "N
+    written" is a prefix. The mixed deferred-signal count is not a prefix: a later recorder write
+    can complete first.
+  - The barrier belongs to the scheduler (gpu/shim/bbport_write_order.h) and only rises, so a
+    WRITE_DATA may wait for a later barrier than its own position needed: longer, never shorter.
+  - Stage B submits its batched labels before waiting.
+  - Tests (test_label_check, through a real draw pipe): stage B held while EOP, the marker, a
+    later recorder write and WRITE_DATA are committed. The recorder write completes first and the
+    label stays pending, and WRITE_DATA waits. Without a WAIT it does not. A negative control
+    shows that a marker taken before its producer lets WRITE_DATA through.
 
 A WRITE_DATA before a later completion label stays visible first: it is written when stage B runs
 it, the label only at GPU completion. Toggle bit 63 (WriteDataAfterLabels) restores the old wait

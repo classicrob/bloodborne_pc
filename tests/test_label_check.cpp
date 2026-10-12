@@ -731,11 +731,27 @@ int main() {
             no_wait_landed = f.written.load() && !f.labels.CompleteThrough(1);
             f.labels.Complete();
         }
+        bool early_capture_leaks = false;
+        {
+            // Negative control: the marker taken before its producer was issued (what sampling
+            // on stage A at parse amounts to) lets WRITE_DATA through with the label pending.
+            Fixture f;
+            Vulkan::DrawPipe pipe(handler, &f);
+            run({Hold, ForwardedWait, IssueLabel, RecorderWrite, WriteData}, f, pipe);
+            for (int i = 0; i < 2000 && !f.written.load(); ++i) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            early_capture_leaks = f.written.load() && !f.labels.CompleteThrough(1);
+            f.labels.Complete();
+        }
         Expect("write order: after a WAIT_REG_MEM met early, WRITE_DATA waits for its label even "
                "with stage B held and a later recorder write done first",
                held_back && landed_after);
         Expect("  ... without a WAIT, WRITE_DATA does not wait for an earlier completion label",
                no_wait_landed);
+        Expect("  ... (negative control: a marker taken before the producer issued leaks, so "
+               "these controls detect a misplaced capture)",
+               early_capture_leaks);
         BbWriteOrder::Barrier barrier;
         barrier.AtForwardedWait(7);
         barrier.AtForwardedWait(5);
