@@ -371,90 +371,84 @@ assert end['paused_by'] == ['P13'] and end['paused_s'] > 0, end  # the whole pau
 assert not os.path.exists(os.path.join(sys.argv[2], f'paused-{pid}.jsonl')), 'pause file left behind'
 PY
 # --cpu-quiet=ecore: a running build job is not paused but moved to background QoS (E-cores; ps
-# priority 4, read back), a process it forks meanwhile inherits that, a new job starts at once in
-# the background, and at the end the demoted processes come back and the job's end says so.
+# priority 4, read back), its children run there too (inherited, or demoted by the next rescan), a
+# new job starts at once in the background, and at the end the demoted processes come back and the
+# job's end says so.
 pri() { ps -o pri= -p "$1" | tr -d ' '; }
+pri_is() { [[ $(pri "$1") == "$2" ]]; }
+child_in_background() { local c; c=$(pgrep -P "$1" | head -1 || true); [[ -n $c && $(pri "$c") == 4 ]]; }
+gone() { ! kill -0 "$1" 2>/dev/null; }
 BB_HEAVY_POLITE=0 "$heavy" B15 -- sh -c "while :; do echo t >> '$dir/b15'; sleep 0.2; done" 2> "$dir/b15.err" &
 b15=$!
-for _ in $(seq 50); do [[ -s $dir/b15 ]] && break; sleep 0.1; done
+wait_for "B15 never ran" test -s "$dir/b15"
 b15_loop=$(pgrep -f "^sh -c while :; do echo t >> '$dir/b15'" || true)
 [[ -n $b15_loop ]] || fail "B15's loop not found"
 normal=$(pri "$b15_loop")
 (( normal > 4 )) || fail "B15 started in the background already (priority $normal)"
-"$heavy" --pool playtest --gpu exclusive --cpu-quiet=ecore P15 -- sleep 4 2> "$dir/p15.err" &
+"$heavy" --pool playtest --gpu exclusive --cpu-quiet=ecore P15 -- sh -c "$(hold "[ -e '$dir/p15-release' ]")" 2> "$dir/p15.err" &
 p15=$!
-sleep 2
-demoted=$(pri "$b15_loop")
-child_pri=none
-for _ in $(seq 20); do  # the loop's sleep 0.2, forked after the demotion (between its sleeps for an instant)
-    child=$(pgrep -P "$b15_loop" | head -1 || true)
-    if [[ -n $child ]]; then child_pri=$(pri "$child"); [[ -n $child_pri ]] && break; fi
-    child_pri=none; sleep 0.05
-done
-before=$(ticks "$dir/b15"); sleep 1; after=$(ticks "$dir/b15")
-start=$(date +%s)
-b16=$("$heavy" --pool sweep B16 -- sh -c 'ps -o pri= -p $$' 2> /dev/null | tr -d ' ')
-b16_wait=$(( $(date +%s) - start ))
-wait "$p15"
-sleep 1.5
-restored=$(pri "$b15_loop")
-(( demoted == 4 )) || fail "a running build job not at background QoS under --cpu-quiet=ecore (priority $demoted)"
-[[ $child_pri == 4 ]] || fail "a process forked during the E-core quiet did not inherit it (priority $child_pri)"
-(( after > before )) || fail "a build job stopped under --cpu-quiet=ecore ($before -> $after ticks)"
+wait_for "a running build job not at background QoS under --cpu-quiet=ecore (priority $(pri "$b15_loop"))" pri_is "$b15_loop" 4
+wait_for "B15's children not at background QoS during the E-core quiet" child_in_background "$b15_loop"
+grew "$dir/b15" || fail "a build job stopped under --cpu-quiet=ecore"
+b16=$("$heavy" --pool sweep B16 -- sh -c 'ps -o pri= -p $$' 2> /dev/null | tr -d ' ') || fail "B16 failed"
 [[ $b16 == 4 ]] || fail "a job started during the E-core quiet is not in the background (priority '$b16')"
-(( b16_wait < 3 )) || fail "a job waited ${b16_wait} s to start during the E-core quiet"
-(( restored == normal )) || fail "B15 not restored after the E-core quiet (priority $restored, was $normal)"
+touch "$dir/p15-release"
+wait "$p15" || fail "P15 failed: $(cat "$dir/p15.err")"
+quiet_ended() { grep -q "\"event\": \"quiet-end\", \"by\": \"$1\"" "$dir/history.jsonl"; }  # (its watcher writes it)
+wait_for "P15's quiet end not recorded" quiet_ended P15
+order quiet-start:P15 start:B16 quiet-end:P15  # B16 started during the quiet, without waiting for its end
+wait_for "B15 not restored after the E-core quiet (priority $(pri "$b15_loop"), was $normal)" pri_is "$b15_loop" "$normal"
 grep -q 'P15: CPU quiet (E-cores): B15 (build0) at background QoS' "$dir/p15.err" || fail "demotion not reported: $(cat "$dir/p15.err")"
-grep -q 'P15: CPU quiet over: B15 back from E-cores' "$dir/p15.err" || fail "restore not reported: $(cat "$dir/p15.err")"
+wait_for "restore not reported: $(cat "$dir/p15.err")" grep -q 'P15: CPU quiet over: B15 back from E-cores' "$dir/p15.err"
 kill "$b15" 2>/dev/null; wait "$b15" 2>/dev/null || true; pkill -f "$dir/b15" 2>/dev/null || true
 grep -Eq '^heavy: B15: ran [0-9]+ s at E-core QoS for perf runs \(P15\); ended with' "$dir/b15.err" ||
     fail "B15's end does not name the E-core quiet: $(cat "$dir/b15.err")"
-# The same through ninja (posix_spawn, as the GPU build compiles): the job ninja starts after the
-# demotion inherits background QoS; one it started before is demoted by the watcher's rescan.
+# The same through ninja (posix_spawn, as the GPU build compiles): ninja's job a waits for a file;
+# once ninja is demoted the test releases a, and job b, spawned by ninja after the demotion, runs in
+# the background.
 command -v ninja > /dev/null || fail "ninja not on PATH"
-mkdir -p "$dir/nj" && printf 'rule s\n  command = sleep $t\nbuild a: s\n  t = 1\nbuild b: s\n  t = 4\n' > "$dir/nj/build.ninja"
+mkdir -p "$dir/nj"
+printf 'n=0; until [ -e "$1" ]; do n=$((n + 1)); [ $n -gt 600 ] && exit 9; sleep 0.1; done\n' > "$dir/nj/wait.sh"
+printf 'rule w\n  command = sh %s/wait.sh $f\nbuild a: w\n  f = %s/a-go\nbuild b: w\n  f = %s/b-go\n' "$dir/nj" "$dir/nj" "$dir/nj" > "$dir/nj/build.ninja"
 BB_HEAVY_POLITE=0 "$heavy" B17 -- ninja -C "$dir/nj" -j1 a b > /dev/null 2>&1 &
 b17=$!
 until_held build0 B17
 b17_ninja=''
-for _ in $(seq 100); do
-    b17_ninja=$(pgrep -f "^ninja -C $dir/nj" | head -1 || true)
-    [[ -n $b17_ninja ]] && pgrep -P "$b17_ninja" > /dev/null && break; sleep 0.05
-done
-[[ -n $b17_ninja ]] || fail "B17's ninja never started its first job"
-"$heavy" --pool playtest --gpu exclusive --cpu-quiet=ecore P16 -- sleep 3 2> /dev/null &
+ninja_job_running() { b17_ninja=$(pgrep -f "^ninja -C $dir/nj" | head -1 || true); [[ -n $b17_ninja ]] && pgrep -P "$b17_ninja" > /dev/null; }
+wait_for "B17's ninja never started its first job" ninja_job_running
+"$heavy" --pool playtest --gpu exclusive --cpu-quiet=ecore P16 -- sh -c "$(hold "[ -e '$dir/p16-release' ]")" 2> /dev/null &
 p16=$!
-sleep 2.2  # job a (sleep 1) ended during the quiet; ninja spawned job b after the demotion
-job_b=$(pgrep -P "$b17_ninja" | head -1 || true)
-job_b_pri=$( [[ -n $job_b ]] && pri "$job_b" || echo none)
-wait "$p16"; wait "$b17" || fail "B17 (ninja) failed"
-[[ $job_b_pri == 4 ]] || fail "a job ninja spawned during the E-core quiet is not in the background (priority $job_b_pri)"
+wait_for "B17's ninja not demoted" pri_is "$b17_ninja" 4
+touch "$dir/nj/a-go"
+job_b_running() { pgrep -f "wait.sh $dir/nj/b-go" > /dev/null; }
+wait_for "ninja never started job b" job_b_running
+job_b=$(pgrep -f "wait.sh $dir/nj/b-go" | head -1)
+[[ $(pri "$job_b") == 4 ]] || fail "a job ninja spawned during the E-core quiet is not in the background (priority $(pri "$job_b"))"
+touch "$dir/nj/b-go" "$dir/p16-release"
+wait "$p16" || fail "P16 failed"
+wait "$b17" || fail "B17 (ninja) failed"
 # A job's process whose parent exited (re-parented to launchd, out of the job's tree) is still in
 # the job's own process group: CPU quiet stops it, and under ecore demotes it and the children it
 # keeps forking.
 BB_HEAVY_POLITE=0 "$heavy" B18 -- sh -c "(sh -c 'while :; do echo t >> $dir/b18; sleep 0.2; done' &); while :; do sleep 0.5; done" &
 b18=$!
-for _ in $(seq 50); do [[ -s $dir/b18 ]] && break; sleep 0.1; done
+wait_for "B18 never ran" test -s "$dir/b18"
 orphan=$(pgrep -f "^sh -c while :; do echo t >> $dir/b18" || true)
 [[ -n $orphan && $(ps -o ppid= -p "$orphan" | tr -d ' ') == 1 ]] || fail "B18's loop is not an orphan (pid '$orphan')"
-"$heavy" --pool playtest --gpu exclusive --cpu-quiet P21 -- sh -c "sleep 0.5; a=\$(wc -l < '$dir/b18'); sleep 1.5; b=\$(wc -l < '$dir/b18'); echo \$a \$b > '$dir/p21'" 2> /dev/null
+"$heavy" --pool playtest --gpu exclusive --cpu-quiet P21 -- sh -c "
+    $(hold "grep -q 'paused B18' '$dir/p21.err'")
+    a=\$(wc -l < '$dir/b18'); sleep 1.5; b=\$(wc -l < '$dir/b18'); echo \$a \$b > '$dir/p21'" 2> "$dir/p21.err" ||
+    fail "P21 failed: $(cat "$dir/p21.err")"
 read -r a b < "$dir/p21"
 (( a == b )) || fail "an orphaned process of a job kept running during CPU quiet ($a -> $b ticks)"
-"$heavy" --pool playtest --gpu exclusive --cpu-quiet=ecore P22 -- sleep 2.5 2> /dev/null &
+"$heavy" --pool playtest --gpu exclusive --cpu-quiet=ecore P22 -- sh -c "$(hold "[ -e '$dir/p22-release' ]")" 2> /dev/null &
 p22=$!
-sleep 1.6
-orphan_pri=$(pri "$orphan")
-orphan_child=none
-for _ in $(seq 20); do
-    c=$(pgrep -P "$orphan" | head -1 || true)
-    if [[ -n $c ]]; then orphan_child=$(pri "$c"); [[ -n $orphan_child ]] && break; fi
-    orphan_child=none; sleep 0.05
-done
-wait "$p22"
-(( orphan_pri == 4 )) && [[ $orphan_child == 4 ]] ||
-    fail "an orphaned process (priority $orphan_pri) or its new child ($orphan_child) not demoted under ecore"
+wait_for "an orphaned process not demoted under ecore (priority $(pri "$orphan"))" pri_is "$orphan" 4
+wait_for "an orphaned process's new children not at background QoS" child_in_background "$orphan"
+touch "$dir/p22-release"
+wait "$p22" || fail "P22 failed"
 kill "$b18" 2>/dev/null; wait "$b18" 2>/dev/null || true
-sleep 0.3; ! kill -0 "$orphan" 2>/dev/null || fail "the job's orphan outlived the job's SIGTERM (group forwarding)"
+wait_for "the job's orphan outlived the job's SIGTERM (group forwarding)" gone "$orphan"
 # A SIGKILL to the caller's process group (a stopped task, a killed shell) takes the job's command
 # down too, though it runs in its own session: its reaper SIGKILLs the job's group once heavy.py is
 # gone, so the slot is never free while the job still runs. Build and quick pools.
@@ -463,28 +457,30 @@ for pool in build quick; do
     perl -e 'setpgrp(0, 0); exec @ARGV' -- "$heavy" --pool $pool K20$pool -- \
         sh -c "while :; do echo t >> '$dir/$tag'; sleep 0.2; done" 2> /dev/null &
     launcher=$!
-    for _ in $(seq 100); do [[ -s $dir/$tag ]] && break; sleep 0.05; done
+    wait_for "K20$pool's command never ran" test -s "$dir/$tag"
     loop=$(pgrep -f "^sh -c while :; do echo t >> '$dir/$tag'" || true)
-    [[ -n $loop ]] || fail "K20$pool's command never started"
+    [[ -n $loop ]] || fail "K20$pool's command not found"
     kill -KILL -- -"$launcher"
-    for _ in $(seq 40); do kill -0 "$loop" 2>/dev/null || break; sleep 0.1; done
-    ! kill -0 "$loop" 2>/dev/null || { kill "$loop"; fail "$pool job's command survived a SIGKILL to the caller's group"; }
-    "$heavy" status | grep -q "held by K20$pool" && fail "$pool slot still held after the job's group died"
+    wait_for "$pool job's command survived a SIGKILL to the caller's group" gone "$loop"
+    not_held() { ! "$heavy" status | grep -q "held by K20$1"; }
+    wait_for "$pool slot still held after the job's group died" not_held "$pool"
     wait "$launcher" 2>/dev/null || true
 done
 # Restore after ecore returns a polite job to its own scheduling (a priority-lane job: nice 5,
 # utility QoS), not merely out of the background.
 "$heavy" --priority B19 -- sh -c "while :; do echo t >> '$dir/b19'; sleep 0.2; done" 2> /dev/null &
 b19=$!
-for _ in $(seq 50); do [[ -s $dir/b19 ]] && break; sleep 0.1; done
+wait_for "B19 never ran" test -s "$dir/b19"
 b19_loop=$(pgrep -f "^sh -c while :; do echo t >> '$dir/b19'" || true)
 [[ -n $b19_loop ]] || fail "B19's loop not found"
 b19_before="$(ps -o pri=,nice= -p "$b19_loop" | tr -s ' ')"
-"$heavy" --pool playtest --gpu exclusive --cpu-quiet=ecore P23 -- sleep 2 2> /dev/null &
-p23=$!; sleep 1.5; b19_during=$(pri "$b19_loop"); wait "$p23"; sleep 1.5
-b19_after="$(ps -o pri=,nice= -p "$b19_loop" | tr -s ' ')"
-(( b19_during == 4 )) || fail "the priority-lane job was not demoted (priority $b19_during)"
-[[ $b19_after == "$b19_before" ]] || fail "restore changed the priority-lane job's scheduling: '$b19_before' -> '$b19_after'"
+"$heavy" --pool playtest --gpu exclusive --cpu-quiet=ecore P23 -- sh -c "$(hold "[ -e '$dir/p23-release' ]")" 2> /dev/null &
+p23=$!
+wait_for "the priority-lane job was not demoted (priority $(pri "$b19_loop"))" pri_is "$b19_loop" 4
+touch "$dir/p23-release"
+wait "$p23" || fail "P23 failed"
+b19_restored() { [[ "$(ps -o pri=,nice= -p "$b19_loop" | tr -s ' ')" == "$b19_before" ]]; }
+wait_for "restore changed the priority-lane job's scheduling: '$b19_before' -> '$(ps -o pri=,nice= -p "$b19_loop" | tr -s ' ')'" b19_restored
 kill "$b19" 2>/dev/null; wait "$b19" 2>/dev/null || true
 # --settle LOAD,SECONDS: a quiet run waits for the 1-minute load to fall below LOAD, or refuses
 # (exit 75) past SECONDS, naming the top processes; the quiet start records the top 5 CPU
