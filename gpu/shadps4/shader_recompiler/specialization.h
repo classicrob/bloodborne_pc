@@ -153,7 +153,11 @@ struct StageSpecialization {
         for (size_t i = 0; i < ud.size() && i < NUM_USER_DATA_REGS; ++i) {
             user_data += fmt::format(" s{}={:#x}", i, ud[i]);
         }
-        const std::string source = fetch_source() + user_data + BbCmdData::LastRead() +
+        const std::string source = fetch_source() + user_data +
+                                   BbCmdData::UserDataOrigins(ud.data(),
+                                                              std::min<size_t>(ud.size(),
+                                                                               NUM_USER_DATA_REGS)) +
+                                   BbCmdData::LastRead() +
                                    BbFrameMarks::Describe() + "; " + BbComputeSh::Describe();
 #else
         (void)fetch_source;
