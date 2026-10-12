@@ -10,14 +10,16 @@
 static _Thread_local int guest_error;
 #ifndef BB_QOS_REAL
 static atomic_int sets, qos_get_calls;
-static int inject_error, inject_mismatch;
+static int inject_error, inject_mismatch, inject_get_error;
 static _Thread_local qos_class_t requested=QOS_CLASS_UTILITY;
-static qos_class_t test_get(pthread_t thread,int *relative) {
+static int test_get(pthread_t thread,qos_class_t *qos,int *relative) {
     assert(pthread_equal(thread,pthread_self()));
     atomic_fetch_add(&qos_get_calls,1);
     errno=99;guest_error=77;
     *relative=0;
-    return requested;
+    if (inject_get_error && ((requested==QOS_CLASS_UTILITY) == (inject_get_error==1))) return EINVAL;
+    *qos=requested;
+    return 0;
 }
 static int test_set(qos_class_t qos,int relative) {
     assert(qos==QOS_CLASS_USER_INTERACTIVE && relative==0);
@@ -44,7 +46,8 @@ static void *worker(void *arg) {
 #ifdef BB_QOS_REAL
     int relative=0,policy=0;
     struct sched_param param={0};
-    qos_class_t qos=pthread_get_qos_class_np(pthread_self(),&relative);
+    qos_class_t qos=QOS_CLASS_UNSPECIFIED;
+    assert(!pthread_get_qos_class_np(pthread_self(),&qos,&relative));
     assert(!pthread_getschedparam(pthread_self(),&policy,&param));
     printf("OBSERVED %s requested-qos=%u relative=%d sched=%d priority=%d\n",
            name,(unsigned)qos,relative,policy,param.sched_priority);
@@ -56,6 +59,7 @@ int main(int argc,char **argv) {
     (void)argv;
 #ifndef BB_QOS_REAL
     inject_error=!strcmp(argv[1],"error");
+    inject_get_error=!strcmp(argv[1],"get-before") ? 1 : !strcmp(argv[1],"get-after") ? 2 : 0;
     inject_mismatch=!strcmp(argv[1],"mismatch");
 #endif
     const char *names[]={"FMOD AudioOut thread","FMOD mixer thread","FMOD stream thread",

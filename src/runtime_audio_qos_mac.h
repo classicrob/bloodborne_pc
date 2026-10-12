@@ -33,14 +33,25 @@ static void audio_qos_start(const char *name,int guest_priority,int *guest_error
     if (audio_qos_interactive &&
         (!strcmp(name,"FMOD AudioOut thread") || !strcmp(name,"FMOD mixer thread"))) {
         int before_relative=0, after_relative=0;
-        qos_class_t before=pthread_get_qos_class_np(pthread_self(),&before_relative);
+        qos_class_t before=QOS_CLASS_UNSPECIFIED, after=QOS_CLASS_UNSPECIFIED;
+        error=pthread_get_qos_class_np(pthread_self(),&before,&before_relative);
+        if (error) {
+            fprintf(stderr,"STOP: audio QoS before query failed: %d\n",error);
+            fflush(stderr);
+            _Exit(23);
+        }
         error=pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE,0);
         if (error) {
             fprintf(stderr,"STOP: audio QoS interactive for '%s' failed: %d\n",name,error);
             fflush(stderr);
             _Exit(23);
         }
-        qos_class_t after=pthread_get_qos_class_np(pthread_self(),&after_relative);
+        error=pthread_get_qos_class_np(pthread_self(),&after,&after_relative);
+        if (error) {
+            fprintf(stderr,"STOP: audio QoS after query failed: %d\n",error);
+            fflush(stderr);
+            _Exit(23);
+        }
         if (after!=QOS_CLASS_USER_INTERACTIVE || after_relative!=0) {
             fprintf(stderr,"STOP: audio QoS interactive for '%s' not reported (class=%u relative=%d)\n",
                     name,(unsigned)after,after_relative);

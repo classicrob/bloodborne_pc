@@ -259,10 +259,11 @@ static int32_t output_port(int32_t handle, const void *data, int pace) {
                 char name[64]={0};
                 int relative=0;
                 int name_error=pthread_getname_np(pthread_self(),name,sizeof(name));
-                qos_class_t qos=pthread_get_qos_class_np(pthread_self(),&relative);
-                fprintf(stderr,"Audio producer: port %d thread='%s' pthread=%p requested-qos=%u/%d; effective scheduling may be process-clamped\n",
+                qos_class_t qos=QOS_CLASS_UNSPECIFIED;
+                int qos_error=pthread_get_qos_class_np(pthread_self(),&qos,&relative);
+                fprintf(stderr,"Audio producer: port %d thread='%s' pthread=%p requested-qos=%u/%d query-error=%d; effective scheduling may be process-clamped\n",
                         (int)(p-ports),name_error ? "unavailable" : name,(void *)pthread_self(),
-                        (unsigned)qos,relative);
+                        (unsigned)qos,relative,qos_error);
 #endif
             }
             else if (now-p->stat_last_ns>p->stat_max_gap_ns) p->stat_max_gap_ns=now-p->stat_last_ns;

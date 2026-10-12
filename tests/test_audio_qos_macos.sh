@@ -19,7 +19,9 @@ for value, mode in [(None,'off'), ('','off'), ('inherit','off'), ('interactive',
     subprocess.run(['arch','-x86_64','out/mac-playability/test-audio-qos-fake',mode],env=env,check=True)
 for value,mode,message in [('bogus','off','must be interactive'),
                            ('interactive','error','failed:'),
-                           ('interactive','mismatch','not reported')]:
+                           ('interactive','mismatch','not reported'),
+                           ('interactive','get-before','before query failed'),
+                           ('interactive','get-after','after query failed')]:
     result=subprocess.run(['arch','-x86_64','out/mac-playability/test-audio-qos-fake',mode],
                           env=dict(base,BB_AUDIO_QOS=value),capture_output=True,text=True)
     assert result.returncode==23, result
