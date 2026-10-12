@@ -125,6 +125,28 @@ struct Code {
         Vop3(0x123, vdst, mask, Inline(0));
         Vop3(0x124, vdst, mask + 1, Vgpr(vdst));
     }
+    /// v_bfe_u32 vdst, src0, src1 (offset), src2 (width)
+    void VBfeU32(uint32_t vdst, uint32_t src0, uint32_t src1, uint32_t src2) {
+        words.push_back(0xD0000000u | (0x148u << 17) | vdst);
+        words.push_back(src0 | (src1 << 9) | (src2 << 18));
+    }
+    /// s_buffer_load_dword sdst, s[sbase:sbase+3], offset (dwords)
+    void SBufferLoadDword(uint32_t sdst, uint32_t sbase, uint32_t offset) {
+        words.push_back(0xC2000000u | (8u << 22) | (sdst << 15) | ((sbase / 2) << 9) | (1u << 8) |
+                        offset);
+    }
+    /// ds_write_b32 vaddr, vdata
+    void DsWriteB32(uint32_t vaddr, uint32_t vdata) {
+        words.push_back(0xD8000000u | (13u << 18));
+        words.push_back((vdata << 8) | vaddr);
+    }
+    /// MUBUF buffer_store_dword with offen and glc (a hull's tess factor store): byte offset vaddr +
+    /// offset + soffset.
+    void BufferStoreDwordOffen(uint32_t vdata, uint32_t vaddr, uint32_t offset, uint32_t soffset,
+                               uint32_t srsrc) {
+        words.push_back(0xE0000000u | (28u << 18) | (1u << 14) | (1u << 12) | (offset & 0xFFF));
+        words.push_back((soffset << 24) | ((srsrc >> 2) << 16) | (vdata << 8) | vaddr);
+    }
     /// MUBUF buffer_store_dword (no glc/slc), the index from vaddr with idxen.
     void BufferStoreDword(uint32_t vdata, uint32_t vaddr, bool idxen, uint32_t offset,
                           uint32_t soffset, uint32_t srsrc) {
