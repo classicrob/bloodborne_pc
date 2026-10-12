@@ -1584,7 +1584,8 @@ bool TextureCache::CaptureForReplay(const std::function<void(CapturedImage&&)>& 
                 image.track_addr == image.info.guest_address &&
                 image.track_addr_end == image.info.guest_address + image.info.guest_size;
             state.image_uid = image.image_uid;
-            state.depth_uid = slot_images.is_allocated(image.depth_id) ? image.depth_uid : 0;
+            state.depth_uid =
+                image.depth_id && slot_images.is_allocated(image.depth_id) ? image.depth_uid : 0;
             state.hash = image.hash;
             state.info = image.info;
             captured.state = EncodeState(state);
