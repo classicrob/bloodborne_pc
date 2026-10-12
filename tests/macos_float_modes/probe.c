@@ -6,6 +6,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <vulkan/vulkan.h>
+#include "../test_alarm.h"
 #define CHECK(call) do { VkResult r_=(call); if(r_) { fprintf(stderr,"FAIL %s: %d\n",#call,r_); exit(1); } } while(0)
 static VkDevice device;
 static VkPhysicalDevice physical;
@@ -20,7 +21,6 @@ typedef struct { const char *name; uint32_t op,a,b,c; } Case;
 #include "../macos_pkrtz/cases.h"
 #else
 #include "../macos_fp16/cases.h"
-#include "../test_alarm.h"
 #endif
 #else
 static const Case cases[]={
