@@ -158,7 +158,10 @@ int HotThreadChild(const std::string& mode) {
         return 3;
     }
     if (mode == "role-not-applied") {
-        BbHotThreadQos::VerifyConfiguredRole(); // BB_TASK_ROLE set, nothing applied it
+        // A known role other than the one BB_TASK_ROLE asks for (foreground), whatever this
+        // process inherited; then Liverpool's check.
+        BbHotThreadQos::ApplyRole(TASK_DEFAULT_APPLICATION);
+        BbHotThreadQos::VerifyConfiguredRole();
         return 3;
     }
     if (mode == "startup-line") {
@@ -992,7 +995,7 @@ int main(int argc, char** argv) {
         Expect("  ... stops: BB_TASK_ROLE set but not applied at start (Liverpool's check)",
                stops("role-not-applied", "foreground",
                      "STOP: BB_TASK_ROLE asks for foreground application but the task role is "
-                     "unspecified (0"));
+                     "default application (7"));
 
         const HotThreadChildResult line = RunHotThreadChild("startup-line", nullptr);
         Expect("  ... the startup line: the thread's class and role, then both settings",
@@ -1029,7 +1032,20 @@ int main(int argc, char** argv) {
                    stage_a.find("; BB_HOT_THREAD_QOS user-interactive; BB_TASK_ROLE foreground "
                                 "application") != std::string::npos,
                both.out + both.err);
-        if (BaseOf(before) < 31) {
+        Expect("  ... the class alone: the worker path runs, stage A requests it, role as launched",
+               qos_only.spawned && WIFEXITED(qos_only.status) &&
+                   WEXITSTATUS(qos_only.status) == 0 &&
+                   stage_a_qos_only.find(": requested QoS user-interactive (relative 0)") !=
+                       std::string::npos &&
+                   stage_a_qos_only.find("; BB_TASK_ROLE unset (as launched)") !=
+                       std::string::npos,
+               qos_only.out + qos_only.err);
+        Expect("  ... (base priorities read)",
+               BaseOf(before) > 0 && BaseOf(stage_a) > 0 && BaseOf(stage_a_qos_only) > 0,
+               both.out + " / " + qos_only.out);
+        if (BaseOf(before) <= 0) {
+            // Unread: failed above, no clamp decision.
+        } else if (BaseOf(before) < 31) {
             // A heavy.sh taskpolicy clamp (utility 20, background 4) caps the role too.
             std::fprintf(stderr, "  ... role and class lift stage A: SKIPPED, the process is "
                                  "clamped (base %d)\n",

@@ -13,7 +13,9 @@ Both are read once from the environment (gpu/shim/bbport_hot_thread_qos.h):
 - `BB_TASK_ROLE=foreground|default-app` sets the process's task role (TASK_CATEGORY_POLICY). It
   is applied once by bb-probe's main thread, before bb_macos_ui_run starts the worker that runs
   the game (bbgpu_apply_task_role). Liverpool's constructor, which runs on that worker, checks
-  that the role is in effect before it starts stage A.
+  that the role is in effect before it starts stage A. Only bb-probe calls the export; another
+  entry point that wants the role must call it from its main thread, or Liverpool stops. The
+  check also stops if something between the two (window creation) changes the role.
 
 Unset or empty leaves today's behaviour. Any other value stops, and so do a refused set, a role
 applied off the main thread, and a role not in effect at Liverpool's constructor.
