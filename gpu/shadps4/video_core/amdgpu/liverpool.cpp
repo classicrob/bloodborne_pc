@@ -2172,6 +2172,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                         rasterizer->RunInOrder(
                             [](Vulkan::Rasterizer& r, const u8*) {
                                 r.WriteBarrier().AtForwardedWait(r.LabelsIssued());
+                                BbSplit::flush_census.forwarded_waits.fetch_add(
+                                    1, std::memory_order_relaxed);
                             },
                             nullptr, 0, BbToggle::PipelinedMemoryWrites);
                     }

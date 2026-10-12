@@ -657,8 +657,9 @@ int main() {
                    line.find("1.0 per frame ended an open render pass") != std::string::npos &&
                    line.find("label batches 1.0 per frame, oldest label's age at submit 500 us "
                              "mean, 700 us max") != std::string::npos &&
-                   line.find("labels written 1.0 per frame, issue to write 2000 us mean, 3000 us "
-                             "max") != std::string::npos &&
+                   line.find("WAIT_REG_MEMs met early 0.0 per frame; labels written 1.0 per "
+                             "frame, issue to write 2000 us mean, 3000 us max") !=
+                       std::string::npos &&
                    flush_reason == FOther);
     }
 

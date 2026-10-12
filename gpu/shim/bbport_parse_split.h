@@ -180,6 +180,8 @@ struct FlushCensus {
     /// Labels at GPU completion written, their issue-to-write age (the label thread), and the
     /// window's maximum (reset at each report).
     std::atomic<std::uint64_t> labels_written{0}, label_age_ns{0}, label_age_window_max_ns{0};
+    /// WAIT_REG_MEMs stage A met early from a pending value (their in-order markers ran).
+    std::atomic<std::uint64_t> forwarded_waits{0};
     std::atomic<std::uint64_t> ended_pass{0};       ///< a render pass was open (it ends)
     std::atomic<std::uint64_t> batches{0}, batch_age_ns{0}, batch_age_max_ns{0};
 };
@@ -424,7 +426,8 @@ inline std::string ScopeBy(const Account& a, Previous& previous, K kind, const c
 inline Previous previous_a, previous_b, previous_r;
 inline std::array<std::uint64_t, FCount> previous_flushes{};
 inline std::uint64_t previous_ended_pass = 0, previous_batches = 0, previous_batch_age_ns = 0,
-                     previous_labels_written = 0, previous_label_age_ns = 0;
+                     previous_labels_written = 0, previous_label_age_ns = 0,
+                     previous_forwarded_waits = 0;
 
 /// "  Flushes …" for the window: per frame by reason, passes ended, label batch age.
 inline std::string FlushLine(double frames) {
@@ -460,10 +463,14 @@ inline std::string FlushLine(double frames) {
     const std::uint64_t window_written = written - previous_labels_written;
     const std::uint64_t window_max =
         flush_census.label_age_window_max_ns.exchange(0, std::memory_order_relaxed);
-    char written_text[192];
+    const std::uint64_t forwarded = flush_census.forwarded_waits.load(std::memory_order_relaxed);
+    const double forwarded_per_frame = frames ? (forwarded - previous_forwarded_waits) / frames : 0.0;
+    previous_forwarded_waits = forwarded;
+    char written_text[256];
     std::snprintf(written_text, sizeof(written_text),
-                  "; labels written %.1f per frame, issue to write %.0f us mean, %.0f us max",
-                  frames ? window_written / frames : 0.0,
+                  "; WAIT_REG_MEMs met early %.1f per frame; labels written %.1f per frame, issue "
+                  "to write %.0f us mean, %.0f us max",
+                  forwarded_per_frame, frames ? window_written / frames : 0.0,
                   window_written ? (written_age - previous_label_age_ns) / 1e3 / window_written
                                  : 0.0,
                   window_max / 1e3);
