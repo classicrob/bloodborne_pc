@@ -894,7 +894,9 @@ def reap(watched, command):
     """--reap-for PID -- COMMAND: runs COMMAND in this process group, then ignores SIGINT/SIGTERM/
     SIGHUP (heavy.py sends them to the whole group, so the command gets them; this process stays
     to report). Polls its parent: once it is no longer PID, the group is SIGKILLed, this process
-    included. Exits with the command's status, or by the command's signal."""
+    included. Exits with the command's status, or by the command's signal. A signal to the group
+    between the spawn and the SIG_IGN ends this process only; the command gets it too, and the
+    inherited slot descriptor keeps the slot held until the command exits."""
     try:
         child = subprocess.Popen(command, close_fds=False)
     except OSError as error:

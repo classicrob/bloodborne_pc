@@ -114,7 +114,8 @@ at E-core QoS says so at its end (`ran N s at E-core QoS for perf runs (...)`; `
 --reap-for`), the group's leader: it waits for the command, and when heavy.sh dies for any reason
 (a SIGKILL to the caller's group, a stopped task) it SIGKILLs the job's group, so a job never
 outlives the slot it holds. Only if the reaper dies too does a process of the job keep the slot;
-status then says ORPHANED. Stop and ecore act on the job's tree and on every member of its group
+status then says ORPHANED. Each job therefore has one more python3 process (the reaper, a
+0.1 s poll). Stop and ecore act on the job's tree and on every member of its group
 (also after an intermediate parent exited, re-parented to launchd, and after the leader exited:
 a pid is not reused while its group lives), and SIGINT/SIGTERM/SIGHUP reach the whole group. The
 leader is recorded with its start time; a live leader pid with another start is a stranger (tree
