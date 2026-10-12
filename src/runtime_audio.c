@@ -16,6 +16,9 @@
 #include <errno.h>
 #include <stdatomic.h>
 #include <SDL3/SDL.h>
+#ifdef __APPLE__
+#include <pthread/qos.h>
+#endif
 
 #define PORTS 25
 #define ERR_NOT_OPENED ((int32_t)0x80260001)
@@ -250,7 +253,18 @@ static int32_t output_port(int32_t handle, const void *data, int pace) {
         if (p->dump) fwrite(converted,1,bytes,p->dump);
         if (p->stats) {
             uint64_t now=now_ns();
-            if (!p->stat_start_ns) { p->stat_start_ns=now; p->stat_min_queued=1<<30; }
+            if (!p->stat_start_ns) {
+                p->stat_start_ns=now; p->stat_min_queued=1<<30;
+#ifdef __APPLE__
+                char name[64]={0};
+                int relative=0;
+                int name_error=pthread_getname_np(pthread_self(),name,sizeof(name));
+                qos_class_t qos=pthread_get_qos_class_np(pthread_self(),&relative);
+                fprintf(stderr,"Audio producer: port %d thread='%s' pthread=%p requested-qos=%u/%d; effective scheduling may be process-clamped\n",
+                        (int)(p-ports),name_error ? "unavailable" : name,(void *)pthread_self(),
+                        (unsigned)qos,relative);
+#endif
+            }
             else if (now-p->stat_last_ns>p->stat_max_gap_ns) p->stat_max_gap_ns=now-p->stat_last_ns;
             p->stat_last_ns=now; ++p->stat_buffers;
             if (p->stream) {
