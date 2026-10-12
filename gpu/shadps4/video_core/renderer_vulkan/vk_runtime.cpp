@@ -768,13 +768,42 @@ void Runtime::SetBackingSamples(VideoCore::Image* image, u32 num_samples, bool c
     backing = new_backing;
 }
 
-bool Runtime::IsBufferAccessed(const VideoCore::Buffer* handle, u64 offset, u64 size,
-                               bool check_read_access) {
-    const AddressRange range = {
+/// The barrier tracker's key of a buffer range.
+static AddressRange TrackedRange(const VideoCore::Buffer* handle, u64 offset, u64 size) {
+#ifdef __APPLE__
+    // Callers handle empty ranges; the inclusive end is formed only for a range that fits.
+    const u64 base = handle->cpu_addr;
+    ASSERT_MSG(size != 0 && offset <= ~0ull - base && size - 1 <= ~0ull - (base + offset),
+               "macOS: barrier range {:#x}+{:#x}+{:#x} is empty or overflows", base, offset,
+               size);
+    // Guest memory is reached through imported arenas that overlap (an arena spans up to two
+    // pages), so it is tracked by guest address: one key per guest byte, whichever arena a
+    // command uses. Keyed by Buffer*, a write through one arena and a read through another
+    // got no barrier.
+    if (handle->cpu_addr != 0) {
+        constexpr u64 GuestMemory = 1; // no Buffer* is 1
+        return {
+            .resource = GuestMemory,
+            .range_start = handle->cpu_addr + offset,
+            .range_end = handle->cpu_addr + offset + size - 1,
+        };
+    }
+#endif
+    return {
         .resource = reinterpret_cast<u64>(handle),
         .range_start = offset,
         .range_end = offset + size - 1,
     };
+}
+
+bool Runtime::IsBufferAccessed(const VideoCore::Buffer* handle, u64 offset, u64 size,
+                               bool check_read_access) {
+#ifdef __APPLE__
+    if (size == 0) {
+        return false; // nothing accessed
+    }
+#endif
+    const AddressRange range = TrackedRange(handle, offset, size);
     bool has_access = barrier_tracker.FindRange(range, Access::Write);
     if (check_read_access && !has_access) {
         has_access |= barrier_tracker.FindRange(range, Access::Read);
@@ -784,18 +813,24 @@ bool Runtime::IsBufferAccessed(const VideoCore::Buffer* handle, u64 offset, u64 
 
 void Runtime::AccessBuffer(const VideoCore::Buffer* handle, u64 offset, u64 size,
                            vk::PipelineStageFlags2 src_stage, vk::AccessFlags2 src_access) {
-    AddressRange range = {
-        .resource = reinterpret_cast<u64>(handle),
-        .range_start = offset,
-        .range_end = offset + size - 1,
-    };
+#ifdef __APPLE__
+    if (size == 0) {
+        return; // nothing accessed
+    }
+#endif
+    AddressRange range = TrackedRange(handle, offset, size);
 
     constexpr static vk::AccessFlags2 READ_MASK =
         vk::AccessFlagBits2::eIndexRead | vk::AccessFlagBits2::eVertexAttributeRead |
         vk::AccessFlagBits2::eUniformRead | vk::AccessFlagBits2::eShaderRead |
         vk::AccessFlagBits2::eColorAttachmentRead |
         vk::AccessFlagBits2::eDepthStencilAttachmentRead | vk::AccessFlagBits2::eTransferRead |
-        vk::AccessFlagBits2::eMemoryRead;
+        vk::AccessFlagBits2::eMemoryRead
+#ifdef __APPLE__
+        // Indirect arguments read by draws and dispatches (Rasterizer::InputRead).
+        | vk::AccessFlagBits2::eIndirectCommandRead
+#endif
+        ;
 
     constexpr static vk::AccessFlags2 WRITE_MASK =
         vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eColorAttachmentWrite |

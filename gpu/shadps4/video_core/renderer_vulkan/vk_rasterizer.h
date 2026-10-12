@@ -337,6 +337,35 @@ private:
     /// BB_GPU_READ_CHECK (diagnostic): hashes what the draw just recorded reads, to compare at
     /// GPU retirement.
     void GpuReadCheck(const GraphicsPipeline* pipeline, bool is_indexed, u32 index_offset);
+    /// Reads of a draw's or dispatch's fixed-function inputs (the index range, indirect
+    /// arguments; the GS index buffer its ES kernel reads), noted when resolved and recorded in
+    /// the barrier tracker by ResetBindings, after the draw or dispatch that reads them: a later
+    /// write to them then gets its barrier (WAR). Recorded earlier, a FlushBarriers between could
+    /// clear them before the draw. Vertex data needs no entry on Apple: vertex fetch is emulated
+    /// (pulled through stage.buffers, recorded with the descriptor buffers).
+    struct InputRead {
+        const VideoCore::Buffer* buffer;
+        u64 offset;
+        u64 size;
+        vk::PipelineStageFlags2 stage;
+        vk::AccessFlags2 access;
+    };
+    std::vector<InputRead> input_reads;
+    void NoteInputRead(const VideoCore::Buffer* buffer, u64 offset, u64 size,
+                       vk::PipelineStageFlags2 stage, vk::AccessFlags2 access) {
+        input_reads.push_back({buffer, offset, size, stage, access});
+    }
+    /// BB_INPUT_READ_VERIFY=1: an ordinary indexed draw's index range, and an ordinary indirect
+    /// draw's or dispatch's arguments (and count), as bound, must be among the noted input reads;
+    /// a gap stops, naming the binding. GS-emulated draws (ES index reads) and descriptor buffers
+    /// are not checked.
+    struct InputBinding {
+        const char* what;
+        vk::Buffer handle;
+        u64 offset;
+        u64 size;
+    };
+    void VerifyInputReads(std::span<const InputBinding> bindings);
 #endif
     void DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_indexed,
                             const IndirectDraw& indirect);
