@@ -711,7 +711,8 @@ private:
     mutable vk::Viewport capture_viewport{};
     mutable vk::Rect2D capture_scissor{};
     void DumpSampledImages();
-    bool PendingWriteOverlaps(VAddr address, u64 size);
+    /// `matched_span` (optional): the size of the merged pending range that overlapped.
+    bool PendingWriteOverlaps(VAddr address, u64 size, u64* matched_span = nullptr);
     /// Stage B: the ring bindings of the stages of the packet being recorded.
     struct RingStage {
         const Shader::Info* info;

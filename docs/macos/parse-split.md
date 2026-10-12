@@ -118,6 +118,31 @@ attributes each pass end. A pass counts as ended by a submission when it is stil
 submission's barrier flush, which can close passes itself (counted there as "barrier"). So "ended
 an open render pass" here equals that census's "submit" enders.
 
+## Constant ring (stage A's copies of small constants)
+
+Stage A copies small read-only buffer resources, and each stage's flat user data, into the
+constant ring at decode (`Rasterizer::CollectRingBindings`), so stage B binds them without
+`ObtainBuffer`. A resource is
+skipped, and bound through `ObtainBuffer` at stage B, when:
+- it is larger than the stream threshold;
+- it is GPU-modified;
+- an unreached pending GPU-write note overlaps it.
+
+Notes come from `WRITE_DATA`, DMA and written V#s (`NotePendingGpuWrite`). Overlapping notes
+merge into one pending range, and each new one moves the range's position on. The "Constant ring per frame" line in the
+block gives:
+- the copies (and KiB, buffer resources and flat user data), and copies that did not fit (ring
+  full);
+- the buffer-resource skips by reason. Pending-write skips are counted apart when the merged
+  pending range that decided them is 64 MiB or more (a merged range need not equal any one note);
+- the notes per frame, with those of 64 MiB or more and how many of them were written V#s.
+
+The counts start at the block's first frame end. A written V# of a whole arena (the clinic replay
+notes ~2.18 GB ones) covers every constant in its range while unreached. If the "behind a merged
+pending range >= 64 MiB" count is a real share of the copies, narrowing such notes is a lever.
+It is only correct if the shader's write bounds are proven: these counts size it, they do not
+justify it.
+
 ## Output
 
 One block every 600 frame ends, printed from stage A:
