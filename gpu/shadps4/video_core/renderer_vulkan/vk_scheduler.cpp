@@ -250,9 +250,15 @@ void Scheduler::FlushLabels(bool idle) {
     if (!labels_unflushed.load(std::memory_order_relaxed)) {
         return;
     }
-    if (!idle && std::chrono::steady_clock::now() - unflushed_since < LabelBatchAge) {
+    const auto age = std::chrono::steady_clock::now() - unflushed_since;
+    if (!idle && age < LabelBatchAge) {
         return;
     }
+#ifdef __APPLE__
+    BbSplit::NoteLabelBatch(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(age).count());
+    BbSplit::FlushReason reason{idle ? BbSplit::FBatchIdle : BbSplit::FBatchAge};
+#endif
     Flush(); // asserts it signals unflushed_tick
 }
 
@@ -268,6 +274,9 @@ void Scheduler::SignalAtGpuCompletion(std::function<void()> signal, bool batch) 
         label_thread = std::jthread([this](std::stop_token stoken) { LabelThread(stoken); });
     });
     if (!IsRecordingDeferred()) {
+#ifdef __APPLE__
+        BbSplit::FlushReason reason{BbSplit::FLabel};
+#endif
         const u64 submitted = Flush();
         ASSERT_MSG(submitted == tick,
                    "macOS: a label's submission signals timeline value {}, its writer waits for {}",
@@ -296,6 +305,9 @@ void Scheduler::SignalAtGpuCompletion(std::function<void()> signal, bool batch) 
                    unflushed_tick, tick);
         return;
     }
+#ifdef __APPLE__
+    BbSplit::FlushReason reason{BbSplit::FLabel};
+#endif
     const u64 submitted = Flush();
     // The writer waits for `tick`: it must be the submission holding the label and the work
     // recorded before it (no other submission came between).
@@ -545,6 +557,9 @@ void Scheduler::WaitBeforeNextSubmit(vk::Semaphore semaphore, u64 value) {
 
 void Scheduler::Finish() {
     // When finishing, we need to wait for the submission to have executed on the device.
+#ifdef __APPLE__
+    BbSplit::FlushReason reason{BbSplit::FFinish};
+#endif
     const u64 presubmit_tick = CurrentTick();
     SubmitInfo info{};
     SubmitExecution(info);
@@ -646,6 +661,11 @@ u64 Scheduler::SubmitExecution(SubmitInfo& info) {
     next_submit_waits.clear();
 
 #ifdef __APPLE__
+    if (flush_census) {
+        // After on_submit's barrier flush: a pass still open is ended by this submission (the
+        // render pass census's "submit" enders).
+        BbSplit::NoteFlush(is_rendering);
+    }
     EndRenderingFor(BbPassCensus::Why::Submit);
 #else
     EndRendering();

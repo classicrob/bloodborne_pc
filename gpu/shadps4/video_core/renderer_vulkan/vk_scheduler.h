@@ -1059,6 +1059,16 @@ private:
     // bbport: whether recorder_thread runs, read on every Record(). std::jthread::joinable()
     // compares thread ids, which on Windows (libc++ over winpthreads) costs two system calls.
     bool recording_threaded{false};
+#ifdef __APPLE__
+public:
+    /// The draw scheduler (Rasterizer's): its submissions are counted by reason (parse split).
+    void EnableFlushCensus() {
+        flush_census = true;
+    }
+
+private:
+    bool flush_census = false;
+#endif
     std::jthread recorder_thread;
 #ifdef __APPLE__
     /// SignalAtGpuCompletion's writer: labels only, in issue order (BbLabels::Sequencer), each

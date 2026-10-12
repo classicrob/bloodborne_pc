@@ -94,6 +94,9 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
         };
 #endif
     }
+#ifdef __APPLE__
+    scheduler.EnableFlushCensus(); // its submissions by reason, in the parse split block
+#endif
     // bbport: this thread joins the texture binding helper before it changes image state.
     runtime.SetImageAccessHook(&JoinBindHelper, this);
     scheduler.SetSubmitCallback([this](Vulkan::SubmitInfo& info) {
