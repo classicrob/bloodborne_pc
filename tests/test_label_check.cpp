@@ -22,6 +22,8 @@
 #include "bbport_label_mode.h"
 #include "bbport_label_store.h"
 #include "bbport_parse_split.h"
+#include "bbport_write_order.h"
+#include "video_core/renderer_vulkan/vk_draw_pipe.h"
 #include "bbport_compute_sh.h"
 #include "bbport_frame_marks.h"
 #include "bbport_label_sequencer.h"
@@ -657,6 +659,122 @@ int main() {
                    line.find("labels written 1.0 per frame, issue to write 2000 us mean, 3000 us "
                              "max") != std::string::npos &&
                    flush_reason == FOther);
+    }
+
+    {
+        // WRITE_DATA ordering (bbport_write_order.h) through a real draw pipe: stage A commits
+        // EOP (a completion label), the WAIT_REG_MEM met early (its in-order marker), a later
+        // recorder-side write, then WRITE_DATA. Stage B is held while all are committed, the
+        // recorder write completes at once and the label stays pending: WRITE_DATA must not land
+        // before the label. Without a WAIT, WRITE_DATA does not wait for the label.
+        struct Fixture {
+            BbDeferred::Count labels, recorder;
+            BbWriteOrder::Barrier barrier;
+            std::atomic<bool> hold{true}, written{false}, waiting{false};
+        };
+        enum Op : std::uint8_t { Hold, IssueLabel, ForwardedWait, RecorderWrite, WriteData };
+        const auto handler = [](void* context, const std::uint8_t* packet, std::uint32_t) {
+            auto& f = *static_cast<Fixture*>(context);
+            switch (static_cast<Op>(packet[0])) {
+            case Hold:
+                while (f.hold.load()) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                }
+                break;
+            case IssueLabel:
+                f.labels.Issue();
+                break;
+            case ForwardedWait: // the marker at the WAIT's position, after its producer issued
+                f.barrier.AtForwardedWait(f.labels.Issued());
+                break;
+            case RecorderWrite:
+                f.recorder.Issue();
+                f.recorder.Complete(); // completes before the earlier label
+                break;
+            case WriteData:
+                f.barrier.BeforeWriteData([&](std::uint64_t through) {
+                    f.waiting.store(true); // reached its wait (the test's handshake)
+                    while (!f.labels.CompleteThrough(through)) {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                    }
+                });
+                f.written.store(true);
+                break;
+            }
+        };
+        const auto run = [&](std::initializer_list<Op> ops, Fixture& f, Vulkan::DrawPipe& pipe) {
+            for (const Op op : ops) {
+                *pipe.Begin(1) = op;
+                pipe.Commit(1);
+            }
+            f.hold.store(false);
+        };
+        bool held_back = false, landed_after = false, no_wait_landed = false;
+        {
+            Fixture f;
+            Vulkan::DrawPipe pipe(handler, &f);
+            run({Hold, IssueLabel, ForwardedWait, RecorderWrite, WriteData}, f, pipe);
+            // Bounded handshake: WRITE_DATA has reached its wait (after the recorder write
+            // completed); it must still be held there.
+            for (int i = 0; i < 5000 && !f.waiting.load(); ++i) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            held_back = f.waiting.load() && !f.written.load() && f.recorder.CompleteThrough(1);
+            f.labels.Complete(); // the label lands
+            for (int i = 0; i < 2000 && !f.written.load(); ++i) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            landed_after = f.written.load();
+        }
+        {
+            Fixture f;
+            Vulkan::DrawPipe pipe(handler, &f);
+            run({Hold, IssueLabel, RecorderWrite, WriteData}, f, pipe);
+            for (int i = 0; i < 2000 && !f.written.load(); ++i) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            no_wait_landed = f.written.load() && !f.labels.CompleteThrough(1);
+            f.labels.Complete();
+        }
+        bool early_capture_leaks = false;
+        {
+            // Negative control: the marker taken before its producer was issued (what sampling
+            // on stage A at parse amounts to) lets WRITE_DATA through with the label pending.
+            Fixture f;
+            Vulkan::DrawPipe pipe(handler, &f);
+            run({Hold, ForwardedWait, IssueLabel, RecorderWrite, WriteData}, f, pipe);
+            for (int i = 0; i < 2000 && !f.written.load(); ++i) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            early_capture_leaks = f.written.load() && !f.labels.CompleteThrough(1);
+            f.labels.Complete();
+        }
+        Expect("write order: after a WAIT_REG_MEM met early, WRITE_DATA waits for its label even "
+               "with stage B held and a later recorder write done first",
+               held_back && landed_after);
+        Expect("  ... without a WAIT, WRITE_DATA does not wait for an earlier completion label",
+               no_wait_landed);
+        Expect("  ... (negative control: a marker taken before the producer issued leaks, so "
+               "these controls detect a misplaced capture)",
+               early_capture_leaks);
+        BbWriteOrder::Barrier barrier;
+        barrier.AtForwardedWait(7);
+        barrier.AtForwardedWait(5);
+        Expect("  ... the barrier only rises", barrier.Required() == 7);
+        {
+            using namespace BbSplit;
+            DeferredSite outer{KDeferredWriteData};
+            const bool set = deferred_site == KDeferredWriteData;
+            {
+                DeferredSite inner{KDeferredFlip};
+                Expect("  ... deferred-signal waits are charged to their named site, nesting "
+                       "restored",
+                       set && deferred_site == KDeferredFlip);
+            }
+            Expect("  ... (outer site back)", deferred_site == KDeferredWriteData);
+        }
+        Expect("  ... (default site back)", BbSplit::deferred_site == BbSplit::KDeferred);
     }
 
     std::fprintf(stderr, "%s: %u failures\n", failures ? "FAIL" : "PASS", failures);
