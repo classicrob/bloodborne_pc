@@ -12,6 +12,10 @@ if [ "$BB_HEAVY_GPU" != "exclusive" ]; then
   cd "$ROOT" && exec tools/macos/heavy.sh --pool playtest --gpu exclusive --cpu-quiet "R0 perf (${R0_LABEL:-R0-perf})" -- /bin/bash "$HERE/r0.sh" "$@"
 fi
 cd "$ROOT"
+# Host state per run (orchestrator): thermal and memory pressure before the route and after the walk,
+# kept in the run dir as host.txt. The load wait and the CPU-hog check are heavy.sh's (--settle).
+host(){ echo "## $1 $(date -u +%T): load $(sysctl -n vm.loadavg)"; pmset -g therm 2>&1 | grep -v '^$'; memory_pressure -Q 2>&1 | tail -1; }
+HOST_BEFORE=$(host before)
 L=${R0_LABEL:-R0-perf}; ROUTE=$(mktemp)
 python3 tools/macos/play_route.py route --probe "$1" --label $L --fps 60 --gpu-log info --fixture clinic-start \
   --warm-cache ${WARM:-p23-clinic} --diag-env BB_LABELS_AT_GPU_COMPLETE=1 --diag-env BB_FLIP_AT_GPU_RETIRE=1 ${R0_EXTRA} \
@@ -21,6 +25,7 @@ grep -q 'timed out\|fatal\|exited' $ROUTE && { echo "ROUTE FAILED"; python3 tool
 rm -f $ROUTE
 t(){ python3 tools/macos/play_route.py --run $R "$@" > /dev/null 2>&1; }
 mark(){ echo "$1 line=$(( $(wc -l < $R/game.log) )) $(date -u +%T) perf=$(( $(cat $R/perf.jsonl 2>/dev/null | wc -l) ))"; }
+echo "$HOST_BEFORE" > $R/host.txt
 grep -m3 "Labels (EOP/EOS/RELEASE_MEM)\|Flips are published\|App Nap" $R/game.log | cut -c1-140
 mark idle-start > $R/segments.log
 if [ -n "$R0_FLIP_AT" ]; then
@@ -35,7 +40,8 @@ while [ $(date +%s) -lt $end ] && [ ! -f $R/exit.json ]; do
   wl=$((${wl:-0} + 1)); t capture walk-$wl
 done
 mark end >> $R/segments.log
-cat $R/segments.log
+host after >> $R/host.txt
+cat $R/segments.log; cat $R/host.txt
 python3 - "$R" <<'PY'
 import re, sys
 run = sys.argv[1]
