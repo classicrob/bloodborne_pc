@@ -191,3 +191,38 @@ in air or inside geometry, record that result rather than qualify the preset;
 a different grounded preset is the fallback. Then walk, interact with the
 Central Yharnam lamp if available, attack/fire, save normally and reload in a
 fresh process. This position edit does not itself unlock that lamp.
+
+### Central Yharnam gameplay acceptance
+
+Playtest qualified the preset on PREVIEW-26 in
+`20261012-011841-1080p-CYHARNAM-1` (input
+`central-yharnam-weapons-edited`) and
+`20261012-012459-1080p-CYHARNAM-2-reload` (input
+`central-yharnam-lamp-lit`). Both manifests pin bb-probe SHA256
+`f7ffed0127cb31f5a48e5b7a47078881461663495e87e0aa30286b753af3e53f`
+and libbbgpu SHA256
+`8ed45f2661112b65a855e05aa2f9313172928f46a99e2cc9c313c03b8ba0f50c`.
+
+Reported observations:
+
+- The edited spawn stood on solid cobblestone near the clinic-side iron gate
+  and Central Yharnam lamp, with both weapons and 19 bullets.
+- Lighting the lamp displayed the transport/respawn confirmation, spawned
+  messengers, and changed its prompt to Return to the Hunter's Dream.
+- Walking around the yard and up the stairs to the next street worked.
+  Searching a body yielded eight Pebbles.
+- Normal save/quit passed twice. Fresh-process reload resumed at the saved
+  yard-fence position with weapons and 19 bullets.
+- All 33 reviewed captures were reported clean; no STOP or fault. Observed
+  frame rate was 9–12 FPS, not a controlled performance baseline.
+
+Exports `~/bbport-game/saves/central-yharnam-lamp-lit` and
+`~/bbport-game/saves/central-yharnam-street` retain edited ancestry. The latter
+is the exploration starting point beyond the first stairs. The lamp's lit
+prompt was **not rechecked after reload**, so persistent lamp activation is
+still unverified; successful reload alone does not establish it. No enemy
+was encountered, and enemy combat remains untested. The item was acquired in
+the second run; its persistence has not been checked by a subsequent reload.
+These observations supersede the preset's pending ground/load/walk status,
+without broadening them into progression or combat acceptance. Playtest owns
+adding narrowly scoped verification records to fixture metadata.
