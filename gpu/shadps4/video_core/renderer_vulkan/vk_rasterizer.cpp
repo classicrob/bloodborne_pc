@@ -489,6 +489,9 @@ void Rasterizer::NotePendingGpuWrite(VAddr address, u64 size) {
     if (!draw_pipe || !size) {
         return;
     }
+#ifdef __APPLE__
+    BbSplit::NotePendingNote(size);
+#endif
     // Draws write the same buffers over and over: an entry for the range only moves on.
     const u64 position = draw_pipe->Head();
     const VAddr end = address + size;
@@ -521,6 +524,18 @@ void Rasterizer::SyncParserRead(VAddr address, u64 size) {
         Finish();
     }
 }
+
+#ifdef __APPLE__
+u64 Rasterizer::PendingWriteOverlapSpan(VAddr address, u64 size) const {
+    const VAddr end = address + size;
+    for (const auto& write : pending_writes) {
+        if (address < write.end && write.begin < end && !draw_pipe->Reached(write.position)) {
+            return write.end - write.begin;
+        }
+    }
+    return 0;
+}
+#endif
 
 bool Rasterizer::PendingWriteOverlaps(VAddr address, u64 size) {
     if (pending_writes.empty() || address >= pending_max || address + size <= pending_min) {
@@ -576,6 +591,15 @@ void Rasterizer::CollectRingBindings(const Shader::Info& stage, const PreparedDr
         constant_ring->Flush(*offset, size);
         out.push_back({index, static_cast<u32>(size), *offset, address});
     };
+#ifdef __APPLE__
+    const auto copy_counted = [&](u32 index, const void* source, VAddr address, u64 size) {
+        const std::size_t before = out.size();
+        copy(index, source, address, size);
+        BbSplit::NoteRingCopy(size, out.size() != before);
+    };
+#else
+    const auto& copy_counted = copy;
+#endif
     for (u32 index = 0; index < stage.buffers.size(); ++index) {
         const auto& desc = stage.buffers[index];
         if (desc.IsSpecial()) {
@@ -594,16 +618,36 @@ void Rasterizer::CollectRingBindings(const Shader::Info& stage, const PreparedDr
         }
         const u64 size = memory->ClampRangeSize(address, vsharp.GetSize());
         if (desc.is_written) {
+#ifdef __APPLE__
+            if (size >= BbSplit::HugeNote) {
+                BbSplit::NoteHugeShaderNote();
+            }
+#endif
             NotePendingGpuWrite(address, size);
             continue;
         }
         // The stream path of BufferCache::ObtainBuffer, taken here: small, read-only, not
         // written by the GPU (now or by work still queued for the recording thread).
+#ifdef __APPLE__
+        const BbSplit::RingSkip skip =
+            size == 0 || size > VideoCore::BufferCache::STREAM_THRESHOLD
+                ? BbSplit::RingSkip::Large
+            : buffer_cache.IsRegionGpuModified(address, size) ? BbSplit::RingSkip::GpuModified
+            : PendingWriteOverlaps(address, size)              ? BbSplit::RingSkip::Pending
+                                                               : BbSplit::RingSkip::None;
+        if (skip != BbSplit::RingSkip::None) {
+            BbSplit::NoteRingSkip(skip, skip == BbSplit::RingSkip::Pending &&
+                                            PendingWriteOverlapSpan(address, size) >=
+                                                BbSplit::HugeNote);
+            continue;
+        }
+#else
         if (size == 0 || size > VideoCore::BufferCache::STREAM_THRESHOLD ||
             buffer_cache.IsRegionGpuModified(address, size) || PendingWriteOverlaps(address, size)) {
             continue;
         }
-        copy(index, nullptr, address, size);
+#endif
+        copy_counted(index, nullptr, address, size);
     }
 }
 

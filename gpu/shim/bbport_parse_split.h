@@ -575,6 +575,71 @@ inline std::uint64_t previous_cpu_a = ~0ull, previous_cpu_b = ~0ull, previous_cp
 inline std::chrono::steady_clock::time_point window_start{};
 } // namespace detail
 
+/// Stage A's constant ring (Rasterizer::CollectRingBindings): small read-only buffer resources
+/// copied at decode, or skipped (bound through ObtainBuffer at stage B instead), and the pending
+/// GPU-write notes that make it skip. A note of HugeNote bytes or more (a written V# of a whole
+/// arena) covers every constant in its range while unreached.
+enum class RingSkip : std::uint32_t { None, Large, GpuModified, Pending };
+inline constexpr std::uint64_t HugeNote = 64ull << 20;
+struct RingCounters {
+    std::atomic<std::uint64_t> copies{0}, copy_bytes{0}, ring_full{0}, skip_large{0},
+        skip_gpu_modified{0}, skip_pending{0}, skip_pending_huge{0}, notes{0}, notes_huge{0},
+        notes_huge_shader{0};
+};
+inline RingCounters ring;
+inline void NoteRingSkip(RingSkip skip, bool behind_huge_note) {
+    auto& c = skip == RingSkip::Large         ? ring.skip_large
+              : skip == RingSkip::GpuModified ? ring.skip_gpu_modified
+                                              : ring.skip_pending;
+    c.fetch_add(1, std::memory_order_relaxed);
+    if (behind_huge_note) {
+        ring.skip_pending_huge.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+inline void NoteRingCopy(std::uint64_t bytes, bool copied) {
+    if (copied) {
+        ring.copies.fetch_add(1, std::memory_order_relaxed);
+        ring.copy_bytes.fetch_add(bytes, std::memory_order_relaxed);
+    } else {
+        ring.ring_full.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+/// A pending GPU-write note (Rasterizer::NotePendingGpuWrite).
+inline void NotePendingNote(std::uint64_t bytes) {
+    ring.notes.fetch_add(1, std::memory_order_relaxed);
+    if (bytes >= HugeNote) {
+        ring.notes_huge.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+/// A written V# of HugeNote bytes or more is about to be noted (counted in NotePendingNote too).
+inline void NoteHugeShaderNote() {
+    ring.notes_huge_shader.fetch_add(1, std::memory_order_relaxed);
+}
+
+namespace detail {
+inline std::string RingLine(double frames) {
+    static std::array<std::uint64_t, 10> previous{};
+    const std::array<std::uint64_t, 10> now{
+        ring.copies.load(), ring.copy_bytes.load(), ring.ring_full.load(),
+        ring.skip_large.load(), ring.skip_gpu_modified.load(), ring.skip_pending.load(),
+        ring.skip_pending_huge.load(), ring.notes.load(), ring.notes_huge.load(),
+        ring.notes_huge_shader.load()};
+    std::array<double, 10> d{};
+    for (std::size_t i = 0; i < d.size(); ++i) {
+        d[i] = double(now[i] - previous[i]) / frames;
+    }
+    previous = now;
+    char text[512];
+    std::snprintf(text, sizeof(text),
+                  "  Constant ring per frame: %.0f copied at stage A (%.0f KiB), %.1f not copied "
+                  "(ring full); skipped to ObtainBuffer: large %.1f, GPU-modified %.1f, pending "
+                  "write %.1f (behind a note >= 64 MiB %.1f); pending-write notes %.0f "
+                  "(>= 64 MiB %.1f, of which written V#s %.1f)",
+                  d[0], d[1] / 1024.0, d[2], d[3], d[4], d[5], d[6], d[7], d[8], d[9]);
+    return text;
+}
+} // namespace detail
+
 /// On stage A at each frame end: every 600, prints the split per frame and starts a new window.
 /// `draws`: the running draw count (for draws per frame).
 inline void NoteFrameEnd(std::uint64_t draws) {
@@ -649,12 +714,13 @@ inline void NoteFrameEnd(std::uint64_t draws) {
                 "    stage B drains at other packets during: %s\n"
                 "  stage B (draw recording thread, %.0f%%, %s per frame): %s\n"
                 "  Vulkan recording thread (%.0f%%, %s per frame): %s\n"
-                "%s\n",
+                "%s\n%s\n",
                 frame_ms, double(window_draw_count) / frames, a_us_per_draw,
                 100.0 * a_cycles * ms_per_cycle / wall_ms, a_cpu.c_str(), a_line.c_str(),
                 a_deferred.c_str(), a_drain.c_str(), 100.0 * b_cycles * ms_per_cycle / wall_ms,
                 b_cpu.c_str(), b_line.c_str(), 100.0 * r_cycles * ms_per_cycle / wall_ms,
-                r_cpu.c_str(), r_line.c_str(), flush_line.c_str());
+                r_cpu.c_str(), r_line.c_str(), flush_line.c_str(),
+                detail::RingLine(frames).c_str());
     std::fflush(stdout);
     window_cycles = now_cycles;
     window_start = now;

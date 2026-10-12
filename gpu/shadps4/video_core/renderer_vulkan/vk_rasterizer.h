@@ -712,6 +712,10 @@ private:
     mutable vk::Rect2D capture_scissor{};
     void DumpSampledImages();
     bool PendingWriteOverlaps(VAddr address, u64 size);
+#ifdef __APPLE__
+    /// The size of the first unreached pending write overlapping the range (0: none).
+    [[nodiscard]] u64 PendingWriteOverlapSpan(VAddr address, u64 size) const;
+#endif
     /// Stage B: the ring bindings of the stages of the packet being recorded.
     struct RingStage {
         const Shader::Info* info;
