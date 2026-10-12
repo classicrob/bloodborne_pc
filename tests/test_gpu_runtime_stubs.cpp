@@ -26,6 +26,7 @@ int runtime_memory_inventory(RuntimeMemoryInventory*) { std::abort(); }
 int runtime_memory_layout(RuntimeMemoryView*, size_t, size_t*, RuntimeMemoryBlock*, size_t, size_t*, uint64_t*) { std::abort(); }
 const void* runtime_memory_backing(uint64_t*, uint64_t*) { std::abort(); }
 int runtime_guest_image(uintptr_t*, uint64_t*) { std::abort(); }
+int runtime_guest_object(uintptr_t, RuntimeGuestObject*) { std::abort(); }
 void runtime_hle_trace_dump(void) { std::abort(); }
 void runtime_hle_trace_frame(void) {}
 void runtime_cpu_profile_thread(const char*) {}

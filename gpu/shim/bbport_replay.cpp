@@ -39,6 +39,7 @@
 #include <map>
 #include <xxhash.h>
 #include "../../src/runtime_memory.h"
+#include "bbport_replay_compare.h"
 
 extern std::unique_ptr<AmdGpu::Liverpool> liverpool;
 
@@ -108,7 +109,8 @@ struct Submission {
 struct Reset {
     u64 address;
     std::vector<u8> bytes;
-    bool host; ///< outside the guest views: restored in place (same HLE allocation order)
+    bool host; ///< outside the guest views: restored only into the identified object
+    HostObjectRecord object{};
 };
 
 struct Capture {
@@ -272,7 +274,8 @@ private:
                 return false;
             }
             Reset reset{rr.address, std::vector<u8>(rr.bytes), rr.host != 0};
-            if (!r.Read(reset.bytes.data(), reset.bytes.size(), why)) {
+            if (!r.Read(reset.bytes.data(), reset.bytes.size(), why) ||
+                (reset.host && !r.Get(reset.object, why))) {
                 return false;
             }
             resets.push_back(std::move(reset));
@@ -280,6 +283,31 @@ private:
         return true;
     }
 };
+
+bool WaitIdle(AmdGpu::Liverpool& lp, std::chrono::seconds bound);
+
+/// Before any CPU write of guest bytes: the command processor idle (WaitIdle), then on the GPU
+/// command thread everything recorded submitted and complete on the GPU and every deferred write
+/// (labels, downloads) run (Rasterizer::QuiesceForCapture). IsGpuIdle alone is not a fence for
+/// earlier GPU work, which may still read or write the bytes the restore rewrites.
+bool QuiesceForRestore(AmdGpu::Liverpool& lp, std::string& why) {
+    if (!WaitIdle(lp, std::chrono::seconds(30))) {
+        why = "the command processor did not go idle within 30 s";
+        return false;
+    }
+    Vulkan::Rasterizer* rasterizer = AmdGpu::ReplayStateAccess::Rasterizer(lp);
+    if (!rasterizer) {
+        why = "no rasterizer";
+        return false;
+    }
+    std::string quiet_why;
+    bool ok = false;
+    lp.SendCommand<true>([&] { ok = rasterizer->QuiesceForCapture(quiet_why); });
+    if (!ok) {
+        why = "the GPU work before the restore did not complete: " + quiet_why;
+    }
+    return ok;
+}
 
 bool WaitIdle(AmdGpu::Liverpool& lp, std::chrono::seconds bound) {
     const auto end = std::chrono::steady_clock::now() + bound;
@@ -404,21 +432,26 @@ struct ProcessCounters {
 bool Restore(AmdGpu::Liverpool& lp, Capture& c, std::string& why) {
     for (const auto& reset : c.resets) {
         if (reset.host) {
-            // Host memory (an HLE object the frame's packets write): restored in place when this
-            // process has it mapped writable, as the capture's did.
-            mach_vm_address_t region = reset.address;
-            mach_vm_size_t size = 0;
-            vm_region_basic_info_data_64_t info{};
-            mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
-            mach_port_t object = MACH_PORT_NULL;
-            if (mach_vm_region(mach_task_self(), &region, &size, VM_REGION_BASIC_INFO_64,
-                               reinterpret_cast<vm_region_info_t>(&info), &count,
-                               &object) != KERN_SUCCESS ||
-                region > reset.address || reset.address + reset.bytes.size() > region + size ||
-                !(info.protection & VM_PROT_WRITE)) {
-                why = fmt::format("host reset range {:#x} (+{}) is not writable memory in the "
-                                  "replay process (HLE allocations differ from the capture's?)",
-                                  reset.address, reset.bytes.size());
+            // Host memory (an HLE object the frame's packets write): restored only into the live
+            // guest-heap object with the captured identity (same payload range, allocation
+            // ordinal and allocating code), never by address alone.
+            const HostObjectRecord& want = reset.object;
+            RuntimeGuestObject o{};
+            const bool found = runtime_guest_object(reset.address, &o) == 0;
+            const bool same = found && o.start == want.start && o.size == want.size &&
+                              o.ordinal == want.ordinal && o.offset == want.offset &&
+                              std::strncmp(o.module, want.module, sizeof(o.module)) == 0 &&
+                              reset.bytes.size() <= o.size &&
+                              reset.address - o.start <= o.size - reset.bytes.size();
+            if (!same) {
+                why = fmt::format(
+                    "host reset range {:#x} (+{}): the capture's object is guest-heap #{} [{:#x}, "
+                    "+{:#x}) allocated at {}+{:#x}; here {}",
+                    reset.address, reset.bytes.size(), want.ordinal, want.start, want.size,
+                    want.module, want.offset,
+                    found ? fmt::format("#{} [{:#x}, +{:#x}) at {}+{:#x}", o.ordinal, o.start,
+                                        o.size, o.module, o.offset)
+                          : std::string{"no live guest-heap object holds it"});
                 return false;
             }
             std::memcpy(reinterpret_cast<void*>(reset.address), reset.bytes.data(),
@@ -494,6 +527,7 @@ struct ImagePrint {
     std::vector<std::pair<std::string, u64>> aspects; ///< "aspect a mip m", XXH3 of the texels
 };
 using ImageKey = std::pair<VAddr, u64>; ///< guest address, XXH3 of the ImageInfo
+using BbReplay::InsertUnique;
 
 bool PrintOf(const VideoCore::CapturedImage& image, ImageKey& key, ImagePrint& print,
              std::string& why) {
@@ -600,22 +634,31 @@ bool RestoreImagesChecked(AmdGpu::Liverpool& lp, const std::filesystem::path& di
         if (!PrintOf(image, key, print, read_why)) {
             return false;
         }
-        captured.emplace(key, std::move(print));
+        if (!InsertUnique(captured, key, std::move(print))) {
+            read_why = fmt::format("images.bin holds two records for the image at {:#x} (same "
+                                   "address and ImageInfo): a round trip cannot be a bijection",
+                                   key.first);
+            return false;
+        }
         ++read;
         return true;
     };
     VideoCore::CapturedMetadata metadata_again;
     std::string capture_why;
+    u64 recaptured = 0;
+    std::vector<VAddr> recaptured_twice;
     const bool restored = OnGpuThread(lp, [&] {
         if (!rasterizer->RestoreImages(next, metadata, why)) {
             return false;
         }
         return rasterizer->CaptureImages(
             [&](VideoCore::CapturedImage&& image) {
+                ++recaptured;
                 ImageKey key;
                 ImagePrint print;
-                if (PrintOf(image, key, print, capture_why)) {
-                    again.emplace(key, std::move(print));
+                if (PrintOf(image, key, print, capture_why) &&
+                    !InsertUnique(again, key, std::move(print))) {
+                    recaptured_twice.push_back(key.first);
                 }
             },
             metadata_again, capture_why);
@@ -630,6 +673,21 @@ bool RestoreImagesChecked(AmdGpu::Liverpool& lp, const std::filesystem::path& di
     }
     if (read != images.records) {
         why = fmt::format("RestoreImages took {} of {} images", read, images.records);
+        return false;
+    }
+    if (!capture_why.empty()) {
+        why = "recapture: " + capture_why;
+        return false;
+    }
+    if (!recaptured_twice.empty()) {
+        why = fmt::format("the recapture holds two images at {:#x} (same address and ImageInfo), "
+                          "{} such keys", recaptured_twice.front(), recaptured_twice.size());
+        return false;
+    }
+    if (captured.size() != read || again.size() != recaptured || captured.size() != again.size()) {
+        why = fmt::format("image counts differ: {} records read, {} distinct; {} recaptured, {} "
+                          "distinct",
+                          read, captured.size(), recaptured, again.size());
         return false;
     }
     std::vector<std::string> diffs;
@@ -717,14 +775,16 @@ extern "C" int bbgpu_replay_run(const char* dir, unsigned iterations) {
     }
     const auto host_resets = std::ranges::count_if(capture.resets, [](const Reset& r) { return r.host; });
     fmt::print("Perf replay: {} ({} submissions, {} reset ranges, {} of them in host memory restored "
-               "in place), {} iterations; pixel output not qualified, iteration 1 is warm-up\n",
+               "in place), {} iterations; pixel output not qualified, iteration 1 is warm-up. A "
+               "repeated workload, not a restored-frame replay: each iteration restores the "
+               "command-processor ranges, the command words and the Liverpool state only; "
+               "shader-written buffers and images and the renderer's caches carry over\n",
                dir, capture.submissions.size(), capture.resets.size(), host_resets, iterations);
     std::fflush(stdout);
     // Memory and registers first (RestoreImages needs them), then the images, checked.
-    if (!WaitIdle(*lp, std::chrono::seconds(30)) ||
+    if (!QuiesceForRestore(*lp, why) ||
         !OnGpuThread(*lp, [&] { return Restore(*lp, capture, why); })) {
-        std::fprintf(stderr, "STOP: perf replay: %s\n",
-                     why.empty() ? "the GPU did not go idle before the restore" : why.c_str());
+        std::fprintf(stderr, "STOP: perf replay: %s\n", why.c_str());
         return 3;
     }
     u64 images = 0;
@@ -736,8 +796,8 @@ extern "C" int bbgpu_replay_run(const char* dir, unsigned iterations) {
                images);
     std::fflush(stdout);
     // BB_REPLAY_GPU_WAIT=1: after each iteration also wait for its GPU work to complete
-    // (Rasterizer::QuiesceForCapture) and report submit -> GPU done; otherwise GPU work may queue
-    // up across iterations until vkQueueSubmit blocks (the loop then runs at the GPU's pace).
+    // (Rasterizer::QuiesceForCapture) inside the timing and report submit -> GPU done. Either
+    // way every iteration starts with the GPU quiesced (QuiesceForRestore, untimed).
     const char* gpu_wait_env = std::getenv("BB_REPLAY_GPU_WAIT");
     if (gpu_wait_env && std::strcmp(gpu_wait_env, "0") && std::strcmp(gpu_wait_env, "1")) {
         std::fprintf(stderr, "STOP: perf replay: BB_REPLAY_GPU_WAIT=%s (0 or 1)\n", gpu_wait_env);
@@ -756,9 +816,9 @@ extern "C" int bbgpu_replay_run(const char* dir, unsigned iterations) {
     std::vector<double> wall_ms, cpu_ms, done_ms, busy_ms;
     BbPerf::GpuTotals gpu_last = BbPerf::Totals();
     for (unsigned it = 1; it <= iterations; ++it) {
-        if (!WaitIdle(*lp, std::chrono::seconds(30))) {
-            std::fprintf(stderr, "STOP: perf replay: the GPU did not go idle within 30 s before "
-                                 "iteration %u\n", it);
+        // Untimed: the previous iteration's GPU work completes before its bytes are rewritten.
+        if (!QuiesceForRestore(*lp, why)) {
+            std::fprintf(stderr, "STOP: perf replay: before iteration %u: %s\n", it, why.c_str());
             return 3;
         }
         if (!OnGpuThread(*lp, [&] { return Restore(*lp, capture, why); })) {

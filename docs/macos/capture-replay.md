@@ -257,6 +257,26 @@ WRITE_DATA packets covering an address, with context, and the view holding it), 
 dispatches, writes, waits), `drainseg.py` (one command buffer split at its self-polling
 WAIT_REG_MEMs).
 
+What the replay checks before it writes anything (Sol-2's review):
+- The capture directory is complete: not `*.incomplete`, `manifest.json` at manifest_version 2,
+  and every file at the size the manifest records. A capture writes into its own exclusively
+  created `frame-<time>-<pid>.incomplete` and renames it when done; it never removes another
+  capture's directory.
+- The view table, before any allocation or mapping: blocks page-aligned, inside the pool,
+  sorted and disjoint; views page-aligned, inside the guest user range, sorted, disjoint, over
+  no existing mapping, direct ones backed by one captured block; file sizes exactly the records.
+- Every iteration starts with the GPU quiesced (work complete, deferred writes run), untimed.
+  It is a repeated workload, not a restored-frame replay: only the command processor's reset
+  ranges, the command words and the Liverpool state are restored; shader-written buffers and
+  images and the renderer's caches carry over between iterations.
+- A reset range in host memory is restored only into the live guest-heap object with the
+  captured identity (payload range, allocation ordinal, allocating code address), never by address.
+- The capture's reset walk (`replay_reset_walk.h`) passes only decoded writers and packets that
+  write no memory; truncated packets and wrapping ranges are blockers; a wait counts as
+  satisfied by the frame only after an unconditional drawing-engine write (not one inside a
+  COND_EXEC window, not a constant-engine write).
+- The image round trip refuses duplicate keys on either side and checks both counts.
+
 Not handled in v0, and stated rather than solved:
 - guest CPU/HLE writers (none run);
 - flips (a flip submission is replayed without presenting);

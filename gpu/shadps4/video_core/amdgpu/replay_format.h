@@ -11,7 +11,7 @@
 /// on any mismatch or short read.
 namespace ReplayFormat {
 
-constexpr u32 Version = 1;
+constexpr u32 Version = 2; ///< 2: host resets carry a HostObjectRecord
 
 struct FileHeader {
     char magic[8];  ///< one of the *Magic values, not NUL-terminated
@@ -29,6 +29,13 @@ constexpr char SubmissionsMagic[8] = {'B', 'B', 'R', 'P', 'S', 'U', 'B', 'S'};
 constexpr char ResetsMagic[8] = {'B', 'B', 'R', 'P', 'R', 'S', 'E', 'T'};
 constexpr char ImagesMagic[8] = {'B', 'B', 'R', 'P', 'I', 'M', 'G', 'S'};
 constexpr char ImageMetaMagic[8] = {'B', 'B', 'R', 'P', 'I', 'M', 'T', 'A'};
+
+/// The files of a complete capture, each with its size in manifest.json ("files"; manifest_version
+/// 2). The loader (src/probe.c, which mirrors this list) refuses a directory whose manifest is
+/// missing or whose files differ from it.
+constexpr const char* CaptureFiles[] = {"views.bin",     "backing.bin",       "image.bin",
+                                        "liverpool.bin", "submissions.bin",   "resets.bin",
+                                        "images.bin",    "image_metadata.bin"};
 
 /// views.bin: blocks first (records = blocks + views), then views.
 struct BlockRecord {
@@ -109,6 +116,14 @@ struct ResetRecord {
     u32 opcode; ///< the PM4 opcode that named it (first one, after merging)
     u32 host;   ///< 1: outside the guest views (host memory, e.g. an HLE object in the low arena)
 };
+/// After a host reset's bytes: the guest-heap object it lies in (runtime_guest_object), which the
+/// replay must find with the same identity before it writes the bytes.
+struct HostObjectRecord {
+    u64 start, size, ordinal; ///< payload start and size, allocation sequence number
+    u64 offset;               ///< the allocating code: offset in `module`
+    char module[64];          ///< its file name, NUL-terminated
+};
+static_assert(sizeof(HostObjectRecord) == 96);
 
 /// images.bin: per GPU-modified image (Rasterizer::CaptureImages), an ImageHeader, its state
 /// blob, then `aspects` x (AspectRecord + texels).

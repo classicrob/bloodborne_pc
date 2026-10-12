@@ -123,4 +123,50 @@ int main(void) {
     expect("all views unmapped",0,0,1,0,0,0,0);
     assert(!direct_release(physical,4*PAGE));
     puts("PASS: inventory counts views, backing union and shared views through aliases and unmaps");
+
+    /* Guest-heap object identity (perf replay host resets): interior lookups name the object,
+     * ordinals follow allocation order, a freed object and a non-object address have none. */
+    {
+        unsigned char *x=runtime_guest_malloc(64), *y=runtime_guest_malloc(100);
+        RuntimeGuestObject ox, oy, none;
+        assert(x && y);
+        assert(!runtime_guest_object((uintptr_t)x+10,&ox) && ox.start==(uintptr_t)x && ox.size>=64);
+        assert(!runtime_guest_object((uintptr_t)y,&oy) && oy.start==(uintptr_t)y && oy.ordinal==ox.ordinal+1);
+        assert(strcmp(ox.module,"unknown") && ox.offset);
+        assert(runtime_guest_object((uintptr_t)y+oy.size,&none)==-1 || none.start!=(uintptr_t)y);
+        runtime_guest_free(x);
+        assert(runtime_guest_object((uintptr_t)x+10,&none)==-1);
+        assert(runtime_guest_object((uintptr_t)&none,&none)==-1); /* a stack address */
+        runtime_guest_free(y);
+        printf("  guest object identity: ordinal %llu, allocated at %s+%#llx\n",
+               (unsigned long long)ox.ordinal,ox.module,(unsigned long long)ox.offset);
+    }
+    /* Replay map preflight: a malformed view table fails before anything is mapped. */
+    {
+        char why[512];
+        const uint64_t at=USER_MIN+UINT64_C(0x100000000);
+        ReplayBlock blk[2]={{0,4*PAGE,0,0},{8*PAGE,4*PAGE,0,0}};
+        ReplayView ok[2]={{at,at+2*PAGE,0,0,3,0,0},{at+4*PAGE,at+6*PAGE,8*PAGE,0,3,0,0}};
+        if (replay_preflight(blk,2,ok,2,why,sizeof(why))) { printf("  valid table refused: %s\n",why); assert(0); }
+        ReplayView v[2];
+        memcpy(v,ok,sizeof(v)); v[1].start=at+PAGE;                      /* overlap */
+        assert(replay_preflight(blk,2,v,2,why,sizeof(why))==-1);
+        memcpy(v,ok,sizeof(v)); v[0].start=LOW_MIN; v[0].end=LOW_MIN+PAGE; /* host low arena */
+        assert(replay_preflight(blk,2,v,2,why,sizeof(why))==-1);
+        memcpy(v,ok,sizeof(v)); v[0].end=at+PAGE+1;                       /* misaligned */
+        assert(replay_preflight(blk,2,v,2,why,sizeof(why))==-1);
+        memcpy(v,ok,sizeof(v)); v[1].phys=5*PAGE;                         /* backed by no block */
+        assert(replay_preflight(blk,2,v,2,why,sizeof(why))==-1);
+        memcpy(v,ok,sizeof(v)); v[0].flexible=2;                          /* unknown kind */
+        assert(replay_preflight(blk,2,v,2,why,sizeof(why))==-1);
+        ReplayBlock bad[2]={{0,4*PAGE,0,0},{2*PAGE,4*PAGE,0,0}};          /* overlapping blocks */
+        assert(replay_preflight(bad,2,ok,2,why,sizeof(why))==-1);
+        void *live=NULL;                                                  /* over a live mapping */
+        assert(!map_flexible(&live,PAGE,3,0));
+        ReplayView over={(uint64_t)(uintptr_t)live,(uint64_t)(uintptr_t)live+PAGE,POOL_SIZE,1,3,0,0};
+        assert(replay_preflight(blk,2,&over,1,why,sizeof(why))==-1);
+        printf("  replay preflight: last refusal: %s\n",why);
+        assert(!release_flexible(live,PAGE));
+        puts("PASS: guest object identity and replay map preflight controls");
+    }
 }

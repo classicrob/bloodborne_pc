@@ -22,11 +22,14 @@
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/amdgpu/pm4_cmds.h"
 #include "video_core/amdgpu/replay_format.h"
+#include "video_core/amdgpu/replay_reset_walk.h"
 #include "video_core/amdgpu/replay_state_access.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/texture_cache/capture_images.h"
 #include "../../../../src/runtime_memory.h"
 
+
+#include <unistd.h>
 
 namespace ReplayCapture::Perf {
 namespace {
@@ -381,252 +384,24 @@ bool WriteSubmissions(const std::filesystem::path& dir,
 
 /// The frame's command-processor memory traffic, in execution order (CCB, then DCB with every
 /// indirect buffer where it is called): what each iteration must find as it was at the cut.
-class ResetWalk {
-public:
-    ResetWalk(const Memory& memory_, const Liverpool& lp_) : memory{memory_}, lp{lp_} {}
+using Detail::ResetWalk;
+using Detail::WalkRegion;
 
-    void Submission(const CmdSnapshot& snapshot_) {
-        snapshot = &snapshot_;
-        auto& s = const_cast<CmdSnapshot&>(snapshot_);
-        if (const CmdSnapshot::Region* ccb = s.Ccb()) {
-            Walk(*ccb, 0);
-        }
-        Walk(s.Dcb(), 0);
-    }
-
-    std::vector<std::string> blockers;
-
-    struct Range {
-        u64 address;
-        u64 bytes;
-        ResetKind kind;
-        u32 opcode;
+/// One held submission as the reset walk sees it: every captured region with its words.
+void WalkSubmission(ResetWalk& walk, const CmdSnapshot& snapshot_) {
+    auto& snapshot = const_cast<CmdSnapshot&>(snapshot_);
+    const auto view = [&](const CmdSnapshot::Region& r) {
+        return WalkRegion{reinterpret_cast<u64>(r.guest), r.size_dw, r.constant, r.copied,
+                          r.copied ? snapshot.Words(r) : std::span<const u32>{}};
     };
-    std::vector<Range> ranges;
-
-private:
-    void Blocker(std::string why) {
-        if (blockers.size() < 32) {
-            blockers.push_back(std::move(why));
-        }
+    std::vector<WalkRegion> regions;
+    for (const auto& r : snapshot.Regions()) {
+        regions.push_back(view(r));
     }
-
-    void Add(u64 address, u64 bytes, ResetKind kind, u32 opcode) {
-        if (!bytes) {
-            return;
-        }
-        ranges.push_back({address, bytes, kind, opcode});
-        if (kind == ResetKind::Written) {
-            written.emplace_back(address, address + bytes);
-        }
-    }
-
-    bool WrittenBefore(u64 address, u64 bytes) const {
-        return std::ranges::any_of(written, [&](const auto& w) {
-            return address >= w.first && address + bytes <= w.second;
-        });
-    }
-
-    void Walk(const CmdSnapshot::Region& region, int depth) {
-        if (!region.copied) {
-            Blocker(fmt::format("command region {:#x} ({} dwords) was not copied at submit",
-                                reinterpret_cast<u64>(region.guest), region.size_dw));
-            return;
-        }
-        if (depth > 8) {
-            Blocker("indirect buffers nested deeper than 8");
-            return;
-        }
-        const auto words = snapshot->Words(region);
-        for (size_t i = 0; i < words.size();) {
-            const u32 header = words[i];
-            const u32 type = header >> 30;
-            if (type == 2) {
-                ++i;
-                continue;
-            }
-            const u64 length = u64{(header >> 16) & 0x3FFF} + 2;
-            if (type == 1 || length > words.size() - i) {
-                Blocker(fmt::format("command region {:#x}: bad packet at dword {}",
-                                    reinterpret_cast<u64>(region.guest), i));
-                return;
-            }
-            if (type == 3) {
-                Packet(words.subspan(i, length), (header >> 8) & 0xFF, depth);
-            }
-            i += length;
-        }
-    }
-
-    void Packet(std::span<const u32> p, u32 op, int depth) {
-        using AmdGpu::DataSelect;
-        const void* raw = p.data();
-        switch (op) {
-        case 0x3F:   // INDIRECT_BUFFER
-        case 0x33: { // INDIRECT_BUFFER_CONST
-            const auto* ib = static_cast<const AmdGpu::PM4CmdIndirectBuffer*>(raw);
-            const u32* address = ib->Address<const u32>();
-            const auto regions = snapshot->Regions();
-            const auto it = std::ranges::find_if(regions, [&](const CmdSnapshot::Region& r) {
-                return r.guest == address && r.size_dw == ib->ib_size.Value() &&
-                       r.constant == (op == 0x33);
-            });
-            if (it == regions.end()) {
-                Blocker(fmt::format("indirect buffer {:#x} ({} dwords) has no captured region",
-                                    reinterpret_cast<u64>(address), ib->ib_size.Value()));
-                return;
-            }
-            Walk(*it, depth + 1);
-            return;
-        }
-        case 0x47: { // EVENT_WRITE_EOP
-            const auto* eop = static_cast<const AmdGpu::PM4CmdEventWriteEop*>(raw);
-            const auto sel = eop->data_sel.Value();
-            if (sel != DataSelect::None) {
-                Add(reinterpret_cast<u64>(eop->Address<u8>()), sel == DataSelect::Data32Low ? 4 : 8,
-                    ResetKind::Written, op);
-            }
-            return;
-        }
-        case 0x48: { // EVENT_WRITE_EOS
-            const auto* eos = static_cast<const AmdGpu::PM4CmdEventWriteEos*>(raw);
-            const u64 address = reinterpret_cast<u64>(eos->Address<u8*>());
-            if (eos->command.Value() == AmdGpu::PM4CmdEventWriteEos::Command::SignalFence) {
-                Add(address, 4, ResetKind::Written, op);
-            } else {
-                Add(address, u64{eos->size.Value()} * 4, ResetKind::Written, op);
-            }
-            return;
-        }
-        case 0x49: { // RELEASE_MEM
-            const auto* rel = static_cast<const AmdGpu::PM4CmdReleaseMem*>(raw);
-            const auto sel = rel->data_sel.Value();
-            const u64 address = rel->Address<u64>();
-            if (sel == DataSelect::GdsMemStore) {
-                Add(address, u64{rel->num_dw} * 4, ResetKind::Written, op);
-            } else if (sel != DataSelect::None) {
-                Add(address, sel == DataSelect::Data32Low ? 4 : 8, ResetKind::Written, op);
-            }
-            return;
-        }
-        case 0x37: { // WRITE_DATA
-            const auto* wd = static_cast<const AmdGpu::PM4CmdWriteData*>(raw);
-            const u32 sel = wd->dst_sel.Value();
-            if (sel == 2 || sel == 5) {
-                Add(wd->Address<u64>(), wd->wr_one_addr.Value() ? 4 : wd->Size(),
-                    ResetKind::Written, op);
-            } else if (sel != 0) {
-                Blocker(fmt::format("WRITE_DATA with dst_sel {} is not decoded", sel));
-            }
-            return;
-        }
-        case 0x50: { // DMA_DATA, as Liverpool::ProcessGraphics and RunDmaData handle it
-            const auto* dma = static_cast<const AmdGpu::PM4DmaData*>(raw);
-            if (dma->dst_addr_lo == 0x3022C) {
-                return; // skipped by the parser: no effect here
-            }
-            const auto dst = dma->dst_sel;
-            if (dma->command.das) {
-                Blocker(fmt::format("DMA_DATA to register space (dst {:#x}), which the parser "
-                                    "asserts against",
-                                    dma->dst_addr_lo));
-            } else if (dst == AmdGpu::DmaDataDst::Memory ||
-                       dst == AmdGpu::DmaDataDst::MemoryUsingL2) {
-                Add(dma->DstAddress<u64>(), dma->NumBytes(), ResetKind::Written, op);
-            } else if (dst != AmdGpu::DmaDataDst::Gds) {
-                Blocker(fmt::format("DMA_DATA with dst_sel {}", u32(dst)));
-            }
-            return;
-        }
-        case 0x40: // COPY_DATA: the parser stops on every form (none is implemented), so a
-                   // frame holding one cannot be replayed either.
-            Blocker("COPY_DATA, which the parser stops on");
-            return;
-        case 0x83: { // DUMP_CONST_RAM
-            const auto* dump = static_cast<const AmdGpu::PM4DumpConstRam*>(raw);
-            Add(dump->Address<u64>(), dump->Size(), ResetKind::Written, op); // as the parser
-            return;
-        }
-        case 0x46: { // EVENT_WRITE
-            const auto* ev = static_cast<const AmdGpu::PM4CmdEventWrite*>(raw);
-            if (ev->event_index.Value() == AmdGpu::EventIndex::ZpassDone &&
-                ev->event_type.Value() == AmdGpu::EventType::PixelPipeStatDump) {
-                Add(ev->Address<u64>(), u64{ReplayStateAccess::CounterPairs(lp)} * 16,
-                    ResetKind::Written, op);
-            }
-            return;
-        }
-        case 0x3C: { // WAIT_REG_MEM
-            const auto* wait = static_cast<const AmdGpu::PM4CmdWaitRegMem*>(raw);
-            if (wait->mem_space.Value() != AmdGpu::PM4CmdWaitRegMem::MemSpace::Memory) {
-                return;
-            }
-            const u64 address = reinterpret_cast<u64>(wait->Address());
-            Add(address, 4, ResetKind::Waited, op);
-            if (WrittenBefore(address, 4)) {
-                return;
-            }
-            u32 value = 0;
-            if (!memory.Read(address, &value, 4)) {
-                Blocker(fmt::format("WAIT_REG_MEM polls {:#x}, outside captured memory", address));
-            } else if (!wait->TestValue(value)) {
-                Blocker(fmt::format(
-                    "WAIT_REG_MEM polls {:#x} (function {}, ref {:#x}, mask {:#x}): no earlier packet "
-                    "of the frame writes it and its value at the cut ({:#x}) does not satisfy it, "
-                    "so the frame waits on the guest CPU or another queue",
-                    address, u32(wait->function.Value()), wait->ref, wait->mask, value));
-            }
-            return;
-        }
-        case 0x22: { // COND_EXEC
-            const auto* cond = static_cast<const AmdGpu::PM4CmdCondExec*>(raw);
-            Add(reinterpret_cast<u64>(cond->Address()), 4, ResetKind::Waited, op);
-            return;
-        }
-        case 0x11: { // SET_BASE
-            const auto* base = static_cast<const AmdGpu::PM4CmdSetBase*>(raw);
-            if (base->base_index.Value() == AmdGpu::PM4CmdSetBase::BaseIndex::DrawIndexIndirPatchTable) {
-                indirect_base = base->Address<u64>();
-            }
-            return;
-        }
-        case 0x24: // DRAW_INDIRECT
-        case 0x25: // DRAW_INDEX_INDIRECT
-        case 0x16: { // DISPATCH_INDIRECT
-            const u32 offset = p[1];
-            const u64 bytes = op == 0x16 ? 12 : op == 0x24 ? 16 : 20;
-            if (!indirect_base) {
-                Blocker(fmt::format("indirect packet {:#04x} before any SET_BASE in the frame", op));
-                return;
-            }
-            Add(indirect_base + offset, bytes, ResetKind::Indirect, op);
-            return;
-        }
-        // Memory writers and readers v0 does not decode: refuse rather than guess.
-        case 0x1D: // ATOMIC_GDS
-        case 0x1E: // ATOMIC_MEM
-        case 0x1F: // OCCLUSION_QUERY
-        case 0x2C: // DRAW_INDIRECT_MULTI
-        case 0x34: // STRMOUT_BUFFER_UPDATE
-        case 0x38: // DRAW_INDEX_INDIRECT_MULTI
-        case 0x39: // MEM_SEMAPHORE
-        case 0x45: // COND_WRITE
-        case 0x59: // REWIND
-            Blocker(fmt::format("packet {:#04x} reads or writes memory and is not decoded by the "
-                                "perf capture",
-                                op));
-            return;
-        default:
-            return;
-        }
-    }
-
-    const Memory& memory;
-    const Liverpool& lp;
-    const CmdSnapshot* snapshot = nullptr;
-    u64 indirect_base = 0;
-    std::vector<std::pair<u64, u64>> written; // in execution order
-};
+    const CmdSnapshot::Region* ccb = snapshot.Ccb();
+    const WalkRegion ccb_view = ccb ? view(*ccb) : WalkRegion{};
+    walk.Submission(regions, ccb ? &ccb_view : nullptr, view(snapshot.Dcb()));
+}
 
 /// Every GPU-modified image (Rasterizer::CaptureImages, GPU command thread after
 /// QuiesceForCapture), streamed: one image's texels in memory at a time.
@@ -719,8 +494,27 @@ bool WriteResets(const std::filesystem::path& dir, const Memory& m, ResetWalk& w
             return false;
         }
         host_count += host;
+        HostObjectRecord object{};
+        if (host) {
+            // Host memory is restored only into an identified object: a live guest-heap object
+            // (runtime_guest_malloc) holding the whole range.
+            RuntimeGuestObject o{};
+            if (runtime_guest_object(r.address, &o) != 0 || r.bytes > o.size ||
+                r.address - o.start > o.size - r.bytes) {
+                why = fmt::format("reset range [{:#x}, +{:#x}) (packet {:#04x}) is host memory outside "
+                                  "any live guest-heap object: the replay could not identify it",
+                                  r.address, r.bytes, r.opcode);
+                return false;
+            }
+            object.start = o.start;
+            object.size = o.size;
+            object.ordinal = o.ordinal;
+            object.offset = o.offset;
+            std::memcpy(object.module, o.module, sizeof(object.module));
+            object.module[sizeof(object.module) - 1] = 0;
+        }
         if (!f.Put(ResetRecord{r.address, u32(r.bytes), r.kind, r.opcode, u32(host)}, why) ||
-            !f.Write(value.data(), value.size(), why)) {
+            !f.Write(value.data(), value.size(), why) || (host && !f.Put(object, why))) {
             return false;
         }
         f.Record();
@@ -739,9 +533,10 @@ std::string Write(const Liverpool& liverpool, std::span<const std::shared_ptr<Cm
         return {};
     }
     // The reset walk first: a frame the replay cannot run is refused before anything is written.
-    ResetWalk walk{memory, liverpool};
+    ResetWalk walk{[&](u64 address, void* out, u64 bytes) { return memory.Read(address, out, bytes); },
+                   ReplayStateAccess::CounterPairs(liverpool)};
     for (const auto& snapshot : held) {
-        walk.Submission(*snapshot);
+        WalkSubmission(walk, *snapshot);
     }
     if (!walk.blockers.empty()) {
         why = "the frame's command-processor memory traffic cannot be replayed:";
@@ -759,15 +554,13 @@ std::string Write(const Liverpool& liverpool, std::span<const std::shared_ptr<Cm
         why = fmt::format("cannot create {}: {}", base.string(), ec.message());
         return {};
     }
-    // A capture that crashed left its *.incomplete directory (never a usable capture): removed
-    // before the free-space check, each named.
+    // Another capture's *.incomplete directory (one still being written, or left by a crash) is
+    // never touched here: named, so whoever owns it can remove it.
     for (const auto& entry : std::filesystem::directory_iterator(base, ec)) {
         if (entry.is_directory() && entry.path().extension() == ".incomplete") {
-            std::error_code removed;
-            const auto bytes = std::filesystem::remove_all(entry.path(), removed);
-            fmt::print("  perf capture: removed the partial capture {} ({} entries){}\n",
-                       entry.path().string(), bytes,
-                       removed ? " FAILED: " + removed.message() : std::string{});
+            fmt::print("  perf capture: {} is an unfinished capture (another one running, or a "
+                       "crash's leftover); not touched\n",
+                       entry.path().string());
         }
     }
     ec.clear();
@@ -792,14 +585,21 @@ std::string Write(const Liverpool& liverpool, std::span<const std::shared_ptr<Cm
         return {};
     }
 
+    // This capture's own directory: time and process id, created exclusively (an existing one
+    // is someone else's), renamed to its final name only when complete.
     char stamp[32];
     const std::time_t now = std::time(nullptr);
     std::strftime(stamp, sizeof(stamp), "frame-%Y%m%d-%H%M%S", std::localtime(&now));
-    const std::filesystem::path final_dir = base / stamp;
-    const std::filesystem::path dir = base / (std::string(stamp) + ".incomplete");
-    std::filesystem::create_directories(dir, ec);
-    if (ec) {
-        why = fmt::format("cannot create {}: {}", dir.string(), ec.message());
+    const std::string name = fmt::format("{}-{}", stamp, getpid());
+    const std::filesystem::path final_dir = base / name;
+    const std::filesystem::path dir = base / (name + ".incomplete");
+    if (std::filesystem::exists(final_dir, ec) || ec) {
+        why = fmt::format("{} exists already", final_dir.string());
+        return {};
+    }
+    if (!std::filesystem::create_directory(dir, ec) || ec) {
+        why = fmt::format("cannot create {} exclusively: {}", dir.string(),
+                          ec ? ec.message() : "it exists");
         return {};
     }
     const auto fail = [&]() -> std::string {
@@ -817,7 +617,17 @@ std::string Write(const Liverpool& liverpool, std::span<const std::shared_ptr<Cm
         !WriteImages(dir, liverpool, images, texel_bytes, why)) {
         return fail();
     }
-    // Written last: a capture without a manifest is not a capture.
+    // Written last: a capture without a manifest is not a capture. It records every file's size,
+    // which the loader checks before it maps or writes anything (src/probe.c).
+    std::string files;
+    for (const char* file : CaptureFiles) {
+        const u64 size = std::filesystem::file_size(dir / file, ec);
+        if (ec) {
+            why = fmt::format("{}: {}", file, ec.message());
+            return fail();
+        }
+        files += fmt::format("{}\n    \"{}\": {}", files.empty() ? "" : ",", file, size);
+    }
     std::FILE* manifest = std::fopen((dir / "manifest.json").c_str(), "w");
     if (!manifest) {
         why = fmt::format("cannot create manifest.json: {}", std::strerror(errno));
@@ -825,6 +635,7 @@ std::string Write(const Liverpool& liverpool, std::span<const std::shared_ptr<Cm
     }
     fmt::print(manifest,
                "{{\n  \"format\": \"bbport perf replay\",\n  \"version\": {},\n"
+               "  \"manifest_version\": 2,\n  \"files\": {{{}\n  }},\n"
                "  \"pixel_output\": \"not qualified (perf replay)\",\n"
                "  \"vma_generation\": {},\n  \"blocks\": {},\n  \"views\": {},\n"
                "  \"backing_payload_bytes\": {},\n  \"image\": [{}, {}],\n"
@@ -832,12 +643,16 @@ std::string Write(const Liverpool& liverpool, std::span<const std::shared_ptr<Cm
                "  \"submissions\": {},\n  \"command_dwords\": {},\n"
                "  \"resets\": {},\n  \"reset_bytes\": {},\n  \"host_resets\": {},\n"
                "  \"images\": {},\n  \"image_texel_bytes\": {}\n}}\n",
-               Version, memory.generation, memory.blocks.size(), memory.views.size(), backing_bytes,
+               Version, files, memory.generation, memory.blocks.size(), memory.views.size(), backing_bytes,
                memory.image_start, memory.image_size, image_readable, held.size(), words, resets,
                reset_bytes, host_resets,
                images, texel_bytes);
     if (std::fclose(manifest) != 0) {
         why = "writing manifest.json failed";
+        return fail();
+    }
+    if (std::filesystem::exists(final_dir, ec) || ec) {
+        why = fmt::format("{} appeared while the capture was written", final_dir.string());
         return fail();
     }
     std::filesystem::rename(dir, final_dir, ec);

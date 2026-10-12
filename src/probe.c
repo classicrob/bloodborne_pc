@@ -1,5 +1,6 @@
 /* Minimal x86-64 native loader experiment. Not a PS4 emulator or game port. */
 #define _GNU_SOURCE
+#include <sys/stat.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -809,8 +810,55 @@ static int probe_worker(void *argument) {
 /* Perf replay v0 (BB_REPLAY_RUN=<capture dir>, BB_REPLAY_ITERATIONS=N, default 10): instead of
  * running the guest, map the captured memory, restore the eboot image bytes and replay the
  * captured frame (docs/macos/capture-replay.md). The image must load at its captured address. */
+/* A complete capture: not a *.incomplete directory, a manifest_version 2 manifest.json, and every
+ * file the manifest lists at its recorded size (replay_format.h CaptureFiles, mirrored here). */
+static int replay_capture_complete(const char *dir, char *why, size_t why_size) {
+    static const char *const files[]={"views.bin","backing.bin","image.bin","liverpool.bin",
+                                      "submissions.bin","resets.bin","images.bin","image_metadata.bin"};
+    size_t n=strlen(dir);
+    while (n>1 && dir[n-1]=='/') --n;
+    if (n>=11 && !memcmp(dir+n-11,".incomplete",11)) {
+        snprintf(why,why_size,"%s is an unfinished capture (*.incomplete)",dir); return -1;
+    }
+    char path[4096], text[8192];
+    snprintf(path,sizeof(path),"%s/manifest.json",dir);
+    FILE *f=fopen(path,"rb");
+    if (!f) { snprintf(why,why_size,"%s: no manifest.json (not a complete capture)",dir); return -1; }
+    const size_t got=fread(text,1,sizeof(text)-1,f);
+    const int whole=feof(f);
+    fclose(f);
+    text[got]=0;
+    if (!whole) { snprintf(why,why_size,"%s is larger than %zu bytes",path,sizeof(text)-1); return -1; }
+    if (!strstr(text,"\"manifest_version\": 2,")) {
+        snprintf(why,why_size,"%s: not manifest_version 2 (a capture from an older build: take a new one)",path);
+        return -1;
+    }
+    for (size_t i=0;i<sizeof(files)/sizeof(files[0]);++i) {
+        char key[64];
+        snprintf(key,sizeof(key),"\"%s\": ",files[i]);
+        const char *at=strstr(text,key);
+        char *end=NULL;
+        const unsigned long long want=at ? strtoull(at+strlen(key),&end,10) : 0;
+        if (!at || !end || end==at+strlen(key)) {
+            snprintf(why,why_size,"%s does not list %s",path,files[i]); return -1;
+        }
+        struct stat st;
+        snprintf(path,sizeof(path),"%s/%s",dir,files[i]);
+        if (stat(path,&st) || !S_ISREG(st.st_mode) || (unsigned long long)st.st_size!=want) {
+            snprintf(why,why_size,"%s: %s, the manifest records %llu bytes",path,
+                     stat(path,&st) ? "missing" : "a different size",want);
+            return -1;
+        }
+    }
+    return 0;
+}
+
 static int run_replay(const char *dir, unsigned char *image_base, uint64_t image_size) {
     char why[1024];
+    if (replay_capture_complete(dir,why,sizeof(why))) {
+        fprintf(stderr,"STOP: perf replay: %s\n",why);
+        return 2;
+    }
     if (runtime_memory_replay_map(dir,why,sizeof(why))) {
         fprintf(stderr,"STOP: perf replay: %s\n",why);
         return 2;
@@ -820,9 +868,9 @@ static int run_replay(const char *dir, unsigned char *image_base, uint64_t image
     FILE *f=fopen(path,"rb");
     struct { char magic[8]; uint32_t version, reserved; uint64_t records; } h;
     uint64_t range[2];
-    if (!f || fread(&h,sizeof(h),1,f)!=1 || memcmp(h.magic,"BBRPEBOT",8) || h.version!=1 ||
+    if (!f || fread(&h,sizeof(h),1,f)!=1 || memcmp(h.magic,"BBRPEBOT",8) || h.version!=2 ||
         fread(range,sizeof(range),1,f)!=1) {
-        fprintf(stderr,"STOP: perf replay: %s is not a version 1 image file\n",path);
+        fprintf(stderr,"STOP: perf replay: %s is not a version 2 image file\n",path);
         if (f) fclose(f);
         return 2;
     }

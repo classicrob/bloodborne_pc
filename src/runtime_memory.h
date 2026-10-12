@@ -97,6 +97,17 @@ const void *runtime_memory_backing(uint64_t *direct_bytes, uint64_t *total_bytes
 /* The guest executable image as loaded (a host allocation outside the VMA table): 0 and its
  * range, or -1 before the launcher set it (runtime_set_guest_image). */
 int runtime_guest_image(uintptr_t *start, uint64_t *size);
+/* A live guest-heap object (runtime_guest_malloc/calloc) and its identity: payload range,
+ * allocation ordinal (sequence number since start) and the code address that allocated it
+ * (module file name + offset). The perf replay restores a host-memory reset range only into the
+ * object with the same identity. 0 when `address` is inside a live object's payload, else -1. */
+typedef struct {
+    uintptr_t start;
+    uint64_t size, ordinal;
+    char module[64];
+    uint64_t offset;
+} RuntimeGuestObject;
+int runtime_guest_object(uintptr_t address, RuntimeGuestObject *out);
 void runtime_set_guest_image(uintptr_t start, uint64_t size);
 /* Writes through the backing view, bypassing guest/GPU page protection: 1, or 0 when part of
  * the range has no backing. */

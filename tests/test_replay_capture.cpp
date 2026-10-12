@@ -1,14 +1,22 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Replay capture inventory (replay_capture.h): the environment parser accepts decimal digits
 // within the bound only, and the PM4 census counts whole packets only, stopping a region (and
-// marking the census incomplete) at an invalid header or a packet past the region's end.
+// marking the census incomplete) at an invalid header or a packet past the region's end. The perf
+// capture's reset walk refuses truncated packets, unknown opcodes, wrapping ranges and waits that
+// only a conditional or constant-engine write would satisfy; the image round trip refuses
+// duplicate keys.
+#include <algorithm>
 #include <cstdio>
+#include <cstring>
 #include <limits>
 #include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
+#include <map>
+#include "bbport_replay_compare.h"
 #include "video_core/amdgpu/replay_capture.h"
+#include "video_core/amdgpu/replay_reset_walk.h"
 
 using ReplayCapture::Detail::CountRegion;
 using ReplayCapture::Detail::ParseBounded;
@@ -40,6 +48,55 @@ constexpr u32 Type0(u32 reg, u32 values) {
 }
 constexpr u32 Type2 = 2u << 30;
 constexpr u32 DrawIndexAuto = 0x2D, Rewind = 0x59, Nop = 0x10;
+
+using ReplayCapture::Perf::Detail::ResetWalk;
+using ReplayCapture::Perf::Detail::WalkRegion;
+
+constexpr u32 Eop = 0x47, WaitRegMem = 0x3C, CondExec = 0x22, WriteData = 0x37, DumpConstRam = 0x83;
+
+/// EVENT_WRITE_EOP writing a 32-bit value to `address`.
+std::vector<u32> EopTo(u64 address) {
+    return {Type3(Eop, 5), 0x504, u32(address), u32(address >> 32) | (1u << 29), 1, 0};
+}
+/// WAIT_REG_MEM on memory: `address` == ref.
+std::vector<u32> WaitFor(u64 address, u32 ref) {
+    return {Type3(WaitRegMem, 6), 3u | (1u << 4), u32(address), u32(address >> 32), ref, ~0u, 10};
+}
+
+/// Runs the walk over `dcb` (and `ccb`); memory reads zero everywhere.
+ResetWalk Walk(const std::vector<u32>& dcb, const std::vector<u32>& ccb = {}) {
+    ResetWalk walk{[](u64, void* out, u64 bytes) {
+                       std::memset(out, 0, bytes);
+                       return true;
+                   },
+                   1};
+    std::vector<WalkRegion> regions;
+    const WalkRegion d{0x7000000000, u32(dcb.size()), false, true, dcb};
+    const WalkRegion c{0x7000100000, u32(ccb.size()), true, true, ccb};
+    regions.push_back(d);
+    if (!ccb.empty()) {
+        regions.push_back(c);
+    }
+    walk.Submission(regions, ccb.empty() ? nullptr : &c, d);
+    return walk;
+}
+
+bool Blocked(const ResetWalk& walk, std::string_view text) {
+    for (const auto& b : walk.blockers) {
+        if (b.find(text) != std::string::npos) {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::vector<u32> Cat(std::initializer_list<std::vector<u32>> parts) {
+    std::vector<u32> out;
+    for (const auto& part : parts) {
+        out.insert(out.end(), part.begin(), part.end());
+    }
+    return out;
+}
 
 Pm4Census Scan(const std::vector<u32>& words) {
     Pm4Census census;
@@ -132,6 +189,54 @@ int main() {
         CountRegion(c, std::vector<u32>{Type3(Nop, 1), 0});
         Check(c.packets == 2 && c.bad_header_regions == 1,
               "a bad region stops only itself; later regions scanned");
+    }
+    {
+        // Positive control: an unconditional DE EOP certifies the later wait on its address.
+        const auto w = Walk(Cat({EopTo(0x1000), WaitFor(0x1000, 1)}));
+        Check(w.blockers.empty() && w.ranges.size() == 2, "walk: EOP then WAIT on it passes");
+    }
+    {
+        const auto w = Walk({Type3(Eop, 2), 0x504, 0x1000});
+        Check(Blocked(w, "holds 3 dwords"), "walk: truncated EOP is a blocker");
+    }
+    {
+        const auto w = Walk({Type3(WaitRegMem, 3), 0x13, 0x1000, 0});
+        Check(Blocked(w, "packet 0x3c holds"), "walk: truncated WAIT_REG_MEM is a blocker");
+    }
+    {
+        const auto w = Walk({Type3(0x9F, 1), 0});
+        Check(Blocked(w, "packet 0x9f is not on"), "walk: unknown opcode is a blocker");
+    }
+    {
+        const auto w = Walk({Type3(WriteData, 5), 5u << 8, 0xFFFFFFFCu, 0xFFFFFFFFu, 1, 2});
+        Check(Blocked(w, "wraps"), "walk: WRITE_DATA range that wraps is a blocker");
+    }
+    {
+        // COND_EXEC whose window holds the EOP: that write may not run, so the wait is open.
+        const auto eop = EopTo(0x1000);
+        const auto w = Walk(Cat({{Type3(CondExec, 3), 0x2000 >> 2, 0, u32(eop.size())}, eop,
+                                 WaitFor(0x1000, 1)}));
+        Check(Blocked(w, "WAIT_REG_MEM polls 0x1000"), "walk: conditional producer does not certify");
+        Check(std::ranges::any_of(w.ranges, [](const auto& r) { return r.address == 0x1000 && r.opcode == Eop; }),
+              "walk: the conditional write is still reset");
+    }
+    {
+        // After the COND_EXEC window ends, an unconditional write certifies again.
+        const auto w = Walk(Cat({{Type3(CondExec, 3), 0x2000 >> 2, 0, 1}, {Type2}, EopTo(0x1000),
+                                 WaitFor(0x1000, 1)}));
+        Check(w.blockers.empty(), "walk: write after the COND_EXEC window certifies");
+    }
+    {
+        // A constant-engine write runs concurrently with the DE: it does not certify a DE wait.
+        const auto w = Walk(WaitFor(0x1000, 1), {Type3(DumpConstRam, 4), 0, 1, 0x1000, 0});
+        Check(Blocked(w, "WAIT_REG_MEM polls 0x1000"), "walk: CE producer does not certify");
+    }
+    {
+        std::map<int, int> m;
+        const bool first = BbReplay::InsertUnique(m, 1, 10);
+        const bool second = BbReplay::InsertUnique(m, 1, 20);
+        Check(first && !second && m.size() == 1 && m.at(1) == 10,
+              "image round trip: a duplicate key is refused, not dropped");
     }
     std::fprintf(stderr, "%s: %u failures\n", failures ? "FAIL" : "PASS", failures);
     return failures ? 1 : 0;
