@@ -120,8 +120,9 @@ an open render pass" here equals that census's "submit" enders.
 
 ## Output
 
-One block every 600 frame ends (`BB_SPLIT_WINDOW=<n>`, 1..100000, changes the window; the
-perf replay uses 1, a block per replayed iteration), printed from stage A:
+One block every 600 frame ends (`BB_SPLIT_WINDOW=<n>`, 1..100000, changes the window, for this
+block and the render pass census; the perf replay uses 1, a block per replayed iteration), printed
+from stage A:
 
 ```
 Parse split, last <n> frame ends: <ms> ms per frame, <n> draws per frame (stage A draw bucket <us> us wall per draw); ms per frame by thread (accounted / wall)

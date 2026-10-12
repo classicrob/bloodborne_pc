@@ -1,14 +1,15 @@
-// bbport (macOS): render passes per frame and what ends each, for cutting Metal encoding cost
-// (each render pass is a MTLRenderCommandEncoder; PREVIEW-20 prefill A/B: begin/end encoding
-// 8-14 ms per frame). Printed with the parse split, every 600 frame ends ("Render passes, last
-// 600 frame ends"). An ender that is not one of the named causes is listed by its caller's
-// address as a library offset ("lib+0x..."), for atos against the same libbbgpu.dylib. Barrier
-// ends are attributed by what they wait for (source stage classes, image transitions) and by the
-// FlushBarriers caller ("unknown" when no source is attributed); begins whose state equals the
-// state of the pass just ended are same-state resume candidates: the targets did not require the
-// split, but its barrier may still have been needed (speed lever a, RENDER-PASS-SPLITS). They
-// are attributed to what ended the pass before them (the cause, and the ender's or flusher's
-// address): the splits that moving that op or barrier out of the pass could save.
+// bbport (macOS): render passes per frame and what ends each, for cutting Metal encoding cost (each
+// render pass is a MTLRenderCommandEncoder; PREVIEW-20 prefill A/B: begin/end encoding 8-14 ms per
+// frame). Printed with the parse split, every BbSplit::WindowFrames() frame ends (BB_SPLIT_WINDOW,
+// default 600: "Render passes, last 600 frame ends"). An ender that is not one of the named causes
+// is listed by its caller's address as a library offset ("lib+0x..."), for atos against the same
+// libbbgpu.dylib. Barrier ends are attributed by what they wait for (source stage classes, image
+// transitions) and by the FlushBarriers caller ("unknown" when no source is attributed); begins
+// whose state equals the state of the pass just ended are same-state resume candidates: the targets
+// did not require the split, but its barrier may still have been needed (speed lever a,
+// RENDER-PASS-SPLITS). They are attributed to what ended the pass before them (the cause, and the
+// ender's or flusher's address): the splits that moving that op or barrier out of the pass could
+// save.
 // Submissions per frame and their causes are PM4's Flush census in the parse-split block.
 // Always on: a few stores per pass under a mutex (hundreds per frame).
 #pragma once
@@ -22,6 +23,7 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include "bbport_parse_split.h"
 
 namespace BbPassCensus {
 
@@ -184,10 +186,11 @@ inline void NoteEnd(Why why, const void* caller) {
     detail::barrier_caller = nullptr;
 }
 
-/// On stage A at each frame end: every 600, prints the census and starts a new window.
+/// On stage A at each frame end: every BbSplit::WindowFrames() (600), prints the census and starts
+/// a new window, in step with the parse split.
 inline void NoteFrameEnd() {
     std::scoped_lock lk{detail::mutex};
-    if (++detail::frames < 600) {
+    if (++detail::frames < BbSplit::WindowFrames()) {
         return;
     }
     const double f = double(detail::frames);
@@ -201,14 +204,15 @@ inline void NoteFrameEnd() {
                       detail::resumes_after[i] / f);
         resumes_after += item;
     }
-    std::printf("Render passes, last 600 frame ends: %.1f begun per frame; ended per frame by: "
+    std::printf("Render passes, last %llu frame ends: %.1f begun per frame; ended per frame by: "
                 "%s\n"
                 "  other enders per frame (atos -o libbbgpu.dylib -l 0): %s\n"
                 "  barrier ends per frame by what they wait for: %s; by flusher: %s\n"
                 "  same-state resume candidates per frame (begun with the state the last pass "
                 "ended with): %.1f; after a pass ended by: %s; by its ender or flusher: %s\n",
-                detail::begins / f, ends.c_str(), detail::Top(detail::other_ends, 12, f).c_str(),
-                detail::Sources(f).c_str(), detail::Top(detail::barrier_callers, 8, f).c_str(),
+                static_cast<unsigned long long>(detail::frames), detail::begins / f, ends.c_str(),
+                detail::Top(detail::other_ends, 12, f).c_str(), detail::Sources(f).c_str(),
+                detail::Top(detail::barrier_callers, 8, f).c_str(),
                 detail::resumes / f, resumes_after.c_str(),
                 detail::Top(detail::resume_callers, 8, f).c_str());
     std::fflush(stdout);
