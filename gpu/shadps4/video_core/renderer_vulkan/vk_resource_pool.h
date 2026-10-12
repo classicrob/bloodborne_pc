@@ -93,8 +93,12 @@ public:
     /// bbport (Apple): MoltenVK's limit on Metal command buffers in flight on a queue, set at
     /// instance creation (vk_platform.cpp). Above it, MoltenVK blocks inside vkQueueSubmit, under
     /// the schedulers' shared submit mutex. It is set above every live pool's MaxBuffers together
-    /// plus MetalCommandBufferHeadroom (MoltenVK's own, e.g. presents), so the pool cap, which
-    /// waits outside that mutex, is the bound; a pool that would exceed it stops.
+    /// plus MetalCommandBufferHeadroom, so the pool cap is reached first; a pool that would exceed
+    /// the total stops. The headroom is an allowance for Metal command buffers MoltenVK uses
+    /// outside our pools (e.g. presents), not a measured or enforced bound. The pool cap waits
+    /// outside the submit mutex on the asynchronous path (the recording thread commits after
+    /// releasing it); the synchronous SubmitExecution commits, and can wait at the cap, with it
+    /// held. Qualified with MoltenVK's default prefill (0).
     static constexpr std::size_t MaxActiveMetalCommandBuffers = 4096;
     static constexpr std::size_t MetalCommandBufferHeadroom = 256;
     /// bbport: for the submission with timeline value `tick`.

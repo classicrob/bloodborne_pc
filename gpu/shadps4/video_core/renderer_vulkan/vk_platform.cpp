@@ -430,9 +430,9 @@ vk::UniqueInstance CreateInstance(Frontend::WindowSystemType window_type, bool e
 
 #ifdef __APPLE__
     // MoltenVK (1.4.2) allows 64 Metal command buffers in flight per queue by default and blocks
-    // inside vkQueueSubmit beyond that, with the schedulers' submit mutex held. The command pools'
-    // own cap (CommandPool::MaxBuffers, docs/macos/async-submission.md) waits outside it, so the
-    // MoltenVK limit is set above all pools together. MoltenVK reads the value as uint32.
+    // inside vkQueueSubmit beyond that, with the schedulers' submit mutex held. It is set above
+    // all command pools' caps together (CommandPool::MaxActiveMetalCommandBuffers), so the pool
+    // cap is reached first (docs/macos/async-submission.md). MoltenVK reads the value as uint32.
     static constexpr u32 MaxActiveMetalCommandBuffers =
         static_cast<u32>(CommandPool::MaxActiveMetalCommandBuffers);
     layer_setings.push_back(vk::LayerSettingEXT{

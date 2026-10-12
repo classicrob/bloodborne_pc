@@ -273,6 +273,12 @@ Controls added to scheduler-async-submit-test:
   in the environment, the same binary reached exactly 256 and passed. The Apple instance now sets
   it through VK_EXT_layer_settings (required, as the shelved prefill branch did) to
   CommandPool::MaxActiveMetalCommandBuffers = 4096. A CommandPool stops at construction if the
-  live pools' caps plus 256 for MoltenVK's own buffers (presents) would exceed it. So the pool
-  cap, which waits outside submit_mutex, is the one bound. This changes game behavior only when
-  more than 64 Metal command buffers are in flight, and is part of the async A/B.
+  live pools' caps plus 256 would exceed it, so the pool cap (256, observed exactly on the device
+  in the control) is reached before MoltenVK's limit. Qualifications (Sol-2): the 256 headroom is
+  an engineering allowance for Metal command buffers MoltenVK uses outside our pools (presents),
+  not a measured or enforced bound. The pool cap waits outside submit_mutex on the asynchronous
+  path only (SubmitFromRecorder releases it before Commit); the synchronous SubmitExecution holds
+  it through AllocateWorkerCommandBuffers, which can now wait at the cap. Qualified with
+  MoltenVK's default prefill (0); the shelved prefill setting does not accompany it. The changed
+  capacity changes game behavior only when more than 64 Metal command buffers are in flight, and
+  the preview A/B with asynchronous submission qualifies it.
