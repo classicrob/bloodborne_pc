@@ -41,8 +41,10 @@ struct ChildResult {
     std::string stderr_text;
 };
 
+/// Runs `body` in a forked child with stderr captured. One deadline bounds reading and reaping: a
+/// child still alive at it (silent, or with stderr closed) is killed and reported as timed out.
 template <typename Body>
-ChildResult RunChild(Body body) {
+ChildResult RunChild(Body body, std::chrono::seconds limit = std::chrono::seconds(120)) {
     ChildResult result;
     int pipe_fds[2];
     if (pipe(pipe_fds) != 0) {
@@ -65,8 +67,7 @@ ChildResult RunChild(Body body) {
     }
     result.forked = true;
     close(pipe_fds[1]);
-    // Bounded: a child that neither stops nor exits within 120 s is killed and fails.
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(120);
+    const auto deadline = std::chrono::steady_clock::now() + limit;
     char chunk[4096];
     for (;;) {
         const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -74,9 +75,7 @@ ChildResult RunChild(Body body) {
                               .count();
         pollfd fd{pipe_fds[0], POLLIN, 0};
         if (left <= 0 || poll(&fd, 1, int(left)) <= 0) {
-            kill(child, SIGKILL);
-            result.timed_out = true;
-            break;
+            break; // the deadline: reaped (and killed) below
         }
         const ssize_t n = read(pipe_fds[0], chunk, sizeof(chunk));
         if (n <= 0) {
@@ -85,7 +84,21 @@ ChildResult RunChild(Body body) {
         result.stderr_text.append(chunk, size_t(n));
     }
     close(pipe_fds[0]);
-    result.waited = waitpid(child, &result.status, 0) == child;
+    // Reap within the same deadline: stderr may be closed while the child lives on.
+    for (;;) {
+        const pid_t done = waitpid(child, &result.status, WNOHANG);
+        if (done == child) {
+            result.waited = true;
+            return result;
+        }
+        if (done < 0 || std::chrono::steady_clock::now() >= deadline) {
+            break;
+        }
+        usleep(10000);
+    }
+    kill(child, SIGKILL);
+    result.timed_out = true;
+    result.waited = waitpid(child, &result.status, 0) == child; // after SIGKILL: prompt
     return result;
 }
 
@@ -110,6 +123,20 @@ AmdGpu::Image Sharp(VAddr address, AmdGpu::DataFormat data, AmdGpu::NumberFormat
 } // namespace
 
 int main() {
+    // The fixture's own bound (before any Vulkan): a child that closes stderr and stays alive is
+    // killed at the deadline, not waited for.
+    const ChildResult silent = RunChild(
+        [] {
+            close(STDERR_FILENO);
+            for (;;) {
+                pause();
+            }
+        },
+        std::chrono::seconds(2));
+    Expect("fixture: a child with stderr closed that stays alive is killed at the deadline",
+           silent.forked && silent.timed_out && silent.waited && WIFSIGNALED(silent.status) &&
+               WTERMSIG(silent.status) == SIGKILL);
+
     constexpr VAddr Address = 0x70e5c3af00; // the stop's address (any aligned address works)
     constexpr u32 Size = 256;               // BC4 texels; the block grid is 64 x 64
     const AmdGpu::Image bc4 = Sharp(Address, AmdGpu::DataFormat::FormatBc4,
