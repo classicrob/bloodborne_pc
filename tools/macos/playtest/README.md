@@ -11,5 +11,6 @@ exclusively with `--cpu-quiet`. Warm cache default: `p23-clinic` (Apple shader c
 - `footprint.sh PROBE LABEL FIXTURE SECONDS [walk]`: `BB_PASS_FOOTPRINT_VERIFY=1` run; mutation builds must stop loudly.
 - `perfcap.sh PROBE REPLAY_DIR`: the verifier's live `perf:60` replay capture at the settled clinic idle.
 - `motion.sh PROBE`: camera-only motion-vector gate (pitch up/down), judged by `tools/macos/motion_agree.py`.
+- `pan-explore.sh PROBE LABEL FIXTURE LEGS [TURN_S]`: rendering coverage; per leg a walk, a 4-way camera pan and a contact sheet (`<run>/sheet-NN.jpg`) to review by eye.
 - `arch-route.sh PROBE LABEL`: Central Yharnam coffin-arch route from `central-yharnam-arch` (depth-bounds repro); `KEEP=1` keeps the game.
 - `../play_route_goto.py`: closed-loop walk-to-XYZ on Astra-2's player-position file (`BB_PLAYER_POS_FILE`); tests in `tests/test_play_route_goto.py`. Not wired into play_route yet (waits for the publisher build).
