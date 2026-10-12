@@ -165,12 +165,20 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
 
 Presenter::~Presenter() {
 
+#ifdef __APPLE__
+    // Submit and wait, opening no new command buffer (Finish opened one, which was then reset
+    // unsubmitted; MoltenVK commits such a buffer when prefill is on: docs/macos/moltenvk-prefill.md).
+    draw_scheduler.Close();
+    present_scheduler.Close();
+    flip_scheduler.Close();
+#else
     draw_scheduler.Finish();
     present_scheduler.Finish();
     flip_scheduler.Finish();
     Check(draw_scheduler.CommandBuffer().reset());
     Check(present_scheduler.CommandBuffer().reset());
     Check(flip_scheduler.CommandBuffer().reset());
+#endif
 
     const vk::Device device = instance.GetDevice();
     for (auto& frame : present_frames) {

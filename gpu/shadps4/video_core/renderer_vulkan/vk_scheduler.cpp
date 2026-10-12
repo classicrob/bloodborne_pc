@@ -34,6 +34,13 @@ Scheduler::Scheduler(const Instance& instance, bool threaded_recording)
     // bbport: BB_VK_RECORD_THREAD=0 records on the calling thread.
     const char* env = std::getenv("BB_VK_RECORD_THREAD");
     if (threaded_recording && !(env && env[0] == '0')) {
+#ifdef __APPLE__
+        // Asynchronous submission (docs/macos/async-submission.md): the recording thread ends,
+        // submits and begins command buffers; Flush only enqueues. Set before the first chunk,
+        // which the budget counts.
+        async_submit = true;
+        RegisterAsyncTimeline(work_semaphore.Handle(), this);
+#endif
         record_chunk = AcquireChunk();
         recorder_thread = std::jthread(std::bind_front(&Scheduler::RecorderThread, this));
         recording_threaded = true;
@@ -47,6 +54,22 @@ Scheduler::Scheduler(const Instance& instance, bool threaded_recording)
 }
 
 Scheduler::~Scheduler() {
+#ifdef __APPLE__
+    if (async_submit) {
+        UnregisterAsyncTimeline(this);
+    }
+    // The open command buffer must not be destroyed unsubmitted (Close). One with recorded
+    // commands at this point would reference resources its owner may already have destroyed.
+    if (!closed) {
+        if (recorded_since_begin) {
+            std::fputs("STOP: a scheduler with unsubmitted recorded commands is destroyed "
+                       "without Scheduler::Close\n",
+                       stderr);
+            ASSERT_MSG(false, "Scheduler destroyed with unsubmitted recorded commands");
+        }
+        Close();
+    }
+#endif
     if (recorder_thread.joinable()) {
         SyncRecording();
         recorder_thread.request_stop();
@@ -195,6 +218,28 @@ void Scheduler::TraceDirectRecording(void* caller) {
 }
 
 std::unique_ptr<RecordChunk> Scheduler::AcquireChunk() {
+#ifdef __APPLE__
+    if (async_submit) {
+        // A bounded budget of chunks (queued, held by this thread, being executed): over it,
+        // this thread's full chunks go to the recorder and it waits for one to come back.
+        std::unique_lock lk{recorder_mutex};
+        if (free_chunks.empty() && live_chunks >= MaxChunks) {
+            lk.unlock();
+            QueueFullChunks();
+            lk.lock();
+            BbStats::WaitTimer timer{BbStats::sync_recording_ns};
+            BB_SPLIT_SCOPE(KRecorderSync);
+            recorder_space_cv.wait(lk, [this] { return !free_chunks.empty(); });
+        }
+        if (free_chunks.empty()) {
+            ++live_chunks;
+            return std::make_unique<RecordChunk>();
+        }
+        auto chunk = std::move(free_chunks.back());
+        free_chunks.pop_back();
+        return chunk;
+    }
+#endif
     std::scoped_lock lk{recorder_mutex};
     if (free_chunks.empty()) {
         return std::make_unique<RecordChunk>();
@@ -203,6 +248,60 @@ std::unique_ptr<RecordChunk> Scheduler::AcquireChunk() {
     free_chunks.pop_back();
     return chunk;
 }
+
+#ifdef __APPLE__
+namespace {
+/// Timelines whose submissions are asynchronous, by semaphore (WaitDependencies).
+std::mutex async_timelines_mutex;
+std::array<std::pair<VkSemaphore, Scheduler*>, 4> async_timelines{};
+} // namespace
+
+void Scheduler::RegisterAsyncTimeline(vk::Semaphore semaphore, Scheduler* owner) {
+    std::scoped_lock lk{async_timelines_mutex};
+    for (auto& entry : async_timelines) {
+        if (!entry.first || entry.second == owner) {
+            entry = {semaphore, owner};
+            return;
+        }
+    }
+    UNREACHABLE_MSG("More than {} asynchronously submitting schedulers", async_timelines.size());
+}
+
+void Scheduler::UnregisterAsyncTimeline(Scheduler* owner) {
+    std::scoped_lock lk{async_timelines_mutex};
+    for (auto& entry : async_timelines) {
+        if (entry.second == owner) {
+            entry = {};
+        }
+    }
+}
+
+Scheduler* Scheduler::AsyncTimelineOwner(vk::Semaphore semaphore) {
+    std::scoped_lock lk{async_timelines_mutex};
+    for (const auto& entry : async_timelines) {
+        if (entry.first && entry.first == static_cast<VkSemaphore>(semaphore)) {
+            return entry.second;
+        }
+    }
+    return nullptr;
+}
+
+void Scheduler::QueueFullChunks() {
+    bool wake;
+    {
+        std::scoped_lock lk{recorder_mutex};
+        for (auto& chunk : full_chunks) {
+            recorder_queue.push_back({std::move(chunk), nullptr});
+        }
+        wake = recorder_sleeping;
+        queued_chunks.store(recorder_queue.size(), std::memory_order_release);
+    }
+    full_chunks.clear();
+    if (wake) {
+        recorder_cv.notify_one();
+    }
+}
+#endif
 
 void Scheduler::SignalAfterHostCopies(std::function<void()> signal) {
     if (!IsRecordingDeferred()) {
@@ -490,10 +589,18 @@ void Scheduler::KickRecording(bool force) {
     {
         std::scoped_lock lk{recorder_mutex};
         for (auto& chunk : full_chunks) {
+#ifdef __APPLE__
+            recorder_queue.push_back({std::move(chunk), nullptr});
+#else
             recorder_queue.push_back(std::move(chunk));
+#endif
         }
         if (!record_chunk->Empty()) {
+#ifdef __APPLE__
+            recorder_queue.push_back({std::move(record_chunk), nullptr});
+#else
             recorder_queue.push_back(std::move(record_chunk));
+#endif
         }
         wake = recorder_sleeping;
         queued_chunks.store(recorder_queue.size(), std::memory_order_release);
@@ -522,6 +629,7 @@ void Scheduler::SyncRecording() {
 void Scheduler::RecorderThread(std::stop_token stoken) {
     Common::SetCurrentThreadName("bb:VkRecorder");
 #ifdef __APPLE__
+    recording_for = this; // this thread records for this scheduler (StopOnRecorderThread)
     BbHotThreadQos::Start("Vulkan recording");
 #endif
 #ifdef __APPLE__
@@ -543,6 +651,9 @@ void Scheduler::RecorderThread(std::stop_token stoken) {
             }
         }
         std::unique_ptr<RecordChunk> chunk;
+#ifdef __APPLE__
+        std::unique_ptr<SubmitPacket> submit;
+#endif
         {
             std::unique_lock lk{recorder_mutex};
             recorder_sleeping = true;
@@ -551,11 +662,30 @@ void Scheduler::RecorderThread(std::stop_token stoken) {
             if (recorder_queue.empty()) {
                 return; // stop requested
             }
+#ifdef __APPLE__
+            chunk = std::move(recorder_queue.front().chunk);
+            submit = std::move(recorder_queue.front().submit);
+#else
             chunk = std::move(recorder_queue.front());
+#endif
             recorder_queue.pop_front();
             queued_chunks.store(recorder_queue.size(), std::memory_order_release);
             recorder_busy = true;
         }
+#ifdef __APPLE__
+        if (submit) {
+            // A strict boundary: the commands after it are recorded into the buffer it begins.
+            SubmitFromRecorder(*submit);
+            std::scoped_lock lk{recorder_mutex};
+            --queued_submits;
+            recorder_busy = false;
+            if (recorder_queue.empty()) {
+                recorder_idle_cv.notify_all();
+            }
+            recorder_space_cv.notify_all();
+            continue;
+        }
+#endif
         // current_cmdbuf only changes after SyncRecording(), which waits for this thread.
         {
 #ifdef __APPLE__
@@ -574,14 +704,35 @@ void Scheduler::RecorderThread(std::stop_token stoken) {
             if (recorder_queue.empty()) {
                 recorder_idle_cv.notify_all();
             }
+#ifdef __APPLE__
+            recorder_space_cv.notify_all();
+#endif
         }
     }
 }
 
 u64 Scheduler::Flush(SubmitInfo& info) {
     // When flushing, we only send data to the driver; no waiting is necessary.
+#ifdef __APPLE__
+    if (closed) {
+        return CurrentTick() - 1; // Close submitted everything and waited; nothing is open
+    }
+    BB_SPLIT_SCOPE(KFlush);
+    // Every wait is in `info` once it is sealed (on_submit, WaitBeforeNextSubmit's waits);
+    // ordered against other schedulers outside submit_mutex.
+    const u64 value = SealSubmission(info);
+    WaitDependencies(info, value);
+    if (async_submit && !closing && IsRecordingDeferred()) {
+        return EnqueueSubmission(info, value);
+    }
+    // Synchronous (direct recording, toggle): queued packets need submit_mutex, which
+    // SubmitExecution holds while it syncs: submit them first.
+    SyncRecording();
+    return SubmitExecution(info, value);
+#else
     BB_SPLIT_SCOPE(KFlush);
     return SubmitExecution(info);
+#endif
 }
 
 u64 Scheduler::Flush() {
@@ -597,22 +748,290 @@ void Scheduler::WaitBeforeNextSubmit(vk::Semaphore semaphore, u64 value) {
 void Scheduler::Finish() {
     // When finishing, we need to wait for the submission to have executed on the device.
 #ifdef __APPLE__
+    if (closed) {
+        return; // Close waited for everything submitted; recording since then stops
+    }
     BbSplit::FlushReason reason{BbSplit::FFinish};
 #endif
-    const u64 presubmit_tick = CurrentTick();
     SubmitInfo info{};
+#ifdef __APPLE__
+    // Through Flush: enqueued like any submission, then waited for (Wait accepts a value still
+    // queued for vkQueueSubmit).
+    Wait(Flush(info));
+#else
+    const u64 presubmit_tick = CurrentTick();
     SubmitExecution(info);
     Wait(presubmit_tick);
+#endif
 }
 
-void Scheduler::WaitSubmitted() {
+#ifdef __APPLE__
+void Scheduler::Close() {
+    if (closed || closing) {
+        return;
+    }
+    SyncRecording();
+    EndRendering();
+    closing = true;
+    SubmitInfo info{};
+    // The submit callback may still record (pending barriers); its waits are ordered as any.
+    const u64 tick = SealSubmission(info);
+    WaitDependencies(info, tick);
+    SyncRecording();
+    SubmitExecution(info, tick);
+    closed = true;
+    BB_SPLIT_SCOPE(KGpuTick);
+    work_semaphore.Wait(tick);
+    PopPendingOperations();
+}
+
+void Scheduler::StopRecordingAfterClose() {
+    std::fputs("STOP: recording after Scheduler::Close\n", stderr);
+    ASSERT_MSG(false, "Recording after Scheduler::Close");
+    std::abort();
+}
+#endif
+
+void Scheduler::WaitPreviousRetired() {
     const u64 tick = CurrentTick();
     if (tick > 1) {
         Wait(tick - 1);
     }
 }
 
+#ifdef __APPLE__
+void Scheduler::WaitDependencies(const SubmitInfo& info, u64 own_value) {
+    StopOnRecorderThread("WaitDependencies");
+    for (u32 i = 0; i < info.num_wait_semas; ++i) {
+        Scheduler* const owner = AsyncTimelineOwner(info.wait_semas[i]);
+        if (!owner) {
+            continue; // binary or external semaphores: not ordered by our queues
+        }
+        const u64 value = info.wait_ticks[i];
+        if (owner == this) {
+            // An earlier value of this timeline is ahead in this queue already (FIFO); this
+            // submission's own or a later one can never be signalled before it.
+            if (value >= own_value) {
+                std::fprintf(stderr,
+                             "STOP: a submission waits on its own scheduler's value %llu (open "
+                             "value %llu): never signalled before it\n",
+                             static_cast<unsigned long long>(value),
+                             static_cast<unsigned long long>(own_value));
+                ASSERT_MSG(false, "A submission waits on its own scheduler's value {}", value);
+            }
+            continue;
+        }
+        // The proven dependency graph: synchronous schedulers (present, flip) wait on the
+        // asynchronous one (draw). An asynchronous scheduler waiting on another could cycle.
+        if (async_submit) {
+            std::fputs("STOP: an asynchronously submitting scheduler waits on another one's "
+                       "timeline (not a proven acyclic edge)\n",
+                       stderr);
+            ASSERT_MSG(false, "Async scheduler waits on another async timeline");
+        }
+        owner->WaitQueueSubmitted(value);
+    }
+}
+
+void Scheduler::StopOnRecorderThread(const char* what) const {
+    if (recording_for == this) {
+        std::fprintf(stderr,
+                     "STOP: %s on the scheduler's own recording thread (it would wait for "
+                     "itself)\n",
+                     what);
+        ASSERT_MSG(false, "{} on the recording thread", what);
+    }
+}
+
+void Scheduler::WaitQueueSubmitted(u64 tick) {
+    StopOnRecorderThread("WaitQueueSubmitted");
+    if (tick >= CurrentTick()) {
+        std::fprintf(stderr,
+                     "STOP: WaitQueueSubmitted(%llu) for a value not assigned yet (open value "
+                     "%llu)\n",
+                     static_cast<unsigned long long>(tick),
+                     static_cast<unsigned long long>(CurrentTick()));
+        ASSERT_MSG(false, "WaitQueueSubmitted({}) for a value not assigned yet", tick);
+    }
+    if (submitted_through.load(std::memory_order_acquire) >= tick) {
+        return;
+    }
+    BbStats::WaitTimer timer{BbStats::tick_wait_ns};
+    BB_SPLIT_SCOPE(KGpuTick);
+    std::unique_lock lk{recorder_mutex};
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    const bool ready = recorder_space_cv.wait_until(lk, deadline, [&] {
+        return submitted_through.load(std::memory_order_acquire) >= tick || submit_failed ||
+               closed;
+    });
+    if (submitted_through.load(std::memory_order_acquire) >= tick) {
+        return;
+    }
+    std::fprintf(stderr,
+                 "STOP: submission %llu was not handed to vkQueueSubmit (%s; enqueued through "
+                 "%llu, submitted through %llu)\n",
+                 static_cast<unsigned long long>(tick),
+                 !ready ? "10 s" : submit_failed ? "submission failed" : "scheduler closed",
+                 static_cast<unsigned long long>(enqueued_through.load()),
+                 static_cast<unsigned long long>(submitted_through.load()));
+    ASSERT_MSG(false, "Submission {} was never handed to vkQueueSubmit", tick);
+}
+
+u64 Scheduler::SealSubmission(SubmitInfo& info) {
+    const u64 signal_value = work_semaphore.NextTick();
+    // Batched labels (SignalAtGpuCompletion) were recorded for exactly this submission.
+    if (labels_unflushed.exchange(false, std::memory_order_acq_rel)) {
+        ASSERT_MSG(signal_value == unflushed_tick,
+                   "macOS: batched labels wait for timeline value {}, their submission signals {}",
+                   unflushed_tick, signal_value);
+    }
+    if (on_submit) {
+        on_submit(info); // records into this submission (the rasterizer's barriers)
+    }
+    for (const auto& [semaphore, value] : next_submit_waits) {
+        info.AddWait(semaphore, value, vk::PipelineStageFlagBits::eAllCommands);
+    }
+    next_submit_waits.clear();
+    return signal_value;
+}
+
+u64 Scheduler::EnqueueSubmission(SubmitInfo& info, u64 signal_value) {
+    auto packet = std::make_unique<SubmitPacket>();
+    {
+        if (flush_census) {
+            // After on_submit's barrier flush, as in SubmitExecution: a pass still open is
+            // ended by this submission (the pass census's "submit" enders).
+            BbSplit::NoteFlush(is_rendering);
+        }
+        EndRenderingFor(BbPassCensus::Why::Submit);
+        packet->info = info;
+        packet->signal_value = signal_value;
+        packet->next_tick = signal_value + 1;
+        packet->copies_through = host_copies_issued;
+        packet->perf_phase = perf_phase;
+        packet->perf_frame = perf_frame;
+    }
+    {
+        std::unique_lock lk{recorder_mutex};
+        if (queued_submits >= MaxQueuedSubmits) {
+            BbStats::WaitTimer timer{BbStats::sync_recording_ns};
+            BB_SPLIT_SCOPE(KRecorderSync);
+            recorder_space_cv.wait(lk, [this] { return queued_submits < MaxQueuedSubmits; });
+        }
+        // The submission's commands, then the packet: a strict boundary (the commands after it
+        // are recorded into the buffer it begins).
+        for (auto& chunk : full_chunks) {
+            recorder_queue.push_back({std::move(chunk), nullptr});
+        }
+        if (!record_chunk->Empty()) {
+            recorder_queue.push_back({std::move(record_chunk), nullptr});
+        }
+        recorder_queue.push_back({nullptr, std::move(packet)});
+        ++queued_submits;
+        enqueued_through.store(signal_value, std::memory_order_release);
+        queued_chunks.store(recorder_queue.size(), std::memory_order_release);
+    }
+    full_chunks.clear();
+    // Always woken: waits on host copies no longer kick the recorder themselves (PM4).
+    recorder_cv.notify_one();
+    if (!record_chunk) {
+        record_chunk = AcquireChunk();
+    }
+    direct_mode = false;
+    recorded_since_begin = false; // the recorder begins the next buffer
+    dynamic_state.Invalidate();   // which the next commands are recorded into
+    PopPendingOperations();
+    return signal_value;
+}
+
+void Scheduler::SubmitFromRecorder(SubmitPacket& packet) {
+    // The recorder's "queue submit": end, the host-copy wait (its own scope), vkQueueSubmit
+    // (MoltenVK encodes the command buffer here), commit and begin of the next buffer.
+    BB_SPLIT_SCOPE(KFlush);
+    if (perf) perf->End(current_cmdbuf);
+    Check(current_cmdbuf.end());
+    // The host copies this submission reads: their dispatch commands were recorded before the
+    // packet, so they have run (FIFO); wait for the copies themselves. AfterCopies also covers
+    // copies the owner issued after the packet (BbCopy::Async from ObtainBuffer): a harmless
+    // over-wait. No copy task waits on a GPU submission (they copy guest memory into staging,
+    // docs/macos/async-submission.md), so this cannot cycle; 10 s is a hang detector.
+    ASSERT_MSG(host_copies_done.load(std::memory_order_acquire) >= packet.copies_through,
+               "Submission {}: host copy {} not dispatched before its submit (done {})",
+               packet.signal_value, packet.copies_through, host_copies_done.load());
+    {
+        auto copies_done = std::make_shared<std::atomic<bool>>(false);
+        BbCopy::AfterCopies([copies_done] { copies_done->store(true, std::memory_order_release); });
+        if (!copies_done->load(std::memory_order_acquire)) {
+            BbStats::WaitTimer timer{BbStats::copy_threads_wait_ns};
+            BB_SPLIT_SCOPE(KHostCopies);
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+            for (u32 spins = 1; !copies_done->load(std::memory_order_acquire); ++spins) {
+                std::this_thread::yield();
+                if (!(spins & 255) && std::chrono::steady_clock::now() > deadline) {
+                    std::fprintf(stderr,
+                                 "STOP: the host copies awaited by submission %llu have not "
+                                 "finished in 10 s (a hung copy task)\n",
+                                 static_cast<unsigned long long>(packet.signal_value));
+                    ASSERT_MSG(false, "Host copies of submission {} did not finish",
+                               packet.signal_value);
+                }
+            }
+        }
+    }
+    SubmitInfo& info = packet.info;
+    info.AddSignal(work_semaphore.Handle(), packet.signal_value);
+    const vk::TimelineSemaphoreSubmitInfo timeline_si = {
+        .waitSemaphoreValueCount = info.num_wait_semas,
+        .pWaitSemaphoreValues = info.wait_ticks.data(),
+        .signalSemaphoreValueCount = info.num_signal_semas,
+        .pSignalSemaphoreValues = info.signal_ticks.data(),
+    };
+    const vk::SubmitInfo submit_info = {
+        .pNext = &timeline_si,
+        .waitSemaphoreCount = info.num_wait_semas,
+        .pWaitSemaphores = info.wait_semas.data(),
+        .pWaitDstStageMask = info.wait_stages.data(),
+        .commandBufferCount = 1U,
+        .pCommandBuffers = &current_cmdbuf,
+        .signalSemaphoreCount = info.num_signal_semas,
+        .pSignalSemaphores = info.signal_semas.data(),
+    };
+    vk::Result submit_result;
+    {
+        std::scoped_lock lk{submit_mutex};
+        submit_result = instance.GetGraphicsQueue().submit(submit_info, info.fence);
+    }
+    if (submit_result != vk::Result::eSuccess) {
+        {
+            std::scoped_lock lk{recorder_mutex};
+            submit_failed = true;
+        }
+        recorder_space_cv.notify_all();
+        ASSERT_MSG(false, "Submission {} failed: {}", packet.signal_value,
+                   vk::to_string(submit_result));
+    }
+    if (perf) perf->Submitted(packet.signal_value);
+    work_semaphore.Refresh();
+    {
+        // Under the mutex WaitQueueSubmitted checks its predicate with: no lost wakeup.
+        std::scoped_lock lk{recorder_mutex};
+        submitted_through.store(packet.signal_value, std::memory_order_release);
+    }
+    recorder_space_cv.notify_all();
+    // The next buffer, stamped for the submission that will use it.
+    current_cmdbuf = command_pool.Commit(packet.next_tick);
+    recording_tick.store(packet.next_tick, std::memory_order_release);
+    Check(current_cmdbuf.begin(vk::CommandBufferBeginInfo{
+        .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
+    }));
+    if (perf) perf->Begin(current_cmdbuf, packet.perf_phase, packet.perf_frame);
+}
+#endif
+
 void Scheduler::Wait(u64 tick) {
+#ifdef __APPLE__
+    StopOnRecorderThread("Scheduler::Wait");
+#endif
     if (tick >= work_semaphore.CurrentTick()) {
         // Make sure we are not waiting for the current tick without signalling
         SubmitInfo info{};
@@ -655,6 +1074,12 @@ void Scheduler::AllocateWorkerCommandBuffers() {
     current_cmdbuf = command_pool.Commit();
     Check(current_cmdbuf.begin(begin_info));
 #ifdef __APPLE__
+    recording_tick.store(CurrentTick(), std::memory_order_release);
+#endif
+#ifdef __APPLE__
+    recorded_since_begin = false;
+#endif
+#ifdef __APPLE__
     if (perf) perf->Begin(current_cmdbuf, perf_phase, perf_frame);
 #endif
 
@@ -671,16 +1096,13 @@ void Scheduler::AllocateWorkerCommandBuffers() {
 #endif
 }
 
-u64 Scheduler::SubmitExecution(SubmitInfo& info) {
+u64 Scheduler::SubmitExecution(SubmitInfo& info, u64 sealed_value) {
     std::scoped_lock lk{submit_mutex};
-    const u64 signal_value = work_semaphore.NextTick();
 #ifdef __APPLE__
-    // Batched labels (SignalAtGpuCompletion) were recorded for exactly this submission.
-    if (labels_unflushed.exchange(false, std::memory_order_acq_rel)) {
-        ASSERT_MSG(signal_value == unflushed_tick,
-                   "macOS: batched labels wait for timeline value {}, their submission signals {}",
-                   unflushed_tick, signal_value);
-    }
+    // Sealed by the caller (SealSubmission: value, labels check, on_submit, waits), or here.
+    const u64 signal_value = sealed_value ? sealed_value : SealSubmission(info);
+#else
+    const u64 signal_value = work_semaphore.NextTick();
 #endif
 
 #if TRACY_GPU_ENABLED
@@ -691,6 +1113,7 @@ u64 Scheduler::SubmitExecution(SubmitInfo& info) {
     }
 #endif
 
+#ifndef __APPLE__
     if (on_submit) {
         on_submit(info);
     }
@@ -698,6 +1121,7 @@ u64 Scheduler::SubmitExecution(SubmitInfo& info) {
         info.AddWait(semaphore, value, vk::PipelineStageFlagBits::eAllCommands);
     }
     next_submit_waits.clear();
+#endif
 
 #ifdef __APPLE__
     if (flush_census) {
@@ -753,6 +1177,20 @@ u64 Scheduler::SubmitExecution(SubmitInfo& info) {
 #endif
 
     work_semaphore.Refresh();
+#ifdef __APPLE__
+    // Synchronous submission (no recording thread, direct recording, Close): the same
+    // watermarks the asynchronous path keeps.
+    {
+        std::scoped_lock lk{recorder_mutex};
+        enqueued_through.store(signal_value, std::memory_order_release);
+        submitted_through.store(signal_value, std::memory_order_release);
+    }
+    recorder_space_cv.notify_all();
+    if (closing) {
+        PopPendingOperations();
+        return signal_value;
+    }
+#endif
     AllocateWorkerCommandBuffers();
 
     // Apply pending operations

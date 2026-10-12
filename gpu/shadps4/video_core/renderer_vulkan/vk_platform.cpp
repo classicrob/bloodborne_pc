@@ -24,6 +24,7 @@
 #include "core/emulator_settings.h"
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
+#include "video_core/renderer_vulkan/vk_resource_pool.h"
 
 
 namespace Vulkan {
@@ -295,7 +296,26 @@ vk::UniqueInstance CreateInstance(Frontend::WindowSystemType window_type, bool e
                VK_VERSION_MAJOR(available_version), VK_VERSION_MINOR(available_version));
 
     const auto layers = GetInstanceLayers(enable_validation, enable_crash_diagnostic);
-    const auto extensions = GetLayerExtensions(GetInstanceExtensions(window_type, true), layers);
+    auto extensions = GetLayerExtensions(GetInstanceExtensions(window_type, true), layers);
+#ifdef __APPLE__
+    // MoltenVK reads its configuration from VK_EXT_layer_settings ("MoltenVK" layer settings
+    // below); it ignores them when the extension is not enabled, so it is required here.
+    if (std::ranges::none_of(extensions, [](const char* extension) {
+            return std::strcmp(extension, VK_EXT_LAYER_SETTINGS_EXTENSION_NAME) == 0;
+        })) {
+        const auto [driver_result, driver_extensions] = vk::enumerateInstanceExtensionProperties();
+        ASSERT_MSG(driver_result == vk::Result::eSuccess &&
+                       std::ranges::any_of(driver_extensions,
+                                           [](const vk::ExtensionProperties& extension) {
+                                               return std::string_view{extension.extensionName} ==
+                                                      VK_EXT_LAYER_SETTINGS_EXTENSION_NAME;
+                                           }),
+                   "The Vulkan driver (MoltenVK) lacks {}: its Metal command buffers in flight "
+                   "cannot be configured",
+                   VK_EXT_LAYER_SETTINGS_EXTENSION_NAME);
+        extensions.push_back(VK_EXT_LAYER_SETTINGS_EXTENSION_NAME);
+    }
+#endif
 
     const vk::ApplicationInfo application_info = {
         .pApplicationName = "shadPS4",
@@ -321,7 +341,7 @@ vk::UniqueInstance CreateInstance(Frontend::WindowSystemType window_type, bool e
     const char* log_path = crash_diagnostic_path.c_str();
     vk::Bool32 enable_force_barriers = vk::True;
 
-    const std::array layer_setings = {
+    std::vector layer_setings = {
         vk::LayerSettingEXT{
             .pLayerName = VALIDATION_LAYER_NAME,
             .pSettingName = "validate_core",
@@ -408,6 +428,22 @@ vk::UniqueInstance CreateInstance(Frontend::WindowSystemType window_type, bool e
         },
     };
 
+#ifdef __APPLE__
+    // MoltenVK (1.4.2) allows 64 Metal command buffers in flight per queue by default and blocks
+    // inside vkQueueSubmit beyond that, with the schedulers' submit mutex held. It is set above
+    // all command pools' caps together (CommandPool::MaxActiveMetalCommandBuffers), so the pool
+    // cap is reached first (docs/macos/async-submission.md). MoltenVK reads the value as uint32.
+    static constexpr u32 MaxActiveMetalCommandBuffers =
+        static_cast<u32>(CommandPool::MaxActiveMetalCommandBuffers);
+    layer_setings.push_back(vk::LayerSettingEXT{
+        .pLayerName = "MoltenVK",
+        .pSettingName = "MVK_CONFIG_MAX_ACTIVE_METAL_COMMAND_BUFFERS_PER_QUEUE",
+        .type = vk::LayerSettingTypeEXT::eUint32,
+        .valueCount = 1,
+        .pValues = &MaxActiveMetalCommandBuffers,
+    });
+#endif
+
     vk::InstanceCreateFlags instance_flags{};
 #ifdef __APPLE__
     if (std::ranges::any_of(extensions, [](const char* extension) {
@@ -434,7 +470,7 @@ vk::UniqueInstance CreateInstance(Frontend::WindowSystemType window_type, bool e
             .ppEnabledExtensionNames = extensions.data(),
         },
         vk::LayerSettingsCreateInfoEXT{
-            .settingCount = layer_setings.size(),
+            .settingCount = static_cast<u32>(layer_setings.size()),
             .pSettings = layer_setings.data(),
         },
 #ifdef __APPLE__

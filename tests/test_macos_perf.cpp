@@ -149,10 +149,13 @@ int main() {
     assert(Has(lines[1], "\"type\":\"queue\"") && Has(lines[1], "\"present\":false"));
     assert(Has(lines[2], "\"final\":true") && Has(lines[2], "\"perturbed\":false"));
     assert(Number(lines[2], "flips") == Frames);
-    // Run() submits twice per frame; Finish() submits once more.
-    assert(Number(lines[2], "main_submissions") == 2 * Frames + 1);
+    // Run() submits twice per frame; Finish() submits once more, and on Apple the scheduler's
+    // destructor closes it, submitting the open command buffer (Scheduler::Close): every real
+    // submission is one timed span.
+    constexpr int Submissions = 2 * Frames + 2;
+    assert(Number(lines[2], "main_submissions") == Submissions);
     assert(Number(lines[2], "present_submissions") == 0);
-    assert(Has(lines[2], "\"gpu_main_submission_ms\":{\"n\":" + std::to_string(2 * Frames + 1)));
+    assert(Has(lines[2], "\"gpu_main_submission_ms\":{\"n\":" + std::to_string(Submissions)));
     assert(Has(lines[2], "\"guest_flip_interval_ms\":{\"n\":" + std::to_string(Frames - 1)));
     assert(!Has(lines[2], "gpu_scene_ms"));
     for (const char* name : {"deferred_signal_wait_wall_ms", "host_copy_record_wait_wall_ms",
@@ -173,7 +176,7 @@ int main() {
     assert(Number(lines[2], "flips") == Frames);
     const long long submissions = Number(lines[2], "main_submissions");
     std::printf("BB_PERF phases: %lld submissions for %d frames\n", submissions, Frames);
-    assert(submissions > 2 * Frames + 1);
+    assert(submissions > Submissions); // phases add submissions to the unperturbed run
     // A frame's phase samples are complete when the next frame's first submission is read:
     // all but the last frame.
     for (const char* name : {"gpu_scene_ms", "gpu_post_ms", "gpu_upscaler_ms", "gpu_frame_work_ms"})
@@ -185,7 +188,7 @@ int main() {
     assert(Passed(InChild([&] { Env("1", tight.c_str(), nullptr); RunTight(Tight); })));
     lines = Lines(tight);
     assert(lines.size() == 3);
-    assert(Number(lines[2], "main_submissions") == Tight);
+    assert(Number(lines[2], "main_submissions") == Tight + 1); // + the destructor's Close
     const long long deferred = Number(lines[2], "deferred_reads");
     std::printf("BB_PERF read-after-timeline: %d submissions, %lld deferred reads\n", Tight, deferred);
 
