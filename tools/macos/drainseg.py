@@ -24,7 +24,7 @@ with open(f'{cap}/submissions.bin', 'rb') as f:
                 d, n = describe(words, i)
                 op = d.split(' ')[0]
                 seg[op] += 1
-                if op == 'WAIT_REG_MEM' and 'poll ' in d:
+                if op == 'WaitRegMem' and 'poll ' in d:
                     poll = int(d.split('poll ')[1].split(' ')[0], 0)
                     if guest <= poll < end:
                         segs.append((guest + i * 4, seg))
@@ -34,8 +34,8 @@ with open(f'{cap}/submissions.bin', 'rb') as f:
             print(f'submission {si} (submit #{num}) DCB {guest:#x} {size_dw} dwords: {len(segs) - 1} self-polling waits')
             for k, (at, c) in enumerate(segs):
                 label = f'up to self-polling WAIT at {at:#x}' if k < len(segs) - 1 else 'after the last one'
-                draws = sum(v for o, v in c.items() if o.startswith('DRAW'))
-                disp = sum(v for o, v in c.items() if o.startswith('DISPATCH'))
+                draws = sum(v for o, v in c.items() if o.startswith('Draw'))
+                disp = sum(v for o, v in c.items() if o.startswith('Dispatch'))
                 top = ', '.join(f'{o} {v}' for o, v in c.most_common())
                 print(f'  segment {k} ({label}): draws {draws}, dispatches {disp}, '
-                      f'WRITE_DATA {c["WRITE_DATA"]}; {top}')
+                      f'WRITE_DATA {c["WriteData"]}; {top}')

@@ -24,16 +24,16 @@ with open(f'{cap}/submissions.bin', 'rb') as f:
                 d, n = describe(words, i)
                 op = d.split(' ')[0]
                 c[op] += 1
-                if op == 'NOP':
+                if op == 'Nop':
                     nop_dw += n
                 i += n
-            draws = sum(v for o, v in c.items() if o.startswith('DRAW'))
-            disp = sum(v for o, v in c.items() if o.startswith('DISPATCH'))
+            draws = sum(v for o, v in c.items() if o.startswith('Draw'))
+            disp = sum(v for o, v in c.items() if o.startswith('Dispatch'))
             total['draws'] += draws
             total['dispatches'] += disp
-            if draws or disp or c['WRITE_DATA'] or c['WAIT_REG_MEM']:
+            if draws or disp or c['WriteData'] or c['WaitRegMem']:
                 print(f'sub {si:3d} #{num} region {ri} {guest:#x} {"CE " if const else ""}{size_dw:6d} dw: '
-                      f'draws {draws}, dispatches {disp}, WRITE_DATA {c["WRITE_DATA"]}, '
-                      f'EOP {c["EVENT_WRITE_EOP"]}, EOS {c["EVENT_WRITE_EOS"]}, WAIT {c["WAIT_REG_MEM"]}, '
-                      f'IB {c["INDIRECT_BUFFER"]}, NOP dw {nop_dw}')
+                      f'draws {draws}, dispatches {disp}, WRITE_DATA {c["WriteData"]}, '
+                      f'EOP {c["EventWriteEop"]}, EOS {c["EventWriteEos"]}, WAIT {c["WaitRegMem"]}, '
+                      f'IB {c["IndirectBuffer"]}, NOP dw {nop_dw}')
 print('total', dict(total))

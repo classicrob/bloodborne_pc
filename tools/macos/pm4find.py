@@ -2,16 +2,19 @@
 """Usage: python3 tools/macos/pm4find.py out/replay/<capture> 0xADDR [CONTEXT=10]
 Finds the WRITE_DATA packets in a perf replay capture (docs/macos/capture-replay.md) whose destination covers
 ADDR, with CONTEXT packets before and after each, and the guest view (views.bin) that holds ADDR."""
-import struct, sys
-NAMES = {0x10:'NOP',0x11:'SET_BASE',0x12:'CLEAR_STATE',0x13:'INDEX_BUFFER_SIZE',0x15:'DISPATCH_DIRECT',0x16:'DISPATCH_INDIRECT',
- 0x1F:'ATOMIC_GDS',0x22:'COND_EXEC',0x23:'PRED_EXEC',0x25:'DRAW_INDEX_INDIRECT_MULTI',0x26:'DRAW_INDEX_2',0x27:'CONTEXT_CONTROL',
- 0x28:'DRAW_INDEX_OFFSET',0x2A:'INDEX_TYPE',0x2C:'DRAW_INDEX_MULTI_AUTO',0x2D:'DRAW_INDEX_AUTO',0x2F:'NUM_INSTANCES',0x33:'INDIRECT_BUFFER_CONST',
- 0x34:'STRMOUT_BUFFER_UPDATE',0x35:'DRAW_INDEX_OFFSET_2',0x37:'WRITE_DATA',0x38:'DRAW_INDEX_INDIRECT_MULTI',0x3A:'MEM_SEMAPHORE',0x3C:'WAIT_REG_MEM',
- 0x3F:'INDIRECT_BUFFER',0x40:'COPY_DATA',0x41:'CP_DMA',0x42:'PFP_SYNC_ME',0x43:'SURFACE_SYNC',0x46:'EVENT_WRITE',0x47:'EVENT_WRITE_EOP',
- 0x48:'EVENT_WRITE_EOS',0x49:'RELEASE_MEM',0x4A:'PREAMBLE_CNTL',0x50:'DMA_DATA',0x58:'ACQUIRE_MEM',0x59:'REWIND',0x5E:'LOAD_UCONFIG_REG',
- 0x5F:'LOAD_SH_REG',0x60:'LOAD_CONFIG_REG',0x61:'LOAD_CONTEXT_REG',0x68:'SET_CONFIG_REG',0x69:'SET_CONTEXT_REG',0x6D:'SET_CONTEXT_REG_INDIRECT',
- 0x76:'SET_SH_REG',0x77:'SET_SH_REG_OFFSET',0x79:'SET_UCONFIG_REG',0x80:'LOAD_CONST_RAM',0x81:'WRITE_CONST_RAM',0x83:'DUMP_CONST_RAM',
- 0x84:'INCREMENT_CE_COUNTER',0x85:'INCREMENT_DE_COUNTER',0x86:'WAIT_ON_CE_COUNTER',0x88:'WAIT_ON_DE_COUNTER_DIFF',0x8B:'SWITCH_BUFFER'}
+import os, struct, sys
+def _load_names():
+    """Opcode names from the parser's own table (gpu/shadps4/video_core/amdgpu/pm4_opcodes.h)."""
+    import re
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    path = os.path.join(root, 'gpu', 'shadps4', 'video_core', 'amdgpu', 'pm4_opcodes.h')
+    names = {}
+    for name, value in re.findall(r'^\s*(\w+)\s*=\s*(0x[0-9A-Fa-f]+)\s*,', open(path).read(), re.M):
+        names.setdefault(int(value, 16), name)  # first name of a shared value (IndirectBuffer)
+    if not names:
+        sys.exit(f'STOP: no opcodes read from {path}')
+    return names
+NAMES = _load_names()
 def name(op): return NAMES.get(op, f'op_{op:#04x}')
 def header(f, magic):
     m, ver, _, recs = struct.unpack('<8sIIQ', f.read(24))
