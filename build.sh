@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 cd -- "$(dirname -- "$0")"
+if [[ -n ${BB_TEST_SKIP:-} && ${1:-} != --test-keep-going ]]; then
+    echo 'BB_TEST_SKIP is for build.sh --test-keep-going only (a skip is listed in its summary)' >&2
+    exit 2
+fi
 # macOS: the whole build (and --test) runs in a machine-wide heavy-job slot (tools/macos/heavy.sh;
 # BB_HEAVY_PRIORITY=1 is the critical lane: shared builds).
 if [[ $(uname -s) == Darwin && -z ${BB_HEAVY_HELD:-} ]]; then
@@ -193,7 +197,7 @@ if [[ ${1:-} == --test-one && -z ${2:-} ]]; then
     echo 'usage: build.sh --test-one <test target or script, as build.sh --test runs it>' >&2
     exit 2
 fi
-if [[ ${1:-} == --test || ${1:-} == --test-dry || ${1:-} == --test-one ]]; then
+if [[ ${1:-} == --test || ${1:-} == --test-dry || ${1:-} == --test-one || ${1:-} == --test-keep-going ]]; then
     # --test-dry builds, links and signs everything --test would run, and runs the static checks
     # (export gate, test wiring), but executes no test: t checks each test binary exists and is
     # signed, and each test script exists. Run it before merging a change to build.sh or a test
@@ -203,11 +207,18 @@ if [[ ${1:-} == --test || ${1:-} == --test-dry || ${1:-} == --test-one ]]; then
     # out/gpu/x-test, a script) exactly as --test does: same environment, signing and directories,
     # with the checks of its outputs (spirv-val, file counts). Each run prints "test-one: exit N";
     # the exit is the first failure's, or 0. A NAME no test command has is an error that lists them.
-    dry='' one=''
+    # --test-keep-going (the gate for previews and merge requests) runs every test even after a
+    # failure: each exit goes to out/test-results.txt, each failure is said as it happens, and the
+    # end prints run/passed/failed/skipped and the failures; the exit is 1 if any test failed, 3 if
+    # none failed but some were skipped (NOT A FULL GATE), 0 only when every test ran and passed.
+    # BB_TEST_SKIP=SUBSTRING skips the test commands containing it, listed as skipped. A failing
+    # build or non-test step still stops it (non-zero, no summary).
+    dry='' one='' keep=''
     if [[ $1 == --test-dry ]]; then dry=1; fi
     if [[ $1 == --test-one ]]; then one=$2; fi
-    one_ran=0 one_failed=0 one_last=0 one_seen=()
-    # --- test runner (tests/test_build_test_one.sh sources this block) ---
+    if [[ $1 == --test-keep-going ]]; then keep=1; mkdir -p out; : > out/test-results.txt; fi
+    one_ran=0 one_failed=0 one_last=0 one_seen=() keep_ran=0 keep_skipped=() keep_failed=()
+    # --- test runner (tests/test_build_test_one.sh and test_build_keep_going.sh source this block) ---
     names() {  # does an argument name the --test-one test?
         local arg
         for arg; do [[ $arg == "$one" || $arg == */"$one" ]] && return 0; done
@@ -224,16 +235,38 @@ if [[ ${1:-} == --test || ${1:-} == --test-dry || ${1:-} == --test-one ]]; then
     }
     # Skip a check of a test's outputs: --test-dry, or --test-one when that test was not selected
     # or failed (its own exit is the failure; its missing outputs are not a second one).
-    unchecked() { [[ -n $dry ]] || [[ -n $one && $one_last == 0 ]]; }
+    unchecked() { [[ -n $dry ]] || [[ -n $one$keep && $one_last == 0 ]]; }
     fresh_dir() {  # fresh_dir TEST DIR: an empty output directory for TEST, if TEST runs
         if want "$1"; then rm -rf "$2" && mkdir -p "$2"; fi
     }
     outputs_ok() {  # outputs_ok COUNT EXPECTED MESSAGE: the output count of the test just run
         unchecked || (($1 == $2)) && return 0
         echo "$3" >&2
+        if [[ -n $keep ]]; then
+            ((++keep_ran))  # the check is a test of its own: run, and failed
+            keep_failed+=("output check: $3")
+            echo "output check: $3" >> out/test-results.txt
+            echo "test-keep-going: FAIL output check: $3"
+            return 0
+        fi
         [[ -n $one ]] || exit 1
         echo "test-one: exit 1: output check: $3"
         if ((!one_failed)); then one_failed=1; fi
+    }
+    test_keep_going_summary() {  # --test-keep-going's end: counts and failures; exit 1 on a
+        # failure, 3 when tests were skipped (passed, but not a full gate), 0 only for all run and passed
+        local passed=$((keep_ran - ${#keep_failed[@]}))
+        echo "test-keep-going: ${keep_ran} run, ${passed} passed, ${#keep_failed[@]} failed, ${#keep_skipped[@]} skipped (out/test-results.txt)"
+        if ((${#keep_skipped[@]})); then printf '  skipped: %s\n' "${keep_skipped[@]}"; fi
+        if ((${#keep_failed[@]})); then
+            printf '  FAILED: %s\n' "${keep_failed[@]}"
+            exit 1
+        fi
+        if ((${#keep_skipped[@]})); then
+            echo "test-keep-going: NOT A FULL GATE: ${#keep_skipped[@]} skipped (exit 3)"
+            exit 3
+        fi
+        exit 0
     }
     test_one_summary() {  # --test-one's end: its runs, or the test commands when none was named
         if ((!one_ran)); then
@@ -245,6 +278,26 @@ if [[ ${1:-} == --test || ${1:-} == --test-dry || ${1:-} == --test-one ]]; then
         exit "$one_failed"
     }
     t() {
+        if [[ -n $keep ]]; then
+            if [[ $1 == spirv-val ]] && ((!one_last)); then return 0; fi  # its producer failed
+            if [[ -n ${BB_TEST_SKIP:-} && "$*" == *"$BB_TEST_SKIP"* ]]; then
+                keep_skipped+=("$*")
+                echo "skipped (BB_TEST_SKIP): $*" >> out/test-results.txt
+                echo "test-keep-going: SKIPPED (BB_TEST_SKIP=$BB_TEST_SKIP): $*"
+                [[ $1 == spirv-val ]] || one_last=0
+                return 0
+            fi
+            local rc=0
+            "$@" || rc=$?
+            ((++keep_ran))
+            echo "exit $rc: $*" >> out/test-results.txt
+            if ((rc)); then
+                keep_failed+=("exit $rc: $*")
+                echo "test-keep-going: FAIL exit $rc: $*"
+            fi
+            if [[ $1 != spirv-val ]]; then one_last=$((rc == 0)); fi
+            return 0
+        fi
         if [[ -n $one ]]; then
             if [[ $1 == spirv-val ]]; then
                 ((one_last)) || return 0  # checks the outputs of the test before it
@@ -461,6 +514,7 @@ if [[ ${1:-} == --test || ${1:-} == --test-dry || ${1:-} == --test-one ]]; then
         t bash tests/test_savedata_macos.sh
         t bash tests/test_heavy.sh
         t bash tests/test_build_test_one.sh
+        t bash tests/test_build_keep_going.sh
         t sh tests/test_sync_diagnostics_macos.sh
         t sh tests/test_cond_wake_check_macos.sh
         t python3 tests/test_restart_macos.py
@@ -507,4 +561,5 @@ if [[ ${1:-} == --test || ${1:-} == --test-dry || ${1:-} == --test-one ]]; then
         t bash tests/run_python_tests.sh
     fi
     if [[ -n $one ]]; then test_one_summary; fi
+    if [[ -n $keep ]]; then test_keep_going_summary; fi
 fi

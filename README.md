@@ -239,6 +239,8 @@ More in [docs/](docs); recent changes: [docs/CHANGES_2026-10-02.md](docs/CHANGES
 
 Tests: `bash build.sh --test`, `python3 -m unittest discover -s tests`, and
 `ninja -C out/gpu motion-history-test ui-composition-test scene-resolution-test motion-shader-test`.
+The gate for previews and merge requests: `bash build.sh --test-keep-going` (every test, a
+pass/fail/skip summary, exit 1 on any failure; see [docs/macos/testing.md](docs/macos/testing.md)).
 One test as `--test` runs it (its environment, signing and directories):
 `bash build.sh --test-one <target or script>`, e.g. `capture-quiesce-test` or
 `tests/test_alarm.sh`.

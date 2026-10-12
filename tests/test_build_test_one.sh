@@ -6,7 +6,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 runner=$(mktemp); dir=$(mktemp -d); trap 'rm -rf "$runner" "$dir"' EXIT
-sed -n '/# --- test runner (tests\/test_build_test_one.sh sources this block) ---/,/# --- end test runner ---/p' \
+sed -n '/# --- test runner (tests\/test_build_test_one.sh and test_build_keep_going.sh source this block) ---/,/# --- end test runner ---/p' \
     build.sh > "$runner"
 [[ $(wc -l < "$runner") -gt 20 ]] || { echo "build.sh test runner block not found" >&2; exit 1; }
 fail() { echo "build.sh --test-one test FAILED: $*" >&2; exit 1; }
@@ -20,7 +20,7 @@ fake() {  # fake NAME FILES STATUS
 # scenario ONE FILES STATUS: --test-one ONE over the depth-bounds block, in a subshell;
 # prints its output, returns its exit status.
 scenario() {
-    (cd "$dir"; dry='' one=$1 one_ran=0 one_failed=0 one_last=0 one_seen=()
+    (cd "$dir"; dry='' keep='' one=$1 one_ran=0 one_failed=0 one_last=0 one_seen=()
      sign_darwin() { :; }
      spirv-val() { echo "$*" >> "$dir/spirv-calls"; }  # counts t's spirv-val follow-ups
      : > "$dir/spirv-calls"
@@ -73,7 +73,7 @@ set -e
    $out == *'sentinel kept'* ]] || fail "unknown name (exit $status): $out"
 echo "PASS unknown name: exit 1, lists the tests, touches no output directory"
 set +e
-out=$(cd "$dir"; dry='' one='' one_ran=0 one_failed=0 one_last=0 one_seen=()
+out=$(cd "$dir"; dry='' keep='' one='' one_ran=0 one_failed=0 one_last=0 one_seen=()
       sign_darwin() { :; }; source "$runner"; fake depth-bounds-shader-test 3 0
       t out/gpu/depth-bounds-shader-test out/depth-bounds-shader
       outputs_ok 3 10 "wrote 3, expected 10"; echo "went on" 2>&1); status=$?
