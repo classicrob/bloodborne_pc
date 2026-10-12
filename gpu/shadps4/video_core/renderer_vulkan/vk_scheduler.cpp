@@ -636,11 +636,6 @@ u64 Scheduler::SubmitExecution(SubmitInfo& info) {
     std::scoped_lock lk{submit_mutex};
     const u64 signal_value = work_semaphore.NextTick();
 #ifdef __APPLE__
-    if (flush_census) {
-        BbSplit::NoteFlush(is_rendering); // a pass still open is ended by this submission
-    }
-#endif
-#ifdef __APPLE__
     // Batched labels (SignalAtGpuCompletion) were recorded for exactly this submission.
     if (labels_unflushed.exchange(false, std::memory_order_acq_rel)) {
         ASSERT_MSG(signal_value == unflushed_tick,
@@ -666,6 +661,11 @@ u64 Scheduler::SubmitExecution(SubmitInfo& info) {
     next_submit_waits.clear();
 
 #ifdef __APPLE__
+    if (flush_census) {
+        // After on_submit's barrier flush: a pass still open is ended by this submission (the
+        // render pass census's "submit" enders).
+        BbSplit::NoteFlush(is_rendering);
+    }
     EndRenderingFor(BbPassCensus::Why::Submit);
 #else
     EndRendering();
