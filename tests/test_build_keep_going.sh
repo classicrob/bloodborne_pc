@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # build.sh --test-keep-going's runner (the block between build.sh's "--- test runner" markers)
 # with fake tests: every test runs after a failure, each exit is in out/test-results.txt, the
-# summary counts run/passed/failed/skipped and lists failures, the exit is 1 on any failure and 0
-# when all pass, a failed test's outputs are not checked again, a wrong output count is a failure,
+# summary counts run/passed/failed/skipped and lists failures, the exit is 1 on any failure, 3 when
+# something was skipped (NOT A FULL GATE) and 0 only when all ran and passed, a failed test's outputs are not checked again, a wrong output count is a failure,
 # BB_TEST_SKIP skips (listed), and build.sh refuses BB_TEST_SKIP outside --test-keep-going.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -76,9 +76,16 @@ echo "PASS a failed test's outputs are not checked or validated (1 failure, not 
 set +e
 out=$(run c-test 0 2 0); status=$?
 set -e
-((status == 0)) && [[ $out == *'4 run, 4 passed, 0 failed, 1 skipped'* && $out == *'  skipped: out/gpu/c-test'* &&
-    $out == *'skipped (BB_TEST_SKIP): out/gpu/c-test'* ]] || fail "BB_TEST_SKIP (exit $status): $out"
-echo "PASS BB_TEST_SKIP: the test is skipped and listed (summary and results file)"
+((status == 3)) && [[ $out == *'4 run, 4 passed, 0 failed, 1 skipped'* && $out == *'  skipped: out/gpu/c-test'* &&
+    $out == *'skipped (BB_TEST_SKIP): out/gpu/c-test'* && $out == *'NOT A FULL GATE: 1 skipped (exit 3)'* ]] ||
+    fail "BB_TEST_SKIP (exit $status): $out"
+echo "PASS BB_TEST_SKIP: skipped and listed; exit 3, NOT A FULL GATE (never 0)"
+set +e
+out=$(run c-test 23 2 0); status=$?
+set -e
+((status == 1)) && [[ $out == *'1 skipped'* && $out == *'FAILED: exit 23: out/gpu/a-test'* ]] ||
+    fail "a failure with a skip (exit $status): $out"
+echo "PASS a failure and a skip: exit 1 (the failure decides)"
 set +e
 out=$(BB_TEST_SKIP=x bash build.sh --test 2>&1 < /dev/null); status=$?  # refused before any slot or build
 set -e

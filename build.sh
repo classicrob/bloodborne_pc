@@ -209,7 +209,8 @@ if [[ ${1:-} == --test || ${1:-} == --test-dry || ${1:-} == --test-one || ${1:-}
     # the exit is the first failure's, or 0. A NAME no test command has is an error that lists them.
     # --test-keep-going (the gate for previews and merge requests) runs every test even after a
     # failure: each exit goes to out/test-results.txt, each failure is said as it happens, and the
-    # end prints run/passed/failed/skipped and the failures; the exit is 1 if any test failed.
+    # end prints run/passed/failed/skipped and the failures; the exit is 1 if any test failed, 3 if
+    # none failed but some were skipped (NOT A FULL GATE), 0 only when every test ran and passed.
     # BB_TEST_SKIP=SUBSTRING skips the test commands containing it, listed as skipped. A failing
     # build or non-test step still stops it (non-zero, no summary).
     dry='' one='' keep=''
@@ -252,13 +253,18 @@ if [[ ${1:-} == --test || ${1:-} == --test-dry || ${1:-} == --test-one || ${1:-}
         echo "test-one: exit 1: output check: $3"
         if ((!one_failed)); then one_failed=1; fi
     }
-    test_keep_going_summary() {  # --test-keep-going's end: the counts and failures; exit 1 on any
+    test_keep_going_summary() {  # --test-keep-going's end: counts and failures; exit 1 on a
+        # failure, 3 when tests were skipped (passed, but not a full gate), 0 only for all run and passed
         local passed=$((keep_ran - ${#keep_failed[@]}))
         echo "test-keep-going: ${keep_ran} run, ${passed} passed, ${#keep_failed[@]} failed, ${#keep_skipped[@]} skipped (out/test-results.txt)"
         if ((${#keep_skipped[@]})); then printf '  skipped: %s\n' "${keep_skipped[@]}"; fi
         if ((${#keep_failed[@]})); then
             printf '  FAILED: %s\n' "${keep_failed[@]}"
             exit 1
+        fi
+        if ((${#keep_skipped[@]})); then
+            echo "test-keep-going: NOT A FULL GATE: ${#keep_skipped[@]} skipped (exit 3)"
+            exit 3
         fi
         exit 0
     }
