@@ -18,6 +18,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <string>
+#include <mach/mach.h>
+#include <pthread.h>
 #include <x86intrin.h>
 
 namespace BbSplit {
@@ -197,6 +199,8 @@ struct Account {
     std::uint64_t last = 0;
     std::uint32_t open = 0, depth = 0;
     std::array<K, MaxDepth> stack{};
+    /// The thread's Mach port (Attach), for its on-CPU time at reports.
+    std::atomic<mach_port_t> thread{MACH_PORT_NULL};
 };
 
 inline Account stage_a, stage_b, recorder;
@@ -229,6 +233,7 @@ inline void Charge(Account& a, std::uint64_t now) {
 /// Starts accounting this thread in `account`, in `bucket`.
 inline void Attach(Account& account, std::uint32_t bucket) {
     current = &account;
+    account.thread.store(pthread_mach_thread_np(pthread_self()), std::memory_order_relaxed);
     account.last = __rdtsc();
     account.open = bucket;
     account.depth = 0;
@@ -444,6 +449,39 @@ inline std::string FlushLine(double frames) {
     return head + out + tail + written_text;
 }
 inline std::uint64_t window_cycles = 0, window_frames = 0, window_draws = 0;
+/// The account's thread's user + system CPU time in ns (thread_info), or ~0 when unavailable
+/// (no thread attached yet, or the call failed).
+inline std::uint64_t CpuNs(const Account& a) {
+    const mach_port_t thread = a.thread.load(std::memory_order_relaxed);
+    if (thread == MACH_PORT_NULL) {
+        return ~0ull;
+    }
+    thread_basic_info_data_t info{};
+    mach_msg_type_number_t count = THREAD_BASIC_INFO_COUNT;
+    if (thread_info(thread, THREAD_BASIC_INFO, reinterpret_cast<thread_info_t>(&info), &count) !=
+        KERN_SUCCESS) {
+        return ~0ull;
+    }
+    const auto ns = [](const time_value_t& t) {
+        return std::uint64_t(t.seconds) * 1000000000ull + std::uint64_t(t.microseconds) * 1000ull;
+    };
+    return ns(info.user_time) + ns(info.system_time);
+}
+/// On-CPU ms per frame since the previous call ("n/a" when either reading is unavailable): wall
+/// time a thread spends neither blocked nor waiting for a core.
+inline std::string OnCpu(const Account& a, std::uint64_t& previous, double frames) {
+    const std::uint64_t now = CpuNs(a);
+    const bool known = now != ~0ull && previous != ~0ull && now >= previous && frames > 0;
+    char text[48];
+    if (known) {
+        std::snprintf(text, sizeof(text), "on CPU %.2f ms", double(now - previous) / 1e6 / frames);
+    } else {
+        std::snprintf(text, sizeof(text), "on CPU n/a");
+    }
+    previous = now;
+    return text;
+}
+inline std::uint64_t previous_cpu_a = ~0ull, previous_cpu_b = ~0ull, previous_cpu_r = ~0ull;
 inline std::chrono::steady_clock::time_point window_start{};
 } // namespace detail
 
@@ -463,6 +501,9 @@ inline void NoteFrameEnd(std::uint64_t draws) {
         Line(stage_b, previous_b, b_names, BCount, 0, 1, ignored);
         Line(recorder, previous_r, r_names, RCount, 0, 1, ignored);
         FlushLine(0);
+        OnCpu(stage_a, previous_cpu_a, 0);
+        OnCpu(stage_b, previous_cpu_b, 0);
+        OnCpu(recorder, previous_cpu_r, 0);
         for (std::uint32_t k = 0; k < KCount; ++k) {
             ScopeBy(stage_a, previous_a, static_cast<K>(k), a_names, ACount, 0, 1);
             ScopeBy(stage_b, previous_b, static_cast<K>(k), b_names, BCount, 0, 1);
@@ -478,6 +519,14 @@ inline void NoteFrameEnd(std::uint64_t draws) {
         std::chrono::duration<double, std::milli>(now - window_start).count();
     const double ms_per_cycle = wall_ms / double(now_cycles - window_cycles);
     const double frames = double(window_frames);
+    // Stage A's direct-draw time per draw (pipeline selection, packet build), before Line moves
+    // the baseline.
+    const std::uint64_t window_draw_count = draws - window_draws;
+    const double a_us_per_draw =
+        window_draw_count ? double(stage_a.bucket[ADraw].load(std::memory_order_relaxed) -
+                                   previous_a.bucket[ADraw]) *
+                                ms_per_cycle * 1000.0 / double(window_draw_count)
+                          : 0.0;
     std::uint64_t a_cycles = 0, b_cycles = 0, r_cycles = 0;
     const std::string a_line =
         Line(stage_a, previous_a, a_names, ACount, ms_per_cycle, frames, a_cycles);
@@ -499,19 +548,23 @@ inline void NoteFrameEnd(std::uint64_t draws) {
         Line(recorder, previous_r, r_names, RCount, ms_per_cycle, frames, r_cycles);
     const double frame_ms = wall_ms / frames;
     const std::string flush_line = FlushLine(frames);
+    const std::string a_cpu = OnCpu(stage_a, previous_cpu_a, frames);
+    const std::string b_cpu = OnCpu(stage_b, previous_cpu_b, frames);
+    const std::string r_cpu = OnCpu(recorder, previous_cpu_r, frames);
     // Printed like the Stall lines: Info-level logging is filtered in perf runs.
-    std::printf("Parse split, last 600 frame ends: %.2f ms per frame, %.0f draws per frame; "
-                "ms per frame by thread (accounted / wall)\n"
-                "  stage A (GPU command thread, %.0f%%): %s\n"
+    std::printf("Parse split, last 600 frame ends: %.2f ms per frame, %.0f draws per frame "
+                "(stage A %.2f us per draw); ms per frame by thread (accounted / wall)\n"
+                "  stage A (GPU command thread, %.0f%%, %s per frame): %s\n"
                 "    deferred-signal waits during: %s\n"
                 "    stage B drains at other packets during: %s\n"
-                "  stage B (draw recording thread, %.0f%%): %s\n"
-                "  Vulkan recording thread (%.0f%%): %s\n"
+                "  stage B (draw recording thread, %.0f%%, %s per frame): %s\n"
+                "  Vulkan recording thread (%.0f%%, %s per frame): %s\n"
                 "%s\n",
-                frame_ms, double(draws - window_draws) / frames,
-                100.0 * a_cycles * ms_per_cycle / wall_ms, a_line.c_str(), a_deferred.c_str(),
-                a_drain.c_str(), 100.0 * b_cycles * ms_per_cycle / wall_ms, b_line.c_str(),
-                100.0 * r_cycles * ms_per_cycle / wall_ms, r_line.c_str(), flush_line.c_str());
+                frame_ms, double(window_draw_count) / frames, a_us_per_draw,
+                100.0 * a_cycles * ms_per_cycle / wall_ms, a_cpu.c_str(), a_line.c_str(),
+                a_deferred.c_str(), a_drain.c_str(), 100.0 * b_cycles * ms_per_cycle / wall_ms,
+                b_cpu.c_str(), b_line.c_str(), 100.0 * r_cycles * ms_per_cycle / wall_ms,
+                r_cpu.c_str(), r_line.c_str(), flush_line.c_str());
     std::fflush(stdout);
     window_cycles = now_cycles;
     window_start = now;
