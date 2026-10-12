@@ -279,8 +279,9 @@ BbCmdData::Result Liverpool::LookupCommandData(void* owner, u64 address, u64 siz
 
 Liverpool::Liverpool() : guest_markers_enabled{EmulatorSettings.IsVkGuestMarkersEnabled()} {
 #ifdef __APPLE__
-    // Before stage A (below) and the presenter's threads exist: they start at the role's priority.
-    BbHotThreadQos::ApplyConfiguredRole();
+    // BB_TASK_ROLE was applied by the main thread at start (bbgpu_apply_task_role): stage A
+    // (below) and the presenter's threads must start with it.
+    BbHotThreadQos::VerifyConfiguredRole();
     SetAssertStopHook(&ReportParserStop);
     if (BbCmdData::Enabled()) {
         BbCmdData::Register(&Liverpool::LookupCommandData, &Liverpool::LookupOrigin, this);

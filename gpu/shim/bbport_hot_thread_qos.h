@@ -3,16 +3,17 @@
 // - BB_HOT_THREAD_QOS=user-interactive|user-initiated|default: the thread's QoS class, set at its
 //   start;
 // - BB_TASK_ROLE=foreground|default-app: the process's task role (TASK_CATEGORY_POLICY), set
-//   once, before the hot threads are created (Liverpool's constructor).
+//   once by the main thread at process start (bbgpu_apply_task_role, from bb-probe's main);
+//   Liverpool's constructor checks it is in effect before the hot threads start.
 // Unset or empty leaves today's behaviour: the inherited class, and the role we are launched
-// with. Diagnostic A/B arms (docs/macos/hot-thread-scheduling.md): the verifier saw these threads
-// move from P-cores to E-cores after ~1-1.5 s of sustained load as an accessory app (role 6), not
-// as a regular app (role 2). Measured: the role, not the requested class, sets the Mach base
-// priority (31 in role 0 for every class, 46 as default-app, 47 as foreground).
-// Any other value, a refused set, or a role applied off the main thread stops: an A/B arm must
-// not silently run with the wrong setting. The thread's startup line (bbport_thread_report.h)
-// gives the class requested, the Mach priorities and the task role the thread actually has, then
-// both settings.
+// with. Diagnostic A/B arms (docs/macos/hot-thread-scheduling.md). Measured through bb-probe's
+// startup path (label-check): as launched (role 0) every class runs at legacy priority (base 31);
+// with the foreground role the class sets the tier (user-interactive 47, user-initiated 37,
+// default 31). So only both together move a hot thread.
+// Any other value, a refused set, a role applied off the main thread, or a role not in effect
+// when the hot threads start stops: an A/B arm must not silently run with the wrong setting.
+// The thread's startup line (bbport_thread_report.h) gives the class requested, the Mach
+// priorities and the task role the thread actually has, then both settings.
 #pragma once
 #ifdef __APPLE__
 #include <cstdio>
@@ -87,11 +88,9 @@ inline std::optional<task_role_t> ConfiguredRole() {
 }
 
 /// Sets this task's role, from the main thread; stops otherwise or if Darwin refuses. Measured
-/// (Rosetta and native, one process per case): set from the main thread (directly or through a
-/// joined helper), the main thread and threads created afterwards run at the role's base
-/// priority. Set by any other thread, that thread and every thread it then creates stay at the
-/// old one (31, for 3 s and more). A forked child's threads are never lifted. The role survives
-/// exec.
+/// (probes, native and Rosetta): set by a thread other than the main thread, that thread and the
+/// threads it then creates kept the old priority (3 s and more); a forked child's threads were
+/// never lifted.
 inline void ApplyRole(task_role_t role) {
     if (!pthread_main_np()) {
         std::fprintf(stderr, "STOP: BB_TASK_ROLE must be applied from the main thread (another "
@@ -109,9 +108,9 @@ inline void ApplyRole(task_role_t role) {
     }
 }
 
-/// BB_TASK_ROLE, applied once: from Liverpool's constructor (on the main thread: main,
-/// probe_main, bbgpu_init, RegisterLib), before it starts stage A and before the presenter
-/// starts stage B and the Vulkan recording threads.
+/// BB_TASK_ROLE, applied once: from the process's main thread before it starts any other thread
+/// (bb-probe's main, through bbgpu_apply_task_role, before bb_macos_ui_run starts the worker that
+/// runs the game and creates the hot threads).
 inline void ApplyConfiguredRole() {
     static std::once_flag once;
     std::call_once(once, [] {
@@ -119,6 +118,30 @@ inline void ApplyConfiguredRole() {
             ApplyRole(*role);
         }
     });
+}
+
+/// Before the hot threads start (Liverpool's constructor): with BB_TASK_ROLE set, the task must
+/// already have that role; stops otherwise (the entry point did not apply it at start).
+inline void VerifyConfiguredRole() {
+    const std::optional<task_role_t> role = ConfiguredRole();
+    if (!role) {
+        return;
+    }
+    task_category_policy_data_t category{};
+    mach_msg_type_number_t count = TASK_CATEGORY_POLICY_COUNT;
+    boolean_t get_default = false;
+    const kern_return_t kr =
+        task_policy_get(mach_task_self(), TASK_CATEGORY_POLICY,
+                        reinterpret_cast<task_policy_t>(&category), &count, &get_default);
+    if (kr != KERN_SUCCESS || category.role != *role) {
+        std::fprintf(stderr,
+                     "STOP: BB_TASK_ROLE asks for %s but the task role is %s (%d, query %d): "
+                     "this entry point did not apply it from its main thread at start "
+                     "(bbgpu_apply_task_role)\n",
+                     BbThreadReport::RoleName(*role), BbThreadReport::RoleName(category.role),
+                     category.role, kr);
+        std::abort();
+    }
 }
 
 /// Sets the calling thread's class to `qos`; stops if Darwin refuses.
