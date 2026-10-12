@@ -630,10 +630,26 @@ def save_fixture(run, name):
     shutil.copytree(source, target / 'savedata')
     stages = [json.loads(l).get('stage') for l in (run / 'events.jsonl').read_text().splitlines()
               if json.loads(l).get('kind') == 'capture']
-    (target / 'fixture.json').write_text(json.dumps({
+    meta = {
         'name': name, 'saved': now(), 'run': str(run), 'last_capture': stages[-1] if stages else None,
         'artifacts': {k: v['sha256'] for k, v in info['artifacts'].items() if isinstance(v, dict) and 'sha256' in v},
-        'output': info.get('output')}, indent=2) + '\n')
+        'output': info.get('output')}
+    # The run's source fixture is kept verbatim, so the chain nests. A save that descends from an edited
+    # one (e.g. a position edit) stays marked edited, with what the edit left unverified: playing on
+    # from it does not make it a played-through save.
+    saves = info.get('saves')
+    parent = saves.get('from') if isinstance(saves, dict) else None
+    if parent is not None:
+        meta['parent'] = parent
+    ancestor = parent
+    while isinstance(ancestor, dict) and not ancestor.get('edited'):
+        ancestor = ancestor.get('parent')
+    if isinstance(ancestor, dict):
+        meta['edited'] = True
+        meta['edited_origin'] = ancestor.get('edited_origin', ancestor.get('name'))
+        if 'unverified' in ancestor:
+            meta['unverified'] = ancestor['unverified']
+    (target / 'fixture.json').write_text(json.dumps(meta, indent=2) + '\n')
     event(run, 'save-fixture', name=name, path=str(target))
     print(json.dumps({'fixture': name, 'path': str(target), 'last_capture': stages[-1] if stages else None}))
 
