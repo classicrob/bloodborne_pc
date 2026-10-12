@@ -153,6 +153,13 @@ inline void SetViews(const Entry* entries, std::uint32_t count) {
     std::copy_n(entries, detail::num_pending, detail::pending.begin());
 }
 
+/// The next pass did not begin: the targets provided for it are dropped (Scheduler::BeginRendering
+/// with the open pass's state), so a later helper begin cannot take them.
+inline void DiscardViews() {
+    std::scoped_lock lk{detail::mutex};
+    detail::num_pending = 0;
+}
+
 /// An image bound to a draw or dispatch (Rasterizer::ResetBindings, after it was recorded).
 inline void NoteBind(std::uint64_t uid) {
     std::scoped_lock lk{detail::mutex};

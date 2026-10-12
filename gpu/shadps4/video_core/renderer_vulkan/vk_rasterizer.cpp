@@ -3357,8 +3357,10 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
             begin_memo = {true, MakeBeginSignature(pipeline), state, push_data.scene_size,
                           target_scale};
 #ifdef __APPLE__
-            begin_memo_trace = trace_views;
-            num_begin_memo_trace = num_trace_views;
+            if (BbPassTrace::Enabled()) {
+                begin_memo_trace = trace_views;
+                num_begin_memo_trace = num_trace_views;
+            }
 #endif
         }
     }

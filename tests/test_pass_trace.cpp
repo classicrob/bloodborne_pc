@@ -111,6 +111,10 @@ int main() {
     clear.color_attachments[0] = {{ColorView}, ColorAttachmentOptimal, 1};
     NoteViews(true, false);
     Pass(clear, false, 0, Why::Submit, nullptr);
+    // A memo hit provides targets but the open pass continues (Scheduler::BeginRendering with the
+    // same state discards them): pass 4, a helper pass reusing that handle, stays unknown.
+    NoteViews(true, false);
+    BbPassTrace::DiscardViews();
     // Pass 4: a helper pass (no views noted for it) reusing pass 3's view handle: unknown.
     State helper;
     helper.num_color_attachments = 1;

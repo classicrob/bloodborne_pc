@@ -84,6 +84,11 @@ Scheduler::~Scheduler() {
 
 void Scheduler::BeginRendering(const RenderState& new_state) {
     if (is_rendering && render_state == new_state) {
+#ifdef __APPLE__
+        if (BbPassTrace::Enabled()) {
+            BbPassTrace::DiscardViews(); // the open pass continues: no pass takes them
+        }
+#endif
         return;
     }
     BB_SPLIT_SCOPE(KRenderPassSwitch);
