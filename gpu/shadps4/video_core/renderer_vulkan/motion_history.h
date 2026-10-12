@@ -229,23 +229,32 @@ public:
     };
     struct Stats {
         uint64_t draws{}, stored{}, loaded{}, unmatched{}, exhausted{}, invalid{}, still{};
+        /// Draws whose mesh had several copies in the previous frame or this one: no history
+        /// is loaded (which previous copy is this one is unknown; occurrence order changes with
+        /// culling and gave other copies' positions, hundreds of pixels off).
+        uint64_t ambiguous{};
     } stats;
 
     // A small skeleton (weapon, prop; most are static world pieces) only needs history
     // while its bone palette changes: with last frame's bones its motion is the camera's.
     // Checked before the index scan of Prepare, with a cheap identity. The first frame
     // of a change stores positions (nothing to load yet), the next one loads them.
+    // Copies of one mesh share the identity; their draw order changes with culling. So a draw
+    // is still when its palette is ANY of last frame's palettes for the mesh (a set, not the
+    // copy at the same position in the order), and moving only when the mesh was drawn last
+    // frame with none of them.
     struct GateKey {
         uint64_t shader{}, geometry{}, indices{};
-        uint32_t index_count{}, instances{}, first_instance{}, occurrence{};
+        uint32_t index_count{}, instances{}, first_instance{};
+        uint32_t occurrence{}; ///< unused (kept for the callers' designated initializers)
         bool operator==(const GateKey&) const = default;
     };
     bool Moving(GateKey key, uint64_t palette) {
         key.occurrence = 0;
-        key.occurrence = gate_occurrences[key]++;
-        const auto* prev = gate_previous.find(key);
-        const bool moving = prev && *prev != palette;
-        gate_current.emplace(key, palette);
+        const bool seen = gate_previous_seen.find(key) != nullptr;
+        const bool moving = seen && gate_previous.find({key, palette}) == nullptr;
+        gate_current_seen.emplace(key, 1);
+        gate_current.emplace({key, palette}, 1);
         stats.still += moving ? 0 : 1;
         return moving;
     }
@@ -253,10 +262,12 @@ public:
     void NextFrame() {
         previous.swap(current);
         current.clear();
+        previous_occurrences.swap(occurrences);
         occurrences.clear();
         gate_previous.swap(gate_current);
         gate_current.clear();
-        gate_occurrences.clear();
+        gate_previous_seen.swap(gate_current_seen);
+        gate_current_seen.clear();
         ++frame;
         used = 0;
     }
@@ -271,12 +282,19 @@ public:
             ++stats.invalid;
             return {};
         }
+        // History only when the match is unique: the mesh was drawn once last frame, and this
+        // is its first draw this frame. With several copies the occurrence order is not an
+        // identity (culling reorders them).
+        Key first{draw, 0};
+        const auto* previous_count = previous_occurrences.find(first);
         const auto* prev = previous.find(key);
         Allocation result{0, 0, draw.vertices.count, draw.instances,
                           draw.vertices.first, draw.first_instance};
-        if (prev) {
+        if (prev && key.occurrence == 0 && previous_count && *previous_count == 1) {
             result.load = *prev;
             ++stats.loaded;
+        } else if (prev || key.occurrence > 0) {
+            ++stats.ambiguous;
         } else {
             ++stats.unmatched;
         }
@@ -312,7 +330,7 @@ private:
     };
     uint32_t capacity{}, used{};
     uint64_t frame{};
-    FlatMap<Key, uint32_t, Hash> previous, current, occurrences;
+    FlatMap<Key, uint32_t, Hash> previous, current, occurrences, previous_occurrences;
     struct GateHash {
         size_t operator()(const GateKey& key) const {
             uint64_t h = 0;
@@ -322,8 +340,18 @@ private:
             return size_t(h);
         }
     };
-    FlatMap<GateKey, uint64_t, GateHash> gate_previous, gate_current;
-    FlatMap<GateKey, uint32_t, GateHash> gate_occurrences;
+    struct GatePalette {
+        GateKey key;
+        uint64_t palette{};
+        bool operator==(const GatePalette&) const = default;
+    };
+    struct GatePaletteHash {
+        size_t operator()(const GatePalette& p) const {
+            return GateHash{}(p.key) ^ size_t(p.palette * 0x9e3779b97f4a7c15ULL);
+        }
+    };
+    FlatMap<GatePalette, uint8_t, GatePaletteHash> gate_previous, gate_current;
+    FlatMap<GateKey, uint8_t, GateHash> gate_previous_seen, gate_current_seen;
 };
 
 } // namespace Vulkan::Motion

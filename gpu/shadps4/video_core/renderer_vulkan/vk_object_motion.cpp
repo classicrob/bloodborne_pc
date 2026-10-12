@@ -98,10 +98,12 @@ void ObjectMotion::OnFrameStart() {
     if (BbStats::enabled && (frame % 600) == 0 && history.stats.draws) {
         const auto& s = history.stats;
         std::printf("Object motion: %llu draws, %llu stored, %llu with history, %llu unmatched, "
+                    "%llu copies without history (ambiguous), "
                     "%llu capacity skips, %llu invalid, %llu still (600 frames); last frame %u/%u vertices; "
                     "index ranges %llu reused, %llu scanned (%llu found changed), %zu cached\n",
                     (unsigned long long)s.draws, (unsigned long long)s.stored,
                     (unsigned long long)s.loaded, (unsigned long long)s.unmatched,
+                    (unsigned long long)s.ambiguous,
                     (unsigned long long)s.exhausted, (unsigned long long)s.invalid,
                     (unsigned long long)s.still,
                     history.Used(), PositionsPerFrame, (unsigned long long)index_ranges.stats.hits,

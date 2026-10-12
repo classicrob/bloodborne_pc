@@ -32,10 +32,26 @@ int main() {
     assert(duplicate.store == first.store + 16); // shared geometry, different draw
     assert(history.Used() == 32); // firstInstance must NOT multiply the allocation
     assert(!history.Prepare(draw).store && history.stats.exhausted == 1);
+    // Several copies of one mesh: the occurrence order is not an identity (culling reorders
+    // copies; the GPU then read another copy's positions, hundreds of pixels off), so none
+    // loads history.
+    // (The first frame's second and third draws are already counted: copies, no history.)
+    assert(history.stats.ambiguous == 2);
     history.NextFrame();
     const auto next = history.Prepare(draw);
-    assert(next.load == first.store && next.store != first.store);
-    assert(history.Prepare(draw).load == duplicate.store);
+    assert(!next.load && next.store != first.store && history.stats.ambiguous == 3);
+    assert(!history.Prepare(draw).load && history.stats.ambiguous == 4);
+    // One copy in each frame: unique, its history loads (the first of them still follows a
+    // frame with two copies: ambiguous).
+    history.NextFrame();
+    const auto single = history.Prepare(draw);
+    assert(single.store && !single.load && history.stats.ambiguous == 5);
+    history.NextFrame();
+    const auto again = history.Prepare(draw);
+    assert(again.load == single.store && history.stats.loaded == 1);
+    // A second copy appearing this frame: the first draw of the mesh already took the single
+    // previous copy's history; the second loads none.
+    assert(!history.Prepare(draw).load && history.stats.ambiguous == 6);
     history.NextFrame(); // a missing frame invalidates the match
     history.NextFrame();
     assert(!history.Prepare(draw).load);
@@ -82,7 +98,15 @@ int main() {
     gated.NextFrame();
     gated.NextFrame();
     assert(!gated.Moving(weapon, 4));     // after a skipped frame: no comparison
-    assert(!gated.Moving(weapon, 5));     // second occurrence of the same draw
+    assert(!gated.Moving(weapon, 5));     // second copy of the same draw, same frame
+    // Static copies drawn in another order (culling): neither is moving.
+    assert(!frame(5) && !gated.Moving(weapon, 4));
+    // One copy's palette changed: that copy is moving, the other is still.
+    assert(frame(6) && !gated.Moving(weapon, 5));
+    // The mesh not drawn last frame: no comparison.
+    gated.NextFrame();
+    gated.NextFrame();
+    assert(!gated.Moving(weapon, 7));
     assert(ClassifyBuffer(864) == BufferRole::Other && ClassifyBuffer(416) == BufferRole::Other);
     assert(ClassifyBuffer(96) == BufferRole::SmallSkeleton &&
            ClassifyBuffer(384) == BufferRole::SmallSkeleton);
@@ -109,5 +133,5 @@ int main() {
     assert(JitterPhases(960, 1920) == 32);
     assert(JitterPhases(640, 1920) == 72);
     assert(JitterPhases(0, 1920) == 8);
-    std::puts("Motion history: PASS (ranges, restart, offsets, matching, capacity, gating, index cache, jitter)");
+    std::puts("Motion history: PASS (ranges, restart, offsets, matching, copies, capacity, gating, index cache, jitter)");
 }
