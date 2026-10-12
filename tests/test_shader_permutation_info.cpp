@@ -3,8 +3,13 @@
 #define NDEBUG
 #define BB_RESTORE_TEST_ASSERTS
 #endif
+#ifdef __APPLE__
+#include <fstream>
+#include <sstream>
+#include <string>
 #include <sys/wait.h>
 #include <unistd.h>
+#endif
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -378,16 +383,33 @@ int main() {
         assert(!reject_worker.failed && reject_worker.stages.size() == 1);
         selection.worker = nullptr;
         table[0].num_format = 6;
+        // The child's output goes to a file: the stop must be the conversion stop (exit 23 with
+        // its message), not some other failure of a process forked after Vulkan started threads.
+        char log_path[] = "/tmp/permutation-stop-XXXXXX";
+        const int log_fd = mkstemp(log_path);
+        assert(log_fd >= 0);
         std::fflush(nullptr);
         const pid_t child = fork();
+        assert(child >= 0);
         if (child == 0) {
-            std::freopen("/dev/null", "w", stderr);
+            dup2(log_fd, STDOUT_FILENO);
+            dup2(log_fd, STDERR_FILENO);
             select(first_fetch); // the GPU thread's selection: stops
             std::_Exit(0);
         }
+        close(log_fd);
         int status = 0;
-        waitpid(child, &status, 0);
-        assert(!(WIFEXITED(status) && WEXITSTATUS(status) == 0));
+        const pid_t waited = waitpid(child, &status, 0);
+        std::stringstream child_log;
+        child_log << std::ifstream(log_path).rdbuf();
+        unlink(log_path);
+        const std::string text = child_log.str();
+        if (waited != child || !WIFEXITED(status) || WEXITSTATUS(status) != 23 ||
+            text.find("which this backend cannot convert") == std::string::npos) {
+            std::fprintf(stderr, "GPU-thread control: wait %d, status %#x, log:\n%s\n", int(waited),
+                         status, text.c_str());
+            std::abort();
+        }
         table[0] = saved;
         std::puts("Worker selection abandons an unconvertible descriptor; GPU thread stops PASS");
     }
