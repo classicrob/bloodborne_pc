@@ -371,12 +371,13 @@ int main() {
         Vulkan::PrepWorker reject_worker;
         selection.worker = &reject_worker;
         const auto rejections = Shader::speculative_rejections.load();
+        const u32 snapshots = Shader::Info::num_ud_snapshots;
         select(first_fetch);
         assert(reject_worker.failed && reject_worker.stages.empty());
         assert(Shader::speculative_rejections.load() == rejections + 1);
         assert(!Shader::speculative_selection);
         assert(runtime_fault_recover == nullptr);
-        assert(Shader::Info::num_ud_snapshots == 1);
+        assert(Shader::Info::num_ud_snapshots == snapshots);
         table[0] = saved;
         reject_worker.failed = false;
         assert(std::get<1>(select(first_fetch)) == std::get<1>(first));
