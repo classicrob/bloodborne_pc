@@ -576,9 +576,10 @@ inline std::chrono::steady_clock::time_point window_start{};
 } // namespace detail
 
 /// Stage A's constant ring (Rasterizer::CollectRingBindings): small read-only buffer resources
-/// copied at decode, or skipped (bound through ObtainBuffer at stage B instead), and the pending
-/// GPU-write notes that make it skip. A note of HugeNote bytes or more (a written V# of a whole
-/// arena) covers every constant in its range while unreached.
+/// and flat user data copied at decode; buffer resources skipped (bound through ObtainBuffer at
+/// stage B instead); and the pending GPU-write notes that make it skip. Overlapping notes merge
+/// into one pending range; a range of HugeNote bytes or more (a written V# of a whole arena)
+/// covers every constant in it while unreached.
 enum class RingSkip : std::uint32_t { None, Large, GpuModified, Pending };
 inline constexpr std::uint64_t HugeNote = 64ull << 20;
 struct RingCounters {
@@ -587,6 +588,7 @@ struct RingCounters {
         notes_huge_shader{0};
 };
 inline RingCounters ring;
+/// `behind_huge_note`: the merged pending range that decided a Pending skip is >= HugeNote.
 inline void NoteRingSkip(RingSkip skip, bool behind_huge_note) {
     auto& c = skip == RingSkip::Large         ? ring.skip_large
               : skip == RingSkip::GpuModified ? ring.skip_gpu_modified
@@ -617,13 +619,20 @@ inline void NoteHugeShaderNote() {
 }
 
 namespace detail {
+inline std::array<std::uint64_t, 10> ring_previous{};
+inline std::array<std::uint64_t, 10> RingNow() {
+    return {ring.copies.load(),       ring.copy_bytes.load(),        ring.ring_full.load(),
+            ring.skip_large.load(),   ring.skip_gpu_modified.load(), ring.skip_pending.load(),
+            ring.skip_pending_huge.load(), ring.notes.load(),        ring.notes_huge.load(),
+            ring.notes_huge_shader.load()};
+}
+/// The window's start: counts before it are not reported.
+inline void RingBaseline() {
+    ring_previous = RingNow();
+}
 inline std::string RingLine(double frames) {
-    static std::array<std::uint64_t, 10> previous{};
-    const std::array<std::uint64_t, 10> now{
-        ring.copies.load(), ring.copy_bytes.load(), ring.ring_full.load(),
-        ring.skip_large.load(), ring.skip_gpu_modified.load(), ring.skip_pending.load(),
-        ring.skip_pending_huge.load(), ring.notes.load(), ring.notes_huge.load(),
-        ring.notes_huge_shader.load()};
+    auto& previous = ring_previous;
+    const std::array<std::uint64_t, 10> now = RingNow();
     std::array<double, 10> d{};
     for (std::size_t i = 0; i < d.size(); ++i) {
         d[i] = double(now[i] - previous[i]) / frames;
@@ -631,10 +640,11 @@ inline std::string RingLine(double frames) {
     previous = now;
     char text[512];
     std::snprintf(text, sizeof(text),
-                  "  Constant ring per frame: %.0f copied at stage A (%.0f KiB), %.1f not copied "
-                  "(ring full); skipped to ObtainBuffer: large %.1f, GPU-modified %.1f, pending "
-                  "write %.1f (behind a note >= 64 MiB %.1f); pending-write notes %.0f "
-                  "(>= 64 MiB %.1f, of which written V#s %.1f)",
+                  "  Constant ring per frame: %.0f copied at stage A (%.0f KiB; buffer resources "
+                  "and flat user data), %.1f not copied (ring full); buffer resources skipped to "
+                  "ObtainBuffer: large %.1f, GPU-modified %.1f, pending write %.1f (behind a "
+                  "merged pending range >= 64 MiB %.1f); pending-write notes %.0f (>= 64 MiB "
+                  "%.1f, of which written V#s %.1f)",
                   d[0], d[1] / 1024.0, d[2], d[3], d[4], d[5], d[6], d[7], d[8], d[9]);
     return text;
 }
@@ -659,6 +669,7 @@ inline void NoteFrameEnd(std::uint64_t draws) {
         OnCpu(stage_a, previous_cpu_a, 0);
         OnCpu(stage_b, previous_cpu_b, 0);
         OnCpu(recorder, previous_cpu_r, 0);
+        detail::RingBaseline();
         for (std::uint32_t k = 0; k < KCount; ++k) {
             ScopeBy(stage_a, previous_a, static_cast<K>(k), a_names, ACount, 0, 1);
             ScopeBy(stage_b, previous_b, static_cast<K>(k), b_names, BCount, 0, 1);

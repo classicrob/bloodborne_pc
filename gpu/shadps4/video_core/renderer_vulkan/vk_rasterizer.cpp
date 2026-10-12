@@ -525,19 +525,7 @@ void Rasterizer::SyncParserRead(VAddr address, u64 size) {
     }
 }
 
-#ifdef __APPLE__
-u64 Rasterizer::PendingWriteOverlapSpan(VAddr address, u64 size) const {
-    const VAddr end = address + size;
-    for (const auto& write : pending_writes) {
-        if (address < write.end && write.begin < end && !draw_pipe->Reached(write.position)) {
-            return write.end - write.begin;
-        }
-    }
-    return 0;
-}
-#endif
-
-bool Rasterizer::PendingWriteOverlaps(VAddr address, u64 size) {
+bool Rasterizer::PendingWriteOverlaps(VAddr address, u64 size, u64* matched_span) {
     if (pending_writes.empty() || address >= pending_max || address + size <= pending_min) {
         return false;
     }
@@ -556,6 +544,9 @@ bool Rasterizer::PendingWriteOverlaps(VAddr address, u64 size) {
     const VAddr end = address + size;
     for (const auto& write : pending_writes) {
         if (address < write.end && write.begin < end && !draw_pipe->Reached(write.position)) {
+            if (matched_span) {
+                *matched_span = write.end - write.begin; // the merged pending range
+            }
             return true;
         }
     }
@@ -605,7 +596,7 @@ void Rasterizer::CollectRingBindings(const Shader::Info& stage, const PreparedDr
         if (desc.IsSpecial()) {
             if (desc.buffer_type == Shader::BufferType::Flatbuf &&
                 !stage.flattened_ud_buf.empty()) {
-                copy(index, stage.flattened_ud_buf.data(), 0,
+                copy_counted(index, stage.flattened_ud_buf.data(), 0,
                      stage.flattened_ud_buf.size() * sizeof(u32));
             }
             continue;
@@ -629,16 +620,19 @@ void Rasterizer::CollectRingBindings(const Shader::Info& stage, const PreparedDr
         // The stream path of BufferCache::ObtainBuffer, taken here: small, read-only, not
         // written by the GPU (now or by work still queued for the recording thread).
 #ifdef __APPLE__
-        const BbSplit::RingSkip skip =
-            size == 0 || size > VideoCore::BufferCache::STREAM_THRESHOLD
-                ? BbSplit::RingSkip::Large
-            : buffer_cache.IsRegionGpuModified(address, size) ? BbSplit::RingSkip::GpuModified
-            : PendingWriteOverlaps(address, size)              ? BbSplit::RingSkip::Pending
-                                                               : BbSplit::RingSkip::None;
+        // The same checks in the same order; the pending one also reports the merged range it
+        // matched, from the scan that decided.
+        BbSplit::RingSkip skip = BbSplit::RingSkip::None;
+        u64 matched_span = 0;
+        if (size == 0 || size > VideoCore::BufferCache::STREAM_THRESHOLD) {
+            skip = BbSplit::RingSkip::Large;
+        } else if (buffer_cache.IsRegionGpuModified(address, size)) {
+            skip = BbSplit::RingSkip::GpuModified;
+        } else if (PendingWriteOverlaps(address, size, &matched_span)) {
+            skip = BbSplit::RingSkip::Pending;
+        }
         if (skip != BbSplit::RingSkip::None) {
-            BbSplit::NoteRingSkip(skip, skip == BbSplit::RingSkip::Pending &&
-                                            PendingWriteOverlapSpan(address, size) >=
-                                                BbSplit::HugeNote);
+            BbSplit::NoteRingSkip(skip, matched_span >= BbSplit::HugeNote);
             continue;
         }
 #else
