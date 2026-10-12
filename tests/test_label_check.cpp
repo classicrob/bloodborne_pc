@@ -650,6 +650,10 @@ int main() {
         NoteLabelBatch(700000);
         NoteLabelWritten(1000000);
         NoteLabelWritten(3000000);
+        NoteOrderedWrite(true, true);   // submitted a batch holding its label
+        NoteOrderedWrite(true, false);  // submitted a batch of later labels only
+        NoteOrderedWrite(false, false); // nothing batched
+        NoteOrderedWriteWaited(400000);
         const std::string line = detail::FlushLine(2);
         Expect("flush census: reasons nest and restore; per frame by reason, passes ended, batch age",
                line.find("2.0 per frame = frame end 1.0, unbatched labels 0.5") != std::string::npos &&
@@ -660,6 +664,9 @@ int main() {
                    line.find("WAIT_REG_MEMs met early 0.0 per frame; labels written 1.0 per "
                              "frame, issue to write 2000 us mean, 3000 us max") !=
                        std::string::npos &&
+                   line.find("WRITE_DATAs behind a met-early WAIT 1.5 per frame: submitted the "
+                             "label batch 1.0 (holding only later labels 0.5), waited for labels "
+                             "0.5, 400 us mean wait") != std::string::npos &&
                    flush_reason == FOther);
     }
 

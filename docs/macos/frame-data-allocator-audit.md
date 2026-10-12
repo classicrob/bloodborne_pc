@@ -234,3 +234,8 @@ retirement label issue/completion, reclaim/free and next payload write
 against this read. Only that timeline can separate legitimate retirement
 followed by stale use from alternate free or premature reclaim. The
 current stop fields alone justify none of those three verdicts.
+
+The held [entry-only capture recipe](allocator-lifetime-capture.md) provides
+node observations at retirement/immediate-free entries and a bounded external
+stop window. It states which successful allocation/reclaim transitions the
+existing entry probe cannot observe.

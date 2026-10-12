@@ -104,5 +104,190 @@ class FixtureChecks(unittest.TestCase):
         self.assertEqual(self.original, tool.inventory(self.source))
 
 
+
+
+class WeaponFixtureChecks(unittest.TestCase):
+    def setUp(self):
+        import struct
+        import save_weapon_fixture as weapon
+        self.weapon = weapon
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.source = self.root / 'dream-exited'
+        self.destination = self.root / 'weapons'
+        character = self.source / tool.CHARACTER
+        character.parent.mkdir(parents=True)
+        data = bytearray(b'Z' * tool.SOURCE_SIZE)
+        data[:0x54] = bytes(0x54)
+        struct.pack_into('<I', data, 0, 0x41)
+        pos = 0x54
+        for i in range(4096):
+            if i < 5 or 71 <= i <= 79:
+                handle = 0x90800000 | (i if i < 5 else i)
+                record = struct.pack('<15I', handle, 0x10000000 + i, *([0] * 13))
+            else:
+                record = struct.pack('<2I', 0, 0xffffffff)
+            data[pos:pos + len(record)] = record
+            pos += len(record)
+        self.assertEqual(pos, 0x832c)
+        data[0x10a84:0x10a88] = b'FACE'
+        for i in range(1984):
+            off = 0x858c + 16*i
+            struct.pack_into('<4I', data, off, i+1 if i < 10 else 0,
+                             100+i if i < 10 else 0xffffffff, 1 if i < 10 else 0, i)
+        struct.pack_into('<I', data, 0x8588, 10)
+        struct.pack_into('<I', data, 0x10994, 75)
+        struct.pack_into('<2I', data, 0x4c, 0x3dbb0, 0x20004)
+        struct.pack_into('<2I', data, 0x5dbb4, 1, 4096)
+        character.write_bytes(data)
+        (self.source / 'fixture.json').write_text(json.dumps({
+            'name': 'dream-exited', 'edited': True, 'edited_origin': 'dream-location',
+            'parent': {'name': 'dream-location', 'edited': True, 'edits': ['position']}}))
+        (character.parent / 'userdata0010').write_bytes(b'untouched global state')
+        self.original = tool.inventory(self.source)
+        patcher = mock.patch.object(weapon, 'SOURCE_SHA256', tool.digest(data))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def run_tool(self, dry=False):
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            result = self.weapon.create(self.source, self.destination, dry)
+        return result, output.getvalue()
+
+    def test_weapon_dry_run(self):
+        _, output = self.run_tool(True)
+        self.assertIn('BYTE DIFF', output)
+        self.assertIn('DRY RUN', output)
+        self.assertFalse(self.destination.exists())
+        self.assertEqual(tool.inventory(self.source), self.original)
+
+    def test_weapon_copy_roundtrip_tail_and_ancestry(self):
+        result, _ = self.run_tool()
+        before = (self.source / tool.CHARACTER).read_bytes()
+        after = (self.destination / tool.CHARACTER).read_bytes()
+        self.assertEqual(self.weapon.reverse(after, result['edit']), before)
+        self.assertEqual(len(before), len(after))
+        self.assertEqual(before[0x5ec3f:], after[0x5ec3f:])
+        self.assertEqual(tool.inventory(self.source), self.original)
+        parent = json.loads((self.source / 'fixture.json').read_text())
+        meta = json.loads((self.destination / 'fixture.json').read_text())
+        self.assertEqual(meta['parent'], parent)
+        self.assertTrue(meta['edited'])
+        self.assertEqual(meta['validation'], 'pending')
+        self.assertEqual(meta['edit_provenance']['source_metadata'], parent)
+
+    def test_weapon_hash_refusal(self):
+        path = self.source / tool.CHARACTER
+        data = bytearray(path.read_bytes()); data[-1] ^= 1; path.write_bytes(data)
+        with self.assertRaisesRegex(ValueError, 'SHA256'):
+            self.run_tool()
+        self.assertFalse(self.destination.exists())
+
+    def test_weapon_existing_or_nested_refusal(self):
+        for destination in (self.source, self.source/'child', self.root):
+            with self.assertRaises(ValueError):
+                self.weapon.create(self.source, destination)
+        self.destination.mkdir()
+        with self.assertRaises(ValueError):
+            self.run_tool()
+
+    def test_weapon_copy_failure_cleanup(self):
+        with mock.patch.object(self.weapon.shutil, 'copytree', side_effect=OSError('injected')):
+            with self.assertRaises(OSError):
+                self.run_tool()
+        self.assertFalse(self.destination.exists())
+        self.assertEqual(tool.inventory(self.source), self.original)
+
+    def test_weapon_reverse_rejects_modified_edit(self):
+        data = (self.source / tool.CHARACTER).read_bytes()
+        edited, operation = self.weapon.edit_character(data)
+        changed = bytearray(edited); changed[0x10] ^= 1
+        with self.assertRaises(ValueError):
+            self.weapon.reverse(changed, operation)
+
+
+
+
+class CentralFixtureChecks(unittest.TestCase):
+    def setUp(self):
+        import struct
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.source = self.root / 'clinic-via-sickroom-lamp'
+        self.destination = self.root / 'central'
+        character = self.source / tool.CHARACTER
+        character.parent.mkdir(parents=True)
+        data = bytearray(b'Z' * tool.SOURCE_SIZE)
+        data[4:8] = struct.pack('<I', 0x18010000)
+        data[0x12548:0x1254c] = b'FACE'
+        data[0x3f7a1:0x3f7a5] = b'LCED'
+        data[0x3f7a9:0x3f7b5] = bytes.fromhex('ffffffff0000000000000000')
+        data[0x3f7b5:0x3f7c1] = struct.pack('<3f', -198.958, -50.64, 160.58)
+        character.write_bytes(data)
+        self.meta = {'name': self.source.name, 'run': 'synthetic', 'edited': True,
+                     'edited_origin': 'dream-location',
+                     'parent': {'name': 'weapons', 'edited': True},
+                     'unverified': ['lamps'],
+                     'verified': [{'item': 'pistol-fire', 'fixture': 'weapons', 'run': 'old'}]}
+        (self.source / 'fixture.json').write_text(json.dumps(self.meta))
+        (character.parent / 'backup0000').write_bytes(b'unchanged backup')
+        self.original = tool.inventory(self.source)
+        patcher = mock.patch.object(tool, 'CENTRAL_SOURCE_SHA256', tool.digest(data))
+        patcher.start(); self.addCleanup(patcher.stop)
+
+    def run_tool(self, dry=False):
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            result = tool.create(self.source, self.destination, dry, 'central-yharnam')
+        return result, output.getvalue()
+
+    def test_central_exact_position_and_reverse(self):
+        import struct
+        provenance, _ = self.run_tool()
+        before = (self.source / tool.CHARACTER).read_bytes()
+        after = (self.destination / tool.CHARACTER).read_bytes()
+        self.assertEqual(len(after), len(before))
+        self.assertEqual(after[:0x3f7b5], before[:0x3f7b5])
+        self.assertEqual(after[0x3f7c1:], before[0x3f7c1:])
+        self.assertEqual(after[0x3f7b5:0x3f7c1], struct.pack('<3f', -193.4, -28.646, 68.5))
+        self.assertEqual(tool.reverse(after, provenance['edits']), before)
+        self.assertEqual(tool.inventory(self.source), self.original)
+        meta = json.loads((self.destination / 'fixture.json').read_text())
+        self.assertEqual(meta['parent'], self.meta)
+        self.assertEqual(meta['verified'], self.meta['verified'])
+        self.assertTrue(meta['edited'])
+        self.assertEqual(meta['edited_origin'], 'dream-location')
+        self.assertEqual(meta['validation'], 'pending')
+
+    def test_central_dry_run(self):
+        _, output = self.run_tool(True)
+        self.assertIn('0x3f7b5', output)
+        self.assertIn('DRY RUN', output)
+        self.assertFalse(self.destination.exists())
+        self.assertEqual(tool.inventory(self.source), self.original)
+
+    def test_central_wrong_hash_or_profile(self):
+        with self.assertRaises(ValueError):
+            tool.plan(self.source, self.destination)
+        with self.assertRaises(ValueError):
+            tool.plan(self.source, self.destination, 'unknown')
+        path = self.source / tool.CHARACTER
+        data = bytearray(path.read_bytes()); data[-1] ^= 1; path.write_bytes(data)
+        with self.assertRaisesRegex(ValueError, 'SHA256'):
+            self.run_tool()
+
+    def test_central_guards_and_tampering(self):
+        path = self.source / tool.CHARACTER
+        data = bytearray(path.read_bytes()); data[4] ^= 1; path.write_bytes(data)
+        with mock.patch.object(tool, 'CENTRAL_SOURCE_SHA256', tool.digest(data)):
+            with self.assertRaisesRegex(ValueError, 'map/coordinate'):
+                self.run_tool()
+        data[4] ^= 1; path.write_bytes(data)
+        provenance, _ = self.run_tool(True)
+        with self.assertRaisesRegex(ValueError, 'no longer matches'):
+            tool.reverse(data, provenance['edits'])
+
+
 if __name__ == '__main__':
     unittest.main()

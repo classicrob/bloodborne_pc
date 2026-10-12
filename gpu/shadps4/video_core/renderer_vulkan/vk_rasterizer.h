@@ -200,7 +200,12 @@ public:
     /// Waits until the first `through` completion labels are written; stage B first submits
     /// the labels it batched (else it would wait for labels not submitted).
     void WaitLabelsThrough(u64 through) {
-        if (DrawPipe::OnStageB()) {
+        const bool stage_b = DrawPipe::OnStageB();
+        // Diagnostic (parse split's Flushes line): whether the batch submitted here held a
+        // label this write waits for.
+        BbSplit::NoteOrderedWrite(stage_b && scheduler.LabelsBatched(),
+                                  stage_b && scheduler.LabelsBatchedThrough(through));
+        if (stage_b) {
             scheduler.FlushLabels(true);
         }
         scheduler.WaitLabelsThrough(through);
@@ -210,13 +215,6 @@ public:
     }
     BbWriteOrder::Barrier& WriteBarrier() noexcept {
         return scheduler.write_barrier;
-    }
-    /// At a WAIT_REG_MEM met early: on stage B, submits the batched labels at once, so the
-    /// labels later WRITE_DATAs must wait for reach the GPU without waiting for the batch age.
-    void FlushLabelsForWait() {
-        if (DrawPipe::OnStageB()) {
-            scheduler.FlushLabelsFor(BbSplit::FBatchForWait);
-        }
     }
 #endif
     /// Runs `signal` after the guest memory copies issued so far, without waiting here.

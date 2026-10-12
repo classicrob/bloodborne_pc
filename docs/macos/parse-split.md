@@ -95,7 +95,6 @@ Every draw-scheduler submission is counted by reason, from a thread-local reason
 - frame end;
 - unbatched labels (one per label: stage A, or recording not deferred);
 - stage B's label batch, at an idle packet boundary or at LabelBatchAge (500 us);
-- stage B's label batch at a WAIT_REG_MEM met early (submitted at once);
 - Finish;
 - other.
 
@@ -105,6 +104,14 @@ label in each batch at submit. It also gives labels written per frame and their 
 later label flushing must keep this within about one submission's encode time. Compare both the
 mean and the maximum across arms over the same windows, and read the maximum over several windows,
 since one window's maximum is a single extreme.
+
+It counts the WAIT_REG_MEMs stage A met early (their in-order markers), and the in-order
+WRITE_DATAs behind one (the write barrier, gpu-idle.md):
+- how many submitted stage B's label batch before waiting. These submissions are counted under
+  "label batch at idle";
+- of those, how many batches held only labels after the ones the WRITE_DATA needs. Such a
+  submission does not order that WRITE_DATA; it only writes the later labels sooner;
+- how many then waited for labels, and the mean wait.
 
 One line is printed in the parse-split block. Renderer's render pass census ("Render passes ...")
 attributes each pass end. A pass counts as ended by a submission when it is still open after the
