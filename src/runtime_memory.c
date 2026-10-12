@@ -1032,7 +1032,8 @@ __attribute__((noinline)) void runtime_guest_free(void *pointer) {
 /* Bits 32 and up: the draw pipeline and related GPU thread work (gpu/shim/bbport_toggles.h). */
 uint64_t runtime_disabled_optimizations;
 /* Word 2 (BbToggle::Word2 in gpu/shim/bbport_toggles.h): an optional second number in the
- * same file, after white space. A file with one number clears it. */
+ * same file, after white space. A file with one number clears it. The two words are stored
+ * one after the other, not as a pair: write the file elsewhere and rename it into place. */
 uint64_t runtime_disabled_optimizations2;
 /* Speculative readers of guest memory (GPU draw-preparation workers) register a recovery
  * point: a fault on that thread jumps back to it instead of terminating (probe.c). */
@@ -1061,25 +1062,43 @@ static void toggle_bits(char *out, size_t size, const char *label, uint64_t mask
         if (mask>>bit & 1) used+=(size_t)snprintf(out+used,size-used," %d",bit);
     if (used<size) snprintf(out+used,size-used,")");
 }
+/* Reads the toggle file: 0 with both masks (a missing file is both 0), or -1 with the reason. */
+static int toggle_read(const char *path, uint64_t mask[2], char *why, size_t size) {
+    mask[0]=mask[1]=0;
+    FILE *f=fopen(path,"r");
+    if (!f) {
+        if (errno==ENOENT) return 0;
+        snprintf(why,size,"cannot open: %s",strerror(errno));
+        return -1;
+    }
+    char text[256];
+    const size_t length=fread(text,1,sizeof text,f);
+    const int error=ferror(f) ? errno : 0;
+    fclose(f);
+    if (error) snprintf(why,size,"read failed: %s",strerror(error));
+    else if (length==sizeof text) snprintf(why,size,"longer than 255 bytes");
+    else if (memchr(text,0,length)) snprintf(why,size,"contains a NUL byte");
+    else if (text[length]=0, toggle_parse(text,mask)) snprintf(why,size,"not one or two decimal masks");
+    else return 0;
+    mask[0]=mask[1]=0;
+    return -1;
+}
 static void *toggle_watcher(void *path) {
     uint64_t last[2]={0,0};
-    for (int bad=0,printed=0;;) {
-        /* A missing file is no toggles; a file that does not parse keeps the masks as they were. */
-        char text[256]="";
-        size_t length=0;
-        FILE *f=fopen(path,"r");
-        if (f) { length=fread(text,1,sizeof text,f); fclose(f); }
+    char last_why[160]="";
+    for (int printed=0;;) {
         uint64_t mask[2];
-        const int parsed=length<sizeof text ? (text[length]=0, toggle_parse(text,mask)) : -1;
-        if (parsed) {
-            if (!bad) {
-                printf("Runtime: BB_TOGGLE_FILE %s: not one or two decimal masks; "
-                       "disabled optimizations unchanged\n",(const char *)path);
+        char why[160];
+        if (toggle_read(path,mask,why,sizeof why)) {
+            /* Unreadable or malformed: both words stay as they were, said once per reason. */
+            if (strcmp(why,last_why)) {
+                printf("Runtime: BB_TOGGLE_FILE %s: %s; disabled optimizations unchanged\n",
+                    (const char *)path,why);
                 fflush(stdout);
+                strcpy(last_why,why);
             }
-            bad=1;
         } else {
-            bad=0;
+            last_why[0]=0;
             if (!printed || mask[0]!=last[0] || mask[1]!=last[1]) {
                 __atomic_store_n(&runtime_disabled_optimizations2,mask[1],__ATOMIC_RELEASE);
                 __atomic_store_n(&runtime_disabled_optimizations,mask[0],__ATOMIC_RELEASE);

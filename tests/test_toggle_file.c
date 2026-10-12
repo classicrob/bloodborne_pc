@@ -2,18 +2,39 @@
 #include "../src/runtime_memory.c"
 #include <assert.h>
 #include <signal.h>
+#include <sys/stat.h>
 #include <unistd.h>
 uintptr_t runtime_lookup(const RuntimeExport *table,size_t count,const char *name) {
     for (size_t i=0;i<count;++i) if (!strcmp(table[i].name,name)) return (uintptr_t)table[i].function;
     return 0;
 }
 static char path[64];
-static void put(const char *text) {
+static void put_bytes(const char *text, size_t length) {
     char staged[80];
     snprintf(staged,sizeof staged,"%s.new",path);
     FILE *f=fopen(staged,"w");
-    assert(f && fputs(text,f)>=0 && !fclose(f));
+    assert(f && fwrite(text,1,length,f)==length && !fclose(f));
     assert(!rename(staged,path));
+}
+static void put(const char *text) { put_bytes(text,strlen(text)); }
+/* toggle_read fails with a reason containing want, and leaves both masks 0. */
+static void read_fails(const char *what, const char *want) {
+    uint64_t m[2]={1,1};
+    char why[160]="";
+    assert(toggle_read(path,m,why,sizeof why)==-1 && m[0]==0 && m[1]==0);
+    if (!strstr(why,want)) { fprintf(stderr,"FAIL %s: reason '%s', expected '%s'\n",what,why,want); exit(1); }
+    printf("PASS %s: %s\n",what,why); fflush(stdout);
+}
+/* The watcher has had two reads of a bad file; both words are as they were. */
+static void kept(const char *what, uint64_t mask, uint64_t mask2) {
+    struct timespec t={0,600000000}; nanosleep(&t,NULL);
+    if (runtime_disabled_optimizations!=mask || runtime_disabled_optimizations2!=mask2) {
+        fprintf(stderr,"FAIL %s: mask=%llu mask2=%llu, expected %llu %llu kept\n",what,
+            (unsigned long long)runtime_disabled_optimizations,(unsigned long long)runtime_disabled_optimizations2,
+            (unsigned long long)mask,(unsigned long long)mask2);
+        exit(1);
+    }
+    printf("PASS %s keeps both words\n",what); fflush(stdout);
 }
 /* Waits up to 2 s (the watcher reads every 250 ms) for both words. */
 static void expect(const char *what, uint64_t mask, uint64_t mask2) {
@@ -48,6 +69,20 @@ int main(void) {
     puts("PASS bit list"); fflush(stdout);
 
     snprintf(path,sizeof path,"/tmp/bb-toggle-test.%d",(int)getpid());
+    /* The reader: only a missing file reads as no toggles. */
+    uint64_t r[2]={1,1}; char why[160];
+    assert(!toggle_read(path,r,why,sizeof why) && r[0]==0 && r[1]==0);
+    put("4 5\n");
+    assert(!toggle_read(path,r,why,sizeof why) && r[0]==4 && r[1]==5);
+    put_bytes("1\0garbage",10); read_fails("embedded NUL","NUL byte");
+    put_bytes("1\0",2); read_fails("trailing NUL","NUL byte");
+    char longer[300]; memset(longer,' ',sizeof longer); longer[sizeof longer-1]='1';
+    put_bytes(longer,sizeof longer); read_fails("file over 255 bytes","longer than 255");
+    put("1 2\n"); assert(!chmod(path,0)); read_fails("unreadable file (EACCES)","cannot open");
+    assert(!unlink(path) && !mkdir(path,0700)); read_fails("directory (read error)","read failed");
+    assert(!rmdir(path));
+    puts("PASS reader"); fflush(stdout);
+
     put("5 7\n");
     pthread_t watcher;
     assert(!pthread_create(&watcher,NULL,toggle_watcher,path));
@@ -57,13 +92,21 @@ int main(void) {
     put("0 1\n");
     expect("word 2 only",0,1);
     put("3 garbage\n");
-    struct timespec t={0,600000000}; nanosleep(&t,NULL);
-    expect("unparsed file keeps both words",0,1);
+    kept("unparsed text",0,1);
     put("");
     expect("empty file: both 0",0,0);
     put("8 16");
     expect("recovers after the empty file",8,16);
-    assert(!unlink(path));
+    put_bytes("1\0garbage",10);
+    kept("binary file with a NUL",8,16);
+    put("8 16"); assert(!chmod(path,0));
+    kept("unreadable file",8,16);
+    assert(!unlink(path) && !mkdir(path,0700));
+    kept("directory",8,16);
+    assert(!rmdir(path));
     expect("missing file: both 0",0,0);
+    put("2 3");
+    expect("readable again",2,3);
+    assert(!unlink(path));
     return 0;
 }

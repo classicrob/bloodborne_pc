@@ -109,6 +109,8 @@ inline bool Disabled(std::uint64_t bit) {
 // Word 2, the second number in BB_TOGGLE_FILE ("<mask> <mask2>"); the first 64 bits are all
 // taken. New toggles go here, from bit 0 up: Word2::Name = 1ull << n. A scoped type, so
 // Disabled(Word2::Name) reads word 2 and a word-2 bit cannot be passed as a word-1 number.
+// The words switch independently (a reader can see a new word 2 with the old word 1), so a
+// toggle must not need a bit in the other word to be set at the same moment.
 enum class Word2 : std::uint64_t {
 };
 constexpr Word2 operator|(Word2 a, Word2 b) {
