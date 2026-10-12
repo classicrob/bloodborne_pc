@@ -519,8 +519,8 @@ inline void NoteFrameEnd(std::uint64_t draws) {
         std::chrono::duration<double, std::milli>(now - window_start).count();
     const double ms_per_cycle = wall_ms / double(now_cycles - window_cycles);
     const double frames = double(window_frames);
-    // Stage A's direct-draw time per draw (pipeline selection, packet build), before Line moves
-    // the baseline.
+    // Stage A's direct-draw bucket (wall time, exclusive of named scopes) per counted direct draw,
+    // before Line moves the baseline. Not CPU time, not a draw's whole processing cost.
     const std::uint64_t window_draw_count = draws - window_draws;
     const double a_us_per_draw =
         window_draw_count ? double(stage_a.bucket[ADraw].load(std::memory_order_relaxed) -
@@ -553,7 +553,7 @@ inline void NoteFrameEnd(std::uint64_t draws) {
     const std::string r_cpu = OnCpu(recorder, previous_cpu_r, frames);
     // Printed like the Stall lines: Info-level logging is filtered in perf runs.
     std::printf("Parse split, last 600 frame ends: %.2f ms per frame, %.0f draws per frame "
-                "(stage A %.2f us per draw); ms per frame by thread (accounted / wall)\n"
+                "(stage A draw bucket %.2f us wall per draw); ms per frame by thread (accounted / wall)\n"
                 "  stage A (GPU command thread, %.0f%%, %s per frame): %s\n"
                 "    deferred-signal waits during: %s\n"
                 "    stage B drains at other packets during: %s\n"
