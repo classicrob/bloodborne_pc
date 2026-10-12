@@ -2422,6 +2422,12 @@ void Rasterizer::ResetBindings(bool is_compute) {
         runtime.AccessBuffer(read.buffer, read.offset, read.size, read.stage, read.access);
     }
     input_reads.clear();
+    if (BbPassTrace::Enabled()) {
+        // Reads that need no layout change pass no Runtime::Transit: the bound images are.
+        for (const auto image_id : bound_images) {
+            BbPassTrace::NoteBind(texture_cache.GetImage(image_id).image_uid);
+        }
+    }
 #endif
     for (auto& image_id : bound_images) {
         texture_cache.GetImage(image_id).binding = {};
@@ -3323,6 +3329,13 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
         }
         if (usable) {
             ++begin_memo_hits;
+#ifdef __APPLE__
+            if (BbPassTrace::Enabled()) {
+                // A pass begun from this memo (after a barrier ends the open one) has the
+                // targets the memo's full render state resolved.
+                BbPassTrace::SetViews(begin_memo_trace.data(), num_begin_memo_trace);
+            }
+#endif
             attachment_feedback_loop = false;
             push_data.scene_size = begin_memo.scene_size;
             target_scale = begin_memo.target_scale;
@@ -3343,6 +3356,10 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
             // Recomputed after the full path: it may have started the scene (scene_started).
             begin_memo = {true, MakeBeginSignature(pipeline), state, push_data.scene_size,
                           target_scale};
+#ifdef __APPLE__
+            begin_memo_trace = trace_views;
+            num_begin_memo_trace = num_trace_views;
+#endif
         }
     }
     return state;
@@ -3681,37 +3698,42 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
     }
 #ifdef __APPLE__
     if (BbPassTrace::Enabled()) {
-        // The pass trace resolves the next pass's attachments that are their guest image's own
-        // view; redirected and proxy views (other storage) and the object motion attachment
-        // below stay unknown.
-        BbPassTrace::ClearViews();
+        // The pass trace resolves the next pass's targets to their guest images: known where the
+        // pass uses the image's own view; a redirect or proxy (other storage) keeps only the
+        // guest uid. The object motion attachment below stays unresolved.
+        num_trace_views = 0;
         const auto note = [&](vk::ImageView view, const VideoCore::Image& image,
-                              const VideoCore::SubresourceRange& range) {
+                              const VideoCore::SubresourceRange& range, bool own) {
             const auto& info = image.info;
-            BbPassTrace::NoteView(std::bit_cast<u64>(view),
-                                  {
-                                      .uid = image.image_uid,
-                                      .format = u32(info.pixel_format),
-                                      .texel_bytes = vk::blockSize(info.pixel_format),
-                                      .width = std::max(info.size.width >> range.base.level, 1u),
-                                      .height = std::max(info.size.height >> range.base.level, 1u),
-                                      .layers = range.extent.layers,
-                                      .level = range.base.level,
-                                  });
+            trace_views[num_trace_views++] = {
+                std::bit_cast<u64>(view),
+                {
+                    .uid = image.image_uid,
+                    .format = u32(info.pixel_format),
+                    .texel_bytes = vk::blockSize(info.pixel_format),
+                    .width = std::max(info.size.width >> range.base.level, 1u),
+                    .height = std::max(info.size.height >> range.base.level, 1u),
+                    .layer = range.base.layer,
+                    .layers = range.extent.layers,
+                    .level = range.base.level,
+                    .samples = info.num_samples,
+                    .own = own,
+                }};
         };
         for (u32 cb = 0; cb < state.num_color_attachments; ++cb) {
-            if (cb_descs[cb].first && state.color_attachments[cb].image_view &&
-                state.color_attachments[cb].image_view == native_color[cb]) {
+            if (cb_descs[cb].first && state.color_attachments[cb].image_view) {
                 note(state.color_attachments[cb].image_view,
                      texture_cache.GetImage(cb_descs[cb].first),
-                     cb_descs[cb].second.view_info.range);
+                     cb_descs[cb].second.view_info.range,
+                     state.color_attachments[cb].image_view == native_color[cb]);
             }
         }
-        if (db_desc.first && state.depth_stencil_attachment.image_view &&
-            state.depth_stencil_attachment.image_view == native_depth) {
+        if (db_desc.first && state.depth_stencil_attachment.image_view) {
             note(state.depth_stencil_attachment.image_view, texture_cache.GetImage(db_desc.first),
-                 db_desc.second.view_info.range);
+                 db_desc.second.view_info.range,
+                 state.depth_stencil_attachment.image_view == native_depth);
         }
+        BbPassTrace::SetViews(trace_views.data(), num_trace_views);
     }
 #endif
     // bbport: object motion vector attachment of G-buffer pipelines.

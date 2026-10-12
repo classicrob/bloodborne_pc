@@ -13,11 +13,15 @@
 // layout, access, stage, whole image or not), recorded before the barrier flush that may end the
 // open pass, so "requested_in_pass" does not prove the access ran inside that pass. Image uses
 // recorded straight into command buffers without Runtime::Transit are not seen.
+// Images bound to each draw or dispatch ("bind": sampled, storage and target images, from the
+// rasterizer's bindings) cover the reads that need no layout change and so no Runtime::Transit.
 // Attachments are resolved only for the next pass, from the targets the rasterizer notes for it
-// (NoteView, cleared at every begin), and only where the attachment is the guest image's own
-// view. Redirected and proxy views, the blit helper's and the object motion attachment are
-// unknown (their bytes are not counted). Only the rasterizer's draws are counted. A pass open when
-// the trace starts ends with a "partial" end record.
+// (SetViews after its full render state, or with a render-state memo hit's snapshot;
+// cleared at every begin), and only where the attachment is the guest image's own view ("known").
+// A redirected or proxy view keeps its guest image's uid but is not known (other storage); the
+// blit helper's views, the object motion attachment and passes begun from a cached state without
+// a memo hit are unresolved (uid 0). Bytes are counted for known attachments only. Only the
+// rasterizer's draws are counted. A pass open when the trace starts ends with a "partial" record.
 #pragma once
 #ifdef __APPLE__
 #include <algorithm>
@@ -39,8 +43,11 @@ struct View {
     std::uint64_t uid = 0;
     std::uint32_t format = 0;      ///< VkFormat
     std::uint32_t texel_bytes = 0; ///< bytes per texel (block bytes for compressed formats)
-    std::uint32_t width = 0, height = 0, layers = 0, level = 0;
+    std::uint32_t width = 0, height = 0; ///< of the level
+    std::uint32_t layer = 0, layers = 0, level = 0, samples = 1;
+    bool own = true; ///< the guest image's own view (false: a redirect or proxy of it)
 };
+using Entry = std::pair<std::uint64_t, View>; ///< view handle, image
 
 namespace detail {
 struct Config {
@@ -94,7 +101,7 @@ inline const Config& Get() {
 
 inline std::mutex mutex;
 /// The targets noted for the next pass (view handle, image); cleared at every begin.
-inline std::array<std::pair<std::uint64_t, View>, 9> pending{};
+inline std::array<Entry, 9> pending{};
 inline std::uint32_t num_pending = 0;
 inline std::uint64_t frame_ends = 0;
 inline bool active = false; ///< inside the traced frames
@@ -104,7 +111,7 @@ inline std::uint64_t pass = 0;  ///< passes begun in the traced frames (the open
 inline bool open = false;        ///< a pass is open (tracked whenever Enabled())
 inline bool open_traced = false; ///< ... and it began inside the traced frames
 inline std::uint64_t draws = 0; ///< in the open pass
-inline std::uint64_t frame_passes = 0, frame_draws = 0, frame_uses = 0;
+inline std::uint64_t frame_passes = 0, frame_draws = 0, frame_uses = 0, frame_binds = 0;
 /// The attachment views and extent of the last pass begun, for "same targets".
 inline std::array<std::uint64_t, 9> last_targets{};
 inline std::uint32_t last_width = 0, last_height = 0;
@@ -125,11 +132,11 @@ inline void AppendAttachment(bool& first, const char* slot, std::uint64_t view,
     }
     const View v = found ? *found : View{};
     Append("%s{\"slot\":\"%s\",\"uid\":%llu,\"known\":%d,\"format\":%u,\"texel_bytes\":%u,"
-           "\"width\":%u,\"height\":%u,\"layers\":%u,\"level\":%u,\"layout\":%u,"
-           "\"load\":\"%s\"}",
-           first ? "" : ",", slot, static_cast<unsigned long long>(v.uid), found ? 1 : 0,
-           v.format, v.texel_bytes, v.width, v.height, v.layers,
-           v.level, layout, clear ? "clear" : "load");
+           "\"width\":%u,\"height\":%u,\"layer\":%u,\"layers\":%u,\"level\":%u,"
+           "\"samples\":%u,\"layout\":%u,\"load\":\"%s\"}",
+           first ? "" : ",", slot, static_cast<unsigned long long>(v.uid),
+           found && v.own ? 1 : 0, v.format, v.texel_bytes, v.width, v.height, v.layer, v.layers,
+           v.level, v.samples, layout, clear ? "clear" : "load");
     first = false;
 }
 } // namespace detail
@@ -138,18 +145,25 @@ inline void AppendAttachment(bool& first, const char* slot, std::uint64_t view,
     return detail::Get().enabled;
 }
 
-/// The next pass's targets are about to be noted (the rasterizer's full render state).
-inline void ClearViews() {
+/// The next pass's targets (view handle, image): the rasterizer's full render state, or the
+/// snapshot kept with a render-state memo the next pass begins from. Only when Enabled().
+inline void SetViews(const Entry* entries, std::uint32_t count) {
     std::scoped_lock lk{detail::mutex};
-    detail::num_pending = 0;
+    detail::num_pending = std::min<std::uint32_t>(count, std::uint32_t(detail::pending.size()));
+    std::copy_n(entries, detail::num_pending, detail::pending.begin());
 }
 
-/// The next pass uses `view`, the guest image's own view of `image`. Only when Enabled().
-inline void NoteView(std::uint64_t view, const View& image) {
+/// An image bound to a draw or dispatch (Rasterizer::ResetBindings, after it was recorded).
+inline void NoteBind(std::uint64_t uid) {
     std::scoped_lock lk{detail::mutex};
-    if (detail::num_pending < detail::pending.size()) {
-        detail::pending[detail::num_pending++] = {view, image};
+    if (!detail::active) {
+        return;
     }
+    using namespace detail;
+    ++frame_binds;
+    Append("{\"e\":\"bind\",\"frame\":%llu,\"pass\":%llu,\"uid\":%llu}\n",
+           static_cast<unsigned long long>(frame_ends), static_cast<unsigned long long>(pass),
+           static_cast<unsigned long long>(uid));
 }
 
 /// A pass begins (Scheduler::BeginRendering, after the census's NoteBegin). `State` is
@@ -261,17 +275,18 @@ inline void NoteFrameEnd() {
     using namespace detail;
     if (active) {
         Append("{\"e\":\"frame\",\"frame\":%llu,\"passes\":%llu,\"draws\":%llu,\"uses\":%llu,"
-               "\"open_at_end\":%d}\n",
+               "\"binds\":%llu,\"open_at_end\":%d}\n",
                static_cast<unsigned long long>(frame_ends),
                static_cast<unsigned long long>(frame_passes),
                static_cast<unsigned long long>(frame_draws),
-               static_cast<unsigned long long>(frame_uses), open ? 1 : 0);
+               static_cast<unsigned long long>(frame_uses),
+               static_cast<unsigned long long>(frame_binds), open ? 1 : 0);
         if (std::fwrite(lines.data(), 1, lines.size(), file) != lines.size()) {
             std::fprintf(stderr, "STOP: pass trace: writing %s failed\n", config.out);
             std::abort();
         }
         lines.clear();
-        frame_passes = frame_draws = frame_uses = 0;
+        frame_passes = frame_draws = frame_uses = frame_binds = 0;
     }
     ++frame_ends;
     if (frame_ends == config.first) {

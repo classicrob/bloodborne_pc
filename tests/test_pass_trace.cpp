@@ -1,6 +1,7 @@
 // Pass trace (gpu/shim/bbport_pass_trace.h): a known sequence of passes, draws and image accesses
 // over two traced frames, written to BB_PASS_TRACE_OUT for tests/test_pass_trace.sh, which checks
 // the file and tools/macos/pass_trace.py's report of it. Run with BB_PASS_TRACE=1+2.
+#include <array>
 #include <cstdint>
 #include <cstdio>
 #include "bbport_pass_trace.h"
@@ -53,15 +54,17 @@ void Ender() {}
 
 // The rasterizer notes the next pass's own guest-image views before it begins.
 void NoteViews(bool color, bool depth) {
-    BbPassTrace::ClearViews();
+    std::array<BbPassTrace::Entry, 2> entries;
+    std::uint32_t n = 0;
     if (color) {
-        BbPassTrace::NoteView(ColorView, {.uid = 1, .format = 37, .texel_bytes = 4, .width = 100,
-                                          .height = 100, .layers = 1, .level = 0});
+        entries[n++] = {ColorView, {.uid = 1, .format = 37, .texel_bytes = 4, .width = 100,
+                                    .height = 100, .layers = 1}};
     }
     if (depth) {
-        BbPassTrace::NoteView(DepthView, {.uid = 2, .format = 130, .texel_bytes = 5,
-                                          .width = 100, .height = 100, .layers = 1, .level = 0});
+        entries[n++] = {DepthView, {.uid = 2, .format = 130, .texel_bytes = 5, .width = 100,
+                                    .height = 100, .layers = 1}};
     }
+    BbPassTrace::SetViews(entries.data(), n);
 }
 } // namespace
 
@@ -87,6 +90,7 @@ int main() {
     NoteViews(true, true);
     Pass(ColorDepth(false, true), false, 3, Why::Barrier, ender);
     BbPassTrace::NoteUse(1, 5, SampledRead, StageFragment, true, false); // pass 0's color: read
+    BbPassTrace::NoteBind(42); // an image no pass stored
     // Pass 1 resumes it (same state as recorded by the scheduler): loads color and depth.
     NoteViews(true, true);
     Pass(ColorDepth(false, false), true, 1, Why::Other, ender);
