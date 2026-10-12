@@ -592,6 +592,31 @@ int main() {
                                          "1, flip preparation entered 1 (latest arg 12), status "
                                          "published 1 (latest arg 11)") != std::string::npos);
 
+    {
+        using namespace BbSplit;
+        detail::FlushLine(0); // baseline
+        BbSplit::NoteFlush(true); // no reason set: other
+        {
+            FlushReason frame{FFrameEnd};
+            NoteFlush(true);
+            {
+                FlushReason label{FLabel};
+                NoteFlush(false);
+            }
+            NoteFlush(false); // back to the frame end
+        }
+        NoteLabelBatch(300000);
+        NoteLabelBatch(700000);
+        const std::string line = detail::FlushLine(2);
+        Expect("flush census: reasons nest and restore; per frame by reason, passes ended, batch age",
+               line.find("2.0 per frame = frame end 1.0, unbatched labels 0.5") != std::string::npos &&
+                   line.find("other 0.5") != std::string::npos &&
+                   line.find("1.0 per frame ended an open render pass") != std::string::npos &&
+                   line.find("label batches 1.0 per frame, oldest label's age at submit 500 us "
+                             "mean, 700 us max") != std::string::npos &&
+                   flush_reason == FOther);
+    }
+
     std::fprintf(stderr, "%s: %u failures\n", failures ? "FAIL" : "PASS", failures);
     return failures ? 1 : 0;
 }
