@@ -370,6 +370,65 @@ pid = [e for e in events if e.get('event') == 'start' and e['label'] == 'Q14'][-
 assert end['paused_by'] == ['P13'] and end['paused_s'] > 0, end  # the whole pause, closed before the resume
 assert not os.path.exists(os.path.join(sys.argv[2], f'paused-{pid}.jsonl')), 'pause file left behind'
 PY
+# --cpu-quiet=ecore: a running build job is not paused but moved to background QoS (E-cores; ps
+# priority 4, read back), a process it forks meanwhile inherits that, a new job starts at once in
+# the background, and at the end the demoted processes come back and the job's end says so.
+pri() { ps -o pri= -p "$1" | tr -d ' '; }
+BB_HEAVY_POLITE=0 "$heavy" B15 -- sh -c "while :; do echo t >> '$dir/b15'; sleep 0.2; done" 2> "$dir/b15.err" &
+b15=$!
+for _ in $(seq 50); do [[ -s $dir/b15 ]] && break; sleep 0.1; done
+b15_loop=$(pgrep -f "^sh -c while :; do echo t >> '$dir/b15'" || true)
+[[ -n $b15_loop ]] || fail "B15's loop not found"
+normal=$(pri "$b15_loop")
+(( normal > 4 )) || fail "B15 started in the background already (priority $normal)"
+"$heavy" --pool playtest --gpu exclusive --cpu-quiet=ecore P15 -- sleep 4 2> "$dir/p15.err" &
+p15=$!
+sleep 2
+demoted=$(pri "$b15_loop")
+child_pri=none
+for _ in $(seq 20); do  # the loop's sleep 0.2, forked after the demotion (between its sleeps for an instant)
+    child=$(pgrep -P "$b15_loop" | head -1 || true)
+    if [[ -n $child ]]; then child_pri=$(pri "$child"); [[ -n $child_pri ]] && break; fi
+    child_pri=none; sleep 0.05
+done
+before=$(ticks "$dir/b15"); sleep 1; after=$(ticks "$dir/b15")
+start=$(date +%s)
+b16=$("$heavy" --pool sweep B16 -- sh -c 'ps -o pri= -p $$' 2> /dev/null | tr -d ' ')
+b16_wait=$(( $(date +%s) - start ))
+wait "$p15"
+sleep 1.5
+restored=$(pri "$b15_loop")
+(( demoted == 4 )) || fail "a running build job not at background QoS under --cpu-quiet=ecore (priority $demoted)"
+[[ $child_pri == 4 ]] || fail "a process forked during the E-core quiet did not inherit it (priority $child_pri)"
+(( after > before )) || fail "a build job stopped under --cpu-quiet=ecore ($before -> $after ticks)"
+[[ $b16 == 4 ]] || fail "a job started during the E-core quiet is not in the background (priority '$b16')"
+(( b16_wait < 3 )) || fail "a job waited ${b16_wait} s to start during the E-core quiet"
+(( restored == normal )) || fail "B15 not restored after the E-core quiet (priority $restored, was $normal)"
+grep -q 'P15: CPU quiet (E-cores): B15 (build0) at background QoS' "$dir/p15.err" || fail "demotion not reported: $(cat "$dir/p15.err")"
+grep -q 'P15: CPU quiet over: B15 back from E-cores' "$dir/p15.err" || fail "restore not reported: $(cat "$dir/p15.err")"
+kill "$b15" 2>/dev/null; wait "$b15" 2>/dev/null || true; pkill -f "$dir/b15" 2>/dev/null || true
+grep -Eq '^heavy: B15: ran [0-9]+ s at E-core QoS for perf runs \(P15\); ended with' "$dir/b15.err" ||
+    fail "B15's end does not name the E-core quiet: $(cat "$dir/b15.err")"
+# The same through ninja (posix_spawn, as the GPU build compiles): the job ninja starts after the
+# demotion inherits background QoS; one it started before is demoted by the watcher's rescan.
+command -v ninja > /dev/null || fail "ninja not on PATH"
+mkdir -p "$dir/nj" && printf 'rule s\n  command = sleep $t\nbuild a: s\n  t = 1\nbuild b: s\n  t = 4\n' > "$dir/nj/build.ninja"
+BB_HEAVY_POLITE=0 "$heavy" B17 -- ninja -C "$dir/nj" -j1 a b > /dev/null 2>&1 &
+b17=$!
+until_held build0 B17
+b17_ninja=''
+for _ in $(seq 100); do
+    b17_ninja=$(pgrep -f "^ninja -C $dir/nj" | head -1 || true)
+    [[ -n $b17_ninja ]] && pgrep -P "$b17_ninja" > /dev/null && break; sleep 0.05
+done
+[[ -n $b17_ninja ]] || fail "B17's ninja never started its first job"
+"$heavy" --pool playtest --gpu exclusive --cpu-quiet=ecore P16 -- sleep 3 2> /dev/null &
+p16=$!
+sleep 2.2  # job a (sleep 1) ended during the quiet; ninja spawned job b after the demotion
+job_b=$(pgrep -P "$b17_ninja" | head -1 || true)
+job_b_pri=$( [[ -n $job_b ]] && pri "$job_b" || echo none)
+wait "$p16"; wait "$b17" || fail "B17 (ninja) failed"
+[[ $job_b_pri == 4 ]] || fail "a job ninja spawned during the E-core quiet is not in the background (priority $job_b_pri)"
 if "$heavy" --cpu-quiet K1 -- true 2>/dev/null; then fail "--cpu-quiet without --gpu exclusive accepted"; fi
 if "$heavy" K2 -- "$heavy" --pool playtest --gpu exclusive --cpu-quiet K3 -- true 2>/dev/null; then
     fail "--cpu-quiet inside a slot accepted"
@@ -464,4 +523,4 @@ assert any(l['label'] == 'B' for l in starts), 'B started'  # after A ended: che
 assert all({'pool', 'slot', 'waited_s', 'load', 'held'} <= set(l) for l in starts)
 assert any(l['label'] == 'Q4' and l['status'] == 124 for l in ends), 'Q4 killed'
 PY
-echo "heavy.sh: history log, build/playtest/quick pools, quick hints and time limit, waiting, priority slot, GPU shared/exclusive lock with gate, start announcement, polite scheduling, idle-aware admission, CPU-quiet pause (leaving another pause's processes stopped; named at the job's end), job records (command, directory, end status/signal, orphans), one job per worktree and INVALID on a changed tree, sweep lane, release on SIGKILL, nesting, exit status, usage errors PASS"
+echo "heavy.sh: history log, build/playtest/quick pools, quick hints and time limit, waiting, priority slot, GPU shared/exclusive lock with gate, start announcement, polite scheduling, idle-aware admission, CPU-quiet pause (leaving another pause's processes stopped; named at the job's end), --cpu-quiet=ecore (background QoS read back, inherited, restored), job records (command, directory, end status/signal, orphans), one job per worktree and INVALID on a changed tree, sweep lane, release on SIGKILL, nesting, exit status, usage errors PASS"

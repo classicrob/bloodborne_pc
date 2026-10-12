@@ -99,6 +99,17 @@ The pause is bounded by `BB_HEAVY_QUIET_MAX` (1200 s); past that the jobs resume
 "CPU QUIET BOUND REACHED". Each pause and resume is printed in the run's output and recorded in
 the history. Games are not paused (the exclusive GPU hold already keeps them off).
 
+`--cpu-quiet=ecore` (an option; `--cpu-quiet` and `--cpu-quiet=stop` stay as above) does not
+pause anything. While the run lasts, the watcher moves each running build, quick and sweep process
+to darwin background QoS every second (`setpriority(PRIO_DARWIN_PROCESS, PRIO_DARWIN_BG)`, as
+`taskpolicy -b`: efficiency cores, low CPU and I/O priority; `ps -o pri` shows 4), and processes
+they start meanwhile, including ninja's compiles, inherit it. New jobs start at once, under
+`taskpolicy -b`, instead of waiting. At the end, the processes it demoted, and those that
+inherited it from them, are restored; a job started in the background stays there. A job that ran
+at E-core QoS says so at its end (`ran N s at E-core QoS for perf runs (...)`; `ecore_s`,
+`ecore_by` in its end event). It is for A/Bs only once measured: a replay pair, idle against a
+full build at E-core QoS, with medians within 1% and no tail change.
+
 A paused job says so when it ends, with its exit status, and its end event in the history
 carries `paused_s` and `paused_by`:
 

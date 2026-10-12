@@ -268,6 +268,19 @@ def polite(pool, priority, gpu, command, idle=(False, '')):
 QUIET_POOLS = ('build', 'quick', 'sweep')
 
 
+def quiet_mode():
+    """While a --cpu-quiet job holds BB_HEAVY_DIR/cpu-quiet: 'stop' (build/quick/sweep jobs are
+    paused and none starts) or 'ecore' (they run at background QoS, E-cores only); else None. A
+    holder that wrote no mode (an older heavy.py) is 'stop'."""
+    if not quiet_active():
+        return None
+    try:
+        with open(os.path.join(lock_dir(), 'cpu-quiet.mode')) as f:
+            return 'ecore' if f.read().strip() == 'ecore' else 'stop'
+    except FileNotFoundError:
+        return 'stop'
+
+
 def quiet_active():
     """True while a --cpu-quiet job (a perf run) holds BB_HEAVY_DIR/cpu-quiet."""
     fd = lock_file('cpu-quiet')
@@ -309,27 +322,28 @@ def process_states(pids):
     return {int(fields[0]): fields[1] for fields in (line.split() for line in out.splitlines()) if len(fields) == 2}
 
 
-def pause_file(pid):
-    """BB_HEAVY_DIR/paused-<pid>.jsonl: when the job whose slot holder is pid was paused for a perf
-    run and resumed (one line each), read by the job itself at its end."""
-    return os.path.join(lock_dir(), f'paused-{pid}.jsonl')
+def pause_file(pid, kind='paused'):
+    """BB_HEAVY_DIR/<kind>-<pid>.jsonl: when the job whose slot holder is pid was paused (kind
+    paused) or demoted to E-core QoS (kind ecore) for a perf run, and when that ended (one line
+    each); read by the job itself at its end."""
+    return os.path.join(lock_dir(), f'{kind}-{pid}.jsonl')
 
 
-def note_pause(pid, **entry):
+def note_pause(pid, kind='paused', **entry):
     try:
-        with open(pause_file(pid), 'a') as f:
+        with open(pause_file(pid, kind), 'a') as f:
             f.write(json.dumps({'time': time.time(), **entry}) + '\n')
     except OSError as error:
         print(f'heavy: pause of job {pid} not noted: {error}', file=sys.stderr, flush=True)
 
 
-def pauses(pid):
-    """(seconds paused, [perf runs that paused it]) for the job with slot holder pid, from its
-    pause file (removed); a pause not yet resumed counts until now."""
+def pauses(pid, kind='paused'):
+    """(seconds paused or demoted, [perf runs that did it]) for the job with slot holder pid, from
+    its kind's file (removed); one not yet ended counts until now."""
     try:
-        with open(pause_file(pid)) as f:
+        with open(pause_file(pid, kind)) as f:
             entries = [json.loads(line) for line in f if line.strip()]
-        os.unlink(pause_file(pid))
+        os.unlink(pause_file(pid, kind))
     except FileNotFoundError:
         return 0.0, []
     except (OSError, ValueError) as error:
@@ -395,20 +409,114 @@ def pause_quiet_pools(label):
     return paused
 
 
-def start_quiet(label):
+PRIO_DARWIN_PROCESS, PRIO_DARWIN_BG = 4, 0x1000  # <sys/resource.h>
+BACKGROUND_PRIORITY = 4  # ps pri of a darwin-background process (taskpolicy -b)
+
+
+def process_table(pids):
+    """{pid: (parent pid, ps scheduling priority)} for the pids still alive."""
+    if not pids:
+        return {}
+    out = subprocess.run(['ps', '-o', 'pid=,ppid=,pri=', '-p', ','.join(map(str, pids))],
+                         capture_output=True, text=True).stdout
+    table = {}
+    for fields in (line.split() for line in out.splitlines()):
+        if len(fields) == 3 and all(x.lstrip('-').isdigit() for x in fields):
+            table[int(fields[0])] = (int(fields[1]), int(fields[2]))
+    return table
+
+
+def quiet_jobs():
+    """[(slot, job label, slot holder pid)] of the running build/quick/sweep jobs."""
+    jobs = []
+    for name in ['build-priority', 'build-idle'] + [n for pool in QUIET_POOLS for n in slot_names(pool)]:
+        fd = try_lock(name)
+        if fd is not None:
+            os.close(fd)
+            continue
+        info = holder(name)
+        if info.get('pid') and alive(info['pid']):
+            jobs.append((name, info.get('label', name), info['pid']))
+    return jobs
+
+
+def demote_quiet_pools(label, demoted, seen, noted):
+    """--cpu-quiet=ecore, every second: each process of a running build/quick/sweep job (its whole
+    tree) not yet seen goes to darwin background QoS (efficiency cores, low CPU and I/O priority),
+    setpriority(PRIO_DARWIN_PROCESS, PRIO_DARWIN_BG), as taskpolicy -b does. Children forked
+    later inherit it. demoted: pid -> slot holder, the processes this run demoted or that inherited
+    it from them (it restores those). A process already in the background (a job started with
+    taskpolicy -b) is left alone and not restored."""
+    for name, job, root in quiet_jobs():
+        tree = [root] + [p for p in descendants(root)]
+        table = process_table([p for p in tree if p not in seen])
+        count = 0
+        for pid, (ppid, priority) in table.items():
+            seen.add(pid)
+            if priority <= BACKGROUND_PRIORITY:
+                if ppid in demoted:
+                    demoted[pid] = root  # inherited from a process this run demoted
+                continue
+            try:
+                os.setpriority(PRIO_DARWIN_PROCESS, pid, PRIO_DARWIN_BG)
+                demoted[pid] = root
+                count += 1
+            except (ProcessLookupError, PermissionError):
+                pass
+        if root not in noted:
+            noted[root] = job
+            note_pause(root, 'ecore', start=label)
+            print(f'heavy: {label}: CPU quiet (E-cores): {job} ({name}) at background QoS, {count} processes',
+                  file=sys.stderr, flush=True)
+            record({'event': 'quiet-ecore', 'by': label, 'label': job, 'slot': name, 'pids': count})
+
+
+def restore_demoted(label, demoted, noted):
+    """The end of --cpu-quiet=ecore: the jobs' records first, then each demoted process back."""
+    for root, job in noted.items():
+        note_pause(root, 'ecore', end=label)
+    for pid in demoted:
+        try:
+            os.setpriority(PRIO_DARWIN_PROCESS, pid, 0)
+        except (ProcessLookupError, PermissionError):
+            pass
+    for job in noted.values():
+        print(f'heavy: {label}: CPU quiet over: {job} back from E-cores', file=sys.stderr, flush=True)
+
+
+def start_quiet(label, mode='stop'):
     """--cpu-quiet: until this job ends (at most BB_HEAVY_QUIET_MAX seconds), no build, quick or
     sweep job is admitted and the running ones are paused. A forked watcher holds
     BB_HEAVY_DIR/cpu-quiet, pauses the jobs, waits for this process (which goes on to exec the
-    perf run) to end or the bound to pass, then resumes them and says so."""
+    perf run) to end or the bound to pass, then resumes them and says so.
+    --cpu-quiet=ecore: jobs are not paused but demoted to background QoS (E-cores), new ones
+    start there, and the demoted processes are restored at the end (demote_quiet_pools)."""
     bound = seconds('BB_HEAVY_QUIET_MAX', 1200)
     lock = lock_file('cpu-quiet')
     fcntl.flock(lock, fcntl.LOCK_EX)
+    with open(os.path.join(lock_dir(), 'cpu-quiet.mode'), 'w') as f:
+        f.write(mode + '\n')
     target = os.getpid()
     if os.fork():
         os.close(lock)  # the watcher keeps the lock
         return
     os.setsid()
     started = time.monotonic()
+    if mode == 'ecore':
+        demoted, seen, noted = {}, set(), {}
+        while alive(target) and time.monotonic() - started < bound:
+            demote_quiet_pools(label, demoted, seen, noted)
+            time.sleep(1)
+        if not noted:
+            print(f'heavy: {label}: CPU quiet (E-cores): no build, quick or sweep job was running',
+                  file=sys.stderr, flush=True)
+        if alive(target):
+            print(f'heavy: {label}: CPU QUIET BOUND REACHED after {bound} s: restoring demoted jobs while '
+                  f'this job still runs', file=sys.stderr, flush=True)
+        restore_demoted(label, demoted, noted)
+        record({'event': 'quiet-end', 'by': label, 'mode': 'ecore', 'seconds': round(time.monotonic() - started, 1),
+                'bound_reached': alive(target), 'restored': list(noted.values()), 'processes': len(demoted)})
+        os._exit(0)
     paused = pause_quiet_pools(label)
     while alive(target) and time.monotonic() - started < bound:
         time.sleep(1)
@@ -458,7 +566,8 @@ def run(pool, priority, gpu, label, command, pool_given=False, quiet=False):
         # in it keeps running when the user returns. Checked at most every 10 s while waiting.
         if pool in QUIET_POOLS and (idle_checked is None or time.monotonic() - idle_checked >= 10):
             idle, idle_checked = user_state(), time.monotonic()
-        if pool in QUIET_POOLS and quiet_active():
+        ecore = pool in QUIET_POOLS and quiet_mode() == 'ecore'
+        if pool in QUIET_POOLS and not ecore and quiet_active():
             # A perf run wants the CPU quiet: nothing new starts until it ends.
             if time.monotonic() - reported >= WAIT_REPORT_SECONDS:
                 print(f'heavy: {label}: waiting: a perf run keeps the CPU quiet', file=sys.stderr, flush=True)
@@ -477,12 +586,18 @@ def run(pool, priority, gpu, label, command, pool_given=False, quiet=False):
             os.ftruncate(fd, 0)
             os.pwrite(fd, json.dumps(info).encode(), 0)
             os.fsync(fd)
-            try:  # a pause file left by an earlier job with this pid (killed before its end)
-                os.unlink(pause_file(os.getpid()))
-            except FileNotFoundError:
-                pass
+            for kind in ('paused', 'ecore'):  # left by an earlier job with this pid (killed before its end)
+                try:
+                    os.unlink(pause_file(os.getpid(), kind))
+                except FileNotFoundError:
+                    pass
             waited = time.monotonic() - started
             command, policy = polite(pool, priority, gpu, command, idle)
+            if ecore:
+                # Admitted during a perf run's E-core quiet: background QoS for its whole life.
+                command = ['taskpolicy', '-b', *command]
+                policy = f'{policy}; background QoS (E-cores) for a perf run\'s CPU quiet'
+                record({'event': 'quiet-ecore-admit', 'label': label, 'pool': pool})
             if pool in ('build', 'quick', 'sweep') and not priority and policy != 'normal':
                 print(f'heavy: {label}: {policy}', file=sys.stderr, flush=True)
             in_place = os.environ.pop('BB_HEAVY_EXEC', '') == '1'
@@ -499,7 +614,7 @@ def run(pool, priority, gpu, label, command, pool_given=False, quiet=False):
             if gpu:
                 take_gpu(gpu, label)
             if quiet:
-                start_quiet(label)
+                start_quiet(label, quiet)
             announce(label)
             if pool == 'quick':
                 supervise_quick(label, command)
@@ -605,6 +720,14 @@ def record_end(label, pool, status, started, **extra):
                  ': a wall-clock timeout in the job may have fired on resume; rerun before calling it a failure'),
               file=sys.stderr, flush=True)
         event.update(paused_s=round(paused, 1), paused_by=by)
+    slowed, slowed_by = pauses(os.getpid(), 'ecore')
+    if slowed_by:
+        code = event.get('signal') or f'exit {event["status"]}'
+        print(f'heavy: {label}: ran {slowed:.0f} s at E-core QoS for perf runs ({"; ".join(slowed_by)}); ended with {code}'
+              + ('' if event['status'] == 0 else
+                 ': it ran slower, so a tight time limit in the job may have fired; rerun before calling it a failure'),
+              file=sys.stderr, flush=True)
+        event.update(ecore_s=round(slowed, 1), ecore_by=slowed_by)
     invalid = tree_changed(label)
     if invalid:
         print(f'heavy: {label}: INVALID: {invalid}; the result does not belong to one tree',
@@ -664,7 +787,7 @@ def supervise_quick(label, command):
         except subprocess.TimeoutExpired:
             pass
         now = time.monotonic()
-        if quiet_active():
+        if quiet_mode() == 'stop':
             started += now - last  # paused for a perf run: the time limit pauses too
         last = now
         elapsed = now - started
@@ -693,12 +816,15 @@ def main(argv):
             priority, argv = True, argv[1:]
         elif argv[0] == '--pool' and len(argv) > 1 and argv[1] in POOLS:
             pool, argv, pool_given = argv[1], argv[2:], True
-        elif argv[0] == '--cpu-quiet':
-            quiet, argv = True, argv[1:]
+        elif argv[0] in ('--cpu-quiet', '--cpu-quiet=stop'):
+            quiet, argv = 'stop', argv[1:]
+        elif argv[0] == '--cpu-quiet=ecore':
+            quiet, argv = 'ecore', argv[1:]
         elif argv[0] == '--gpu' and len(argv) > 1 and argv[1] in ('shared', 'exclusive'):
             gpu, argv = argv[1], argv[2:]
         else:
-            fail(f'unknown option {argv[0]} (--pool build|playtest|quick|sweep, --priority, --gpu shared|exclusive, --cpu-quiet)')
+            fail(f'unknown option {argv[0]} (--pool build|playtest|quick|sweep, --priority, --gpu shared|exclusive, '
+                 f'--cpu-quiet[=stop|ecore])')
     if pool == 'playtest' and gpu is None:
         gpu = 'shared'  # a game uses the GPU
     if quiet and gpu != 'exclusive':
