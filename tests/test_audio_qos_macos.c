@@ -53,6 +53,7 @@ static void *worker(void *arg) {
 }
 int main(int argc,char **argv) {
     assert(argc==2);
+    (void)argv;
 #ifndef BB_QOS_REAL
     inject_error=!strcmp(argv[1],"error");
     inject_mismatch=!strcmp(argv[1],"mismatch");

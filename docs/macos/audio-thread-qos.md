@@ -11,7 +11,8 @@ are guest requests, not measured host priorities.
 
 `runtime_thread.c::create` copies the guest attributes but applies only host
 stack settings before `pthread_create`. `host_start` attaches TLS and names
-the thread; it applies neither QoS nor a Mach time-constraint policy. Later
+the thread; in default/inherit mode it applies neither QoS nor a Mach
+time-constraint policy. Later
 guest priority setters update the stored field only. Therefore the guest's
 requested audio priority distinction is lost. No current log reports the
 actual requested/effective host QoS; do not substitute a guessed inherited
@@ -46,8 +47,9 @@ It logs the two selected thread identities, guest priorities, requested host QoS
 before/after once, stopping on API errors. Querying pthread QoS records the requested
 class, not proof of the effective scheduling class under process clamps.
 Keep errors loud when the explicit experiment cannot be applied. In stats
-mode, it logs the actual AudioOut caller once per port too, to confirm this
-name-based selection targets the producer. The startup hook preserves host and guest errno.
+mode, it logs the first observed AudioOut caller per port, to confirm this
+name-based selection targets the producer. It does not track subsequent
+producer-thread changes. The startup hook preserves host and guest errno.
 
 Use the documented [pthread QoS API](https://developer.apple.com/library/archive/documentation/Performance/Conceptual/power_efficiency_guidelines_osx/PrioritizeWorkAtTheTaskLevel.html).
 A Mach realtime policy needs a qualified computation budget and bounded
