@@ -138,6 +138,8 @@ def take_gpu(mode, label):
         return
     if held == 'shared':
         fail(f'{label}: --gpu exclusive inside a shared GPU hold would wait for itself')
+    # Requested, then (event gpu) granted: a job that ends while waiting leaves the request alone.
+    record({'event': 'gpu-request', 'label': label, 'mode': mode, 'pid': os.getpid()})
     gate = lock_file('gpu-gate')
     if mode == 'exclusive':
         gate_wait = wait_flock(gate, fcntl.LOCK_EX, label, 'the GPU gate')
@@ -484,6 +486,34 @@ def restore_demoted(label, demoted, noted):
         print(f'heavy: {label}: CPU quiet over: {job} back from E-cores', file=sys.stderr, flush=True)
 
 
+def top_processes(count=5):
+    """The COUNT processes using most CPU now, 'pcpu% pid command' each (ps -r)."""
+    out = subprocess.run(['ps', '-Ao', 'pcpu=,pid=,comm=', '-r'], capture_output=True, text=True).stdout
+    return [' '.join(line.split(None, 2)[:2]) + ' ' + os.path.basename(line.split(None, 2)[2])
+            for line in out.splitlines()[:count] if len(line.split(None, 2)) == 3]
+
+
+def settle(label, limit, bound):
+    """--settle LOAD,SECONDS: before the perf run starts (other jobs already paused or demoted),
+    waits until the 1-minute load average is below LOAD. Past SECONDS it refuses the run (exit 75),
+    naming the load and the top processes."""
+    started = time.monotonic()
+    first = os.getloadavg()[0]
+    while os.getloadavg()[0] >= limit:
+        if time.monotonic() - started >= bound:
+            top = top_processes()
+            record({'event': 'settle', 'label': label, 'limit': limit, 'load': round(os.getloadavg()[0], 2),
+                    'waited_s': round(time.monotonic() - started, 1), 'settled': False, 'top': top})
+            fail(f'{label}: SETTLE FAILED: 1-minute load {os.getloadavg()[0]:.1f} still at or above {limit} after '
+                 f'{bound} s; top: {"; ".join(top)}', 75)
+        time.sleep(2)
+    waited = time.monotonic() - started
+    record({'event': 'settle', 'label': label, 'limit': limit, 'load_before': round(first, 2),
+            'load': round(os.getloadavg()[0], 2), 'waited_s': round(waited, 1), 'settled': True})
+    print(f'heavy: {label}: settled: 1-minute load {os.getloadavg()[0]:.1f} below {limit} after {waited:.0f} s '
+          f'(was {first:.1f})', file=sys.stderr, flush=True)
+
+
 def start_quiet(label, mode='stop'):
     """--cpu-quiet: until this job ends (at most BB_HEAVY_QUIET_MAX seconds), no build, quick or
     sweep job is admitted and the running ones are paused. A forked watcher holds
@@ -496,6 +526,10 @@ def start_quiet(label, mode='stop'):
     fcntl.flock(lock, fcntl.LOCK_EX)
     with open(os.path.join(lock_dir(), 'cpu-quiet.mode'), 'w') as f:
         f.write(mode + '\n')
+    top = top_processes()
+    record({'event': 'quiet-start', 'by': label, 'mode': mode, 'load': [round(x, 2) for x in os.getloadavg()],
+            'top': top})
+    print(f'heavy: {label}: CPU quiet ({mode}) starts; top CPU: {"; ".join(top)}', file=sys.stderr, flush=True)
     target = os.getpid()
     if os.fork():
         os.close(lock)  # the watcher keeps the lock
@@ -543,7 +577,7 @@ def announce(label):
         print(f'heavy: {label}: running', file=sys.stderr, flush=True)
 
 
-def run(pool, priority, gpu, label, command, pool_given=False, quiet=False):
+def run(pool, priority, gpu, label, command, pool_given=False, quiet=False, settle_at=None):
     held = os.environ.get('BB_HEAVY_HELD')
     if held and quiet:
         fail(f'{label}: --cpu-quiet inside {held} would pause the job it runs in')
@@ -615,6 +649,8 @@ def run(pool, priority, gpu, label, command, pool_given=False, quiet=False):
                 take_gpu(gpu, label)
             if quiet:
                 start_quiet(label, quiet)
+                if settle_at:
+                    settle(label, *settle_at)
             announce(label)
             if pool == 'quick':
                 supervise_quick(label, command)
@@ -810,7 +846,7 @@ def supervise_quick(label, command):
 def main(argv):
     if argv == ['status']:
         return status()
-    pool, priority, gpu, pool_given, quiet = 'build', False, None, False, False
+    pool, priority, gpu, pool_given, quiet, settle_at = 'build', False, None, False, False, None
     while argv and argv[0].startswith('--') and argv[0] != '--':
         if argv[0] == '--priority':
             priority, argv = True, argv[1:]
@@ -820,13 +856,24 @@ def main(argv):
             quiet, argv = 'stop', argv[1:]
         elif argv[0] == '--cpu-quiet=ecore':
             quiet, argv = 'ecore', argv[1:]
+        elif argv[0] == '--settle' and len(argv) > 1:
+            load, _, wait = argv[1].partition(',')
+            try:
+                settle_at = (float(load), int(wait))
+            except ValueError:
+                settle_at = None
+            if not settle_at or settle_at[0] <= 0 or settle_at[1] < 1:
+                fail(f'--settle needs LOAD,SECONDS (a positive load and whole seconds), not {argv[1]}')
+            argv = argv[2:]
         elif argv[0] == '--gpu' and len(argv) > 1 and argv[1] in ('shared', 'exclusive'):
             gpu, argv = argv[1], argv[2:]
         else:
             fail(f'unknown option {argv[0]} (--pool build|playtest|quick|sweep, --priority, --gpu shared|exclusive, '
-                 f'--cpu-quiet[=stop|ecore])')
+                 f'--cpu-quiet[=stop|ecore], --settle LOAD,SECONDS)')
     if pool == 'playtest' and gpu is None:
         gpu = 'shared'  # a game uses the GPU
+    if settle_at and not quiet:
+        fail('--settle is for --cpu-quiet runs (the load can only fall while other jobs are quiet)')
     if quiet and gpu != 'exclusive':
         fail('--cpu-quiet is for --gpu exclusive jobs (perf runs)')
     if priority and pool != 'build':
@@ -834,7 +881,7 @@ def main(argv):
     if len(argv) < 3 or argv[1] != '--' or not argv[0]:
         fail('usage: heavy.sh [--pool build|playtest|quick|sweep] [--priority] [--gpu shared|exclusive] LABEL -- '
              'COMMAND [ARG...] | heavy.sh status')
-    run(pool, priority, gpu, argv[0], argv[2:], pool_given, quiet)
+    run(pool, priority, gpu, argv[0], argv[2:], pool_given, quiet, settle_at)
 
 
 if __name__ == '__main__':

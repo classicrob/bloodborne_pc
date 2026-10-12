@@ -110,6 +110,13 @@ at E-core QoS says so at its end (`ran N s at E-core QoS for perf runs (...)`; `
 `ecore_by` in its end event). It is for A/Bs only once measured: a replay pair, idle against a
 full build at E-core QoS, with medians within 1% and no tail change.
 
+`--settle LOAD,SECONDS` (with `--cpu-quiet` only): after the other jobs are paused or demoted
+and before the perf run starts, wait until the 1-minute load average is below LOAD; past SECONDS
+the run is refused (exit 75) with the load and the top CPU processes. Every quiet start records
+the top 5 CPU processes in the history (`quiet-start`, `top`), so a stray hog shows there. GPU
+lock requests are recorded too (`gpu-request` before the `gpu` grant): a job that ended while
+waiting has a request and no grant.
+
 A paused job says so when it ends, with its exit status, and its end event in the history
 carries `paused_s` and `paused_by`:
 

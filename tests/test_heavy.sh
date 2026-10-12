@@ -429,6 +429,28 @@ job_b=$(pgrep -P "$b17_ninja" | head -1 || true)
 job_b_pri=$( [[ -n $job_b ]] && pri "$job_b" || echo none)
 wait "$p16"; wait "$b17" || fail "B17 (ninja) failed"
 [[ $job_b_pri == 4 ]] || fail "a job ninja spawned during the E-core quiet is not in the background (priority $job_b_pri)"
+# --settle LOAD,SECONDS: a quiet run waits for the 1-minute load to fall below LOAD, or refuses
+# (exit 75) past SECONDS, naming the top processes; the quiet start records the top 5 CPU
+# processes; a GPU request is recorded before its grant; --settle needs --cpu-quiet.
+"$heavy" --pool playtest --gpu exclusive --cpu-quiet --settle 1000,5 P17 -- true 2> "$dir/p17.err" ||
+    fail "a run with a reachable --settle failed: $(cat "$dir/p17.err")"
+grep -q 'P17: settled: 1-minute load' "$dir/p17.err" || fail "settle not reported: $(cat "$dir/p17.err")"
+set +e; "$heavy" --pool playtest --gpu exclusive --cpu-quiet --settle 0.001,2 P18 -- touch "$dir/p18-ran" 2> "$dir/p18.err"; p18=$?; set -e
+(( p18 == 75 )) || fail "an unreachable --settle exited $p18, expected 75"
+[[ ! -e $dir/p18-ran ]] || fail "the run started although the load never settled"
+grep -q 'P18: SETTLE FAILED: 1-minute load .* still at or above 0.001 after 2 s; top: ' "$dir/p18.err" ||
+    fail "settle failure not explained: $(cat "$dir/p18.err")"
+if "$heavy" --settle 1,5 P19 -- true 2>/dev/null; then fail "--settle without --cpu-quiet accepted"; fi
+python3 - "$dir/history.jsonl" <<'PY' || fail "settle, quiet-start top or gpu-request events in history.jsonl"
+import json, sys
+events = [json.loads(line) for line in open(sys.argv[1])]
+settles = {e['label']: e for e in events if e.get('event') == 'settle'}
+assert settles['P17']['settled'] is True and settles['P18']['settled'] is False and settles['P18']['top'], settles
+starts = [e for e in events if e.get('event') == 'quiet-start' and e['by'] == 'P17']
+assert starts and len(starts[0]['top']) == 5 and starts[0]['mode'] == 'stop', starts
+order = [e['event'] for e in events if e.get('label') == 'P17' and e['event'] in ('gpu-request', 'gpu')]
+assert order[:2] == ['gpu-request', 'gpu'], order
+PY
 if "$heavy" --cpu-quiet K1 -- true 2>/dev/null; then fail "--cpu-quiet without --gpu exclusive accepted"; fi
 if "$heavy" K2 -- "$heavy" --pool playtest --gpu exclusive --cpu-quiet K3 -- true 2>/dev/null; then
     fail "--cpu-quiet inside a slot accepted"
@@ -523,4 +545,4 @@ assert any(l['label'] == 'B' for l in starts), 'B started'  # after A ended: che
 assert all({'pool', 'slot', 'waited_s', 'load', 'held'} <= set(l) for l in starts)
 assert any(l['label'] == 'Q4' and l['status'] == 124 for l in ends), 'Q4 killed'
 PY
-echo "heavy.sh: history log, build/playtest/quick pools, quick hints and time limit, waiting, priority slot, GPU shared/exclusive lock with gate, start announcement, polite scheduling, idle-aware admission, CPU-quiet pause (leaving another pause's processes stopped; named at the job's end), --cpu-quiet=ecore (background QoS read back, inherited, restored), job records (command, directory, end status/signal, orphans), one job per worktree and INVALID on a changed tree, sweep lane, release on SIGKILL, nesting, exit status, usage errors PASS"
+echo "heavy.sh: history log, build/playtest/quick pools, quick hints and time limit, waiting, priority slot, GPU shared/exclusive lock with gate, start announcement, polite scheduling, idle-aware admission, CPU-quiet pause (leaving another pause's processes stopped; named at the job's end), --cpu-quiet=ecore (background QoS read back, inherited, restored), --settle, quiet-start top processes, GPU request events, job records (command, directory, end status/signal, orphans), one job per worktree and INVALID on a changed tree, sweep lane, release on SIGKILL, nesting, exit status, usage errors PASS"
