@@ -59,6 +59,18 @@ enum : std::uint64_t {
     SampleSceneProxies = 1ull << 48,
     OrderedGuestWrites = 1ull << 49,
     SceneHalfRes = 1ull << 50, ///< live scaling also reduces the 960x540 post targets
+    // Renderer debug switches (bit set: the named effect), read live:
+    // BB_DEBUG_MOTION=1 overlay modes instead of the motion-vector colours (the first set wins).
+    MotionOverlayDepth = 1ull << 20,       ///< raw depth
+    MotionOverlayViewZ = 1ull << 21,       ///< view-space z / 50
+    MotionOverlayReprojected = 1ull << 22, ///< the previous frame reprojected by camera motion
+    MotionOverlayDifference = 1ull << 23,  ///< |reprojected previous - current| * 4
+    TemporalUpscalerOff = 1ull << 24,      ///< FSR 3/4 and TAA switched off at run time
+    UpscalerJitterOff = 1ull << 25,        ///< no sub-pixel jitter of scene geometry
+    UpscalerJitterSign = 1ull << 26,       ///< the opposite jitter sign convention (tests)
+    ReactiveMaskOff = 1ull << 27,          ///< no reactive mask for FSR 3
+    ReactiveMaskView = 1ull << 28,         ///< the reactive mask in red over a darkened frame
+    ObjectMotionOff = 1ull << 29,          ///< no object motion vectors (camera motion only)
     UpdateImageFastPath = 1u << 30,
     // TAA A/B in one run: optional techniques, off by default (no measured gain, 2026-10-02).
     TaaTonemapBlend = 1ull << 51,
@@ -99,7 +111,6 @@ enum : std::uint64_t {
     // recorder-side writes, as on the PS4, where the CP writes it when it parses it. Read per
     // WRITE_DATA (live A/B).
     WriteDataAfterLabels = 1ull << 63,
-    // Bits 20-29 are used as raw debug toggles by the camera/object motion and the upscaler.
 };
 inline bool Disabled(std::uint64_t bit) {
     return (__atomic_load_n(&runtime_disabled_optimizations, __ATOMIC_RELAXED) & bit) != 0;
