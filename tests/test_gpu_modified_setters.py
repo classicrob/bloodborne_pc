@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
-"""Only the allowed functions make an image GPU-authoritative (ImageFlagBits::GpuModified).
+"""Checks the `flags |= ... GpuModified` spelling: only the allowed functions use it.
 
-TextureCache::MarkGpuWritten is the one way to do it after a GPU write recorded outside the
-binding paths: it also tracks the image's pages for guest CPU writes. An image marked
-GpuModified without tracking is trusted by write-backs (SynchronizeMemoryFromImage) while
-guest CPU writes to its memory go unnoticed (the RT fill regression, PREVIEW-20). The binding
-paths go through UpdateImage, which tracks first; the runtime's copies propagate the source's
-flag inside texture-cache merges, whose new images are tracked when registered.
-Exit 0: no other setter. Exit 1: names each one.
+TextureCache::MarkGpuWritten is meant to be the one way to make an image GPU-authoritative after
+a GPU write recorded outside the binding paths: it also tracks the image's pages for guest CPU
+writes. An image marked GpuModified without tracking is trusted by write-backs
+(SynchronizeMemoryFromImage) while guest CPU writes to its memory go unnoticed; that is the
+candidate mechanism of the PREVIEW-20 float-descriptor stops (the PREVIEW-21f A/B decides).
+The binding paths go through UpdateImage, which tracks first; the runtime's copies propagate the
+source's flag inside texture-cache merges, whose new images are tracked when registered.
+A guard for that spelling only, not a proof of every state transition (another spelling, or an
+assignment of a whole flags value, is not seen).
+Exit 0: no matching setter outside the allowed functions. Exit 1: names each one.
 """
 import pathlib
 import re
