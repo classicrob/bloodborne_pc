@@ -3,6 +3,9 @@
 
 #pragma once
 
+#include <cstring>
+
+#include "bbport_lock_wait.h"
 #include <deque>
 #include <functional>
 #include <unordered_map>
@@ -122,6 +125,17 @@ struct PipelineSelection {
     std::array<vk::ShaderModule, MaxShaderStages> modules{};
     std::optional<Shader::Gcn::FetchShaderData> fetch_shader{};
     GraphicsPipelineKey graphics_key{};
+    /// Forgets the previous draw's stages before a selection binds this one's: a stage that is
+    /// disabled or has no program must not keep the last draw's runtime info (the pipeline
+    /// reads the fragment slot even without a fragment shader: a stale depth_bounds_test gave
+    /// an FS-less pipeline a depth-bounds layout, P0 2026-10-12).
+    void ResetStages() {
+        for (auto& info : runtime_infos) {
+            std::memset(&info, 0, sizeof(info)); // all-zero, as RuntimeInfo::Initialize starts
+        }
+        infos.fill(nullptr);
+        modules.fill(nullptr);
+    }
     /// Why RefreshGraphicsKey refused the last draw it refused (BB_FRAME_STATS).
     DrawDrop refusal{DrawDrop::StageCombination};
     bool motion = false;
@@ -254,7 +268,7 @@ private:
     Shader::Pools pools;
     tsl::robin_map<size_t, std::unique_ptr<Program>> program_cache;
     /// bbport: exclusive for program/permutation insertions, shared for worker lookups.
-    std::shared_mutex programs_mutex;
+    BB_TIMED_SHARED_LOCK(std::shared_mutex, KLockPrograms) programs_mutex;
     u64 prepared_hits = 0, prepared_misses = 0;
     const PreparedDraw* used_prepared = nullptr;
     tsl::robin_map<ComputePipelineKey, std::unique_ptr<ComputePipeline>> compute_pipelines;

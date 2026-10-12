@@ -8,6 +8,7 @@
 #include "bbport_toggles.h"
 
 #include <condition_variable>
+#include "bbport_lock_wait.h"
 #include <functional>
 #include <mutex>
 #include <thread>
@@ -448,7 +449,7 @@ private:
     Common::LeastRecentlyUsedCache<u64, u64> sampler_lru_cache;
     const bool readback_linear_images;
     PageTable page_table;
-    std::mutex mutex;
+    BB_TIMED_LOCK(std::mutex, KLockTextureCache) mutex;
     // bbport: FindImage results for unchanged image registrations (guarded by `mutex`).
     struct FindImageCacheEntry {
         VAddr address = 0;
@@ -467,7 +468,7 @@ private:
     };
     std::array<FindImageCacheEntry, 1024> find_image_cache{};
     std::atomic<u64> registry_generation{0};
-    std::mutex samplers_mutex;
+    BB_TIMED_LOCK(std::mutex, KLockSamplers) samplers_mutex;
     std::mutex download_images_mutex;
     struct MetaDataInfo {
         MetaType type;

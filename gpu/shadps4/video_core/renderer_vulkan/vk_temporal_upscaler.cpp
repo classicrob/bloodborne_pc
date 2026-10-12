@@ -262,12 +262,12 @@ bool TemporalUpscaler::Active() const {
            (BbSettings::Get().upscaler == BbSettings::UpscalerFsr3 ||
             BbSettings::IsFsr4(BbSettings::Get().upscaler) ||
             BbSettings::Get().upscaler == BbSettings::UpscalerTaa) &&
-           !BbToggle::Disabled(1u << 24);
+           !BbToggle::Disabled(BbToggle::TemporalUpscalerOff);
 }
 
 bool TemporalUpscaler::ReactiveOn() const {
     // FSR 4 takes no reactive mask: the opaque snapshot and the mask pass would be wasted.
-    return BbSettings::Get().reactive && !BbToggle::Disabled(1u << 27) && !UseFsr4() &&
+    return BbSettings::Get().reactive && !BbToggle::Disabled(BbToggle::ReactiveMaskOff) && !UseFsr4() &&
            BbSettings::Get().upscaler != BbSettings::UpscalerTaa;
 }
 
@@ -323,7 +323,7 @@ bool TemporalUpscaler::OnFrameStart() {
     const int preset = BbSettings::RenderPreset();
     if (applied_preset != preset || settings.upscaler == BbSettings::UpscalerOff) failed = false;
     const bool active = Active();
-    const bool jitter_on = active && settings.jitter && !BbToggle::Disabled(1u << 25);
+    const bool jitter_on = active && settings.jitter && !BbToggle::Disabled(BbToggle::UpscalerJitterOff);
     const int upscaler = settings.upscaler.load();
     const int output = settings.output_res.load();
     const bool output_changed = !scaled_session && applied_output != output;
@@ -1154,8 +1154,8 @@ void TemporalUpscaler::Run() {
                                          FFX_VK_PORTABLE_RESOURCE_STATE_GENERIC_READ);
         }
         info.transparencyAndCompositionMask.structSize = sizeof(info.transparencyAndCompositionMask);
-        // Toggle 1 << 26 (tests): the opposite sign convention for FSR.
-        const float sign = BbToggle::Disabled(1u << 26) ? -1.0f : 1.0f;
+        // Toggle UpscalerJitterSign (bit 26, tests): the opposite sign convention for FSR.
+        const float sign = BbToggle::Disabled(BbToggle::UpscalerJitterSign) ? -1.0f : 1.0f;
         info.jitterOffset = {sign * jitter[0], sign * jitter[1]};
         info.motionVectorScale = {1.0f, 1.0f};
         info.renderSize = {w, h};
@@ -1254,11 +1254,11 @@ void TemporalUpscaler::Run() {
              .descriptorType = vk::DescriptorType::eSampledImage,
              .pImageInfo = &objects_info},
         }};
-        // Debug (menu or toggle 1 << 28): the reactive mask in red over a darkened frame;
+        // Debug (menu or toggle ReactiveMaskView, bit 28): the reactive mask in red over a darkened frame;
         // or the motion vectors (menu).
         const int debug_view = BbSettings::Get().debug_view;
         const u32 mode = has_reactive && (debug_view == BbSettings::DebugReactive ||
-                                          BbToggle::Disabled(1u << 28))
+                                          BbToggle::Disabled(BbToggle::ReactiveMaskView))
                              ? 1
                          : debug_view == BbSettings::DebugMotion ? 2
                                                                  : 0;
@@ -1750,7 +1750,7 @@ void TemporalUpscaler::RunScaled() {
     }
 
     info.transparencyAndCompositionMask.structSize = sizeof(info.transparencyAndCompositionMask);
-    const float sign = BbToggle::Disabled(1u << 26) ? -1.0f : 1.0f;
+    const float sign = BbToggle::Disabled(BbToggle::UpscalerJitterSign) ? -1.0f : 1.0f;
     info.jitterOffset = {sign * jitter[0], sign * jitter[1]};
     info.motionVectorScale = {1.0f, 1.0f};
     info.renderSize = {w, h};
@@ -2028,7 +2028,7 @@ bool TemporalUpscaler::RecordFsr4(vk::CommandBuffer cmdbuf, Fsr4Upscaler::Image 
     const auto& settings = BbSettings::Get();
     // Same jitter convention as FSR 3; the menu (or toggle 1 << 26) flips it for tests.
     const float sign =
-        BbToggle::Disabled(1u << 26) != settings.fsr4_invert_jitter.load() ? -1.0f : 1.0f;
+        BbToggle::Disabled(BbToggle::UpscalerJitterSign) != settings.fsr4_invert_jitter.load() ? -1.0f : 1.0f;
     const bool ok = fsr4->Record({
         .cmdbuf = cmdbuf,
         .color = color,
