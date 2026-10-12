@@ -130,6 +130,26 @@ The previous frame's matrices are not there; the port keeps them itself.
 
 - Camera motion vectors: verified by reprojecting the previous frame (`BB_DEBUG_MOTION=1`,
   toggles 1<<22 reprojected frame, 1<<23 error map): static geometry matches.
+- Camera motion and TAA's previous-depth check invert the scene (G-buffer) pass's own viewport
+  (2026-10-12; supersedes 1c558d3): ndc = (pixel + 0.5 - jitter - offset) / scale on both axes,
+  with the enabled guest x/y scale and offset times the render-target scale, from the frame's
+  G-buffer draws (CameraMotion::OnGBufferViewport, SceneViewportLatch); the previous position is
+  projected with the previous frame's viewport. A frame whose G-buffer draws have no viewport
+  (clip disabled), a zero or non-finite one, or two different ones has no camera motion (the
+  motion pass, TAA and the debug overlay share one readiness check), reported once. The motion
+  pass's push block stays within Vulkan's guaranteed 128 bytes; only BB_DEBUG_MOTION=1 needs
+  136. The dump meta (fNNN_meta.json) records both viewports.
+  **For upstream watchers:** upstream (MaSieS4Fun/ARM_bloodborne_pc 2b705bb, 2026-10-06) fixed
+  the reconstruction to a constant "view +y down" (2v - 1), measured against the object vectors
+  on the Cathedral Ward stairs; the code before it used the constant 1 - 2v. Neither constant is
+  a property of the game: screen y = yoffset + ndc_y * yscale, and the sign of yscale is
+  whatever the game's registers say for that pass. The object vectors already use yscale, so
+  they follow it; a constant matches them only where the game's yscale has the sign it assumes.
+  In the clinic (Playtest motion check 2026-10-11, motion-214203) camera vectors with 2v - 1
+  were y-inverted against the object vectors (sign agreement 2-35%), and per-pixel reprojection
+  of the dumped frames confirmed the object vectors (luma error 2.5x lower than no motion; the
+  camera vectors were worse than no motion). Taking the viewport from the pass removes the
+  choice.
 - FSR 3.1 (`BB_UPSCALER=fsr3`, FireBurn/FSR-Vulkan submodule): scene color before the
   post-processing combine (compute shader 9a9cf8a9), 1:1, RGB written back (the game keeps data
   in the alpha). Toggle 1<<24 switches it off at run time.
