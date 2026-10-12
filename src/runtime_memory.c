@@ -1031,19 +1031,89 @@ __attribute__((noinline)) void runtime_guest_free(void *pointer) {
  * 1073741824 the lock-free UpdateImage path for clean, tracked images. */
 /* Bits 32 and up: the draw pipeline and related GPU thread work (gpu/shim/bbport_toggles.h). */
 uint64_t runtime_disabled_optimizations;
+/* Word 2 (BbToggle::Word2 in gpu/shim/bbport_toggles.h): an optional second number in the
+ * same file, after white space. A file with one number clears it. The two words are stored
+ * one after the other, not as a pair: write the file elsewhere and rename it into place. */
+uint64_t runtime_disabled_optimizations2;
 /* Speculative readers of guest memory (GPU draw-preparation workers) register a recovery
  * point: a fault on that thread jumps back to it instead of terminating (probe.c). */
 __thread sigjmp_buf *runtime_fault_recover;
+/* The toggle file: nothing (both words 0), one decimal mask, or two separated by white space.
+ * 0, or -1 for anything else (other text, a sign, a third number, a value over 64 bits). */
+static int toggle_parse(const char *text, uint64_t mask[2]) {
+    mask[0]=mask[1]=0;
+    for (int word=0;;++word) {
+        while (*text==' ' || *text=='\t' || *text=='\n' || *text=='\r') ++text;
+        if (!*text) return 0;
+        if (word==2 || *text<'0' || *text>'9') return -1;
+        char *end;
+        errno=0;
+        const unsigned long long value=strtoull(text,&end,10);
+        if (errno || (*end && *end!=' ' && *end!='\t' && *end!='\n' && *end!='\r')) return -1;
+        mask[word]=value; text=end;
+    }
+}
+/* " (bits 3 59)" for the set bits of a mask, nothing for 0. */
+static void toggle_bits(char *out, size_t size, const char *label, uint64_t mask) {
+    *out=0;
+    if (!mask) return;
+    size_t used=(size_t)snprintf(out,size," (%s",label);
+    for (int bit=0;bit<64 && used<size;++bit)
+        if (mask>>bit & 1) used+=(size_t)snprintf(out+used,size-used," %d",bit);
+    if (used<size) snprintf(out+used,size-used,")");
+}
+/* Reads the toggle file: 0 with both masks (a missing file is both 0), or -1 with the reason. */
+static int toggle_read(const char *path, uint64_t mask[2], char *why, size_t size) {
+    mask[0]=mask[1]=0;
+    FILE *f=fopen(path,"r");
+    if (!f) {
+        if (errno==ENOENT) return 0;
+        snprintf(why,size,"cannot open: %s",strerror(errno));
+        return -1;
+    }
+    char text[256];
+    const size_t length=fread(text,1,sizeof text,f);
+    const int error=ferror(f) ? errno : 0;
+    fclose(f);
+    if (error) snprintf(why,size,"read failed: %s",strerror(error));
+    else if (length==sizeof text) snprintf(why,size,"longer than 255 bytes");
+    else if (memchr(text,0,length)) snprintf(why,size,"contains a NUL byte");
+    else if (text[length]=0, toggle_parse(text,mask)) snprintf(why,size,"not one or two decimal masks");
+    else return 0;
+    mask[0]=mask[1]=0;
+    return -1;
+}
+/* Reads of the toggle file finished (tests wait on it). */
+static unsigned long toggle_reads;
 static void *toggle_watcher(void *path) {
-    for (unsigned long long last=ULLONG_MAX;;) {
-        FILE *f=fopen(path,"r");
-        unsigned long long value=0;
-        if (f) { if (fscanf(f,"%llu",&value)!=1) value=0; fclose(f); }
-        if (value!=last) {
-            __atomic_store_n(&runtime_disabled_optimizations,(uint64_t)value,__ATOMIC_RELEASE);
-            printf("Runtime: disabled optimizations mask=%llu\n",value);
-            last=value;
+    uint64_t last[2]={0,0};
+    char last_why[160]="";
+    for (int printed=0;;) {
+        uint64_t mask[2];
+        char why[160];
+        if (toggle_read(path,mask,why,sizeof why)) {
+            /* Unreadable or malformed: both words stay as they were, said once per reason. */
+            if (strcmp(why,last_why)) {
+                printf("Runtime: BB_TOGGLE_FILE %s: %s; disabled optimizations unchanged\n",
+                    (const char *)path,why);
+                fflush(stdout);
+                strcpy(last_why,why);
+            }
+        } else {
+            last_why[0]=0;
+            if (!printed || mask[0]!=last[0] || mask[1]!=last[1]) {
+                __atomic_store_n(&runtime_disabled_optimizations2,mask[1],__ATOMIC_RELEASE);
+                __atomic_store_n(&runtime_disabled_optimizations,mask[0],__ATOMIC_RELEASE);
+                char bits[2][256];
+                toggle_bits(bits[0],sizeof bits[0],"bits",mask[0]);
+                toggle_bits(bits[1],sizeof bits[1],"word 2 bits",mask[1]);
+                printf("Runtime: disabled optimizations mask=%llu%s mask2=%llu%s\n",
+                    (unsigned long long)mask[0],bits[0],(unsigned long long)mask[1],bits[1]);
+                fflush(stdout);
+                last[0]=mask[0]; last[1]=mask[1]; printed=1;
+            }
         }
+        __atomic_add_fetch(&toggle_reads,1,__ATOMIC_RELEASE);
 #ifdef _WIN32
         compat_sleep_ns(250000000);
 #else
