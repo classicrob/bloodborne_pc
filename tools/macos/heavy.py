@@ -700,6 +700,13 @@ def run(pool, priority, gpu, label, command, pool_given=False, quiet=False, sett
         os.execvp(command[0], command)
     started, reported = time.monotonic(), time.monotonic()
     idle, idle_checked = (False, ''), None
+    queued = False
+    def queue(reason):  # a job that must wait says so once in the history (one that vanishes
+        nonlocal queued  # while waiting otherwise leaves no trace there)
+        if not queued:
+            record({'event': 'queued', 'label': label, 'pool': pool, 'pid': os.getpid(), 'reason': reason,
+                    'command': ' '.join(command)[:400], 'cwd': os.getcwd()})
+            queued = True
     while True:
         # While the user is idle the build pool admits one more job (build-idle); a job already
         # in it keeps running when the user returns. Checked at most every 10 s while waiting.
@@ -708,6 +715,7 @@ def run(pool, priority, gpu, label, command, pool_given=False, quiet=False, sett
         ecore = pool in QUIET_POOLS and quiet_mode() == 'ecore'
         if pool in QUIET_POOLS and not ecore and quiet_active():
             # A perf run wants the CPU quiet: nothing new starts until it ends.
+            queue('a perf run keeps the CPU quiet')
             if time.monotonic() - reported >= WAIT_REPORT_SECONDS:
                 print(f'heavy: {label}: waiting: a perf run keeps the CPU quiet', file=sys.stderr, flush=True)
                 reported = time.monotonic()
@@ -765,6 +773,7 @@ def run(pool, priority, gpu, label, command, pool_given=False, quiet=False, sett
                 os.execvp(command[0], command)
             except OSError as error:
                 fail(f'cannot run {command[0]}: {error}', 127)
+        queue('every slot of the pool is held')
         if time.monotonic() - reported >= WAIT_REPORT_SECONDS:
             held = '; '.join(f'{name}: {describe(holder(name))}' for name in names)
             print(f'heavy: {label}: waiting for a slot ({held})', file=sys.stderr, flush=True)

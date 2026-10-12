@@ -556,6 +556,10 @@ assert start['R1']['command'].endswith("sh -c exit 7") and \
     os.path.realpath(start['R1']['cwd']) == os.path.realpath(sys.argv[2]), start['R1']
 assert end['R1']['status'] == 7 and end['R1']['pool'] == 'build' and 'seconds' in end['R1'], end['R1']
 assert end['R2']['signal'] == 'SIGTERM' and end['R2']['status'] == 128 + 15, end['R2']
+queued = {l['label']: l for l in lines if l['event'] == 'queued'}
+assert queued['B']['reason'] == 'every slot of the pool is held' and queued['B']['command'], queued.get('B')
+assert queued['B11']['reason'] == 'a perf run keeps the CPU quiet', queued.get('B11')
+assert 'A' not in queued  # it got its slot at once
 assert 'R3' not in end and 'R4' not in end  # heavy.sh SIGKILLed: no end event (R4: ORPHANED)
 assert start['G1']['end'].startswith('recorded by the caller'), start['G1']
 PY

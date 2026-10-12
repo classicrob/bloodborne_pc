@@ -133,7 +133,8 @@ resumed or restored.
 and before the perf run starts, wait until the 1-minute load average is below LOAD; past SECONDS
 the run is refused (exit 75) with the load and the top CPU processes. Every quiet start records
 the top 5 CPU processes in the history (`quiet-start`, `top`: CPU, pid, process group, command,
-working directory), so a stray hog shows there with its owner. GPU
+working directory), so a stray hog shows there with its owner. A job that has to wait records a `queued` event once
+(reason, command, directory), so one that vanishes while waiting still shows. GPU
 lock requests are recorded too (`gpu-request` before the `gpu` grant): a job that ended while
 waiting has a request and no grant.
 
