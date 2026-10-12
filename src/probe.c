@@ -807,6 +807,7 @@ int main(int argc, char **argv) {
 #endif
     }
     bb_macos_begin_game_activity();
+    bbgpu_apply_task_role(); /* before any other thread: the threads created later inherit it */
     ProbeArguments args={argc,argv};
     return bb_macos_ui_run(probe_worker,&args);
 #else

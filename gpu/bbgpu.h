@@ -16,6 +16,11 @@ typedef struct {
 } BbGpuConfig;
 /* Registers kernel event queues (needed with or without graphics). */
 void bbgpu_register_kernel(void);
+#ifdef __APPLE__
+/* BB_TASK_ROLE (docs/macos/hot-thread-scheduling.md): call from the main thread before it starts
+ * any other thread; stops on a bad value or a refused set. Nothing when unset. */
+void bbgpu_apply_task_role(void);
+#endif
 /* Creates window, Vulkan device, presenter and GPU command processor. */
 int bbgpu_init(const BbGpuConfig *config);
 /* Function for an imported NID ("NID#lib#mod"), or 0 when the GPU library does not provide it. */
