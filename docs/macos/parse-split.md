@@ -105,6 +105,14 @@ later label flushing must keep this within about one submission's encode time. C
 mean and the maximum across arms over the same windows, and read the maximum over several windows,
 since one window's maximum is a single extreme.
 
+It counts the WAIT_REG_MEMs stage A met early (their in-order markers), and the in-order
+WRITE_DATAs behind one (the write barrier, gpu-idle.md):
+- how many submitted stage B's label batch before waiting. These submissions are counted under
+  "label batch at idle";
+- of those, how many batches held only labels after the ones the WRITE_DATA needs. Such a
+  submission does not order that WRITE_DATA; it only writes the later labels sooner;
+- how many then waited for labels, and the mean wait.
+
 One line is printed in the parse-split block. Renderer's render pass census ("Render passes ...")
 attributes each pass end. A pass counts as ended by a submission when it is still open after the
 submission's barrier flush, which can close passes itself (counted there as "barrier"). So "ended

@@ -180,6 +180,11 @@ struct FlushCensus {
     std::atomic<std::uint64_t> labels_written{0}, label_age_ns{0}, label_age_window_max_ns{0};
     /// WAIT_REG_MEMs stage A met early from a pending value (their in-order markers ran).
     std::atomic<std::uint64_t> forwarded_waits{0};
+    /// In-order WRITE_DATAs behind such a WAIT (a nonzero barrier, bbport_write_order.h): those
+    /// whose stage B submitted the label batch first, of those the batches holding only labels
+    /// after the required ones, and those that then waited for labels, with the time waited.
+    std::atomic<std::uint64_t> ordered_writes{0}, ordered_writes_flushed{0},
+        ordered_writes_flushed_later_only{0}, ordered_writes_waited{0}, ordered_write_wait_ns{0};
     std::atomic<std::uint64_t> ended_pass{0};       ///< a render pass was open (it ends)
     std::atomic<std::uint64_t> batches{0}, batch_age_ns{0}, batch_age_max_ns{0};
 };
@@ -191,6 +196,24 @@ inline void NoteFlush(bool pass_open) {
     if (pass_open) {
         flush_census.ended_pass.fetch_add(1, std::memory_order_relaxed);
     }
+}
+
+/// An in-order WRITE_DATA behind a WAIT_REG_MEM met early: whether stage B submitted a label
+/// batch for it and whether that batch held a label it waits for.
+inline void NoteOrderedWrite(bool flushed_batch, bool batch_holds_required) {
+    flush_census.ordered_writes.fetch_add(1, std::memory_order_relaxed);
+    if (flushed_batch) {
+        flush_census.ordered_writes_flushed.fetch_add(1, std::memory_order_relaxed);
+        if (!batch_holds_required) {
+            flush_census.ordered_writes_flushed_later_only.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+}
+
+/// That WRITE_DATA waited `ns` for its labels to be written.
+inline void NoteOrderedWriteWaited(std::uint64_t ns) {
+    flush_census.ordered_writes_waited.fetch_add(1, std::memory_order_relaxed);
+    flush_census.ordered_write_wait_ns.fetch_add(ns, std::memory_order_relaxed);
 }
 
 /// A label at GPU completion written `age_ns` after it was issued (the guest sees it then).
@@ -425,7 +448,10 @@ inline Previous previous_a, previous_b, previous_r;
 inline std::array<std::uint64_t, FCount> previous_flushes{};
 inline std::uint64_t previous_ended_pass = 0, previous_batches = 0, previous_batch_age_ns = 0,
                      previous_labels_written = 0, previous_label_age_ns = 0,
-                     previous_forwarded_waits = 0;
+                     previous_forwarded_waits = 0, previous_ordered_writes = 0,
+                     previous_ordered_writes_flushed = 0,
+                     previous_ordered_writes_flushed_later_only = 0,
+                     previous_ordered_writes_waited = 0, previous_ordered_write_wait_ns = 0;
 
 /// "  Flushes …" for the window: per frame by reason, passes ended, label batch age.
 inline std::string FlushLine(double frames) {
@@ -474,10 +500,33 @@ inline std::string FlushLine(double frames) {
                   window_max / 1e3);
     previous_labels_written = written;
     previous_label_age_ns = written_age;
+    const auto window = [](const std::atomic<std::uint64_t>& counter, std::uint64_t& previous) {
+        const std::uint64_t now = counter.load(std::memory_order_relaxed);
+        const std::uint64_t delta = now - previous;
+        previous = now;
+        return delta;
+    };
+    const std::uint64_t ordered = window(flush_census.ordered_writes, previous_ordered_writes);
+    const std::uint64_t flushed =
+        window(flush_census.ordered_writes_flushed, previous_ordered_writes_flushed);
+    const std::uint64_t later_only = window(flush_census.ordered_writes_flushed_later_only,
+                                            previous_ordered_writes_flushed_later_only);
+    const std::uint64_t waited =
+        window(flush_census.ordered_writes_waited, previous_ordered_writes_waited);
+    const std::uint64_t wait_ns =
+        window(flush_census.ordered_write_wait_ns, previous_ordered_write_wait_ns);
+    char ordered_text[256];
+    std::snprintf(ordered_text, sizeof(ordered_text),
+                  "; WRITE_DATAs behind a met-early WAIT %.1f per frame: submitted the label "
+                  "batch %.1f (holding only later labels %.1f), waited for labels %.1f, %.0f us "
+                  "mean wait",
+                  frames ? ordered / frames : 0.0, frames ? flushed / frames : 0.0,
+                  frames ? later_only / frames : 0.0, frames ? waited / frames : 0.0,
+                  waited ? wait_ns / 1e3 / waited : 0.0);
     char head[96];
     std::snprintf(head, sizeof(head), "  Flushes of the draw scheduler: %.1f per frame = ",
                   frames ? total / frames : 0.0);
-    return head + out + tail + written_text;
+    return head + out + tail + written_text + ordered_text;
 }
 inline std::uint64_t window_cycles = 0, window_frames = 0, window_draws = 0;
 /// The account's thread's user + system CPU time in ns (thread_info), or ~0 when unavailable
