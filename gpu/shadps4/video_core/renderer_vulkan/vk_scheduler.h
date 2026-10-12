@@ -721,6 +721,20 @@ public:
     /// Sends the current execution context to the GPU and waits for it to complete.
     void Finish();
 
+#ifdef __APPLE__
+    /// Teardown (docs/macos/moltenvk-prefill.md): submits what is recorded through the normal
+    /// submission (its submit callback may still record its final commands, e.g. pending
+    /// barriers), opens no further command buffer, then seals recording and waits for that
+    /// submission's tick on the GPU. After Close no command buffer is open, so none is reset or
+    /// destroyed unsubmitted at teardown (MoltenVK commits such a buffer when its prefill is on,
+    /// outside our lifetime tracking; prefill is shelved but the teardown no longer depends on it). Only the GPU work is waited for: priority operations and
+    /// deferred signals (labels at completion) run on their own threads and are not drained.
+    /// Recording after Close stops; Flush and Finish return at once (owners destroyed later,
+    /// e.g. the upscaler, finish their work this way). ~Scheduler closes an unclosed scheduler
+    /// whose open buffer holds no recorded command, and stops if it holds one.
+    void Close();
+#endif
+
     /// bbport: waits for the work submitted so far but leaves the command buffer being
     /// recorded open, so a CommandBuffer() the caller holds stays valid (Finish() submits it:
     /// recording into a submitted buffer crashes AMD's driver).
@@ -765,6 +779,12 @@ public:
     /// records directly (Record() included, so callers may mix both) until the next
     /// KickRecording() or submission.
     [[gnu::noinline]] vk::CommandBuffer CommandBuffer() {
+#ifdef __APPLE__
+        if (closed) [[unlikely]] {
+            StopRecordingAfterClose();
+        }
+        recorded_since_begin = true;
+#endif
         if (recording_threaded && !direct_mode) {
             SyncRecording();
             direct_mode = true;
@@ -781,6 +801,12 @@ public:
     /// everything it uses (capture by value): it may run later on the recording thread.
     template <typename Func>
     void Record(Func&& func) {
+#ifdef __APPLE__
+        if (closed) [[unlikely]] {
+            StopRecordingAfterClose();
+        }
+        recorded_since_begin = true;
+#endif
         if (!recording_threaded || direct_mode) {
             func(current_cmdbuf);
             return;
@@ -1048,6 +1074,10 @@ private:
     bool direct_mode = false; ///< the command buffer is recorded on the caller's thread
 #ifdef __APPLE__
     BbPassCensus::Why end_reason = BbPassCensus::Why::Other; ///< for the next EndRendering
+    [[noreturn, gnu::cold, gnu::noinline]] static void StopRecordingAfterClose();
+    bool closing = false; ///< Close() submits the last command buffer: open no new one
+    bool closed = false;  ///< Close() submitted it: recording is sealed
+    bool recorded_since_begin = false; ///< the open command buffer has a recorded command
 #endif
     u64 host_copies_issued = 0;
     std::atomic<u64> host_copies_done{0};

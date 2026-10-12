@@ -46,6 +46,19 @@ Scheduler::Scheduler(const Instance& instance, bool threaded_recording)
 }
 
 Scheduler::~Scheduler() {
+#ifdef __APPLE__
+    // The open command buffer must not be destroyed unsubmitted (Close). One with recorded
+    // commands at this point would reference resources its owner may already have destroyed.
+    if (!closed) {
+        if (recorded_since_begin) {
+            std::fputs("STOP: a scheduler with unsubmitted recorded commands is destroyed "
+                       "without Scheduler::Close\n",
+                       stderr);
+            ASSERT_MSG(false, "Scheduler destroyed with unsubmitted recorded commands");
+        }
+        Close();
+    }
+#endif
     if (recorder_thread.joinable()) {
         SyncRecording();
         recorder_thread.request_stop();
@@ -541,6 +554,11 @@ void Scheduler::RecorderThread(std::stop_token stoken) {
 
 u64 Scheduler::Flush(SubmitInfo& info) {
     // When flushing, we only send data to the driver; no waiting is necessary.
+#ifdef __APPLE__
+    if (closed) {
+        return CurrentTick() - 1; // Close submitted everything and waited; nothing is open
+    }
+#endif
     BB_SPLIT_SCOPE(KFlush);
     return SubmitExecution(info);
 }
@@ -558,6 +576,9 @@ void Scheduler::WaitBeforeNextSubmit(vk::Semaphore semaphore, u64 value) {
 void Scheduler::Finish() {
     // When finishing, we need to wait for the submission to have executed on the device.
 #ifdef __APPLE__
+    if (closed) {
+        return; // Close waited for everything submitted; recording since then stops
+    }
     BbSplit::FlushReason reason{BbSplit::FFinish};
 #endif
     const u64 presubmit_tick = CurrentTick();
@@ -565,6 +586,30 @@ void Scheduler::Finish() {
     SubmitExecution(info);
     Wait(presubmit_tick);
 }
+
+#ifdef __APPLE__
+void Scheduler::Close() {
+    if (closed || closing) {
+        return;
+    }
+    SyncRecording();
+    EndRendering();
+    const u64 tick = CurrentTick();
+    closing = true;
+    SubmitInfo info{};
+    SubmitExecution(info); // the submit callback may still record (pending barriers)
+    closed = true;
+    BB_SPLIT_SCOPE(KGpuTick);
+    work_semaphore.Wait(tick);
+    PopPendingOperations();
+}
+
+void Scheduler::StopRecordingAfterClose() {
+    std::fputs("STOP: recording after Scheduler::Close\n", stderr);
+    ASSERT_MSG(false, "Recording after Scheduler::Close");
+    std::abort();
+}
+#endif
 
 void Scheduler::WaitSubmitted() {
     const u64 tick = CurrentTick();
@@ -615,6 +660,9 @@ void Scheduler::AllocateWorkerCommandBuffers() {
 
     current_cmdbuf = command_pool.Commit();
     Check(current_cmdbuf.begin(begin_info));
+#ifdef __APPLE__
+    recorded_since_begin = false;
+#endif
 #ifdef __APPLE__
     if (perf) perf->Begin(current_cmdbuf, perf_phase, perf_frame);
 #endif
@@ -714,6 +762,12 @@ u64 Scheduler::SubmitExecution(SubmitInfo& info) {
 #endif
 
     work_semaphore.Refresh();
+#ifdef __APPLE__
+    if (closing) {
+        PopPendingOperations();
+        return signal_value;
+    }
+#endif
     AllocateWorkerCommandBuffers();
 
     // Apply pending operations
