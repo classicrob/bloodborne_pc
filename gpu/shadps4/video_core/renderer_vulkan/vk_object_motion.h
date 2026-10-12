@@ -8,7 +8,6 @@
 #pragma once
 
 #include <array>
-#include <optional>
 #include "video_core/renderer_vulkan/motion_history.h"
 
 #include "common/types.h"
@@ -31,9 +30,11 @@ public:
     }
 
     using DrawInfo = Motion::Draw;
-    /// `anchor`: the instance's world position (Motion::History::Anchor), if the draw has a
-    /// palette; copies of one mesh load history only when identified by it.
-    u32 PrepareDraw(const DrawInfo& draw, const std::optional<Motion::History::Anchor>& anchor);
+    u32 PrepareDraw(const DrawInfo& draw);
+    /// Every motion draw before the gate: counts the mesh's copies (Motion::History::NoteDraw).
+    void NoteDraw(const Motion::History::GateKey& mesh, u64 palette_address) {
+        history.NoteDraw(mesh, palette_address);
+    }
     /// Small skeletons: whether the bone palette changed (Motion::History::Moving).
     bool Moving(const Motion::History::GateKey& key, u64 palette) {
         return history.Moving(key, palette);
