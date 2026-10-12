@@ -25,13 +25,24 @@ static void read_fails(const char *what, const char *want) {
     if (!strstr(why,want)) { fprintf(stderr,"FAIL %s: reason '%s', expected '%s'\n",what,why,want); exit(1); }
     printf("PASS %s: %s\n",what,why); fflush(stdout);
 }
-/* The watcher has had two reads of a bad file; both words are as they were. */
+/* Points path at target with one rename (a symlink), so the file is never missing. */
+static void point(const char *target) {
+    char staged[80];
+    snprintf(staged,sizeof staged,"%s.new",path);
+    assert(!symlink(target,staged) && !rename(staged,path));
+}
+/* After two whole reads of the bad file, both words are as they were. */
 static void kept(const char *what, uint64_t mask, uint64_t mask2) {
-    struct timespec t={0,600000000}; nanosleep(&t,NULL);
-    if (runtime_disabled_optimizations!=mask || runtime_disabled_optimizations2!=mask2) {
-        fprintf(stderr,"FAIL %s: mask=%llu mask2=%llu, expected %llu %llu kept\n",what,
-            (unsigned long long)runtime_disabled_optimizations,(unsigned long long)runtime_disabled_optimizations2,
-            (unsigned long long)mask,(unsigned long long)mask2);
+    const unsigned long start=__atomic_load_n(&toggle_reads,__ATOMIC_ACQUIRE);
+    for (int i=0;i<300 && __atomic_load_n(&toggle_reads,__ATOMIC_ACQUIRE)<start+2;++i) {
+        struct timespec t={0,10000000}; nanosleep(&t,NULL);
+    }
+    const uint64_t got=__atomic_load_n(&runtime_disabled_optimizations,__ATOMIC_ACQUIRE);
+    const uint64_t got2=__atomic_load_n(&runtime_disabled_optimizations2,__ATOMIC_ACQUIRE);
+    if (__atomic_load_n(&toggle_reads,__ATOMIC_ACQUIRE)<start+2 || got!=mask || got2!=mask2) {
+        fprintf(stderr,"FAIL %s: reads %lu after %lu, mask=%llu mask2=%llu, expected %llu %llu kept\n",what,
+            __atomic_load_n(&toggle_reads,__ATOMIC_ACQUIRE),start,(unsigned long long)got,
+            (unsigned long long)got2,(unsigned long long)mask,(unsigned long long)mask2);
         exit(1);
     }
     printf("PASS %s keeps both words\n",what); fflush(stdout);
@@ -101,9 +112,12 @@ int main(void) {
     kept("binary file with a NUL",8,16);
     put("8 16"); assert(!chmod(path,0));
     kept("unreadable file",8,16);
-    assert(!unlink(path) && !mkdir(path,0700));
+    char directory[80];
+    snprintf(directory,sizeof directory,"%s.dir",path);
+    assert(!mkdir(directory,0700));
+    point(directory);
     kept("directory",8,16);
-    assert(!rmdir(path));
+    assert(!unlink(path) && !rmdir(directory));
     expect("missing file: both 0",0,0);
     put("2 3");
     expect("readable again",2,3);

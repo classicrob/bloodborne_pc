@@ -1083,6 +1083,8 @@ static int toggle_read(const char *path, uint64_t mask[2], char *why, size_t siz
     mask[0]=mask[1]=0;
     return -1;
 }
+/* Reads of the toggle file finished (tests wait on it). */
+static unsigned long toggle_reads;
 static void *toggle_watcher(void *path) {
     uint64_t last[2]={0,0};
     char last_why[160]="";
@@ -1111,6 +1113,7 @@ static void *toggle_watcher(void *path) {
                 last[0]=mask[0]; last[1]=mask[1]; printed=1;
             }
         }
+        __atomic_add_fetch(&toggle_reads,1,__ATOMIC_RELEASE);
 #ifdef _WIN32
         compat_sleep_ns(250000000);
 #else
