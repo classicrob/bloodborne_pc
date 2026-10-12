@@ -3,7 +3,8 @@
 `tools/macos/save_combat_fixture.py` copies the immutable
 `central-yharnam-weapons-edited` fixture and changes nine bounded fields in
 its active character. It is an edited test setup, not played progression.
-No game acceptance is claimed by the offline checks.
+The offline checks alone do not establish acceptance; subsequent Playtest
+acceptance is recorded below.
 
 The required character SHA256 is
 `6d873abf6f83ce1c757a7bcc97653a3a23d899c12094d0304712a791736e2d56`,
@@ -97,3 +98,40 @@ and inspect the persisted values. Record each observation against this
 fixture's character hash, run and binary hashes with `verify-fixture`.
 The starting lamp's activation and quest progression are not changed or
 qualified by this edit.
+
+## Gameplay acceptance
+
+Playtest reported all requested observations, with additive `verify-fixture`
+records naming the tested input rather than relabeling its ancestry:
+
+- `20261012-124712-1080p-BC4-B`, PREVIEW-26, initially loaded
+  `central-yharnam-combat-edited` at the parent lamp-yard XYZ with 20 vials
+  and 19 bullets.
+- `20261012-131409-1080p-COMBAT-2`, PREVIEW-28bc (`f9e8738`), confirmed
+  level 40, HP 1100/1100, vitality 30 and strength 23. Endurance 10,
+  skill 10, bloodtinge 9 and arcane 8 remained unchanged. A fall reduced
+  HP; triangle consumed a vial (20 to 19) and refilled HP. R1 performed
+  an attack. Townsmen subsequently killed the character while the system
+  menu was open; that menu does not pause gameplay.
+- Respawn occurred at the 1st Floor Sickroom lamp, consistent with the
+  fixture leaving the Central Yharnam lamp unlit. Normal save/quit produced
+  `combat-after-heal-death`, retaining edited ancestry.
+- `20261012-131959-1080p-COMBAT-3-reload`, the same PREVIEW-28bc artifacts,
+  loaded that descendant in a fresh process. Level 40, HP 1100/1100,
+  vitality 30, strength 23, 19 vials and 19 bullets persisted. Echoes were
+  zero after death.
+
+The COMBAT-2/3 manifests pin bb-probe SHA256
+`b356e62d867cd5dc276669e148265cb4e64d0b8744f368db63b323b8a724350a`
+and libbbgpu SHA256
+`a5646cc8b9050011130c3ee2266186f5e4c70006527989f5fde1671fb7eca544`.
+Playtest reported no stop in those runs. This qualifies the edited fixture's
+observed load, status, consumption/healing, attack and persistence; it does
+not resolve whether the loader recomputes HP internally. Lamp-lit persistence,
+Pebble persistence, clinic events and messenger gifts remain open.
+
+The first goto attempt walked off the lamp-yard balcony, dropping from
+approximately y=-28.6 to y=-44.2 before stopping on no progress. Position
+feedback supplies observation, not pathfinding or knowledge of walkable ground.
+Further routes need visually qualified waypoints and ledge/obstacle handling;
+this fixture's successful acceptance is not navigation qualification.
