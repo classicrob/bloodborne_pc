@@ -542,8 +542,13 @@ public:
         Id run_pos{};
         Id strip_start{};
         Id strip_len{};
-        // GsCompute, CopyVertex
+        // GsCompute, CopyVertex, CopyStreamOut
         Id gsvs_base{};
+        // CopyStreamOut
+        Id so_lane_valid{};  ///< the VGT would launch this lane (invocation < SoCount)
+        Id so_vertex{};      ///< GSVS record of this lane's vertex (clamped for invalid lanes)
+        Id so_config{};      ///< s[ud]: vertices of this wave that fit << 16, stream 0
+        Id so_write_index{}; ///< s[ud + 1]: draw-relative index of the wave's first vertex
     } gs;
     size_t bda_pagetable_index{};
     size_t fault_buffer_index{};

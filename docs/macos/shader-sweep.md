@@ -32,7 +32,10 @@ The game data is only read. A recompiler change states its delta against the mer
    descriptors, resource tables (2D RGBA8 T#s), constant buffer and ring tables (float4 V#s),
    extended user data in memory, and a fetch shader generated from the vertex semantics.
 3. `sweep.py` runs the driver in at most two processes; a job that stops the process
-   (assertion, exit 23) or crashes is recorded and the driver restarts after it. Every SPIR-V
+   (assertion, exit 23) or crashes is recorded and the driver restarts after it. Progress is the
+   driver's `@@` lines only: a driver with no job output 5 minutes after launch stops the sweep
+   ("driver produced no output in 5 min"; never retried), and a job silent for 120 s is a HANG.
+   Every SPIR-V
    module (`BB_DUMP_SHADERS` output) goes through `spirv-val --target-env vulkan1.3`.
 4. The MSL stage (`msl.cpp`, `out/tools/shader-msl`) converts every module to MSL with the
    SPIRV-Cross revision MoltenVK 1.4.2 vendors (6c09849f) and the options MoltenVK sets on an

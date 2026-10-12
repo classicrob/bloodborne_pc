@@ -2,6 +2,8 @@
 // bbport (Apple): renderer side of the geometry-stage emulation (shader_recompiler/gs_emulation.h).
 // An ES/GS draw records the ES and GS as compute dispatches over a per-draw scratch range, then
 // draws the copy shader (the pipeline's vertex stage) over the GS's restart-separated strip runs.
+// A stream-out draw (points only) also runs the copy shader's stream-out as a compute kernel over
+// the compacted points, before the draw.
 #pragma once
 
 #include <memory>
@@ -21,6 +23,8 @@ namespace Vulkan {
 struct GsEmulationStages {
     const ComputePipeline* es;
     const ComputePipeline* gs;
+    const ComputePipeline* so; ///< stream-out kernel (GsEmulationRole::CopyStreamOut), or null
+    u32 so_buffers;            ///< stream-out buffers of stream 0 (VGT_STRMOUT_BUFFER_CONFIG)
     u32 verts_per_prim; ///< input vertices per primitive (list topologies)
     u32 invocations;    ///< GS instances
     u32 max_vert_out;   ///< VGT_GS_MAX_VERT_OUT
@@ -37,6 +41,17 @@ bool GsSkipDraws();
 void GsSkipDrawsCount();     ///< a skipped draw
 void GsSkipDrawsOnFlip();    ///< every flip: prints the total every 600 flips
 void GsSkipDrawsOnWindow();  ///< each frame stats window: prints the window's count
+
+/// Rasterizer::so_state, the GPU-resident stream-out state (dwords). STRMOUT_BUFFER_UPDATE sets
+/// the offsets in command order; the compaction kernel of each stream-out draw advances them and
+/// counts overflow. Host-visible, so overflow is reported.
+enum SoState : u32 {
+    SoBufferOffset0 = 0,    ///< + n: VGT_STRMOUT_BUFFER_OFFSET_n (dwords)
+    SoOverflowDraws = 4,    ///< stream-out draws that dropped vertices
+    SoOverflowVertices = 5, ///< vertices dropped
+    SoStateDwords = 8,
+};
+constexpr u64 SoStateBytes = SoStateDwords * 4;
 
 /// What the emulation does not reproduce for a pipeline (registers of an ES/GS draw), or null.
 const char* GsEmulationUnsupported(const AmdGpu::Regs& regs);
@@ -65,6 +80,9 @@ struct GsEmulationDraw {
     /// The render pass the compute passes ended, if one was open: a split only if the draw then
     /// begins the same pass again.
     std::optional<RenderState> ended_pass{};
+    /// The rasterizer is killed (PA_CL_CLIP_CNTL DX_RASTERIZATION_KILL): the stream-out kernel was
+    /// the draw's only effect, and there is nothing to draw.
+    bool skip_draw{};
 };
 
 } // namespace Vulkan

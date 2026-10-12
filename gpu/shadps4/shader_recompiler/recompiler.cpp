@@ -135,7 +135,7 @@ IR::Program TranslateProgram(const std::span<const u32>& code, Pools& pools, Inf
     auto resources = Shader::Optimization::ResourceDiscoverPass(program, profile);
     Shader::Optimization::FlattenExtendedUserdataPass(program);
     Shader::IR::DumpProgram(program, info, "pre-res-patch.");
-    Shader::Optimization::ResourcePatchingPass(program.info, resources, profile);
+    Shader::Optimization::ResourcePatchingPass(program.info, resources, profile, runtime_info);
     Shader::Optimization::LowerBufferFormatToRaw(program, profile);
     Shader::Optimization::SharedMemorySimplifyPass(program, profile);
     Shader::Optimization::SharedMemoryToStoragePass(program, runtime_info, profile);
@@ -162,6 +162,12 @@ IR::Program TranslateProgram(const std::span<const u32>& code, Pools& pools, Inf
     Shader::Optimization::SsaRepairPass(program);
     Shader::Optimization::SsaRewritePass(program);
     Shader::Optimization::SharedMemoryBarrierPass(program, runtime_info, profile);
+#ifdef __APPLE__
+    // bbport: fold what the structured SSA exposes before the wave64 lowering decides which wave
+    // operations are live (a copy draw's "lane < 0" stream-out guard feeds its exec through
+    // s_and_saveexec chains the first propagation saw only partly constant).
+    Shader::Optimization::ConstantPropagationPass(program.post_order_blocks);
+#endif
     Shader::Optimization::DeadCodeEliminationPass(program);
     Shader::Optimization::LowerWave64BallotPass(program, runtime_info, profile);
     Shader::Optimization::ConstantPropagationPass(program.post_order_blocks);

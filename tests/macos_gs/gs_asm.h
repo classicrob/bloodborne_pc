@@ -33,6 +33,7 @@ struct Code {
     }
     void SMovB64(uint32_t sdst, uint32_t ssrc0) { Sop1(4, sdst, ssrc0); }
     void SAndSaveexecB64(uint32_t sdst, uint32_t ssrc0) { Sop1(36, sdst, ssrc0); }
+    void SOrSaveexecB64(uint32_t sdst, uint32_t ssrc0) { Sop1(37, sdst, ssrc0); }
     void Sopp(uint32_t op, uint32_t simm16) { words.push_back(0xBF800000u | (op << 16) | simm16); }
     void SEndpgm() { Sopp(1, 0); }
     void SWaitcnt() { Sopp(12, 0); }
@@ -82,6 +83,8 @@ struct Code {
     }
     /// vcc = src0 < vsrc1 (unsigned)
     void VCmpLtU32(uint32_t src0, uint32_t vsrc1) { Vopc(0xC1, src0, vsrc1); }
+    /// vcc = src0 == vsrc1
+    void VCmpEqU32(uint32_t src0, uint32_t vsrc1) { Vopc(0xC2, src0, vsrc1); }
     /// vcc = src0 != vsrc1
     void VCmpNeU32(uint32_t src0, uint32_t vsrc1) { Vopc(0xC5, src0, vsrc1); }
 
@@ -91,6 +94,49 @@ struct Code {
         const uint32_t op = store ? 28u : 12u;
         words.push_back(0xE0000000u | (op << 18) | (1u << 14) | (offen ? 1u << 12 : 0) |
                         (offset & 0xFFF));
+        words.push_back((soffset << 24) | (1u << 22) | ((srsrc >> 2) << 16) | (vdata << 8) | vaddr);
+    }
+
+    /// s_load_dwordx4 sdst, s[sbase:sbase+1], offset (dwords)
+    void SLoadDwordx4(uint32_t sdst, uint32_t sbase, uint32_t offset) {
+        words.push_back(0xC0000000u | (2u << 22) | (sdst << 15) | ((sbase / 2) << 9) | (1u << 8) |
+                        offset);
+    }
+    void Sop2(uint32_t op, uint32_t sdst, uint32_t ssrc0, uint32_t ssrc1) {
+        words.push_back(0x80000000u | (op << 23) | (sdst << 16) | (ssrc1 << 8) | ssrc0);
+    }
+    void SLshlB32(uint32_t sdst, uint32_t ssrc0, uint32_t ssrc1) { Sop2(30, sdst, ssrc0, ssrc1); }
+    /// s_bfe_u32 sdst, ssrc0, (width << 16) | offset
+    void SBfeU32(uint32_t sdst, uint32_t ssrc0, uint32_t offset, uint32_t width) {
+        Sop2(39, sdst, ssrc0, LITERAL);
+        words.push_back((width << 16) | offset);
+    }
+    void Vop3(uint32_t op, uint32_t vdst, uint32_t src0, uint32_t src1) {
+        words.push_back(0xD0000000u | (op << 17) | vdst);
+        words.push_back(src0 | (src1 << 9));
+    }
+    /// vdst = the lane id in the wave (v_mbcnt_lo/hi of -1, as copy shaders compute it)
+    void LaneId(uint32_t vdst) {
+        Vop3(0x123, vdst, Inline(0) + 65 /* -1 */, Inline(0));
+        Vop3(0x124, vdst, Inline(0) + 65, Vgpr(vdst));
+    }
+    /// vdst = bits of s[mask:mask+1] below this lane (v_mbcnt_lo/hi)
+    void MaskRank(uint32_t vdst, uint32_t mask) {
+        Vop3(0x123, vdst, mask, Inline(0));
+        Vop3(0x124, vdst, mask + 1, Vgpr(vdst));
+    }
+    /// MUBUF buffer_store_dword (no glc/slc), the index from vaddr with idxen.
+    void BufferStoreDword(uint32_t vdata, uint32_t vaddr, bool idxen, uint32_t offset,
+                          uint32_t soffset, uint32_t srsrc) {
+        words.push_back(0xE0000000u | (28u << 18) | (idxen ? 1u << 13 : 0) | (offset & 0xFFF));
+        words.push_back((soffset << 24) | ((srsrc >> 2) << 16) | (vdata << 8) | vaddr);
+    }
+    /// MTBUF tbuffer_store_format_* (op 4 = x .. 7 = xyzw) with glc+slc, as Gnm's stream-out
+    /// stores; the index from vaddr with idxen.
+    void TBufferStore(uint32_t op, uint32_t dfmt, uint32_t nfmt, uint32_t vdata, uint32_t vaddr,
+                      bool idxen, uint32_t offset, uint32_t soffset, uint32_t srsrc) {
+        words.push_back((0x3Au << 26) | (nfmt << 23) | (dfmt << 19) | (op << 16) | (1u << 14) |
+                        (idxen ? 1u << 13 : 0) | (offset & 0xFFF));
         words.push_back((soffset << 24) | (1u << 22) | ((srsrc >> 2) << 16) | (vdata << 8) | vaddr);
     }
 

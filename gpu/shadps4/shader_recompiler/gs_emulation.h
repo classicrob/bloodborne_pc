@@ -12,9 +12,15 @@
 // compaction. See GsEmulationRole (runtime_info.h) and docs/macos/geometry-shaders.md.
 #pragma once
 
+#include <span>
+
 #include "common/assert.h"
 #include "common/types.h"
 #include "shader_recompiler/ir/attribute.h"
+#include "shader_recompiler/ir/opcodes.h"
+#include "shader_recompiler/ir/microinstruction.h"
+#include "shader_recompiler/ir/value.h"
+#include "video_core/amdgpu/resource.h"
 #include "video_core/amdgpu/regs_vertex.h"
 
 namespace Shader::GsEmulation {
@@ -78,6 +84,64 @@ inline u32 IndexRunLength(u32 max_vert_out, AmdGpu::GsOutputPrimitiveType type) 
     return max_vert_out + max_vert_out / MinStripVertices(type);
 }
 
+/// Gnm's copy-shader stream-out ABI, from the copy shader's input usage slots: the stream-out
+/// buffer table (PtrSoBufferTable, usage 0x18) starts at s2, and no other input starts at s2 or
+/// s3. The recompiler's stream-out store proof (V#s loaded through s[2:3]) rests on it.
+inline bool SoTableAtS2(std::span<const u32> usage_slots) {
+    bool table = false;
+    for (const u32 slot : usage_slots) {
+        const u32 usage = slot & 0xFF, start = (slot >> 16) & 0xFF;
+        if (usage == 0x18 && start == 2) {
+            table = true;
+        } else if (start == 2 || start == 3) {
+            return false;
+        }
+    }
+    return table;
+}
+
+/// The stream-out buffer b whose base offset a CopyStreamOut store's soffset is, in the one shape
+/// Gnm's copy shaders use: GsStreamOutOffset_b << 2 (the VGT's dword offset in bytes). -1 for
+/// any other value.
+inline int StreamOutOffsetBuffer(const IR::Value& soffset) {
+    const IR::Inst* shift = soffset.TryInst();
+    if (!shift || shift->GetOpcode() != IR::Opcode::ShiftLeftLogical32 ||
+        !shift->Arg(1).IsImmediate() || shift->Arg(1).U32() != 2) {
+        return -1;
+    }
+    const IR::Inst* input = shift->Arg(0).TryInst();
+    if (!input || input->GetOpcode() != IR::Opcode::GetAttributeU32) {
+        return -1;
+    }
+    const u64 attr = u64(input->Arg(0).Attribute());
+    const u64 first = u64(IR::Attribute::GsStreamOutOffset0);
+    return attr >= first && attr < first + 4 ? int(attr - first) : -1;
+}
+
+/// Why stream-out buffer `sharp` cannot bound the CopyStreamOut kernel's writes to a VGT buffer of
+/// `size_dw` dwords and `stride_dw`-dword vertices, or null. The kernel writes draw-relative
+/// vertex i (the wave's first vertex plus the lane; i < the vertices the compaction kernel found
+/// to fit) at soffset = the buffer's offset at the draw's start * 4, plus i * V# stride, each
+/// access within one V# stride (checked at compile time). With the V# stride equal to the VGT
+/// stride, every write ends within VGT_STRMOUT_BUFFER_SIZE, so a V# range (the binding) of at
+/// least that size holds all of them.
+inline const char* StreamOutBindingGap(const AmdGpu::Buffer& sharp, u32 size_dw, u32 stride_dw) {
+    const u64 size_bytes = u64(size_dw) * 4;
+    if (sharp.swizzle_enable) {
+        return "a swizzled stream-out V#";
+    }
+    if (u64(sharp.stride) != u64(stride_dw) * 4) {
+        return "a stream-out V# stride other than VGT_STRMOUT_VTX_STRIDE";
+    }
+    if (size_bytes > UINT32_MAX || u64(sharp.stride) * sharp.num_records > UINT32_MAX) {
+        return "a stream-out buffer beyond the 32-bit binding range";
+    }
+    if (u64(sharp.stride) * sharp.num_records < size_bytes) {
+        return "a stream-out V# range shorter than VGT_STRMOUT_BUFFER_SIZE";
+    }
+    return nullptr;
+}
+
 /// Header::IndexKind values.
 enum class IndexKind : u32 {
     None = 0, ///< non-indexed: VertexId = position + BaseVertex
@@ -108,7 +172,12 @@ enum IndirectCommands : u32 {
     GsDispatch = 19,  ///< VkDispatchIndirectCommand of the GS
     StripDraw = 22,   ///< VkDrawIndexedIndirectCommand of the copy-shader draw (firstIndex = runs)
     CompactDraw = 27, ///< point output: VkDrawIndexedIndirectCommand of the compacted point list
-    IndirectDwords = 32, ///< header + commands; the records follow (also for point output draws)
+    /// Stream-out (point output only): the compaction kernel's stream-out tail writes these from
+    /// the GPU-resident stream-out state, then advances that state.
+    SoDispatch = 32, ///< VkDispatchIndirectCommand of the CopyStreamOut kernel (64 per group)
+    SoCount = 35,    ///< vertices written (the compacted vertices that fit in every buffer)
+    SoOffset0 = 36,  ///< SoOffset0 + n: buffer n's offset (dwords) at the start of the draw
+    IndirectDwords = 48, ///< header + commands; the records follow (also for point output draws)
 };
 
 } // namespace Shader::GsEmulation

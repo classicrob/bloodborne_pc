@@ -554,7 +554,8 @@ void LowerWave64WithoutSubgroups(IR::Program& program) {
 // DefineEntryPoint): the geometry-emulation ES/GS roles are compute kernels.
 u32 EmittedStageBit(const IR::Program& program, const RuntimeInfo& runtime_info) {
     if (runtime_info.gs_role == GsEmulationRole::EsCompute ||
-        runtime_info.gs_role == GsEmulationRole::GsCompute) {
+        runtime_info.gs_role == GsEmulationRole::GsCompute ||
+        runtime_info.gs_role == GsEmulationRole::CopyStreamOut) {
         return 0x20;
     }
     switch (program.info.sw_stage) {
@@ -648,9 +649,15 @@ bool OnlyFeedsScalarLoadFallback(const IR::Inst& inst, std::vector<IR::Inst*>& c
     return true;
 }
 
-void LowerWave64Compute(IR::Program& program, const RuntimeInfo& runtime_info, const Profile& profile) {
+/// A compute workgroup: its size and the guest's LDS bytes (the wave scratch follows them).
+struct ComputeShape {
+    std::array<u32, 3> workgroup_size;
+    u32 shared_memory_size;
+};
+
+void LowerWave64Compute(IR::Program& program, const ComputeShape& shape, const Profile& profile) {
     auto& info = program.info;
-    const auto [size_x, size_y, size_z] = runtime_info.hw.cs.workgroup_size;
+    const auto [size_x, size_y, size_z] = shape.workgroup_size;
     const u32 num_threads = size_x * size_y * size_z;
     const u32 num_waves = (num_threads + 63) / 64;
     // A workgroup of at most one subgroup is one GCN wave (lanes beyond the workgroup absent) that
@@ -783,7 +790,7 @@ void LowerWave64Compute(IR::Program& program, const RuntimeInfo& runtime_info, c
 
     // Scratch after the guest's LDS: per wave two mask words and one value word; one word per
     // invocation for shuffles. 32-bit accesses only (valid SPIR-V without explicit layouts).
-    const u32 base = Common::AlignUp(runtime_info.hw.cs.shared_memory_size, sizeof(u32));
+    const u32 base = Common::AlignUp(shape.shared_memory_size, sizeof(u32));
     const u32 mask_base = base;
     const u32 value_base = mask_base + num_waves * 2 * 4;
     const u32 lane_base = value_base + num_waves * 4;
@@ -806,8 +813,8 @@ void LowerWave64Compute(IR::Program& program, const RuntimeInfo& runtime_info, c
         ASSERT_MSG(end <= profile.max_shared_memory_size,
                    "Apple wave64: guest LDS ({} bytes) plus wave scratch exceeds shared memory ({} "
                    "of {} bytes): shader={:#x}",
-                   runtime_info.hw.cs.shared_memory_size, end, profile.max_shared_memory_size, info.pgm_hash);
-        info.shared_memory_scratch_size = end - runtime_info.hw.cs.shared_memory_size;
+                   shape.shared_memory_size, end, profile.max_shared_memory_size, info.pgm_hash);
+        info.shared_memory_scratch_size = end - shape.shared_memory_size;
     }
 
     struct Lanes {
@@ -989,8 +996,14 @@ void LowerWave64Compute(IR::Program& program, const RuntimeInfo& runtime_info, c
 void LowerWave64BallotPass(IR::Program& program, const RuntimeInfo& runtime_info,
                            const Profile& profile) {
     if (profile.emulate_wave64) {
-        if (program.info.hw_stage == HwStage::Compute) {
-            LowerWave64Compute(program, runtime_info, profile);
+        if (runtime_info.gs_role == GsEmulationRole::CopyStreamOut) {
+            // A copy shader (HwStage::Vertex, so hw.cs is not its data) run as a compute kernel of
+            // one GCN wave: 64 invocations, no guest LDS (GS-DESIGN 11.2).
+            LowerWave64Compute(program, {{64u, 1u, 1u}, 0u}, profile);
+        } else if (program.info.hw_stage == HwStage::Compute) {
+            LowerWave64Compute(program,
+                               {runtime_info.hw.cs.workgroup_size, runtime_info.hw.cs.shared_memory_size},
+                               profile);
         } else {
             LowerWave64Graphics(program, runtime_info, profile);
         }

@@ -171,6 +171,8 @@ Id EmitBufferAddress(EmitContext& ctx, IR::Inst* inst, u32 handle, Id index, Id 
         for (Id& predicate : predicates)
             predicate = ctx.OpLogicalAnd(ctx.U1[1], predicate, complete);
     }
+    for (Id& predicate : predicates)
+        predicate = GsEmulationGuardAccess(ctx, predicate);
     const Id result = ctx.OpSelect(ctx.U32[1], predicates[0], aligned, ctx.ConstU32(UINT32_MAX));
     ctx.buffer_address_bounds.emplace(result.value, EmitContext::BufferAddressBounds{predicates, bytes, formatted});
     return result;
@@ -349,6 +351,9 @@ Id EmitGetAttribute(EmitContext& ctx, IR::Attribute attr, u32 comp, u32 index) {
 
 Id EmitGetAttributeU1(EmitContext& ctx, IR::Attribute attr, u32 comp) {
     ASSERT(comp == 0);
+    if (const auto value = GsEmulationGetAttributeU1(ctx, attr)) {
+        return *value;
+    }
     switch (attr) {
     case IR::Attribute::IsFrontFace:
         return ctx.OpLoad(ctx.U1[1], ctx.front_facing);

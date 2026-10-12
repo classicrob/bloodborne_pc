@@ -454,6 +454,15 @@ void ConstantPropagation(IR::Block& block, IR::Inst& inst) {
         FoldWhenAllImmediates(inst, [](s64 a, s64 b) { return a < b; });
         return;
     case IR::Opcode::ULessThan32:
+#ifdef __APPLE__
+        // bbport: x <u 0 is false for any x. A GS copy shader drawn without its stream-out
+        // (CopyVertex) sees "0 vertices fit", so its "lane < count" guard folds and the lane id
+        // (a subgroup mask, which vertex functions cannot use) becomes dead.
+        if (inst.Arg(1).IsImmediate() && inst.Arg(1).U32() == 0) {
+            inst.ReplaceUsesWithAndRemove(IR::Value{false});
+            return;
+        }
+#endif
         FoldWhenAllImmediates(inst, [](u32 a, u32 b) { return a < b; });
         return;
     case IR::Opcode::ULessThan64:

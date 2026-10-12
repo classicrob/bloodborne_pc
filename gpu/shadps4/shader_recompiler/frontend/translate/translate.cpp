@@ -93,6 +93,50 @@ void Translator::EmitPrologue(IR::Block* first_block) {
         ir.SetScalarReg(dst_sreg, ir.GetUserData(dst_sreg));
         ++dst_sreg;
     }
+    if (runtime_info.gs_so_buffers != 0) {
+        // bbport (Apple): a GS copy shader with stream-out (GS-DESIGN 11.2). After the user data,
+        // the VGT supplies the stream-out config (vertices of this wave that fit, bits 16-22), the
+        // write index of the wave's first vertex and the base offset of each enabled buffer, in
+        // buffer order. The stream-out kernel (CopyStreamOut) takes them from its draw; all 64
+        // lanes run and the ones the VGT would not launch start with exec clear. The draw
+        // (CopyVertex) writes nothing: its stream-out stores are removed, and it sees a wave in
+        // which no vertex fits.
+        const bool kernel = runtime_info.gs_role == GsEmulationRole::CopyStreamOut;
+        ASSERT_MSG(kernel || runtime_info.gs_role == GsEmulationRole::CopyVertex,
+                   "Geometry emulation: stream-out inputs for shader {:#x} in role {}",
+                   info.pgm_hash, u32(runtime_info.gs_role));
+        ASSERT_MSG(runtime_info.sw.vs.vertex_sgpr_offset == 0 &&
+                       runtime_info.sw.vs.instance_sgpr_offset == 0,
+                   "Geometry emulation: copy shader {:#x} stream-out with base vertex/instance "
+                   "SGPRs",
+                   info.pgm_hash);
+        // The kernel's lane guard lives in EmitBufferAddress (robust buffer access emulation)
+        // and its wave operations in LowerWave64Compute: the Apple profile.
+        ASSERT_MSG(!kernel || (profile.emulate_robust_buffer_access && profile.emulate_wave64),
+                   "Geometry emulation: stream-out kernel of shader {:#x} needs the Apple profile "
+                   "(robust buffer access and wave64 emulation)",
+                   info.pgm_hash);
+        const auto input = [&](IR::Attribute attr) -> IR::U32 {
+            return kernel ? ir.GetAttributeU32(attr) : ir.Imm32(0u);
+        };
+        if (kernel) {
+            ir.SetExec(ir.GetAttributeU1(IR::Attribute::GsStreamOutLaneValid));
+        }
+        IR::ScalarReg so_sreg = dst_sreg;
+        ir.SetScalarReg(so_sreg++, input(IR::Attribute::GsStreamOutConfig));
+        ir.SetScalarReg(so_sreg++, input(IR::Attribute::GsStreamOutWriteIndex));
+        for (u32 buffer = 0; buffer < 4; ++buffer) {
+            if ((runtime_info.gs_so_buffers >> buffer) & 1) {
+                ir.SetScalarReg(so_sreg++, input(IR::Attribute(
+                                               u64(IR::Attribute::GsStreamOutOffset0) + buffer)));
+            }
+        }
+    } else {
+        ASSERT_MSG(runtime_info.gs_role != GsEmulationRole::CopyStreamOut,
+                   "Geometry emulation: stream-out kernel of shader {:#x} without stream-out "
+                   "buffers",
+                   info.pgm_hash);
+    }
 
     IR::VectorReg dst_vreg = IR::VectorReg::V0;
     switch (info.sw_stage) {

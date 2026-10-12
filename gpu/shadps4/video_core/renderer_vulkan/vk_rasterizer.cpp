@@ -1094,6 +1094,9 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
         }
         gs_draw = RecordGsEmulation(pipeline, regs, is_indexed, index_offset);
         is_indexed = false; // the guest index buffer was read by the ES
+        if (gs_draw.skip_draw) {
+            return; // stream-out only: the rasterizer is killed
+        }
     }
 #endif
     bind_prepared = used_prepared;
@@ -1415,6 +1418,9 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
         gs_draw = RecordGsEmulationIndirect(pipeline, Regs(), is_indexed, indirect.args, stride,
                                             max_count, count_address);
         is_indexed = false; // the guest index buffer is read by the ES
+        if (gs_draw.skip_draw) {
+            return; // stream-out only: the rasterizer is killed
+        }
     }
     // Without the feature vkCmdDraw*IndirectCount is invalid. See docs/macos/feature-audit.md.
     if (!gs_draw.indirect && FeatureChecks::DrawIndirectCountUnsupported(count_address,
@@ -3607,11 +3613,47 @@ void Rasterizer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds
 #ifdef __APPLE__
 void Rasterizer::StreamOutUpdate(u32 buffer, AmdGpu::SourceSelect source, u64 value_or_address,
                                  u64 dst_or_0) {
-    // The GS emulation does not cover stream-out yet: its draws stop too ("does not cover
-    // stream-out"). The state and its ordering come with the copy kernels (GS-DESIGN section 11).
-    UNREACHABLE_MSG("macOS: stream-out state not implemented: buffer {}, source {}, value {:#x}, "
-                    "store to {:#x}",
-                    buffer, magic_enum::enum_name(source), value_or_address, dst_or_0);
+    // The form Gnm emits (liverpool.cpp): set a buffer's offset from the packet, store nothing.
+    // The offset lives on the GPU, where stream-out draws advance it, so it is written in
+    // command order (vk_gs_emulation.h SoState).
+    ASSERT_MSG(buffer < 4 && source == AmdGpu::SourceSelect::BufferOffset && dst_or_0 == 0,
+               "macOS: stream-out update of buffer {} from {} (value {:#x}, store to {:#x}) is "
+               "not modelled",
+               buffer, magic_enum::enum_name(source), value_or_address, dst_or_0);
+    DrainDrawPipe();
+    if (!so_state) {
+        // Host-visible for the overflow counts; zeroed before any command uses it.
+        so_state = std::make_unique<VideoCore::Buffer>(instance, 0, SoStateBytes,
+                                                       VideoCore::MemoryType::Stream,
+                                                       "GsStreamOutState");
+        ASSERT_MSG(!so_state->mapped_data.empty(), "macOS: stream-out state unmapped");
+        std::memset(so_state->mapped_data.data(), 0, SoStateBytes);
+    }
+    scheduler.EndRendering();
+    const u32 offset_dw = u32(value_or_address);
+    scheduler.Record([=, state = so_state->Handle()](vk::CommandBuffer cmdbuf) {
+        // After the compaction kernels of earlier stream-out draws, before later ones.
+        const vk::MemoryBarrier2 before{
+            .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+            .srcAccessMask = vk::AccessFlagBits2::eShaderStorageRead |
+                             vk::AccessFlagBits2::eShaderStorageWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+            .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
+        };
+        cmdbuf.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1,
+                                                   .pMemoryBarriers = &before});
+        cmdbuf.updateBuffer(state, (SoBufferOffset0 + buffer) * 4, sizeof(offset_dw),
+                            &offset_dw);
+        const vk::MemoryBarrier2 after{
+            .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
+            .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+            .dstAccessMask = vk::AccessFlagBits2::eShaderStorageRead |
+                             vk::AccessFlagBits2::eShaderStorageWrite,
+        };
+        cmdbuf.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1,
+                                                   .pMemoryBarriers = &after});
+    });
 }
 #endif
 

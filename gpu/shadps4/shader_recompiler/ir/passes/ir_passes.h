@@ -30,7 +30,7 @@ void FlattenExtendedUserdataPass(IR::Program& program);
 void ReadLaneEliminationPass(IR::Program& program);
 ResourceDiscoveryList ResourceDiscoverPass(IR::Program& program, const Profile& profile);
 void ResourcePatchingPass(Shader::Info& info, const ResourceDiscoveryList& sharp_usages,
-                          const Profile& profile);
+                          const Profile& profile, const RuntimeInfo& runtime_info);
 void CollectShaderInfoPass(IR::Program& program, const Profile& profile);
 void LowerBufferFormatToRaw(IR::Program& program, const Profile& profile);
 void LowerUserClipPlanes(IR::Program& program, const RuntimeInfo& runtime_info);
