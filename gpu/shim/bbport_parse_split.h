@@ -106,6 +106,14 @@ enum K : std::uint32_t {
     KEncCopy,        ///< recorder: copies, fills, clears (Runtime)
     KDeferredWriteData, ///< deferred-signal waits before an in-order WRITE_DATA (RunWriteData)
     KDeferredFlip,      ///< deferred-signal waits before a flip's interrupt (SignalFlip)
+    // Contended acquisitions of our own locks (bbport_lock_wait.h): the wait, not the hold.
+    KLockTextureCache, ///< TextureCache::mutex
+    KLockSamplers,     ///< TextureCache::samplers_mutex
+    KLockRegions,      ///< buffer cache RegionManager::lock
+    KLockPages,        ///< PageManager's range locks
+    KLockStaging,      ///< StagingBufferPool::mutex
+    KLockDrawPrep,     ///< draw preparation (DrawPrep) mutex
+    KLockPrograms,     ///< PipelineCache::programs_mutex (shared or exclusive)
     KCount
 };
 inline constexpr const char* k_names[KCount] = {
@@ -116,7 +124,9 @@ inline constexpr const char* k_names[KCount] = {
     "dynamic state", "barrier flush", "render pass switch", "encode pipeline bind",
     "encode descriptors", "encode draws", "encode dispatches", "encode rendering begin/end",
     "encode barriers", "encode copies", "deferred signals before WRITE_DATA",
-    "deferred signals before a flip"};
+    "deferred signals before a flip", "lock wait: texture cache", "lock wait: samplers",
+    "lock wait: buffer regions", "lock wait: pages", "lock wait: staging pool",
+    "lock wait: draw preparation", "lock wait: pipeline programs"};
 
 /// The scope kind WaitDeferredSignals charges on this thread (KDeferred unless a caller names
 /// its site).
