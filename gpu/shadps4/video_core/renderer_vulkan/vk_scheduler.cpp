@@ -62,7 +62,12 @@ void Scheduler::BeginRendering(const RenderState& new_state) {
         return;
     }
     BB_SPLIT_SCOPE(KRenderPassSwitch);
+#ifdef __APPLE__
+    EndRenderingFor(BbPassCensus::Why::TargetChange);
+    BbPassCensus::NoteBegin();
+#else
     EndRendering();
+#endif
     is_rendering = true;
     render_state = new_state;
 
@@ -131,9 +136,15 @@ void Scheduler::BeginRendering(const RenderState& new_state) {
 }
 
 void Scheduler::EndRendering() {
+#ifdef __APPLE__
+    const auto why = std::exchange(end_reason, BbPassCensus::Why::Other);
+#endif
     if (!is_rendering) {
         return;
     }
+#ifdef __APPLE__
+    BbPassCensus::NoteEnd(why, __builtin_return_address(0));
+#endif
     is_rendering = false;
     BB_SPLIT_SCOPE(KRenderPassSwitch);
     Record([](vk::CommandBuffer cmdbuf) {
@@ -634,7 +645,11 @@ u64 Scheduler::SubmitExecution(SubmitInfo& info) {
     }
     next_submit_waits.clear();
 
+#ifdef __APPLE__
+    EndRenderingFor(BbPassCensus::Why::Submit);
+#else
     EndRendering();
+#endif
     if (auto* profiler = GpuProfiler::Get(); profiler && profiler->Records(this)) {
         // Until the next submission's first timestamp: mostly the GPU waiting for it.
         profiler->Mark(0x5B317ull, [] { return std::string{"(between submissions: GPU idle)"}; });

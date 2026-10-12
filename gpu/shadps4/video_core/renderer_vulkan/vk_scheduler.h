@@ -26,6 +26,9 @@
 
 #include "bbport_toggles.h"
 #include "common/assert.h"
+#ifdef __APPLE__
+#include "bbport_pass_census.h"
+#endif
 #include "common/interval_set.h"
 #include "common/unique_function.h"
 #include "video_core/amdgpu/regs_color.h"
@@ -733,7 +736,14 @@ public:
     void BeginRendering(const RenderState& new_state);
 
     /// Ends current rendering scope.
-    void EndRendering();
+    [[gnu::noinline]] void EndRendering();
+#ifdef __APPLE__
+    /// EndRendering, counted by its cause (bbport_pass_census.h) rather than by caller.
+    void EndRenderingFor(BbPassCensus::Why why) {
+        end_reason = why;
+        EndRendering();
+    }
+#endif
 
     /// Sets a function to be called on every scheduler submission.
     void SetSubmitCallback(SubmitFunc&& on_submit) {
@@ -1036,6 +1046,9 @@ private:
     std::atomic<size_t> queued_chunks{0}; ///< recorder_queue.size() for lock-free polling
     bool recorder_sleeping = false; ///< waiting on recorder_cv (guarded by recorder_mutex)
     bool direct_mode = false; ///< the command buffer is recorded on the caller's thread
+#ifdef __APPLE__
+    BbPassCensus::Why end_reason = BbPassCensus::Why::Other; ///< for the next EndRendering
+#endif
     u64 host_copies_issued = 0;
     std::atomic<u64> host_copies_done{0};
     /// WaitBeforeNextSubmit, consumed by SubmitExecution (both under submit_mutex).
