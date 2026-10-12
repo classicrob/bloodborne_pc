@@ -90,8 +90,22 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
         draw_pipe = std::make_unique<DrawPipe>(&RunDrawPacket, this);
 #ifdef __APPLE__
         draw_pipe->after_packet = [](void* context, bool idle) {
-            static_cast<Rasterizer*>(context)->scheduler.FlushLabels(idle);
+            // Bit 56: not at every momentary idle; the idle hook submits before stage B sleeps.
+            static_cast<Rasterizer*>(context)->scheduler.FlushLabels(
+                idle && !BbToggle::Disabled(BbToggle::LabelFlushWhenAsleep));
         };
+        draw_pipe->SetIdleHook([](void* context, bool sleeping) {
+            if (!BbToggle::Disabled(BbToggle::LabelFlushWhenAsleep)) {
+                return;
+            }
+            auto& scheduler = static_cast<Rasterizer*>(context)->scheduler;
+            if (sleeping) {
+                scheduler.FlushLabelsFor(BbSplit::FBatchSleep);
+            } else if (scheduler.label_flush_requested.exchange(false,
+                                                                std::memory_order_acq_rel)) {
+                scheduler.FlushLabelsFor(BbSplit::FBatchAsked);
+            }
+        });
 #endif
     }
 #ifdef __APPLE__

@@ -144,12 +144,15 @@ enum F : std::uint32_t {
     FLabel,      ///< a label not batched (stage A, or recording not deferred): one per label
     FBatchIdle,  ///< stage B's batched labels, at a packet boundary with the draw pipe idle
     FBatchAge,   ///< stage B's batched labels, the oldest older than LabelBatchAge
+    FBatchSleep, ///< stage B's batched labels, before it sleeps (bit 56)
+    FBatchAsked, ///< stage B's batched labels, asked for by a waiting thread (bit 56)
     FFinish,     ///< Scheduler::Finish (a wait for the GPU)
     FOther,
     FCount
 };
 inline constexpr const char* f_names[FCount] = {
-    "frame end", "unbatched labels", "label batch at idle", "label batch at age", "Finish",
+    "frame end", "unbatched labels", "label batch at idle", "label batch at age",
+    "label batch before sleep", "label batch asked for", "Finish",
     "other"};
 
 /// The reason the calling thread's next draw-scheduler Flush has (FOther unless set).

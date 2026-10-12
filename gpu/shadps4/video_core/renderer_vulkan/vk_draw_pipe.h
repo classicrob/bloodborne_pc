@@ -140,6 +140,11 @@ public:
     u64 packets = 0, drains = 0, drain_cycles = 0;
     std::atomic<u64> busy_cycles{0};
 
+    /// Sets the idle hook (see idle_hook); stage B reads it while it runs.
+    void SetIdleHook(void (*hook)(void* context, bool sleeping)) {
+        idle_hook.store(hook, std::memory_order_release);
+    }
+
 private:
     struct Header {
         u32 size;    ///< bytes to the next packet (0: wrap to the ring start)
@@ -188,7 +193,15 @@ private:
                         return;
                     }
                     __builtin_ia32_pause();
+                    if ((spins & 255) != 0) {
+                        // The clock and the idle hook every 256 pauses.
+                    } else if (const auto hook = idle_hook.load(std::memory_order_acquire)) {
+                        hook(context, false);
+                    }
                     if (!(spins & 255) && std::chrono::steady_clock::now() >= spin_until) {
+                        if (const auto hook = idle_hook.load(std::memory_order_acquire)) {
+                            hook(context, true); // about to sleep
+                        }
                         const u32 seen = wake.load(std::memory_order_seq_cst);
                         sleeping.store(true, std::memory_order_seq_cst);
                         if (published.load(std::memory_order_seq_cst) == at &&
@@ -234,6 +247,9 @@ private:
     /// bbport: optional, on stage B after each packet, before it counts as consumed (labels
     /// batched at GPU completion).
     void (*after_packet)(void* context, bool idle) = nullptr;
+    /// bbport: optional, on stage B while it has no packet: every 256 spins (`sleeping` false)
+    /// and before it sleeps (`sleeping` true). Labels batched at GPU completion (Apple).
+    std::atomic<void (*)(void* context, bool sleeping)> idle_hook{nullptr};
     friend class Rasterizer;
     void* context;
     std::unique_ptr<u8[]> ring;

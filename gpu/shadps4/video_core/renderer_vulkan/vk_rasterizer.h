@@ -192,6 +192,9 @@ public:
         // them (stage A waits only after a drain, which ends with stage B's idle flush).
         if (DrawPipe::OnStageB()) {
             scheduler.FlushLabels(true);
+        } else if (BbToggle::Disabled(BbToggle::LabelFlushWhenAsleep)) {
+            // Bit 56: stage B did not flush at the drain's idle; ask it (its idle hook).
+            scheduler.RequestLabelFlush();
         }
 #endif
         scheduler.WaitDeferredSignals();
@@ -202,6 +205,8 @@ public:
     void WaitLabelsThrough(u64 through) {
         if (DrawPipe::OnStageB()) {
             scheduler.FlushLabels(true);
+        } else if (BbToggle::Disabled(BbToggle::LabelFlushWhenAsleep)) {
+            scheduler.RequestLabelFlush();
         }
         scheduler.WaitLabelsThrough(through);
     }

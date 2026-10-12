@@ -763,6 +763,25 @@ int main() {
         barrier.AtForwardedWait(5);
         Expect("  ... the barrier only rises", barrier.Required() == 7);
         {
+            // The draw pipe's idle hook (bit 56's backstop): called while stage B spins with no
+            // packet, and before it sleeps; never while it has packets.
+            struct Hooks {
+                std::atomic<int> spinning{0}, sleeping{0};
+            } hooks;
+            {
+                Vulkan::DrawPipe pipe([](void*, const std::uint8_t*, std::uint32_t) {}, &hooks);
+                pipe.SetIdleHook([](void* context, bool asleep) {
+                    auto& h = *static_cast<Hooks*>(context);
+                    (asleep ? h.sleeping : h.spinning).fetch_add(1);
+                });
+                for (int i = 0; i < 2000 && hooks.sleeping.load() == 0; ++i) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                }
+            }
+            Expect("  ... the draw pipe calls its idle hook while spinning and before it sleeps",
+                   hooks.spinning.load() > 0 && hooks.sleeping.load() > 0);
+        }
+        {
             using namespace BbSplit;
             DeferredSite outer{KDeferredWriteData};
             const bool set = deferred_site == KDeferredWriteData;

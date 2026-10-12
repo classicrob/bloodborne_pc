@@ -265,6 +265,19 @@ void Scheduler::FlushLabels(bool idle) {
     Flush(); // asserts it signals unflushed_tick
 }
 
+#ifdef __APPLE__
+void Scheduler::FlushLabelsFor(BbSplit::F reason) {
+    if (!labels_unflushed.load(std::memory_order_relaxed)) {
+        return;
+    }
+    BbSplit::NoteLabelBatch(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now() - unflushed_since)
+                                .count());
+    BbSplit::FlushReason flush_reason{reason};
+    Flush(); // asserts it signals unflushed_tick
+}
+#endif
+
 void Scheduler::SignalAtGpuCompletion(std::function<void()> signal, bool batch) {
     // Issue-to-write age, the delay the guest sees on a label (parse split's Flushes line).
     signal = [issued = std::chrono::steady_clock::now(), signal = std::move(signal)] {
