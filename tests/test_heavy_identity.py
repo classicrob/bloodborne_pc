@@ -77,5 +77,40 @@ class ProcessIdentityTests(unittest.TestCase):
         self.assertFalse(ps('stat', pid).startswith('T'))
 
 
+class GroupCoverageTests(unittest.TestCase):
+    """job_processes: the job's own group, also after its leader exited; a leader pid that now
+    names another process (another start) gives the tree only."""
+    def setUp(self):
+        self.heavy = load_heavy()
+        # A group whose leader (sh) exits at once, leaving a member (sleep) that holds the group.
+        self.leader = subprocess.Popen(['sh', '-c', 'sleep 30 & echo $! ; exit'], start_new_session=True,
+                                       stdout=subprocess.PIPE, text=True)
+        self.start = self.heavy.process_start(self.leader.pid)
+        self.member = int(self.leader.stdout.readline())
+        self.leader.wait()
+
+    def tearDown(self):
+        os.kill(self.member, signal.SIGKILL)
+
+    def test_group_after_its_leader_exited(self):
+        self.assertIsNone(self.heavy.process_start(self.leader.pid))
+        info = {'command_pid': self.leader.pid, 'command_start': list(self.start)}
+        self.assertIn(self.member, self.heavy.job_processes(os.getpid(), info))
+
+    def test_no_start_record_no_group(self):
+        info = {'command_pid': self.leader.pid}  # an older heavy.sh's slot
+        self.assertNotIn(self.member, self.heavy.job_processes(os.getpid(), info))
+
+    def test_reused_leader_pid_is_a_stranger(self):
+        # A live process standing for a reused leader pid: its start differs from the record.
+        stranger = subprocess.Popen(['sleep', '30'], start_new_session=True)
+        try:
+            info = {'command_pid': stranger.pid, 'command_start': [1, 0]}
+            self.assertEqual(self.heavy.job_processes(os.getpid(), info), self.heavy.descendants(os.getpid()))
+        finally:
+            stranger.kill()
+            stranger.wait()
+
+
 if __name__ == '__main__':
     unittest.main()

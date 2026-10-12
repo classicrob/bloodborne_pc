@@ -455,6 +455,37 @@ wait "$p22"
     fail "an orphaned process (priority $orphan_pri) or its new child ($orphan_child) not demoted under ecore"
 kill "$b18" 2>/dev/null; wait "$b18" 2>/dev/null || true
 sleep 0.3; ! kill -0 "$orphan" 2>/dev/null || fail "the job's orphan outlived the job's SIGTERM (group forwarding)"
+# A SIGKILL to the caller's process group (a stopped task, a killed shell) takes the job's command
+# down too, though it runs in its own session: its reaper SIGKILLs the job's group once heavy.py is
+# gone, so the slot is never free while the job still runs. Build and quick pools.
+for pool in build quick; do
+    tag=k$pool
+    perl -e 'setpgrp(0, 0); exec @ARGV' -- "$heavy" --pool $pool K20$pool -- \
+        sh -c "while :; do echo t >> '$dir/$tag'; sleep 0.2; done" 2> /dev/null &
+    launcher=$!
+    for _ in $(seq 100); do [[ -s $dir/$tag ]] && break; sleep 0.05; done
+    loop=$(pgrep -f "^sh -c while :; do echo t >> '$dir/$tag'" || true)
+    [[ -n $loop ]] || fail "K20$pool's command never started"
+    kill -KILL -- -"$launcher"
+    for _ in $(seq 40); do kill -0 "$loop" 2>/dev/null || break; sleep 0.1; done
+    ! kill -0 "$loop" 2>/dev/null || { kill "$loop"; fail "$pool job's command survived a SIGKILL to the caller's group"; }
+    "$heavy" status | grep -q "held by K20$pool" && fail "$pool slot still held after the job's group died"
+    wait "$launcher" 2>/dev/null || true
+done
+# Restore after ecore returns a polite job to its own scheduling (a priority-lane job: nice 5,
+# utility QoS), not merely out of the background.
+"$heavy" --priority B19 -- sh -c "while :; do echo t >> '$dir/b19'; sleep 0.2; done" 2> /dev/null &
+b19=$!
+for _ in $(seq 50); do [[ -s $dir/b19 ]] && break; sleep 0.1; done
+b19_loop=$(pgrep -f "^sh -c while :; do echo t >> '$dir/b19'" || true)
+[[ -n $b19_loop ]] || fail "B19's loop not found"
+b19_before="$(ps -o pri=,nice= -p "$b19_loop" | tr -s ' ')"
+"$heavy" --pool playtest --gpu exclusive --cpu-quiet=ecore P23 -- sleep 2 2> /dev/null &
+p23=$!; sleep 1.5; b19_during=$(pri "$b19_loop"); wait "$p23"; sleep 1.5
+b19_after="$(ps -o pri=,nice= -p "$b19_loop" | tr -s ' ')"
+(( b19_during == 4 )) || fail "the priority-lane job was not demoted (priority $b19_during)"
+[[ $b19_after == "$b19_before" ]] || fail "restore changed the priority-lane job's scheduling: '$b19_before' -> '$b19_after'"
+kill "$b19" 2>/dev/null; wait "$b19" 2>/dev/null || true
 # --settle LOAD,SECONDS: a quiet run waits for the 1-minute load to fall below LOAD, or refuses
 # (exit 75) past SECONDS, naming the top processes; the quiet start records the top 5 CPU
 # processes; a GPU request is recorded before its grant; --settle needs --cpu-quiet.
@@ -485,19 +516,35 @@ fi
 
 # Job records: a start event with the command and the directory; an end event for every pool with
 # the exit status, or the signal that killed it (SIGTERM to heavy.sh is forwarded to the command);
-# a job whose heavy.sh was SIGKILLed while its command runs on is shown as ORPHANED.
+# a SIGKILLed heavy.sh's command is reaped; only if its reaper dies too does it run on, ORPHANED.
 "$heavy" R1 -- sh -c 'exit 7' 2>/dev/null || true
 "$heavy" R2 -- sleep 30 &
 r2=$!
 until_held build0 R2
 kill -TERM "$r2"; wait "$r2" 2>/dev/null || true
 wait_for "SIGTERM to heavy.sh did not end its command" slot_free build0
+reaper_of() { python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["command_pid"])' "$dir/build0"; }
+# A SIGKILLed heavy.sh: the command's reaper ends the command and the slot is free.
 "$heavy" R3 -- sleep 30 &
 r3=$!
 until_held build0 R3
+r3_cmd=$(pgrep -P "$(reaper_of)" | head -1 || true)
+[[ -n $r3_cmd ]] || fail "R3's command not found under its reaper"
 kill -9 "$r3"; wait "$r3" 2>/dev/null || true
-"$heavy" status | grep -q '^build0: held by R3 .*ORPHANED' || fail "orphaned command not shown: $("$heavy" status | grep build0)"
-kill "$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["command_pid"])' "$dir/build0")"
+gone() { ! kill -0 "$1" 2>/dev/null; }
+wait_for "a SIGKILLed heavy.sh's command was not reaped" gone "$r3_cmd"
+wait_for "slot not free after the reaped job: $("$heavy" status | grep build0)" slot_free build0
+# Only when heavy.sh and the reaper both die does a command outlive its job: shown as ORPHANED.
+"$heavy" R4 -- sleep 30 &
+r4=$!
+until_held build0 R4
+r4_reaper=$(reaper_of)
+r4_cmd=$(pgrep -P "$r4_reaper" | head -1 || true)
+[[ -n $r4_cmd ]] || fail "R4's command not found under its reaper"
+kill -9 "$r4" "$r4_reaper"; wait "$r4" 2>/dev/null || true
+orphan_shown() { "$heavy" status | grep -q '^build0: held by R4 .*ORPHANED'; }
+wait_for "orphaned command not shown: $("$heavy" status | grep build0)" orphan_shown
+kill "$r4_cmd"
 wait_for "build0 not freed after the orphan ended" slot_free build0
 python3 - "$dir/history.jsonl" "$PWD" <<'PY' || fail "job records in history.jsonl"
 import json, os, sys
@@ -509,7 +556,7 @@ assert start['R1']['command'].endswith("sh -c exit 7") and \
     os.path.realpath(start['R1']['cwd']) == os.path.realpath(sys.argv[2]), start['R1']
 assert end['R1']['status'] == 7 and end['R1']['pool'] == 'build' and 'seconds' in end['R1'], end['R1']
 assert end['R2']['signal'] == 'SIGTERM' and end['R2']['status'] == 128 + 15, end['R2']
-assert 'R3' not in end  # its heavy.sh was SIGKILLed: no end event, and status said ORPHANED
+assert 'R3' not in end and 'R4' not in end  # heavy.sh SIGKILLed: no end event (R4: ORPHANED)
 assert start['G1']['end'].startswith('recorded by the caller'), start['G1']
 PY
 

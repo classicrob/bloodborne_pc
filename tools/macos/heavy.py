@@ -187,9 +187,12 @@ def busy_slots():
 
 def describe(info):
     text = f"{info.get('label', '?')} (pid {info.get('pid', '?')}, since {info.get('since', '?')})"
+    # Called for held slots only: with heavy.sh gone, a process of its job still holds the lock (its
+    # reaper normally ends the job's group with heavy.sh; this is what remains if the reaper died too).
     pid, command_pid = info.get('pid'), info.get('command_pid')
-    if pid and command_pid and not alive(pid) and alive(command_pid):
-        text += f' ORPHANED: heavy.sh pid {pid} is gone, its command pid {command_pid} still holds the slot'
+    if pid and not alive(pid):
+        group = f' (its process group {command_pid})' if command_pid else ''
+        text += f' ORPHANED: heavy.sh pid {pid} is gone, a process of its job{group} still holds the slot'
     return text
 
 
@@ -313,16 +316,29 @@ def descendants(pid):
 def job_processes(root, info):
     """A job's processes below its slot holder (root): its process tree, and every member of the
     command's own process group (heavy starts each command in a new session), which also holds
-    those whose parent exited (re-parented to launchd, out of the tree). A job from an older
-    heavy.sh has no group of its own: its tree only (its group is the caller's)."""
+    those whose parent exited (re-parented to launchd, out of the tree), and still after its
+    leader exited. A leader pid that now names another process (another start time), or a job
+    from an older heavy.sh (no group of its own: its group is the caller's), gives the tree only."""
     pids = descendants(root)
-    leader = info.get('command_pid')
-    if leader:
-        out = subprocess.run(['ps', '-Ao', 'pid=,pgid='], capture_output=True, text=True).stdout
-        table = [tuple(map(int, line.split())) for line in out.splitlines() if len(line.split()) == 2]
-        if (leader, leader) in table:  # the command leads its own group
-            pids += [pid for pid, group in table if group == leader and pid not in pids and pid != root]
-    return pids
+    leader, recorded = info.get('command_pid'), info.get('command_start')
+    if not leader:
+        return pids
+    out = subprocess.run(['ps', '-Ao', 'pid=,pgid='], capture_output=True, text=True).stdout
+    table = [tuple(map(int, line.split())) for line in out.splitlines() if len(line.split()) == 2]
+    try:
+        current = process_start(leader)
+    except OSError as error:
+        print(f'heavy: job {root}: group leader {leader} unreadable ({error}): its tree only', file=sys.stderr, flush=True)
+        return pids
+    if current is not None:
+        if recorded and tuple(recorded) != current:
+            return pids  # the leader's pid now names another process: not this job's group
+        if (leader, leader) not in table:
+            return pids  # an older heavy.sh: the command did not lead a group of its own
+    elif not recorded:
+        return pids  # leader gone, and no record that it ever led a group
+    # The job's group; also when its leader exited (a pid is not reused while its group lives).
+    return pids + [pid for pid, group in table if group == leader and pid not in pids and pid != root]
 
 
 def alive(pid):
@@ -340,16 +356,33 @@ def process_start(pid):
     """The process's start time (seconds, microseconds) from the kernel (sysctl KERN_PROC_PID:
     kinfo_proc begins with it), or None when no such process exists. With the pid it names one
     process: a pid reused by a later process has another start, so CPU quiet never resumes or
-    restores a stranger that inherited a pid it remembered."""
+    restores a stranger that inherited a pid it remembered. OSError when the kernel refuses."""
     mib = (ctypes.c_int * 4)(1, 14, 1, pid)  # CTL_KERN, KERN_PROC, KERN_PROC_PID
     buffer = ctypes.create_string_buffer(1024)
     size = ctypes.c_size_t(len(buffer))
     if _libc.sysctl(mib, 4, buffer, ctypes.byref(size), None, 0) != 0:
         error = ctypes.get_errno()
-        fail(f'sysctl KERN_PROC_PID {pid}: {os.strerror(error)}')
+        raise OSError(error, f'sysctl KERN_PROC_PID {pid}: {os.strerror(error)}')
     if size.value == 0:
         return None
     return struct.unpack_from('qi', buffer.raw, 0)
+
+
+def start_or_none(pid, problems):
+    """process_start, with a kernel refusal noted in PROBLEMS (and None) instead of raised: CPU quiet
+    goes on with every other process and says so at the end."""
+    try:
+        return process_start(pid)
+    except OSError as error:
+        problems.append(f'{pid}: {error.strerror or error}')
+        return None
+
+
+def report_problems(label, what, problems):
+    if problems:
+        print(f'heavy: {label}: CPU quiet: {len(problems)} process(es) not {what} (identity unreadable): '
+              f'{"; ".join(problems[:5])}', file=sys.stderr, flush=True)
+        record({'event': 'quiet-problem', 'by': label, 'what': what, 'problems': problems[:20]})
 
 
 def process_states(pids):
@@ -407,7 +440,7 @@ def pause_quiet_pools(label):
     pause file. A process already stopped is left out: another pause (a test's own heavy.sh, a
     nested perf run) stopped it and resumes it, so this one must not. Returns [(job label, pids it
     stopped, slot holder pid)]."""
-    paused = []
+    paused, problems = [], []
     names = ['build-priority', 'build-idle'] + [n for pool in QUIET_POOLS for n in slot_names(pool)]
     for name in names:
         fd = try_lock(name)
@@ -431,7 +464,7 @@ def pause_quiet_pools(label):
                 if states.get(pid, '').startswith('T'):
                     foreign.append(pid)
                     continue
-                start = process_start(pid)
+                start = start_or_none(pid, problems)
                 if start is None:
                     continue
                 try:
@@ -448,6 +481,7 @@ def pause_quiet_pools(label):
                 **({'already_stopped': len(foreign)} if foreign else {})})
     if not paused:
         print(f'heavy: {label}: CPU quiet: no build, quick or sweep job was running', file=sys.stderr, flush=True)
+    report_problems(label, 'paused', problems)
     return paused
 
 
@@ -492,16 +526,20 @@ def demote_quiet_pools(label, demoted, seen, noted):
     reused pid is a new process, never one remembered (process_start)."""
     for name, job, root, info in quiet_jobs():
         tree = [root] + job_processes(root, info)
-        starts = {pid: process_start(pid) for pid in tree}
+        problems = []
+        starts = {pid: start_or_none(pid, problems) for pid in tree}
+        report_problems(label, 'demoted', problems)
         table = process_table([p for p in tree if starts[p] and (p, starts[p]) not in seen])
         count = 0
         for pid, (ppid, priority) in table.items():
             seen.add((pid, starts[pid]))
             if priority <= BACKGROUND_PRIORITY:
                 parent = demoted.get(ppid)
-                if parent and process_start(ppid) == parent[1]:
+                if parent and start_or_none(ppid, []) == parent[1]:
                     demoted[pid] = (root, starts[pid])  # inherited from a process this run demoted
                 continue
+            if start_or_none(pid, []) != starts[pid]:
+                continue  # died between the reads (its pid may already name another process)
             try:
                 os.setpriority(PRIO_DARWIN_PROCESS, pid, PRIO_DARWIN_BG)
                 demoted[pid] = (root, starts[pid])
@@ -520,13 +558,15 @@ def restore_demoted(label, demoted, noted):
     """The end of --cpu-quiet=ecore: the jobs' records first, then each demoted process back."""
     for root, job in noted.items():
         note_pause(root, 'ecore', end=label)
+    problems = []
     for pid, (_, start) in demoted.items():
-        if process_start(pid) != start:
-            continue  # gone, or the pid now names another process
+        if start_or_none(pid, problems) != start:
+            continue  # gone, the pid now names another process, or unreadable (reported)
         try:
             os.setpriority(PRIO_DARWIN_PROCESS, pid, 0)
         except (ProcessLookupError, PermissionError):
             pass
+    report_problems(label, 'restored (left at background QoS)', problems)
     for job in noted.values():
         print(f'heavy: {label}: CPU quiet over: {job} back from E-cores', file=sys.stderr, flush=True)
 
@@ -572,16 +612,18 @@ def settle(label, limit, bound):
 def resume_paused(label, paused):
     """The end of a stop-mode quiet: each job's pause record first (a job that ends at once reads
     a closed pause), then SIGCONT to each process it stopped that is still the same process."""
+    problems = []
     for job, pids, root in paused:
         note_pause(root, end=label)
         for pid, start in reversed(pids):
-            if process_start(pid) != start:
-                continue  # gone, or the pid now names another process
+            if start_or_none(pid, problems) != start:
+                continue  # gone, the pid now names another process, or unreadable (reported)
             try:
                 os.kill(pid, signal.SIGCONT)
             except ProcessLookupError:
                 pass
         print(f'heavy: {label}: CPU quiet over: resumed {job}', file=sys.stderr, flush=True)
+    report_problems(label, 'resumed (left stopped)', problems)
 
 
 def start_quiet(label, mode='stop'):
@@ -838,6 +880,50 @@ def record_end(label, pool, status, started, **extra):
     return event['status']
 
 
+def spawn_in_session(command):
+    """Starts COMMAND in a new session (its own process group, so CPU quiet acts on the whole job
+    and on none of the caller) under a reaper, heavy.py --reap-for PID: the group's leader, which
+    waits for the command and SIGKILLs the whole group if this heavy.py dies for any reason (a
+    SIGKILL to the caller's group, a stopped task), so a job never outlives the slot it holds.
+    Returns the reaper's Popen; its exit is the command's."""
+    return subprocess.Popen([sys.executable, os.path.abspath(__file__), '--reap-for', str(os.getpid()), '--', *command],
+                            start_new_session=True, close_fds=False)
+
+
+def reap(watched, command):
+    """--reap-for PID -- COMMAND: runs COMMAND in this process group, then ignores SIGINT/SIGTERM/
+    SIGHUP (heavy.py sends them to the whole group, so the command gets them; this process stays
+    to report). Polls its parent: once it is no longer PID, the group is SIGKILLed, this process
+    included. Exits with the command's status, or by the command's signal."""
+    try:
+        child = subprocess.Popen(command, close_fds=False)
+    except OSError as error:
+        print(f'heavy: cannot run {command[0]}: {error}', file=sys.stderr, flush=True)
+        os._exit(127)
+    for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):  # after the spawn: not inherited
+        signal.signal(signum, signal.SIG_IGN)
+    while True:
+        done, status = os.waitpid(child.pid, os.WNOHANG)
+        if done:
+            break
+        if os.getppid() != watched:
+            os.killpg(0, signal.SIGKILL)
+        time.sleep(0.1)
+    if os.WIFSIGNALED(status):
+        signal.signal(os.WTERMSIG(status), signal.SIG_DFL)
+        os.kill(os.getpid(), os.WTERMSIG(status))
+    os._exit(os.WEXITSTATUS(status))
+
+
+def session_info(info, child):
+    """The slot record with the job's process group: its leader (the reaper) and its start."""
+    try:
+        start = process_start(child.pid)
+    except OSError:
+        start = None
+    return {**info, 'command_pid': child.pid, 'command_start': list(start) if start else None}
+
+
 def supervise(label, pool, command, fd=None, info=None):
     """Runs the job's command as a child in its own session (its own process group, so CPU quiet
     finds every process of the job, including ones whose parent exited, and none of the caller's),
@@ -846,12 +932,12 @@ def supervise(label, pool, command, fd=None, info=None):
     be the command's (play_route.py: the game) sets BB_HEAVY_EXEC=1 and records the end itself."""
     started = time.monotonic()
     try:
-        child = subprocess.Popen(command, start_new_session=True, close_fds=False)
+        child = spawn_in_session(command)
     except OSError as error:
         record_end(label, pool, 127, started, error=str(error))
         fail(f'cannot run {command[0]}: {error}', 127)
     if fd is not None:  # the slot names the command too, so status can tell an orphan apart
-        info = {**info, 'command_pid': child.pid}
+        info = session_info(info, child)
         os.ftruncate(fd, 0)
         os.pwrite(fd, json.dumps(info).encode(), 0)
     def forward(signum, _):
@@ -871,12 +957,12 @@ def supervise_quick(label, command, fd=None, info=None):
         os.environ[name] = QUICK_JOBS
     os.environ['MAKEFLAGS'] = f'-j{QUICK_JOBS}'
     try:
-        child = subprocess.Popen(command, start_new_session=True, close_fds=False)
+        child = spawn_in_session(command)
     except OSError as error:
         fail(f'cannot run {command[0]}: {error}', 127)
     if fd is not None:  # the command's process group, for CPU quiet
         os.ftruncate(fd, 0)
-        os.pwrite(fd, json.dumps({**info, 'command_pid': child.pid}).encode(), 0)
+        os.pwrite(fd, json.dumps(session_info(info, child)).encode(), 0)
     started, warned = time.monotonic(), False
     forward = lambda signum, _: os.killpg(child.pid, signum)
     for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
@@ -913,6 +999,8 @@ def supervise_quick(label, command, fd=None, info=None):
 def main(argv):
     if argv == ['status']:
         return status()
+    if len(argv) > 3 and argv[0] == '--reap-for' and argv[1].isdigit() and argv[2] == '--':
+        reap(int(argv[1]), argv[3:])
     pool, priority, gpu, pool_given, quiet, settle_at = 'build', False, None, False, False, None
     while argv and argv[0].startswith('--') and argv[0] != '--':
         if argv[0] == '--priority':

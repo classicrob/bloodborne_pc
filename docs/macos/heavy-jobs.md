@@ -110,12 +110,21 @@ they start meanwhile, including ninja's compiles, inherit it. New jobs start at 
 `taskpolicy -b`, instead of waiting. At the end, the processes it demoted, and those that
 inherited it from them, are restored; a job started in the background stays there. A job that ran
 at E-core QoS says so at its end (`ran N s at E-core QoS for perf runs (...)`; `ecore_s`,
-`ecore_by` in its end event). Every job's command runs in its own session (its own process group): stop and ecore act on the
-job's tree and on every member of that group, so a process whose intermediate parent exited
-(re-parented to launchd) is paused or demoted too, and SIGINT/SIGTERM/SIGHUP reach the whole
-group. Limits: the group is used only while the command (its leader) and the slot holder are
-alive; a group left behind after they exit is not covered, and neither is a process in a group of
-its own (ninja starts each command in one: covered while ninja is its parent). Processes are
+`ecore_by` in its end event). Every job's command runs in its own session (its own process group) under a reaper (`heavy.py
+--reap-for`), the group's leader: it waits for the command, and when heavy.sh dies for any reason
+(a SIGKILL to the caller's group, a stopped task) it SIGKILLs the job's group, so a job never
+outlives the slot it holds. Only if the reaper dies too does a process of the job keep the slot;
+status then says ORPHANED. Stop and ecore act on the job's tree and on every member of its group
+(also after an intermediate parent exited, re-parented to launchd, and after the leader exited:
+a pid is not reused while its group lives), and SIGINT/SIGTERM/SIGHUP reach the whole group. The
+leader is recorded with its start time; a live leader pid with another start is a stranger (tree
+only). Limits: a group left behind after the job ends is not covered, and neither is a process
+in a group of its own (ninja starts each command in one: covered while ninja is its parent). Under
+ecore, a child forked by a demoted process whose parent already exited is not known as inherited
+and stays at background QoS after the quiet (until it ends); a job admitted during an ecore quiet
+runs under taskpolicy -b for its whole life, also after the quiet. A process whose identity the
+kernel will not give is skipped and reported (`quiet-problem`), never left half-handled for the
+others. Processes are
 remembered as (pid, start time from the kernel), so a pid reused by another process is never
 resumed or restored.
 
