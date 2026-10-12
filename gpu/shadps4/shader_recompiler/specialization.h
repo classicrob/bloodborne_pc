@@ -108,8 +108,31 @@ struct StageSpecialization {
     // shader, the resource (its index in Info::buffers or Info::images, not a Vulkan binding) and
     // the descriptor's dwords (a real asset format and a stale or
     // corrupt descriptor look different there), instead of in MapNumberConversion.
+    /// Where each dword of a fetched descriptor came from: an immediate in the shader, a user-data
+    /// register (flat dword < 16) or the SRT walker's output (>= 16), with its value now.
+    template <typename T>
+    std::string DescribeFetch(const SharpFetch<T>& fetch) const {
+        const auto flat = info->FlatUserData();
+        std::string text = "; its dwords come from:";
+        for (u32 i = 0; i < SharpFetch<T>::N; ++i) {
+            if (!((fetch.load_mask >> i) & 1)) {
+                text += fmt::format(" [{}] immediate {:#x}", i, fetch.immediates[i]);
+            } else if (fetch.offsets[i] == UNKNOWN_LOCATION || fetch.offsets[i] >= flat.size()) {
+                text += fmt::format(" [{}] flat dword {} (outside the {}-dword buffer)", i,
+                                    fetch.offsets[i], flat.size());
+            } else {
+                text += fmt::format(" [{}] {} {} = {:#x}", i,
+                                    fetch.offsets[i] < NUM_USER_DATA_REGS ? "user data s"
+                                                                       : "SRT walker output dword",
+                                    fetch.offsets[i], flat[fetch.offsets[i]]);
+            }
+        }
+        return text;
+    }
+
     void CheckNumberConversion(const char* kind, u32 index, const void* sharp, size_t size,
-                               AmdGpu::NumberFormat num_fmt, AmdGpu::DataFormat data_fmt) const {
+                               AmdGpu::NumberFormat num_fmt, AmdGpu::DataFormat data_fmt,
+                               const std::string& fetch_source = {}) const {
         if (AmdGpu::HasNumberConversion(num_fmt, data_fmt)) {
             return;
         }
@@ -122,8 +145,14 @@ struct StageSpecialization {
 #ifdef __APPLE__
         // BB_CMD_DATA_CHECK: where the descriptor's table read came from (submitted command
         // memory, its chunk tail, or elsewhere).
-        const std::string source = BbCmdData::LastRead() + BbFrameMarks::Describe() + "; " +
-                                   BbComputeSh::Describe();
+        // The user-data words (s0..s15), for matching the dwords' sources and pointer pairs.
+        std::string user_data = "; user data now:";
+        const auto ud = info->UserData();
+        for (size_t i = 0; i < ud.size() && i < NUM_USER_DATA_REGS; ++i) {
+            user_data += fmt::format(" s{}={:#x}", i, ud[i]);
+        }
+        const std::string source = fetch_source + user_data + BbCmdData::LastRead() +
+                                   BbFrameMarks::Describe() + "; " + BbComputeSh::Describe();
 #else
         const std::string source;
 #endif
@@ -174,7 +203,15 @@ struct StageSpecialization {
                          if (spec.is_formatted) {
                              CheckNumberConversion("buffer", u32(buffers.size() - 1), &sharp, sizeof(sharp),
                                                    AmdGpu::NumberFormat(sharp.num_format),
-                                                   AmdGpu::DataFormat(sharp.data_format));
+                                                   AmdGpu::DataFormat(sharp.data_format),
+#ifdef __APPLE__
+                                                   DescribeFetch(desc.sharp_fetch) +
+                                                       fmt::format(" (post op {})",
+                                                                   u32(desc.post_op))
+#else
+                                                   std::string{}
+#endif
+                             );
                              spec.data_format = static_cast<u32>(sharp.GetDataFmt());
                              spec.num_format = static_cast<u32>(sharp.GetNumberFmt());
                              spec.dst_select = sharp.DstSelect();
@@ -198,7 +235,15 @@ struct StageSpecialization {
                          }
                          CheckNumberConversion("image", u32(images.size() - 1), &sharp, sizeof(sharp),
                                                AmdGpu::NumberFormat(sharp.num_format),
-                                               AmdGpu::DataFormat(sharp.data_format));
+                                               AmdGpu::DataFormat(sharp.data_format),
+#ifdef __APPLE__
+                                               DescribeFetch(desc.sharp_fetch) +
+                                                   fmt::format(" (post op {})",
+                                                               u32(desc.post_op))
+#else
+                                               std::string{}
+#endif
+                         );
                          spec.num_conversion = sharp.GetNumberConversion();
                      });
         // bbport: every image's descriptor count as the emitter declares it (NumBindings),
