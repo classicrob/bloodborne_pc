@@ -9,12 +9,12 @@
 
 static _Thread_local int guest_error;
 #ifndef BB_QOS_REAL
-static atomic_int sets, gets;
+static atomic_int sets, qos_get_calls;
 static int inject_error, inject_mismatch;
 static _Thread_local qos_class_t requested=QOS_CLASS_UTILITY;
 static qos_class_t test_get(pthread_t thread,int *relative) {
     assert(pthread_equal(thread,pthread_self()));
-    atomic_fetch_add(&gets,1);
+    atomic_fetch_add(&qos_get_calls,1);
     errno=99;guest_error=77;
     *relative=0;
     return requested;
@@ -66,7 +66,7 @@ int main(int argc,char **argv) {
 #ifndef BB_QOS_REAL
     int active=!strcmp(argv[1],"interactive");
     assert(atomic_load(&sets)==(active ? 2 : 0));
-    assert(atomic_load(&gets)==(active ? 4 : 0));
+    assert(atomic_load(&qos_get_calls)==(active ? 4 : 0));
     /* Configuration remains latched; changing the environment doesn't opt in. */
     if (!active) {
         assert(!setenv("BB_AUDIO_QOS","interactive",1));
