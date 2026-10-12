@@ -41,6 +41,7 @@
 #include "bbport_compute_sh.h"
 #include "bbport_frame_marks.h"
 #include "bbport_parse_split.h"
+#include "bbport_thread_report.h"
 #include "bbport_write_order.h"
 #include "bbport_pass_census.h"
 #include "video_core/amdgpu/pm4_cmds.h"
@@ -357,6 +358,9 @@ u32 Liverpool::ProcessCommands(bool* stopped_at_cpu_flip) {
 
 void Liverpool::Process(std::stop_token stoken) {
     Common::SetCurrentThreadName("shadPS4:GpuCommandProcessor");
+#ifdef __APPLE__
+    BbThreadReport::Report("GPU command (stage A)");
+#endif
 #if !defined(_WIN32) && !defined(__APPLE__)
     if (clockid_t clock; pthread_getcpuclockid(pthread_self(), &clock) == 0) {
         BbStats::gpu_thread_clock.store(static_cast<int>(clock));

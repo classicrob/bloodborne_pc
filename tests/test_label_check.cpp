@@ -22,6 +22,7 @@
 #include "bbport_label_mode.h"
 #include "bbport_label_store.h"
 #include "bbport_parse_split.h"
+#include "bbport_thread_report.h"
 #include "bbport_write_order.h"
 #include "video_core/renderer_vulkan/vk_draw_pipe.h"
 #include "bbport_compute_sh.h"
@@ -794,6 +795,15 @@ int main() {
             Expect("  ... (outer site back)", deferred_site == KDeferredWriteData);
         }
         Expect("  ... (default site back)", BbSplit::deferred_site == BbSplit::KDeferred);
+    }
+
+    {
+        const std::string line = BbThreadReport::Describe("test");
+        Expect("thread report: requested QoS, Mach priorities and policy, cluster stated as not "
+               "queryable",
+               line.find("Thread test: requested QoS ") == 0 &&
+                   line.find("Mach priority current ") != std::string::npos &&
+                   line.find("core cluster not queryable on macOS") != std::string::npos);
     }
 
     std::fprintf(stderr, "%s: %u failures\n", failures ? "FAIL" : "PASS", failures);
