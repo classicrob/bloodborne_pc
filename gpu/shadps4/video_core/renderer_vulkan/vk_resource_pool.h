@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <atomic>
+
 #include <deque>
 #include <vector>
 #include <boost/container/static_vector.hpp>
@@ -32,8 +34,22 @@ public:
     ResourcePool& operator=(const ResourcePool&) = default;
     ResourcePool(const ResourcePool&) = default;
 
+public:
+    /// Resources held (the pool grows by grow_step, up to max_resources when set); readable
+    /// from any thread.
+    [[nodiscard]] std::size_t Size() const noexcept {
+        return published.size.load(std::memory_order_acquire);
+    }
+    /// Commits that waited for the GPU at max_resources (any thread).
+    [[nodiscard]] std::uint64_t WaitsAtCap() const noexcept {
+        return published.waits_at_cap.load(std::memory_order_acquire);
+    }
+
 protected:
     std::size_t CommitResource();
+    /// bbport: stamps the resource with `tick` (the submission that will use it) instead of
+    /// the current tick (asynchronous submission commits on the recording thread).
+    std::size_t CommitResource(u64 tick);
 
     /// Called when a chunk of resources have to be allocated.
     virtual void Allocate(std::size_t begin, std::size_t end) = 0;
@@ -47,6 +63,21 @@ protected:
     std::size_t grow_step = 0;     ///< Number of new resources created after an overflow
     std::size_t hint_iterator = 0; ///< Hint to where the next free resources is likely to be found
     std::vector<u64> ticks;        ///< Ticks for each resource
+    std::size_t max_resources = 0; ///< bbport: 0 unbounded; else waits for the GPU at the cap
+    /// Read from other threads (tests): ticks.size() published at each growth, and the commits
+    /// that waited at the cap. Copyable so the pool keeps its defaulted copy and move.
+    struct Published {
+        std::atomic<std::size_t> size{0};
+        std::atomic<std::uint64_t> waits_at_cap{0};
+        Published() = default;
+        Published(const Published& other)
+            : size{other.size.load()}, waits_at_cap{other.waits_at_cap.load()} {}
+        Published& operator=(const Published& other) {
+            size = other.size.load();
+            waits_at_cap = other.waits_at_cap.load();
+            return *this;
+        }
+    } published;
 };
 
 class CommandPool final : public ResourcePool {
@@ -57,6 +88,10 @@ public:
     void Allocate(std::size_t begin, std::size_t end) override;
 
     vk::CommandBuffer Commit();
+    /// bbport (Apple): command buffers in flight at most; a commit beyond waits for the GPU.
+    static constexpr std::size_t MaxBuffers = 256;
+    /// bbport: for the submission with timeline value `tick`.
+    vk::CommandBuffer Commit(u64 tick);
 
 private:
     const Instance& instance;

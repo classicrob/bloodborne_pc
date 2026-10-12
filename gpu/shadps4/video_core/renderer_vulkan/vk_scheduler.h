@@ -735,10 +735,36 @@ public:
     void Close();
 #endif
 
-    /// bbport: waits for the work submitted so far but leaves the command buffer being
-    /// recorded open, so a CommandBuffer() the caller holds stays valid (Finish() submits it:
-    /// recording into a submitted buffer crashes AMD's driver).
-    void WaitSubmitted();
+    /// bbport: waits for the GPU to retire the work submitted so far but leaves the command
+    /// buffer being recorded open, so a CommandBuffer() the caller holds stays valid (Finish()
+    /// submits it: recording into a submitted buffer crashes AMD's driver).
+    void WaitPreviousRetired();
+
+#ifdef __APPLE__
+    /// Asynchronous submission (docs/macos/async-submission.md): waits until the submission with
+    /// timeline value `tick` has been handed to vkQueueSubmit (not that it completed). Stops for
+    /// a value not yet assigned (>= CurrentTick()) or never enqueued, and when submission failed
+    /// or the scheduler closed before it. Call outside submit_mutex.
+    void WaitQueueSubmitted(u64 tick);
+    /// A submission's semaphore waits on an asynchronously submitting scheduler's timeline:
+    /// each such value is submitted first (a waiter ahead of its producer in the one in-order
+    /// Metal queue would block it). Stops for a wait on this scheduler's own unsubmitted value.
+    void WaitDependencies(const SubmitInfo& info, u64 own_value);
+    /// The tick of the command buffer being recorded where this runs: in a Record() closure on
+    /// the recording thread, the submission it lands in (CurrentTick() there is the owner's open
+    /// value, possibly several submissions ahead).
+    [[nodiscard]] u64 RecordingTick() const noexcept {
+        return recording_tick.load(std::memory_order_acquire);
+    }
+    /// Command buffers the pool holds (bounded: CommandPool::MaxBuffers), and the commits that
+    /// waited for the GPU at that bound; readable from any thread.
+    [[nodiscard]] size_t CommandBuffersAllocated() const noexcept {
+        return command_pool.Size();
+    }
+    [[nodiscard]] u64 CommandBufferWaitsAtCap() const noexcept {
+        return command_pool.WaitsAtCap();
+    }
+#endif
 
     /// Waits for the given tick to trigger on the GPU.
     void Wait(u64 tick);
@@ -1026,7 +1052,36 @@ private:
 
     void RecorderThread(std::stop_token stoken);
 
-    u64 SubmitExecution(SubmitInfo& info);
+    u64 SubmitExecution(SubmitInfo& info, u64 sealed_value = 0);
+
+#ifdef __APPLE__
+    /// What the recording thread needs to end, submit and begin: owned copies, never the
+    /// owner's later state.
+    struct SubmitPacket {
+        SubmitInfo info;
+        u64 signal_value = 0;
+        u64 next_tick = 0;      ///< the next submission's value: the begun buffer's pool stamp
+        u64 copies_through = 0; ///< host copies this submission reads (a sealed prefix)
+        BbPerf::Phase perf_phase = BbPerf::Phase::Scene;
+        u64 perf_frame = 0;
+    };
+    /// The owner's half of Flush with asynchronous submission: assigns the value, records the
+    /// submission's last commands, enqueues the packet and returns.
+    u64 EnqueueSubmission(SubmitInfo& info, u64 signal_value);
+    /// Assigns the value and completes `info`: the labels check, on_submit (it records into this
+    /// submission), WaitBeforeNextSubmit's waits.
+    u64 SealSubmission(SubmitInfo& info);
+    /// Stops when called on this scheduler's recording thread (it would wait for itself).
+    void StopOnRecorderThread(const char* what) const;
+    /// The recording thread's half: end, wait for the sealed copies, vkQueueSubmit, begin.
+    void SubmitFromRecorder(SubmitPacket& packet);
+    /// Owner: chunks it holds go to the recorder, without touching record_chunk.
+    void QueueFullChunks();
+    /// The asynchronously submitting schedulers' timelines (WaitDependencies).
+    static void RegisterAsyncTimeline(vk::Semaphore semaphore, Scheduler* owner);
+    static void UnregisterAsyncTimeline(Scheduler* owner);
+    static Scheduler* AsyncTimelineOwner(vk::Semaphore semaphore);
+#endif
 
     void PriorityPendingOpsThread(std::stop_token stoken);
 
@@ -1066,7 +1121,28 @@ private:
     std::mutex recorder_mutex;
     std::condition_variable_any recorder_cv;
     std::condition_variable_any recorder_idle_cv;
+#ifdef __APPLE__
+    /// A recorder queue entry: a chunk of commands, or (asynchronous submission) a submission.
+    struct RecorderItem {
+        std::unique_ptr<RecordChunk> chunk;
+        std::unique_ptr<SubmitPacket> submit;
+    };
+    std::deque<RecorderItem> recorder_queue;
+    bool async_submit = false;      ///< Apple, threaded recording: Flush enqueues (fixed)
+    u32 queued_submits = 0;         ///< enqueued, not yet submitted (recorder_mutex)
+    static constexpr u32 MaxQueuedSubmits = 8;
+    size_t live_chunks = 0;         ///< chunks allocated (recorder_mutex)
+    static constexpr size_t MaxChunks = 128; ///< 16 MiB of recorded commands in flight
+    std::condition_variable_any recorder_space_cv; ///< a submit or a chunk was freed
+    std::atomic<u64> enqueued_through{0};  ///< highest value enqueued
+    std::atomic<u64> submitted_through{0}; ///< highest value handed to vkQueueSubmit
+    bool submit_failed = false;     ///< recorder_mutex
+    /// The scheduler whose recording thread this is (set by that thread, read by itself only).
+    static inline thread_local const Scheduler* recording_for = nullptr;
+    std::atomic<u64> recording_tick{0}; ///< the tick the buffer being recorded is stamped with
+#else
     std::deque<std::unique_ptr<RecordChunk>> recorder_queue;
+#endif
     std::vector<std::unique_ptr<RecordChunk>> free_chunks;
     bool recorder_busy = false;
     std::atomic<size_t> queued_chunks{0}; ///< recorder_queue.size() for lock-free polling

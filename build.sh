@@ -256,7 +256,7 @@ if [[ ${1:-} == --test || ${1:-} == --test-dry ]]; then
         # tests (motion, UI composition, scene resolution, TAA, camera motion).
         unit_tests=(cmd-snapshot-test cond-exec-test label-check-test capture-quiesce-test flip-publish-test videoout-lifecycle-test strmout-update-test equeue-concurrency-test feature-checks-test image-view-storage-test
             submit-info-bounds-test vertex-fetch-translation-test buffer-null-test rect-interface-test
-            fence-address-test fill-clear-device-test capture-images-test scheduler-close-test overlay-concurrency-test depth-bounds-probe-test replay-capture-test
+            fence-address-test fill-clear-device-test capture-images-test scheduler-close-test scheduler-async-submit-test overlay-concurrency-test depth-bounds-probe-test replay-capture-test
             motion-history-test
             motion-shader-test
             ui-composition-test fill-clear-test scene-resolution-test taa-shader-test camera-motion-test)
@@ -278,6 +278,7 @@ if [[ ${1:-} == --test || ${1:-} == --test-dry ]]; then
         t out/gpu/fill-clear-device-test
         t out/gpu/capture-images-test
         t out/gpu/scheduler-close-test
+        t out/gpu/scheduler-async-submit-test
         t out/gpu/overlay-concurrency-test
         t out/gpu/rect-interface-test
         t out/gpu/depth-bounds-probe-test
