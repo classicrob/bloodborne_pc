@@ -362,6 +362,7 @@ void Rasterizer::EliminateFastClear() {
     ScopeMarkerBegin(fmt::format("EliminateFastClear:MRT={:#x}:M={:#x}", col_buf.Address(),
                                  col_buf.CmaskAddress()));
     runtime.ClearImage(&image, desc.view_info.range, clear_value);
+    texture_cache.MarkGpuWritten(image_id);
     ScopeMarkerEnd();
 }
 
@@ -1829,8 +1830,10 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
     const bool gs_emulation_stage =
         pipeline->IsCompute() &&
         pipeline->GetStage(Shader::SwStage::Compute).hw_stage != Shader::HwStage::Compute;
-    if (!gs_emulation_stage && (IsComputeImageCopy(pipeline) || IsComputeMetaClear(pipeline) ||
-                                IsComputeImageClear(pipeline))) {
+    // IsComputeImageCopy and IsComputeImageClear are not taken: they skip the shader's
+    // guest-memory writes and were never shown to match them, so the shader runs (an exact
+    // version needs differential tests through these call sites, Sol-2's review of c7427cc).
+    if (!gs_emulation_stage && IsComputeMetaClear(pipeline)) {
         return false;
     }
 
@@ -2457,6 +2460,7 @@ bool Rasterizer::IsComputeImageClear(const Pipeline* pipeline) {
         .extent = image1.info.resources,
     };
     runtime.ClearImage(&image1, range, clear);
+    texture_cache.MarkGpuWritten(image1_id);
     return true;
 }
 
@@ -3552,13 +3556,15 @@ void Rasterizer::Resolve() {
     VideoCore::TextureCache::ImageDesc mrt0_desc{Regs().color_buffers[0], mrt0_hint};
     VideoCore::TextureCache::ImageDesc mrt1_desc{Regs().color_buffers[1], mrt1_hint};
     auto& mrt0_image = texture_cache.GetImage(texture_cache.FindImage(mrt0_desc, true));
-    auto& mrt1_image = texture_cache.GetImage(texture_cache.FindImage(mrt1_desc, true));
+    const auto mrt1_id = texture_cache.FindImage(mrt1_desc, true);
+    auto& mrt1_image = texture_cache.GetImage(mrt1_id);
 
     ScopeMarkerBegin(fmt::format("Resolve:MRT0={:#x}:MRT1={:#x}",
                                  Regs().color_buffers[0].Address(),
                                  Regs().color_buffers[1].Address()));
     runtime.ResolveImage(&mrt0_image, &mrt1_image, mrt0_desc.view_info.range,
                          mrt1_desc.view_info.range);
+    texture_cache.MarkGpuWritten(mrt1_id);
     ScopeMarkerEnd();
 }
 
@@ -3573,7 +3579,8 @@ void Rasterizer::DepthStencilCopy(bool is_depth, bool is_stencil) {
         regs.depth_htile_data_base.GetAddress(), DbExtent(), true);
 
     auto& read_image = texture_cache.GetImage(texture_cache.FindImage(read_desc));
-    auto& write_image = texture_cache.GetImage(texture_cache.FindImage(write_desc));
+    const auto write_id = texture_cache.FindImage(write_desc);
+    auto& write_image = texture_cache.GetImage(write_id);
 
     VideoCore::SubresourceRange sub_range;
     sub_range.base.layer = Regs().depth_view.slice_start;
@@ -3585,6 +3592,7 @@ void Rasterizer::DepthStencilCopy(bool is_depth, bool is_stencil) {
         regs.depth_buffer.StencilWriteAddress()));
 
     runtime.CopyDepthStencil(&read_image, &write_image, sub_range);
+    texture_cache.MarkGpuWritten(write_id);
 
     ScopeMarkerEnd();
 }

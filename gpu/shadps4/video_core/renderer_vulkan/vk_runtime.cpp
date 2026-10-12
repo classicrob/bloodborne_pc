@@ -589,8 +589,7 @@ void Runtime::CopyDepthStencil(VideoCore::Image* src, VideoCore::Image* dst,
                          vk::ImageLayout::eTransferDstOptimal, region);
     });
 
-    dst->flags |= VideoCore::ImageFlagBits::GpuModified;
-    dst->flags &= ~VideoCore::ImageFlagBits::Dirty;
+    // The caller marks it GPU-written (TextureCache::MarkGpuWritten), which also tracks it.
 }
 
 void Runtime::ResolveImage(VideoCore::Image* src, VideoCore::Image* dst,
@@ -661,8 +660,7 @@ void Runtime::ResolveImage(VideoCore::Image* src, VideoCore::Image* dst,
         });
     }
 
-    dst->flags |= VideoCore::ImageFlagBits::GpuModified;
-    dst->flags &= ~VideoCore::ImageFlagBits::Dirty;
+    // The caller marks it GPU-written (TextureCache::MarkGpuWritten), which also tracks it.
 }
 
 void Runtime::ClearImage(VideoCore::Image* dst, const VideoCore::SubresourceRange& range,
@@ -689,8 +687,7 @@ void Runtime::ClearImage(VideoCore::Image* dst, const VideoCore::SubresourceRang
         cmdbuf.clearColorImage(image, vk::ImageLayout::eTransferDstOptimal, color, vk_range);
     });
 
-    dst->flags |= VideoCore::ImageFlagBits::GpuModified;
-    dst->flags &= ~VideoCore::ImageFlagBits::Dirty;
+    // The caller marks it GPU-written (TextureCache::MarkGpuWritten), which also tracks it.
 }
 
 void Runtime::SetBackingSamples(VideoCore::Image* image, u32 num_samples, bool copy_backing) {
