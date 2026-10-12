@@ -200,7 +200,12 @@ public:
     /// Waits until the first `through` completion labels are written; stage B first submits
     /// the labels it batched (else it would wait for labels not submitted).
     void WaitLabelsThrough(u64 through) {
-        if (DrawPipe::OnStageB()) {
+        const bool stage_b = DrawPipe::OnStageB();
+        // Diagnostic (parse split's Flushes line): whether the batch submitted here held a
+        // label this write waits for.
+        BbSplit::NoteOrderedWrite(stage_b && scheduler.LabelsBatched(),
+                                  stage_b && scheduler.LabelsBatchedThrough(through));
+        if (stage_b) {
             scheduler.FlushLabels(true);
         }
         scheduler.WaitLabelsThrough(through);
