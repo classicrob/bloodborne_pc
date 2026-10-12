@@ -226,3 +226,27 @@ the second run; its persistence has not been checked by a subsequent reload.
 These observations supersede the preset's pending ground/load/walk status,
 without broadening them into progression or combat acceptance. Playtest owns
 adding narrowly scoped verification records to fixture metadata.
+
+### First enemy combat, death and respawn
+
+Playtest's `20261012-014841-1080p-DBOUNDS-27db`, PREVIEW-27db, loaded
+`central-yharnam-arch` and passed the formerly stopping coffin-arch trigger.
+The manifest pins bb-probe
+`48fe30fa1cdf0c9a482b1ff873f56f151963caf4c1bb4952ba6d080fddda453d`
+and libbbgpu
+`5676e4c5304e9ce7d81a29d15e7924481a78694fc42fe114cf461f5db7562d36`.
+
+Reported acceptance: Cleaver hits landed on a townsman, with blood spray and
+stagger; the enemy struck back. The player died, the YOU DIED screen rendered,
+and the character respawned at the lit Central Yharnam lamp with full HP and
+Blood Echoes reduced from 300 to 0. Normal save/quit completed with exit 0.
+The exported `central-yharnam-after-first-death` retains edited ancestry.
+No STOP/fault or rendering defect was reported in the fight.
+
+This closes the first-enemy-combat gap for that input/build. Verification
+records should name `cleaver-enemy-hit`, `enemy-retaliation`, `player-death`,
+`central-lamp-respawn-in-process`, and `normal-save-quit`; inherited records
+keep `central-yharnam-arch` as their tested subject. A single fight does not
+qualify every combat mechanic. The respawn demonstrates the lamp's in-process
+respawn registration, not a direct fresh-process check of lamp-lit state.
+Lamp-lit persistence across reload and Pebble persistence remain open.
