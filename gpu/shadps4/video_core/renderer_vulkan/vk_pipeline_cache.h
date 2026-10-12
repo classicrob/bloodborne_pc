@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include "bbport_lock_wait.h"
 #include <deque>
 #include <functional>
 #include <unordered_map>
@@ -254,7 +255,7 @@ private:
     Shader::Pools pools;
     tsl::robin_map<size_t, std::unique_ptr<Program>> program_cache;
     /// bbport: exclusive for program/permutation insertions, shared for worker lookups.
-    std::shared_mutex programs_mutex;
+    BB_TIMED_SHARED_LOCK(std::shared_mutex, KLockPrograms) programs_mutex;
     u64 prepared_hits = 0, prepared_misses = 0;
     const PreparedDraw* used_prepared = nullptr;
     tsl::robin_map<ComputePipelineKey, std::unique_ptr<ComputePipeline>> compute_pipelines;

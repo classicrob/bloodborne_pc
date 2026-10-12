@@ -16,6 +16,7 @@
 #include <array>
 #include <atomic>
 #include <condition_variable>
+#include "bbport_lock_wait.h"
 #include <cstring>
 #include <deque>
 #include <memory>
@@ -156,7 +157,7 @@ private:
     /// Bumped by ResetBaseline: the scanner and workers restart from the tail state. Guarded by
     /// `mutex`.
     u64 generation = 0;
-    std::mutex mutex;
+    BB_TIMED_LOCK(std::mutex, KLockDrawPrep) mutex;
     std::condition_variable_any cv;
     std::deque<std::shared_ptr<Submission>> submissions; ///< ordered by seq
     std::atomic<u64> gpu_seq{0};
