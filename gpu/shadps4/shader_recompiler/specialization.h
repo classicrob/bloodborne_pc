@@ -7,7 +7,9 @@
 #include "bbport_compute_sh.h"
 #include "bbport_frame_marks.h"
 #endif
+#include <atomic>
 #include <bitset>
+#include <cstdio>
 #include <cstring>
 #include <string>
 
@@ -18,6 +20,17 @@
 #include "shader_recompiler/profile.h"
 
 namespace Shader {
+
+#ifdef __APPLE__
+/// A draw-preparation worker's speculative selection (vk_draw_prep.h) runs on register state the
+/// GPU thread re-checks before using anything from it. There, a descriptor with no number
+/// conversion abandons the preparation instead of stopping: the GPU thread's own selection of
+/// the same draw stays correct-or-loud.
+inline thread_local bool speculative_selection = false;
+struct SpeculativeDescriptorRejected {};
+/// Worker preparations abandoned this way (all so far), the first ones logged.
+inline std::atomic<std::uint64_t> speculative_rejections{0};
+#endif
 
 struct VsAttribSpecialization {
     bool is_null{};
@@ -138,6 +151,20 @@ struct StageSpecialization {
         if (AmdGpu::HasNumberConversion(num_fmt, data_fmt)) [[likely]] {
             return;
         }
+#ifdef __APPLE__
+        if (speculative_selection) {
+            if (speculative_rejections.fetch_add(1, std::memory_order_relaxed) < 8) {
+                std::printf("Draw preparation: a worker's speculative selection abandoned: %s "
+                            "shader %#llx %s %u has data format %u with number format %u (the GPU "
+                            "thread selects this draw itself)\n",
+                            fmt::format("{}", info->hw_stage).c_str(),
+                            static_cast<unsigned long long>(info->pgm_hash), kind, index,
+                            u32(data_fmt), u32(num_fmt));
+                std::fflush(stdout);
+            }
+            throw SpeculativeDescriptorRejected{};
+        }
+#endif
         std::string dwords;
         for (size_t i = 0; i < size / sizeof(u32); ++i) {
             u32 dword;
@@ -158,7 +185,10 @@ struct StageSpecialization {
                                                               std::min<size_t>(ud.size(),
                                                                                NUM_USER_DATA_REGS)) +
                                    BbCmdData::LastRead() +
-                                   BbFrameMarks::Describe() + "; " + BbComputeSh::Describe();
+                                   BbFrameMarks::Describe() + "; " + BbComputeSh::Describe() +
+                                   fmt::format("; draw-preparation selections abandoned on such "
+                                               "descriptors so far: {}",
+                                               speculative_rejections.load());
 #else
         (void)fetch_source;
         const std::string source;

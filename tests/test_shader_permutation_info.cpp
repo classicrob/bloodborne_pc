@@ -3,6 +3,13 @@
 #define NDEBUG
 #define BB_RESTORE_TEST_ASSERTS
 #endif
+#ifdef __APPLE__
+#include <fstream>
+#include <sstream>
+#include <string>
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -352,6 +359,61 @@ int main() {
     assert(std::get<1>(select(first_fetch)) == std::get<1>(first));
     assert(!fault_worker.failed && fault_worker.stages.size() == 1);
     assert(Shader::Info::num_ud_snapshots == 1);
+
+#ifdef __APPLE__
+    // A worker meeting a descriptor with no number conversion abandons the preparation: no stage
+    // is published, and the flag, snapshot count and recovery point are restored. With the
+    // descriptor valid again the worker hits. The GPU thread's own selection of the bad
+    // descriptor still stops (a child process).
+    {
+        const auto saved = table[0];
+        table[0].num_format = 6; // with Format32_32_32_32: no conversion here (the hunts' stop)
+        Vulkan::PrepWorker reject_worker;
+        selection.worker = &reject_worker;
+        const auto rejections = Shader::speculative_rejections.load();
+        select(first_fetch);
+        assert(reject_worker.failed && reject_worker.stages.empty());
+        assert(Shader::speculative_rejections.load() == rejections + 1);
+        assert(!Shader::speculative_selection);
+        assert(runtime_fault_recover == nullptr);
+        assert(Shader::Info::num_ud_snapshots == 1);
+        table[0] = saved;
+        reject_worker.failed = false;
+        assert(std::get<1>(select(first_fetch)) == std::get<1>(first));
+        assert(!reject_worker.failed && reject_worker.stages.size() == 1);
+        selection.worker = nullptr;
+        table[0].num_format = 6;
+        // The child's output goes to a file: the stop must be the conversion stop (exit 23 with
+        // its message), not some other failure of a process forked after Vulkan started threads.
+        char log_path[] = "/tmp/permutation-stop-XXXXXX";
+        const int log_fd = mkstemp(log_path);
+        assert(log_fd >= 0);
+        std::fflush(nullptr);
+        const pid_t child = fork();
+        assert(child >= 0);
+        if (child == 0) {
+            dup2(log_fd, STDOUT_FILENO);
+            dup2(log_fd, STDERR_FILENO);
+            select(first_fetch); // the GPU thread's selection: stops
+            std::_Exit(0);
+        }
+        close(log_fd);
+        int status = 0;
+        const pid_t waited = waitpid(child, &status, 0);
+        std::stringstream child_log;
+        child_log << std::ifstream(log_path).rdbuf();
+        unlink(log_path);
+        const std::string text = child_log.str();
+        if (waited != child || !WIFEXITED(status) || WEXITSTATUS(status) != 23 ||
+            text.find("which this backend cannot convert") == std::string::npos) {
+            std::fprintf(stderr, "GPU-thread control: wait %d, status %#x, log:\n%s\n", int(waited),
+                         status, text.c_str());
+            std::abort();
+        }
+        table[0] = saved;
+        std::puts("Worker selection abandons an unconvertible descriptor; GPU thread stops PASS");
+    }
+#endif
 
     // On the direct path, try the last-used (wrong-layout) permutation first. Its missing
     // table must reject only that candidate, despite a partial write to the scratch flat
