@@ -20,6 +20,7 @@
 //   its own submission: no real copy does, the 10 s hang detector), a self-wait through
 //   WaitBeforeNextSubmit, a Wait on the recording thread itself, and an asynchronous scheduler
 //   waiting on another one.
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -483,7 +484,10 @@ int main() {
         std::atomic<bool> release{false};
         RecordHold(scheduler, &release);
         host.words[50] = host.words[51] = host.words[52] = 0; // written by the first block
-        for (u32 i = 0; i < 3; ++i) {
+        // At most MaxQueuedSubmits fit while the recorder is held (one more Flush would wait for
+        // space this thread frees only after it).
+        constexpr u32 Queued = std::min<u32>(3, Vulkan::Scheduler::MaxQueuedSubmits);
+        for (u32 i = 0; i < Queued; ++i) {
             RecordFill(scheduler, dispatch, host.buffer, 50 + i, 1, 0xF0 + i);
             scheduler.Flush();
         }
@@ -493,8 +497,11 @@ int main() {
         });
         scheduler.Close();
         releaser.join();
-        Expect("Close with queued submissions submits them all",
-               host.words[50] == 0xF0 && host.words[51] == 0xF1 && host.words[52] == 0xF2);
+        bool all_queued = true;
+        for (u32 i = 0; i < Queued; ++i) {
+            all_queued = all_queued && host.words[50 + i] == 0xF0 + i;
+        }
+        Expect("Close with queued submissions submits them all", all_queued);
         const u64 last = scheduler.CurrentTick() - 1;
         scheduler.WaitQueueSubmitted(last);
         Expect("  ... and WaitQueueSubmitted for a submitted value still succeeds after it", true);
