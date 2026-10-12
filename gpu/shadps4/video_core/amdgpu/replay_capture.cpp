@@ -453,7 +453,12 @@ void HoldEnded(Vulkan::Rasterizer* rasterizer, const Held& held) {
             } else {
                 fmt::print("  PERF CAPTURE written to {} in {:.0f} ms (perf replay: pixel output "
                            "not qualified{})\n",
-                           dir, ms, image_rejected.empty() ? "" : "; images are not restored");
+                           dir, ms,
+                           image_rejected.empty()
+                               ? ""
+                               : "; the image-authority rejects above do not apply: the "
+                                 "texture cache's images are captured and the replay restores "
+                                 "them");
             }
         }
     }
