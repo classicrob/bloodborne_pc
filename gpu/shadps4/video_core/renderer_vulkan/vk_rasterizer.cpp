@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <bit>
 #include <xxhash.h>
 #ifdef __APPLE__
 #include <sys/stat.h>
@@ -41,6 +42,8 @@
 #include "video_core/texture_cache/image_view.h"
 #include "video_core/texture_cache/texture_cache.h"
 #include "bbport_parse_split.h"
+#include "bbport_pass_trace.h"
+#include <vulkan/vulkan_format_traits.hpp>
 #include <optional>
 #include <vk_mem_alloc.h>
 
@@ -1268,6 +1271,11 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     UpdateDynamicState(pipeline, is_indexed);
     MarkPass(pipeline, state);
     scheduler.BeginRendering(state);
+#ifdef __APPLE__
+    if (BbPassTrace::Enabled()) {
+        BbPassTrace::NoteDraw();
+    }
+#endif
 
     const auto& vs_info = pipeline->GetStage(Shader::SwStage::Vertex);
     const auto& fetch_shader = pipeline->GetFetchShader();
@@ -1531,6 +1539,11 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
     UpdateDynamicState(pipeline, is_indexed);
     MarkPass(pipeline, state);
     scheduler.BeginRendering(state);
+#ifdef __APPLE__
+    if (BbPassTrace::Enabled()) {
+        BbPassTrace::NoteDraw();
+    }
+#endif
 
 #ifdef __APPLE__
     if (gs_draw.indirect) {
@@ -2409,6 +2422,12 @@ void Rasterizer::ResetBindings(bool is_compute) {
         runtime.AccessBuffer(read.buffer, read.offset, read.size, read.stage, read.access);
     }
     input_reads.clear();
+    if (BbPassTrace::Enabled()) {
+        // Reads that need no layout change pass no Runtime::Transit: the bound images are.
+        for (const auto image_id : bound_images) {
+            BbPassTrace::NoteBind(texture_cache.GetImage(image_id).image_uid);
+        }
+    }
 #endif
     for (auto& image_id : bound_images) {
         texture_cache.GetImage(image_id).binding = {};
@@ -3310,6 +3329,13 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
         }
         if (usable) {
             ++begin_memo_hits;
+#ifdef __APPLE__
+            if (BbPassTrace::Enabled()) {
+                // A pass begun from this memo (after a barrier ends the open one) has the
+                // targets the memo's full render state resolved.
+                BbPassTrace::SetViews(begin_memo_trace.data(), num_begin_memo_trace);
+            }
+#endif
             attachment_feedback_loop = false;
             push_data.scene_size = begin_memo.scene_size;
             target_scale = begin_memo.target_scale;
@@ -3330,6 +3356,12 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
             // Recomputed after the full path: it may have started the scene (scene_started).
             begin_memo = {true, MakeBeginSignature(pipeline), state, push_data.scene_size,
                           target_scale};
+#ifdef __APPLE__
+            if (BbPassTrace::Enabled()) {
+                begin_memo_trace = trace_views;
+                num_begin_memo_trace = num_trace_views;
+            }
+#endif
         }
     }
     return state;
@@ -3342,6 +3374,12 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
     bool color_redirected = false, depth_redirected = false;
     std::pair<u32, u32> guest_extent{1, 1};
     std::pair<vk::ImageView, vk::ImageLayout> original_color{};
+#ifdef __APPLE__
+    // The pass trace: each target's own view of its guest image (a final view that differs is a
+    // redirect or proxy, other storage).
+    std::array<vk::ImageView, AmdGpu::NUM_COLOR_BUFFERS> native_color{};
+    vk::ImageView native_depth{};
+#endif
     const auto& regs = Regs();
     const auto& key = pipeline->GetGraphicsKey();
     if (std::popcount(key.mrt_mask & 0x7f) >= 5 && db_desc.first &&
@@ -3468,6 +3506,9 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
         auto& attachment = state.color_attachments[cb];
         attachment.image_view = *image_view.image_view;
         attachment.image_layout = image->backing->state.layout;
+#ifdef __APPLE__
+        native_color[cb] = attachment.image_view;
+#endif
         attachment.clear_value = clear_value.color.uint32;
         attachment.is_clear = is_clear;
 
@@ -3540,6 +3581,9 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
         auto& attachment = state.depth_stencil_attachment;
         attachment.image_view = *image_view.image_view;
         attachment.image_layout = image.backing->state.layout;
+#ifdef __APPLE__
+        native_depth = attachment.image_view;
+#endif
         attachment.clear_value = {};
         attachment.is_clear = 0;
 
@@ -3654,6 +3698,46 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
             db_desc.first ? &texture_cache.GetImage(db_desc.first).info : nullptr;
         FrameCapture::BeginPass(colors.data(), state.num_color_attachments, depth);
     }
+#ifdef __APPLE__
+    if (BbPassTrace::Enabled()) {
+        // The pass trace resolves the next pass's targets to their guest images: known where the
+        // pass uses the image's own view; a redirect or proxy (other storage) keeps only the
+        // guest uid. The object motion attachment below stays unresolved.
+        num_trace_views = 0;
+        const auto note = [&](vk::ImageView view, const VideoCore::Image& image,
+                              const VideoCore::SubresourceRange& range, bool own) {
+            const auto& info = image.info;
+            trace_views[num_trace_views++] = {
+                std::bit_cast<u64>(view),
+                {
+                    .uid = image.image_uid,
+                    .format = u32(info.pixel_format),
+                    .texel_bytes = vk::blockSize(info.pixel_format),
+                    .width = std::max(info.size.width >> range.base.level, 1u),
+                    .height = std::max(info.size.height >> range.base.level, 1u),
+                    .layer = range.base.layer,
+                    .layers = range.extent.layers,
+                    .level = range.base.level,
+                    .samples = info.num_samples,
+                    .own = own,
+                }};
+        };
+        for (u32 cb = 0; cb < state.num_color_attachments; ++cb) {
+            if (cb_descs[cb].first && state.color_attachments[cb].image_view) {
+                note(state.color_attachments[cb].image_view,
+                     texture_cache.GetImage(cb_descs[cb].first),
+                     cb_descs[cb].second.view_info.range,
+                     state.color_attachments[cb].image_view == native_color[cb]);
+            }
+        }
+        if (db_desc.first && state.depth_stencil_attachment.image_view) {
+            note(state.depth_stencil_attachment.image_view, texture_cache.GetImage(db_desc.first),
+                 db_desc.second.view_info.range,
+                 state.depth_stencil_attachment.image_view == native_depth);
+        }
+        BbPassTrace::SetViews(trace_views.data(), num_trace_views);
+    }
+#endif
     // bbport: object motion vector attachment of G-buffer pipelines.
     if (key.motion_vectors) {
         object_motion->Attach(state, state.width, state.height);

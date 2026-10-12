@@ -22,6 +22,7 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "bbport_parse_split.h"
+#include "bbport_pass_trace.h"
 #include "bbport_hot_thread_qos.h"
 #include "bbport_threads.h"
 
@@ -83,6 +84,11 @@ Scheduler::~Scheduler() {
 
 void Scheduler::BeginRendering(const RenderState& new_state) {
     if (is_rendering && render_state == new_state) {
+#ifdef __APPLE__
+        if (BbPassTrace::Enabled()) {
+            BbPassTrace::DiscardViews(); // the open pass continues: no pass takes them
+        }
+#endif
         return;
     }
     BB_SPLIT_SCOPE(KRenderPassSwitch);
@@ -90,13 +96,19 @@ void Scheduler::BeginRendering(const RenderState& new_state) {
     EndRenderingFor(BbPassCensus::Why::TargetChange);
     // A pass with exactly the state of the pass that ended just before it: a split the targets
     // did not require (render_state still holds the ended pass's state).
-    BbPassCensus::NoteBegin(has_render_state && render_state == new_state);
+    const bool resumed = has_render_state && render_state == new_state;
+    BbPassCensus::NoteBegin(resumed);
     has_render_state = true;
 #else
     EndRendering();
 #endif
     is_rendering = true;
     render_state = new_state;
+#ifdef __APPLE__
+    if (BbPassTrace::Enabled()) {
+        BbPassTrace::NoteBegin(render_state, resumed);
+    }
+#endif
 
     std::array<vk::RenderingAttachmentInfo, 8> color_attachments;
     for (u32 i = 0; i < render_state.num_color_attachments; ++i) {
@@ -170,7 +182,10 @@ void Scheduler::EndRendering() {
         return;
     }
 #ifdef __APPLE__
-    BbPassCensus::NoteEnd(why, __builtin_return_address(0));
+    const void* ender = BbPassCensus::NoteEnd(why, __builtin_return_address(0));
+    if (BbPassTrace::Enabled()) {
+        BbPassTrace::NoteEnd(why, ender);
+    }
 #endif
     is_rendering = false;
     BB_SPLIT_SCOPE(KRenderPassSwitch);

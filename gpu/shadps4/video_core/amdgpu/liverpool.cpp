@@ -44,6 +44,7 @@
 #include "bbport_hot_thread_qos.h"
 #include "bbport_write_order.h"
 #include "bbport_pass_census.h"
+#include "bbport_pass_trace.h"
 #include "video_core/amdgpu/pm4_cmds.h"
 #include "video_core/renderdoc.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
@@ -635,6 +636,9 @@ void Liverpool::Process(std::stop_token stoken) {
         if (retired_frame) {
             BbSplit::NoteFrameEnd(BbStats::draws.load(std::memory_order_relaxed));
             BbPassCensus::NoteFrameEnd();
+            if (BbPassTrace::Enabled()) {
+                BbPassTrace::NoteFrameEnd();
+            }
             static u32 compute_sh_frames = 0;
             if (++compute_sh_frames % 600 == 0 &&
                 (BbComputeSh::into_graphics.load() || BbComputeSh::above_compute.load())) {

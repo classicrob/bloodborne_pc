@@ -368,6 +368,7 @@ if [[ ${1:-} == --test || ${1:-} == --test-dry || ${1:-} == --test-one || ${1:-}
         BB_DEPS_PREFIX="$deps" BB_GPU_BUILD="$PWD/out/gpu" t sh tests/test_buffer_atomic_wrap.sh
         BB_DEPS_PREFIX="$deps" BB_GPU_BUILD="$PWD/out/gpu" t sh tests/test_lds_subword.sh
         BB_DEPS_PREFIX="$deps" t sh tests/test_geometry_runtime_info.sh
+        t sh tests/test_pass_trace.sh
         BB_DEPS_PREFIX="$deps" BB_GPU_BUILD="$PWD/out/gpu" t bash tests/macos_fp16/run.sh
         BB_DEPS_PREFIX="$deps" BB_GPU_BUILD="$PWD/out/gpu" t sh tests/macos_pkrtz/run.sh
         BB_DEPS_PREFIX="$deps" BB_GPU_BUILD="$PWD/out/gpu" t sh tests/macos_ufloat_fold/run.sh

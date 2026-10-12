@@ -11,6 +11,7 @@
 #include "video_core/renderer_vulkan/vk_scene_resolution.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "bbport_parse_split.h"
+#include "bbport_pass_trace.h"
 #include "video_core/texture_cache/blit_helper.h"
 #include "video_core/texture_cache/image.h"
 
@@ -200,6 +201,19 @@ bool Runtime::Transit(VideoCore::Image* image, vk::ImageLayout dst_layout,
                       std::optional<VideoCore::SubresourceRange> subres_range) {
     BeforeImageAccess();
     if (scene_targets) scene_targets->NativeAccess(*image, dst_access);
+#ifdef __APPLE__
+    if (BbPassTrace::Enabled()) {
+        const auto& all = image->info.resources;
+        const bool whole = !subres_range ||
+                           (subres_range->base.level == 0 && subres_range->base.layer == 0 &&
+                            subres_range->extent.levels >= all.levels &&
+                            subres_range->extent.layers >= all.layers);
+        BbPassTrace::NoteUse(image->image_uid, u32(dst_layout),
+                             u64(static_cast<VkAccessFlags2>(dst_access)),
+                             u64(static_cast<VkPipelineStageFlags2>(dst_stage)), whole,
+                             scheduler.IsRendering());
+    }
+#endif
     const size_t prev_num_barriers = static_cast<size_t>(image_barriers.size());
     image->GetBarriers(image_barriers, dst_layout, dst_access, dst_stage, subres_range);
     return image_barriers.size() != prev_num_barriers;

@@ -8,6 +8,7 @@
 #ifdef __APPLE__
 #include <condition_variable>
 #include <mutex>
+#include "bbport_pass_trace.h"
 #endif
 #include "common/shared_first_mutex.h"
 #include "video_core/buffer_cache/buffer_cache.h"
@@ -297,6 +298,14 @@ private:
         u32 scene_size = 0;
         std::array<float, 2> target_scale{};
     } begin_memo;
+#ifdef __APPLE__
+    // The pass trace (BB_PASS_TRACE): the targets the last full render state resolved, and the
+    // snapshot kept with begin_memo, provided again for a pass begun from a memo hit.
+    std::array<BbPassTrace::Entry, 9> trace_views{};
+    u32 num_trace_views = 0;
+    std::array<BbPassTrace::Entry, 9> begin_memo_trace{};
+    u32 num_begin_memo_trace = 0;
+#endif
     u64 begin_memo_hits = 0, begin_memo_misses = 0;
     void Resolve();
     void DepthStencilCopy(bool is_depth, bool is_stencil);
