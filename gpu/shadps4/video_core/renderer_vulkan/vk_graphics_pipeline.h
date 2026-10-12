@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <array>
+#include <cstring>
 #include <memory>
 #include <boost/container/static_vector.hpp>
 #include <xxhash.h>
@@ -84,7 +86,13 @@ struct GsEmulationStages;
     std::span<const Shader::RuntimeInfo, MaxShaderStages> runtime_infos,
     std::span<const vk::ShaderModule> modules) {
     const u32 fs = u32(Shader::SwStage::Fragment);
-    return (fs < modules.size() && modules[fs]) || runtime_infos[fs] == Shader::RuntimeInfo{};
+    if (fs < modules.size() && modules[fs]) {
+        return true;
+    }
+    // All-zero, as PipelineSelection::ResetStages leaves it (RuntimeInfo has unions: compare the
+    // bytes, every one of them written by that reset).
+    static constexpr std::array<u8, sizeof(Shader::RuntimeInfo)> zero{};
+    return std::memcmp(&runtime_infos[fs], zero.data(), zero.size()) == 0;
 }
 
 class GraphicsPipeline : public Pipeline {

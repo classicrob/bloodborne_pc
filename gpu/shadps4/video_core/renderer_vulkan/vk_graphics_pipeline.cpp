@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
+#include <cstring>
 #include <utility>
 #include <boost/container/small_vector.hpp>
 
@@ -46,7 +47,7 @@ GraphicsPipeline::GraphicsPipeline(
     // regardless). The selection resets it (PipelineSelection::ResetStages), so a live pipeline
     // with a stale one is a selection bug: stop. A preloaded pipeline can carry one from a cache
     // written before that reset: reset it here, counted.
-    std::array<Shader::RuntimeInfo, MaxShaderStages> checked_infos;
+    std::array<Shader::RuntimeInfo, MaxShaderStages> checked_infos{};
     std::ranges::copy(runtime_infos, checked_infos.begin());
     if (!FragmentInfoMatchesShader(checked_infos, modules)) {
         ASSERT_MSG(preloading, "graphics pipeline {:#x}: fragment runtime info without a fragment "
@@ -59,7 +60,7 @@ GraphicsPipeline::GraphicsPipeline(
                         "a stale fragment runtime info; reset (depth bounds, clip distances)\n",
                         count);
         }
-        checked_infos[u32(Shader::SwStage::Fragment)] = {};
+        std::memset(&checked_infos[u32(Shader::SwStage::Fragment)], 0, sizeof(Shader::RuntimeInfo));
     }
     runtime_infos = checked_infos;
 #ifdef __APPLE__

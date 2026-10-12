@@ -82,11 +82,14 @@ int main() {
         stale.runtime_infos[fs].hw.fs.clip_distance_emulation = true;
         stale.modules[fs] = vk::ShaderModule{reinterpret_cast<VkShaderModule>(uintptr_t(0x10))};
         stale.ResetStages();
-        assert(stale.runtime_infos[fs] == Shader::RuntimeInfo{} && !stale.modules[fs] &&
-               !stale.infos[fs]);
+        std::array<vk::ShaderModule, Vulkan::MaxShaderStages> modules{};
+        assert(!stale.runtime_infos[fs].hw.fs.depth_bounds_test && !stale.modules[fs] &&
+               !stale.infos[fs] && Vulkan::FragmentInfoMatchesShader(stale.runtime_infos, modules));
         // The pipeline-side check: a fragment runtime info needs a fragment shader.
         std::array<Shader::RuntimeInfo, Vulkan::MaxShaderStages> infos{};
-        std::array<vk::ShaderModule, Vulkan::MaxShaderStages> modules{};
+        for (auto& info : infos) {
+            std::memset(&info, 0, sizeof(info));
+        }
         assert(Vulkan::FragmentInfoMatchesShader(infos, modules));
         infos[fs].hw.fs.depth_bounds_test = true;
         assert(!Vulkan::FragmentInfoMatchesShader(infos, modules)); // stale, no FS: refused

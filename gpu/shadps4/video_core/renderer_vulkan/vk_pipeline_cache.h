@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <cstring>
+
 #include <deque>
 #include <functional>
 #include <unordered_map>
@@ -127,7 +129,9 @@ struct PipelineSelection {
     /// reads the fragment slot even without a fragment shader: a stale depth_bounds_test gave
     /// an FS-less pipeline a depth-bounds layout, P0 2026-10-12).
     void ResetStages() {
-        runtime_infos.fill({});
+        for (auto& info : runtime_infos) {
+            std::memset(&info, 0, sizeof(info)); // all-zero, as RuntimeInfo::Initialize starts
+        }
         infos.fill(nullptr);
         modules.fill(nullptr);
     }
