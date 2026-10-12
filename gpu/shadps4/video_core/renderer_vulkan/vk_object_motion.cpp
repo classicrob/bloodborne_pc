@@ -98,12 +98,13 @@ void ObjectMotion::OnFrameStart() {
     if (BbStats::enabled && (frame % 600) == 0 && history.stats.draws) {
         const auto& s = history.stats;
         std::printf("Object motion: %llu draws, %llu stored, %llu with history, %llu unmatched, "
-                    "%llu copies without history (ambiguous), "
+                    "%llu copies without history (%llu ambiguous, %llu without anchor), "
                     "%llu capacity skips, %llu invalid, %llu still (600 frames); last frame %u/%u vertices; "
                     "index ranges %llu reused, %llu scanned (%llu found changed), %zu cached\n",
                     (unsigned long long)s.draws, (unsigned long long)s.stored,
                     (unsigned long long)s.loaded, (unsigned long long)s.unmatched,
-                    (unsigned long long)s.ambiguous,
+                    (unsigned long long)(s.ambiguous + s.no_identity),
+                    (unsigned long long)s.ambiguous, (unsigned long long)s.no_identity,
                     (unsigned long long)s.exhausted, (unsigned long long)s.invalid,
                     (unsigned long long)s.still,
                     history.Used(), PositionsPerFrame, (unsigned long long)index_ranges.stats.hits,
@@ -139,11 +140,12 @@ void ObjectMotion::OnFrameStart() {
     });
 }
 
-u32 ObjectMotion::PrepareDraw(const DrawInfo& draw) {
+u32 ObjectMotion::PrepareDraw(const DrawInfo& draw,
+                              const std::optional<Motion::History::Anchor>& anchor) {
     if (!enabled || BbToggle::Disabled(1u << 29) || params_used >= ParamsPerFrame) {
         return 0;
     }
-    const auto allocation = history.Prepare(draw);
+    const auto allocation = history.Prepare(draw, anchor);
     u32 flags = (allocation.store ? Shader::MotionVectors::FlagStore : 0) |
                 (allocation.load ? Shader::MotionVectors::FlagLoad : 0);
     if (!flags) {

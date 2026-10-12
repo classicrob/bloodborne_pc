@@ -2,9 +2,11 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include <span>
 #include <unordered_map>
 #include <utility>
@@ -229,20 +231,35 @@ public:
     };
     struct Stats {
         uint64_t draws{}, stored{}, loaded{}, unmatched{}, exhausted{}, invalid{}, still{};
-        /// Draws whose mesh had several copies in the previous frame or this one: no history
-        /// is loaded (which previous copy is this one is unknown; occurrence order changes with
-        /// culling and gave other copies' positions, hundreds of pixels off).
-        uint64_t ambiguous{};
+        /// No history loaded because the previous copy is not identified as this instance:
+        /// none or several of the mesh's previous copies near this one (ambiguous), or no
+        /// instance anchor (no_identity). Draw order is not an identity: culling reorders
+        /// copies of one mesh, and loading by order gave other copies' positions, hundreds of
+        /// pixels off.
+        uint64_t ambiguous{}, no_identity{};
     } stats;
+
+    /// An instance's world position: bone 0's translation (3x4 rows, the .w of each row) of the
+    /// draw's palette, which stays in world space while the camera moves. Copies of one mesh
+    /// are told apart by it.
+    using Anchor = std::array<float, 3>;
+    /// The furthest an instance moves between two frames and is still recognised (world
+    /// units). A history loads only when exactly one of the mesh's previous copies lies within
+    /// 2 * MaxStep of the anchor and it lies within MaxStep; otherwise none does. Too small
+    /// only loses history (camera vectors), never takes another copy's.
+    static constexpr float MaxStep = 0.5f;
+    /// Copies of one mesh tracked per frame; with more, none of them loads history.
+    static constexpr uint32_t MaxCopies = 16;
 
     // A small skeleton (weapon, prop; most are static world pieces) only needs history
     // while its bone palette changes: with last frame's bones its motion is the camera's.
     // Checked before the index scan of Prepare, with a cheap identity. The first frame
     // of a change stores positions (nothing to load yet), the next one loads them.
-    // Copies of one mesh share the identity; their draw order changes with culling. So a draw
-    // is still when its palette is ANY of last frame's palettes for the mesh (a set, not the
-    // copy at the same position in the order), and moving only when the mesh was drawn last
-    // frame with none of them.
+    // Copies of one mesh share the identity, and their draw order changes with culling. So a
+    // draw counts as still when its palette is ANY of last frame's palettes for the mesh (a
+    // set, not the copy at the same position in the order). This is a conservative eligibility
+    // decision for history (a still copy gets camera vectors), not proof that the instance is
+    // motionless or the same as last frame's.
     struct GateKey {
         uint64_t shader{}, geometry{}, indices{};
         uint32_t index_count{}, instances{}, first_instance{};
@@ -262,8 +279,6 @@ public:
     void NextFrame() {
         previous.swap(current);
         current.clear();
-        previous_occurrences.swap(occurrences);
-        occurrences.clear();
         gate_previous.swap(gate_current);
         gate_current.clear();
         gate_previous_seen.swap(gate_current_seen);
@@ -272,36 +287,36 @@ public:
         used = 0;
     }
 
-    Allocation Prepare(const Draw& draw) {
+    Allocation Prepare(const Draw& draw, const std::optional<Anchor>& anchor) {
         ++stats.draws;
-        Key key{draw, 0};
-        key.occurrence = occurrences[key]++;
         const uint64_t count = uint64_t(draw.vertices.count) * draw.instances;
         if (!count || uint64_t(draw.vertices.first) + draw.vertices.count - 1 > INT32_MAX ||
             uint64_t(draw.first_instance) + draw.instances > UINT32_MAX) {
             ++stats.invalid;
             return {};
         }
-        // History only when the match is unique: the mesh was drawn once last frame, and this
-        // is its first draw this frame. With several copies the occurrence order is not an
-        // identity (culling reorders them).
-        Key first{draw, 0};
-        const auto* previous_count = previous_occurrences.find(first);
-        const auto* prev = previous.find(key);
         Allocation result{0, 0, draw.vertices.count, draw.instances,
                           draw.vertices.first, draw.first_instance};
-        if (prev && key.occurrence == 0 && previous_count && *previous_count == 1) {
-            result.load = *prev;
-            ++stats.loaded;
-        } else if (prev || key.occurrence > 0) {
-            ++stats.ambiguous;
-        } else {
+        if (previous.find(draw) == nullptr) {
             ++stats.unmatched;
+        } else if (!anchor) {
+            ++stats.no_identity;
+        } else if (const auto match = Identify(previous[draw], *anchor)) {
+            result.load = *match;
+            ++stats.loaded;
+        } else {
+            ++stats.ambiguous;
         }
         if (count <= capacity - used) {
             result.store = 1 + uint32_t(frame & 1) * capacity + used;
             used += uint32_t(count);
-            current.emplace(key, result.store);
+            auto& copies = current[draw];
+            if (copies.count < MaxCopies) {
+                copies.items[copies.count++] = {result.store, anchor.value_or(Anchor{}),
+                                                anchor.has_value(), false};
+            } else {
+                copies.overflow = true;
+            }
             ++stats.stored;
         } else {
             ++stats.exhausted;
@@ -312,25 +327,60 @@ public:
     uint32_t Used() const { return used; }
 
 private:
-    struct Key {
-        Draw draw;
-        uint32_t occurrence;
-        bool operator==(const Key&) const = default;
+    struct Copy {
+        uint32_t store{};
+        Anchor anchor{};
+        bool anchored{}, taken{};
     };
-    struct Hash {
-        size_t operator()(const Key& key) const {
+    struct Copies {
+        std::array<Copy, MaxCopies> items{};
+        uint32_t count{};
+        bool overflow{};
+    };
+    /// The previous copy that is this instance: the only one within 2 * MaxStep, and within
+    /// MaxStep; not taken by another draw this frame.
+    static std::optional<uint32_t> Identify(Copies& copies, const Anchor& anchor) {
+        if (copies.overflow) {
+            return std::nullopt;
+        }
+        const float near = MaxStep * MaxStep, around = 4.0f * near;
+        Copy* found = nullptr;
+        uint32_t nearby = 0;
+        for (uint32_t i = 0; i < copies.count; ++i) {
+            Copy& copy = copies.items[i];
+            if (!copy.anchored) {
+                return std::nullopt; // a copy without identity could be this instance
+            }
+            const float dx = copy.anchor[0] - anchor[0], dy = copy.anchor[1] - anchor[1],
+                        dz = copy.anchor[2] - anchor[2];
+            const float d2 = dx * dx + dy * dy + dz * dz;
+            if (!(d2 <= around)) { // NaN: not nearby
+                continue;
+            }
+            ++nearby;
+            if (d2 <= near) {
+                found = &copy;
+            }
+        }
+        if (nearby != 1 || !found || found->taken) {
+            return std::nullopt;
+        }
+        found->taken = true;
+        return found->store;
+    }
+    struct DrawHash {
+        size_t operator()(const Draw& d) const {
             uint64_t h = 0;
             const auto mix = [&](uint64_t v) { h ^= v + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2); };
-            const auto& d = key.draw;
             mix(d.shader); mix(d.geometry); mix(d.indices); mix(d.topology);
             mix(d.index_count); mix(d.instances); mix(d.first_instance);
-            mix(d.vertices.first); mix(d.vertices.count); mix(key.occurrence);
+            mix(d.vertices.first); mix(d.vertices.count);
             return size_t(h);
         }
     };
     uint32_t capacity{}, used{};
     uint64_t frame{};
-    FlatMap<Key, uint32_t, Hash> previous, current, occurrences, previous_occurrences;
+    FlatMap<Draw, Copies, DrawHash> previous, current;
     struct GateHash {
         size_t operator()(const GateKey& key) const {
             uint64_t h = 0;

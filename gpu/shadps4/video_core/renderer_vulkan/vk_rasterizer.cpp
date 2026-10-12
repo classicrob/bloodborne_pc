@@ -1174,17 +1174,25 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
         }();
         bool gated = !all_motion;
         u64 palette = 0;
+        // The instance's identity across frames: bone 0's world translation (Motion::History).
+        std::optional<Motion::History::Anchor> anchor;
         for (const auto& resource : vs.buffers) {
             if (resource.IsSpecial()) continue;
             const auto buffer = resource.GetSharp(vs);
             const u32 size = buffer.GetSize();
             if (!buffer.Valid() || buffer.GetStride() != 16) continue;
             const auto role = Motion::ClassifyBuffer(size);
+            const VAddr address = buffer.base_address;
+            if (!anchor && role != Motion::BufferRole::Other && size >= 48 &&
+                memory->IsValidGpuMapping(address, 0) &&
+                memory->ClampRangeSize(address, 48) == 48) {
+                const auto* bone = reinterpret_cast<const float*>(address);
+                anchor = Motion::History::Anchor{bone[3], bone[7], bone[11]};
+            }
             if (role == Motion::BufferRole::Skeleton) {
                 gated = false;
                 break;
             }
-            const VAddr address = buffer.base_address;
             if (role == Motion::BufferRole::SmallSkeleton &&
                 memory->IsValidGpuMapping(address, 0) &&
                 memory->ClampRangeSize(address, size) == size) {
@@ -1236,7 +1244,7 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
                 .instances = regs.num_instances.NumInstances(),
                 .first_instance = first_instance,
                 .vertices = range,
-            });
+            }, anchor);
         }
     }
     pipeline->BindResources(set_writes, push_data);

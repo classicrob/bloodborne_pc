@@ -23,66 +23,114 @@ int main() {
     Draw draw{.shader = 1, .geometry = 2, .indices = 3, .topology = 4,
               .index_count = 5, .instances = 2, .first_instance = 100,
               .vertices = range};
+    using Anchor = History::Anchor;
+    const Anchor at_a{0, 0, 0}, at_b{10, 0, 0}, a_moved{0.3f, 0, 0};
     History history(32);
     history.NextFrame();
-    const auto first = history.Prepare(draw);
-    const auto duplicate = history.Prepare(draw);
+    const auto first = history.Prepare(draw, at_a);
+    const auto duplicate = history.Prepare(draw, at_b);
     assert(first.store && !first.load && first.first_vertex == 100);
     assert(first.first_instance == 100 && first.instances == 2);
     assert(duplicate.store == first.store + 16); // shared geometry, different draw
     assert(history.Used() == 32); // firstInstance must NOT multiply the allocation
-    assert(!history.Prepare(draw).store && history.stats.exhausted == 1);
-    // Several copies of one mesh: the occurrence order is not an identity (culling reorders
-    // copies; the GPU then read another copy's positions, hundreds of pixels off), so none
-    // loads history.
-    // (The first frame's second and third draws are already counted: copies, no history.)
-    assert(history.stats.ambiguous == 2);
+    assert(!history.Prepare(draw, at_a).store && history.stats.exhausted == 1);
+    // Copies of one mesh are identified by their anchors, not by draw order (culling reorders
+    // copies; loading by order gave another copy's positions, hundreds of pixels off).
     history.NextFrame();
-    const auto next = history.Prepare(draw);
-    assert(!next.load && next.store != first.store && history.stats.ambiguous == 3);
-    assert(!history.Prepare(draw).load && history.stats.ambiguous == 4);
-    // One copy in each frame: unique, its history loads (the first of them still follows a
-    // frame with two copies: ambiguous).
-    history.NextFrame();
-    const auto single = history.Prepare(draw);
-    assert(single.store && !single.load && history.stats.ambiguous == 5);
-    history.NextFrame();
-    const auto again = history.Prepare(draw);
-    assert(again.load == single.store && history.stats.loaded == 1);
-    // A second copy appearing this frame: the first draw of the mesh already took the single
-    // previous copy's history; the second loads none.
-    assert(!history.Prepare(draw).load && history.stats.ambiguous == 6);
+    const auto b_first = history.Prepare(draw, at_b);
+    const auto a_second = history.Prepare(draw, a_moved); // A moved 0.3, within MaxStep
+    assert(b_first.load == duplicate.store && a_second.load == first.store);
+    assert(history.stats.loaded == 2);
+
+    // Sol-2's controls: none may load another copy's history.
+    // 1. Previous: A only. Current: B (newly visible) first, then A.
+    History c1(64);
+    c1.NextFrame();
+    const auto c1_a = c1.Prepare(draw, at_a);
+    c1.NextFrame();
+    assert(!c1.Prepare(draw, at_b).load && c1.stats.ambiguous == 1);
+    assert(c1.Prepare(draw, at_a).load == c1_a.store);
+    // 2. Previous: A only. Current: B only.
+    History c2(64);
+    c2.NextFrame();
+    c2.Prepare(draw, at_a);
+    c2.NextFrame();
+    assert(!c2.Prepare(draw, at_b).load && c2.stats.ambiguous == 1);
+    // 3. Two visible copies; the moving gate lets A through in one frame and B in the next
+    //    (each frame reaches Prepare once with the same draw identity).
+    History c3(64);
+    c3.NextFrame();
+    c3.Prepare(draw, at_a);
+    c3.NextFrame();
+    assert(!c3.Prepare(draw, at_b).load && c3.stats.ambiguous == 1);
+    // Two previous copies near this one (within 2 * MaxStep): ambiguous.
+    History close(64);
+    close.NextFrame();
+    close.Prepare(draw, Anchor{0, 0, 0});
+    close.Prepare(draw, Anchor{0.6f, 0, 0});
+    close.NextFrame();
+    assert(!close.Prepare(draw, Anchor{0.3f, 0, 0}).load && close.stats.ambiguous == 1);
+    // A previous copy is taken once: a second draw at the same place loads none.
+    History twice(64);
+    twice.NextFrame();
+    const auto once = twice.Prepare(draw, at_a);
+    twice.NextFrame();
+    assert(twice.Prepare(draw, at_a).load == once.store);
+    assert(!twice.Prepare(draw, at_a).load && twice.stats.ambiguous == 1);
+    // No anchor (no palette): no identity, no history; nor for a draw whose previous copy had
+    // none.
+    History bare(64);
+    bare.NextFrame();
+    bare.Prepare(draw, std::nullopt);
+    bare.NextFrame();
+    assert(!bare.Prepare(draw, std::nullopt).load && bare.stats.no_identity == 1);
+    assert(!bare.Prepare(draw, at_a).load && bare.stats.ambiguous == 1);
+    // A non-finite anchor is never nearby.
+    History nan(64);
+    nan.NextFrame();
+    nan.Prepare(draw, Anchor{NAN, 0, 0});
+    nan.NextFrame();
+    assert(!nan.Prepare(draw, Anchor{NAN, 0, 0}).load);
+    // More copies than tracked: none of them loads.
+    History many(64 * (History::MaxCopies + 1));
+    many.NextFrame();
+    for (uint32_t i = 0; i <= History::MaxCopies; ++i) {
+        many.Prepare(draw, Anchor{float(i) * 10, 0, 0});
+    }
+    many.NextFrame();
+    assert(!many.Prepare(draw, at_a).load);
+
     history.NextFrame(); // a missing frame invalidates the match
     history.NextFrame();
-    assert(!history.Prepare(draw).load);
+    assert(!history.Prepare(draw, at_a).load);
 
     // A changed index buffer may reference formerly unused holes inside the same min/max.
     // Do not accept that history merely because its addresses/counts stayed the same.
     history.NextFrame();
     auto changed = draw;
     changed.topology++;
-    assert(!history.Prepare(changed).load);
+    assert(!history.Prepare(changed, at_a).load);
     changed = draw;
     changed.first_instance++;
-    assert(!history.Prepare(changed).load);
+    assert(!history.Prepare(changed, at_a).load);
     history.NextFrame();
     changed = draw;
     changed.vertices.first++;
-    assert(!history.Prepare(changed).load);
+    assert(!history.Prepare(changed, at_a).load);
 
     History overflow(32);
     draw.vertices.first = 0;
     draw.vertices.count = INT32_MAX;
     draw.instances = UINT32_MAX;
     draw.first_instance = 0;
-    assert(!overflow.Prepare(draw).store);
+    assert(!overflow.Prepare(draw, std::nullopt).store);
     assert(overflow.stats.exhausted == 1);
     draw.first_instance = 10;
-    assert(!overflow.Prepare(draw).store && overflow.stats.invalid == 1);
+    assert(!overflow.Prepare(draw, std::nullopt).store && overflow.stats.invalid == 1);
     draw.first_instance = 0;
     draw.vertices.first = INT32_MAX;
     draw.vertices.count = 2;
-    assert(!overflow.Prepare(draw).store && overflow.stats.invalid == 2);
+    assert(!overflow.Prepare(draw, std::nullopt).store && overflow.stats.invalid == 2);
 
     // Small skeletons: history only while the bone palette changes (weapon spinning).
     History gated(1024);
