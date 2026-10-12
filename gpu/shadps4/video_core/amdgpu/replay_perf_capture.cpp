@@ -36,7 +36,7 @@ using AmdGpu::CmdSnapshot;
 using AmdGpu::Liverpool;
 using AmdGpu::ReplayStateAccess;
 
-constexpr u64 MinFreeAfter = u64{50} << 30; // the orchestrator's disk floor
+constexpr u64 MinFreeAfter = u64{40} << 30; // the orchestrator's disk floor (40 GB)
 
 /// One capture file: a FileHeader (record count patched at Close) and its records.
 class File {
@@ -785,9 +785,10 @@ std::string Write(const Liverpool& liverpool, std::span<const std::shared_ptr<Cm
     }
     const u64 free_bytes = u64(fs.f_bavail) * fs.f_frsize;
     if (free_bytes < estimate || free_bytes - estimate < MinFreeAfter) {
-        why = fmt::format("{:.1f} GiB free, the capture needs up to {:.1f} GiB and must leave 50 GiB: "
+        why = fmt::format("{:.1f} GiB free, the capture needs up to {:.1f} GiB and must leave {} GiB: "
                           "delete an older capture under {}",
-                          free_bytes / 1073741824.0, estimate / 1073741824.0, base.string());
+                          free_bytes / 1073741824.0, estimate / 1073741824.0, MinFreeAfter >> 30,
+                          base.string());
         return {};
     }
 

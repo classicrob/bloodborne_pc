@@ -212,8 +212,8 @@ Steady state means iterations 2..N agree within noise, on times and on the "imag
 registered" / "image uploads" counters.
 
 Capture (`BB_REPLAY_CAPTURE=perf:<frames>`, trigger as for inventory), at the end of the hold,
-after the inventory, into `out/replay/<id>/`. One capture at a time unless `df -h /` stays
-above 50 GiB.
+after the inventory, into `out/replay/<id>/`. The capture refuses to start unless at least 40 GiB
+(the team's disk floor) would stay free after its estimated size; keep one capture at a time.
 - `manifest.json`: version, frame, settings, the sizes and checksums of every file, and
   "perf replay: pixel output not qualified".
 - `views.bin`: every committed direct/flexible view (VA range, kind, protection, memory
