@@ -1495,12 +1495,21 @@ std::vector<vk::BufferImageCopy> ReplayCopies(std::span<const CapturedAspect> as
 
 bool TextureCache::CaptureForReplay(const std::function<void(CapturedImage&&)>& sink,
                                     CapturedMetadata& metadata, std::string& why) {
-    std::vector<ImageId> ids;
+    // slot_images is used under `mutex` only, and no Image& is held across scheduler.Finish():
+    // another thread's insert (the presenter's FindImage) can grow the slot vector and move every
+    // image, and Finish runs deferred operations that erase images (DeleteImage). A dangling
+    // reference here read a garbage mip_hashes size and smashed the stack (perf capture #4).
+    static_assert(decltype(Image::mip_hashes)::static_capacity <=
+                  sizeof(CapturedImageState::mip_hashes) / sizeof(u64));
+    std::vector<std::pair<ImageId, u64>> ids; ///< image and its image_uid
     {
         std::scoped_lock lock{mutex};
         for (auto it = slot_images.begin(); it != slot_images.end(); ++it) {
-            if (True(it->flags & ImageFlagBits::GpuModified)) {
-                ids.push_back(it.Id());
+            // Unregistered images are deleted (erased after the GPU is done with them), not
+            // state: the restore would register them again.
+            if (True(it->flags & ImageFlagBits::GpuModified) &&
+                True(it->flags & ImageFlagBits::Registered)) {
+                ids.emplace_back(it.Id(), it->image_uid);
             }
         }
         std::vector<CapturedMetadataEntry> entries;
@@ -1511,70 +1520,82 @@ bool TextureCache::CaptureForReplay(const std::function<void(CapturedImage&&)>& 
         std::memcpy(metadata.state.data(), entries.data(), metadata.state.size());
     }
     scheduler.EndRendering();
-    for (const ImageId id : ids) {
-        Image& image = slot_images[id];
-        const auto describe = [&] {
-            return fmt::format("image {:#x} ({} bytes, {})", image.info.guest_address,
-                               image.info.guest_size, vk::to_string(image.info.pixel_format));
-        };
-        if (image.info.num_samples > 1 || !image.backing || image.backing->num_samples > 1 ||
-            image.backing_images.size() != 1) {
-            why = describe() + ": multisampled or more than one backing";
-            return false;
+    for (const auto& [id, uid] : ids) {
+        CapturedImage captured;
+        std::optional<std::vector<CapturedAspect>> aspects;
+        std::vector<vk::BufferImageCopy> copies;
+        std::optional<ReplayHostBuffer> host;
+        {
+            std::scoped_lock lock{mutex};
+            if (!slot_images.is_allocated(id) || slot_images[id].image_uid != uid) {
+                why = fmt::format("image uid {} was deleted during the capture", uid);
+                return false;
+            }
+            Image& image = slot_images[id];
+            const auto describe = [&] {
+                return fmt::format("image {:#x} ({} bytes, {})", image.info.guest_address,
+                                   image.info.guest_size, vk::to_string(image.info.pixel_format));
+            };
+            if (image.info.num_samples > 1 || !image.backing || image.backing->num_samples > 1 ||
+                image.backing_images.size() != 1) {
+                why = describe() + ": multisampled or more than one backing";
+                return false;
+            }
+            if (runtime.scene_targets && runtime.scene_targets->Tracks(image.image_uid)) {
+                why = describe() + ": a reduced scene proxy holds its content";
+                return false;
+            }
+            std::string aspect_why;
+            aspects = ReplayAspects(image, aspect_why);
+            if (!aspects) {
+                why = describe() + ": " + aspect_why;
+                return false;
+            }
+            u64 total = 0;
+            copies = ReplayCopies(*aspects, total);
+            std::string buffer_why;
+            host.emplace(instance.GetAllocator(), total, buffer_why);
+            if (!host->buffer) {
+                why = describe() + ": " + buffer_why;
+                return false;
+            }
+            runtime.Transit(&image, vk::ImageLayout::eTransferSrcOptimal,
+                            vk::PipelineStageFlagBits2::eTransfer,
+                            vk::AccessFlagBits2::eTransferRead);
+            runtime.FlushBarriers();
+            // A deletion after this defers the image's destruction past this copy's tick.
+            scheduler.Record([vk_image = image.GetImage(), buffer = vk::Buffer{host->buffer},
+                              regions = scheduler.RecordData(std::span<const vk::BufferImageCopy>{
+                                  copies})](vk::CommandBuffer cmdbuf) {
+                cmdbuf.copyImageToBuffer(vk_image, vk::ImageLayout::eTransferSrcOptimal, buffer,
+                                         regions.size(), regions.data());
+            });
+
+            CapturedImageState state;
+            state.flags = static_cast<u32>(image.flags & ~(ImageFlagBits::Registered |
+                                                            ImageFlagBits::Picked));
+            state.usage = image.usage.texture | image.usage.storage << 1 |
+                          image.usage.render_target << 2 | image.usage.depth_target << 3 |
+                          image.usage.vo_surface << 4;
+            state.aspect_mask = static_cast<u32>(image.aspect_mask);
+            state.num_mip_hashes = static_cast<u32>(image.mip_hashes.size());
+            std::copy(image.mip_hashes.begin(), image.mip_hashes.end(), state.mip_hashes);
+            state.tracked =
+                image.track_addr == image.info.guest_address &&
+                image.track_addr_end == image.info.guest_address + image.info.guest_size;
+            state.image_uid = image.image_uid;
+            state.depth_uid = slot_images.is_allocated(image.depth_id) ? image.depth_uid : 0;
+            state.hash = image.hash;
+            state.info = image.info;
+            captured.state = EncodeState(state);
         }
-        if (runtime.scene_targets && runtime.scene_targets->Tracks(image.image_uid)) {
-            why = describe() + ": a reduced scene proxy holds its content";
-            return false;
-        }
-        std::string aspect_why;
-        auto aspects = ReplayAspects(image, aspect_why);
-        if (!aspects) {
-            why = describe() + ": " + aspect_why;
-            return false;
-        }
-        u64 total = 0;
-        const auto copies = ReplayCopies(*aspects, total);
-        std::string buffer_why;
-        ReplayHostBuffer host{instance.GetAllocator(), total, buffer_why};
-        if (!host.buffer) {
-            why = describe() + ": " + buffer_why;
-            return false;
-        }
-        runtime.Transit(&image, vk::ImageLayout::eTransferSrcOptimal,
-                        vk::PipelineStageFlagBits2::eTransfer,
-                        vk::AccessFlagBits2::eTransferRead);
-        runtime.FlushBarriers();
-        scheduler.Record([vk_image = image.GetImage(), buffer = vk::Buffer{host.buffer},
-                          regions = scheduler.RecordData(std::span<const vk::BufferImageCopy>{
-                              copies})](vk::CommandBuffer cmdbuf) {
-            cmdbuf.copyImageToBuffer(vk_image, vk::ImageLayout::eTransferSrcOptimal, buffer,
-                                     regions.size(), regions.data());
-        });
         scheduler.Finish();
 
-        CapturedImageState state;
-        state.flags = static_cast<u32>(image.flags & ~(ImageFlagBits::Registered |
-                                                        ImageFlagBits::Picked));
-        state.usage = image.usage.texture | image.usage.storage << 1 |
-                      image.usage.render_target << 2 | image.usage.depth_target << 3 |
-                      image.usage.vo_surface << 4;
-        state.aspect_mask = static_cast<u32>(image.aspect_mask);
-        state.num_mip_hashes = static_cast<u32>(image.mip_hashes.size());
-        std::copy(image.mip_hashes.begin(), image.mip_hashes.end(), state.mip_hashes);
-        state.tracked = image.track_addr == image.info.guest_address &&
-                        image.track_addr_end == image.info.guest_address + image.info.guest_size;
-        state.image_uid = image.image_uid;
-        state.depth_uid = slot_images.is_allocated(image.depth_id) ? image.depth_uid : 0;
-        state.hash = image.hash;
-        state.info = image.info;
-
-        CapturedImage captured;
-        captured.state = EncodeState(state);
         for (u64 i = 0; i < aspects->size(); ++i) {
             auto& a = (*aspects)[i];
             const u64 bytes = u64(a.width) * a.height * a.depth * a.texel_bytes * a.layers;
-            a.texels.assign(host.data + copies[i].bufferOffset,
-                            host.data + copies[i].bufferOffset + bytes);
+            a.texels.assign(host->data + copies[i].bufferOffset,
+                            host->data + copies[i].bufferOffset + bytes);
         }
         captured.aspects = std::move(*aspects);
         sink(std::move(captured));
@@ -1607,7 +1628,10 @@ bool TextureCache::RestoreForReplay(const std::function<bool(CapturedImage&)>& n
             return fmt::format("image {:#x} ({} bytes, {})", info.guest_address, info.guest_size,
                                vk::to_string(info.pixel_format));
         };
+        // As in CaptureForReplay: slot_images under `mutex` only, and no Image& across Finish.
         ImageId id;
+        std::optional<ReplayHostBuffer> host;
+        std::vector<vk::BufferImageCopy> copies;
         {
             std::scoped_lock lock{mutex};
             bool overlap = false;
@@ -1619,78 +1643,86 @@ bool TextureCache::RestoreForReplay(const std::function<bool(CapturedImage&)>& n
             }
             id = slot_images.insert(instance, runtime, slot_image_views, info);
             RegisterImage(id);
-        }
-        Image& image = slot_images[id];
-        if (static_cast<u32>(image.aspect_mask) != state->aspect_mask) {
-            why = describe() + ": recreated with other aspects";
-            return false;
-        }
-        std::string aspect_why;
-        const auto expected = ReplayAspects(image, aspect_why);
-        if (!expected || expected->size() != captured.aspects.size()) {
-            why = describe() + ": " + (expected ? "aspect records differ" : aspect_why);
-            return false;
-        }
-        for (u64 i = 0; i < expected->size(); ++i) {
-            const auto& e = (*expected)[i];
-            const auto& c = captured.aspects[i];
-            if (e.aspect != c.aspect || e.mip != c.mip || e.layers != c.layers ||
-                e.width != c.width || e.height != c.height || e.depth != c.depth ||
-                e.texel_bytes != c.texel_bytes ||
-                c.texels.size() != u64(c.width) * c.height * c.depth * c.texel_bytes * c.layers) {
-                why = fmt::format("{}: aspect record {} differs from the recreated image",
-                                  describe(), i);
+            Image& image = slot_images[id];
+            if (static_cast<u32>(image.aspect_mask) != state->aspect_mask) {
+                why = describe() + ": recreated with other aspects";
                 return false;
             }
+            std::string aspect_why;
+            const auto expected = ReplayAspects(image, aspect_why);
+            if (!expected || expected->size() != captured.aspects.size()) {
+                why = describe() + ": " + (expected ? "aspect records differ" : aspect_why);
+                return false;
+            }
+            for (u64 i = 0; i < expected->size(); ++i) {
+                const auto& e = (*expected)[i];
+                const auto& c = captured.aspects[i];
+                if (e.aspect != c.aspect || e.mip != c.mip || e.layers != c.layers ||
+                    e.width != c.width || e.height != c.height || e.depth != c.depth ||
+                    e.texel_bytes != c.texel_bytes ||
+                    c.texels.size() !=
+                        u64(c.width) * c.height * c.depth * c.texel_bytes * c.layers) {
+                    why = fmt::format("{}: aspect record {} differs from the recreated image",
+                                      describe(), i);
+                    return false;
+                }
+            }
+            u64 total = 0;
+            copies = ReplayCopies(captured.aspects, total);
+            std::string buffer_why;
+            host.emplace(instance.GetAllocator(), total, buffer_why);
+            if (!host->buffer) {
+                why = describe() + ": " + buffer_why;
+                return false;
+            }
+            for (u64 i = 0; i < captured.aspects.size(); ++i) {
+                std::memcpy(host->data + copies[i].bufferOffset, captured.aspects[i].texels.data(),
+                            captured.aspects[i].texels.size());
+            }
+            runtime.Transit(&image, vk::ImageLayout::eTransferDstOptimal,
+                            vk::PipelineStageFlagBits2::eTransfer,
+                            vk::AccessFlagBits2::eTransferWrite);
+            runtime.FlushBarriers();
+            scheduler.Record([vk_image = image.GetImage(), buffer = vk::Buffer{host->buffer},
+                              regions = scheduler.RecordData(std::span<const vk::BufferImageCopy>{
+                                  copies})](vk::CommandBuffer cmdbuf) {
+                cmdbuf.copyBufferToImage(buffer, vk_image, vk::ImageLayout::eTransferDstOptimal,
+                                         regions.size(), regions.data());
+            });
         }
-        u64 total = 0;
-        const auto copies = ReplayCopies(captured.aspects, total);
-        std::string buffer_why;
-        ReplayHostBuffer host{instance.GetAllocator(), total, buffer_why};
-        if (!host.buffer) {
-            why = describe() + ": " + buffer_why;
-            return false;
-        }
-        for (u64 i = 0; i < captured.aspects.size(); ++i) {
-            std::memcpy(host.data + copies[i].bufferOffset, captured.aspects[i].texels.data(),
-                        captured.aspects[i].texels.size());
-        }
-        runtime.Transit(&image, vk::ImageLayout::eTransferDstOptimal,
-                        vk::PipelineStageFlagBits2::eTransfer,
-                        vk::AccessFlagBits2::eTransferWrite);
-        runtime.FlushBarriers();
-        scheduler.Record([vk_image = image.GetImage(), buffer = vk::Buffer{host.buffer},
-                          regions = scheduler.RecordData(std::span<const vk::BufferImageCopy>{
-                              copies})](vk::CommandBuffer cmdbuf) {
-            cmdbuf.copyBufferToImage(buffer, vk_image, vk::ImageLayout::eTransferDstOptimal,
-                                     regions.size(), regions.data());
-        });
         scheduler.Finish();
 
-        image.flags = static_cast<ImageFlagBits>(state->flags) | ImageFlagBits::Registered;
-        image.usage.texture = state->usage & 1;
-        image.usage.storage = (state->usage >> 1) & 1;
-        image.usage.render_target = (state->usage >> 2) & 1;
-        image.usage.depth_target = (state->usage >> 3) & 1;
-        image.usage.vo_surface = (state->usage >> 4) & 1;
-        image.mip_hashes.assign(state->mip_hashes, state->mip_hashes + state->num_mip_hashes);
-        image.hash = state->hash;
-        if (state->tracked) {
-            TrackImage(id);
+        {
+            std::scoped_lock lock{mutex};
+            Image& image = slot_images[id];
+            image.flags = static_cast<ImageFlagBits>(state->flags) | ImageFlagBits::Registered;
+            image.usage.texture = state->usage & 1;
+            image.usage.storage = (state->usage >> 1) & 1;
+            image.usage.render_target = (state->usage >> 2) & 1;
+            image.usage.depth_target = (state->usage >> 3) & 1;
+            image.usage.vo_surface = (state->usage >> 4) & 1;
+            image.mip_hashes.assign(state->mip_hashes, state->mip_hashes + state->num_mip_hashes);
+            image.hash = state->hash;
+            if (state->tracked) {
+                TrackImage(id);
+            }
         }
         by_uid[state->image_uid] = id;
         if (state->depth_uid) {
             depth_links.emplace_back(id, state->depth_uid);
         }
     }
-    for (const auto& [id, depth_uid] : depth_links) {
-        const auto it = by_uid.find(depth_uid);
-        if (it == by_uid.end()) {
-            why = fmt::format("image {:#x}: its depth image was not captured",
-                              slot_images[id].info.guest_address);
-            return false;
+    {
+        std::scoped_lock lock{mutex};
+        for (const auto& [id, depth_uid] : depth_links) {
+            const auto it = by_uid.find(depth_uid);
+            if (it == by_uid.end()) {
+                why = fmt::format("image {:#x}: its depth image was not captured",
+                                  slot_images[id].info.guest_address);
+                return false;
+            }
+            slot_images[id].AssociateDepth(it->second, slot_images[it->second].image_uid);
         }
-        slot_images[id].AssociateDepth(it->second, slot_images[it->second].image_uid);
     }
     std::vector<CapturedMetadataEntry> entries(metadata.state.size() /
                                                sizeof(CapturedMetadataEntry));
