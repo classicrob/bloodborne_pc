@@ -358,7 +358,9 @@ void HoldEnded(Vulkan::Rasterizer* rasterizer, const Held& held) {
             ++it->second;
         }
     }
-    std::vector<std::string> image_rejected; // the perf replay v0 does not restore images
+    // Image authority: blocks inventory qualification, not a perf capture (its images are
+    // captured and restored).
+    std::vector<std::string> image_rejected;
     for (const auto& [why, count] : reasons) {
         image_rejected.push_back(fmt::format("{} GPU-modified images not eligible for writeback ({})",
                                              count, why));
