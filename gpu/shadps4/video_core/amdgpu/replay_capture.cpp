@@ -365,8 +365,10 @@ void HoldEnded(Vulkan::Rasterizer* rasterizer, const Held& held) {
     }
 
     // Report.
-    fmt::print("Replay capture inventory (frame end {}, inventory only, nothing written):\n",
-               frames_seen);
+    fmt::print("Replay capture inventory (frame end {}, {}):\n", frames_seen,
+               Settings().mode == Mode::Perf
+                   ? "perf capture follows unless blocked; image rejections do not block it"
+                   : "inventory only, nothing written");
     fmt::print("  G1 cut: {} after {:.1f} ms hold; {} graphics submissions held ({:.1f} KiB copied at "
                "submit, {} graphics tasks queued); renderer quiescent: {}; host commands during "
                "hold: {}\n",
