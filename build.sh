@@ -257,6 +257,7 @@ if [[ ${1:-} == --test || ${1:-} == --test-dry ]]; then
         unit_tests=(cmd-snapshot-test cond-exec-test label-check-test capture-quiesce-test flip-publish-test videoout-lifecycle-test strmout-update-test equeue-concurrency-test feature-checks-test image-view-storage-test
             submit-info-bounds-test vertex-fetch-translation-test buffer-null-test rect-interface-test
             fence-address-test fill-clear-device-test capture-images-test overlay-concurrency-test depth-bounds-probe-test replay-capture-test
+            slot-vector-test
             motion-history-test
             motion-shader-test
             ui-composition-test fill-clear-test scene-resolution-test taa-shader-test camera-motion-test)
@@ -281,6 +282,7 @@ if [[ ${1:-} == --test || ${1:-} == --test-dry ]]; then
         t out/gpu/rect-interface-test
         t out/gpu/depth-bounds-probe-test
         t out/gpu/replay-capture-test
+        t out/gpu/slot-vector-test
         rm -rf out/buffer-null && mkdir -p out/buffer-null
         t out/gpu/buffer-null-test out/buffer-null
         t spirv-val --target-env vulkan1.3 out/buffer-null/null-buffer.spv
