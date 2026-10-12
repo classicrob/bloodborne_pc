@@ -649,7 +649,25 @@ extern "C" int bbgpu_replay_run(const char* dir, unsigned iterations) {
     fmt::print("Perf replay: {} images restored; capture -> restore -> capture again is exact\n",
                images);
     std::fflush(stdout);
-    std::vector<double> wall_ms, cpu_ms;
+    // BB_REPLAY_GPU_WAIT=1: after each iteration also wait for its GPU work to complete
+    // (Rasterizer::QuiesceForCapture) and report submit -> GPU done; otherwise GPU work may queue
+    // up across iterations until vkQueueSubmit blocks (the loop then runs at the GPU's pace).
+    const char* gpu_wait_env = std::getenv("BB_REPLAY_GPU_WAIT");
+    if (gpu_wait_env && std::strcmp(gpu_wait_env, "0") && std::strcmp(gpu_wait_env, "1")) {
+        std::fprintf(stderr, "STOP: perf replay: BB_REPLAY_GPU_WAIT=%s (0 or 1)\n", gpu_wait_env);
+        return 2;
+    }
+    const bool gpu_wait = gpu_wait_env && !std::strcmp(gpu_wait_env, "1");
+    Vulkan::Rasterizer* rasterizer = AmdGpu::ReplayStateAccess::Rasterizer(*lp);
+    const auto prep_totals = [&] {
+        std::pair<u64, u64> totals{};
+        OnGpuThread(*lp, [&] {
+            totals = rasterizer->GetDrawPreparation().UsageTotals();
+            return true;
+        });
+        return totals;
+    };
+    std::vector<double> wall_ms, cpu_ms, done_ms;
     for (unsigned it = 1; it <= iterations; ++it) {
         if (!WaitIdle(*lp, std::chrono::seconds(30))) {
             std::fprintf(stderr, "STOP: perf replay: the GPU did not go idle within 30 s before "
@@ -660,6 +678,7 @@ extern "C" int bbgpu_replay_run(const char* dir, unsigned iterations) {
             std::fprintf(stderr, "STOP: perf replay: %s\n", why.c_str());
             return 3;
         }
+        const auto prep_before = prep_totals();
         const Counters before = Counters::Now();
         const auto t0 = std::chrono::steady_clock::now();
         for (const auto& sub : capture.submissions) {
@@ -684,14 +703,33 @@ extern "C" int bbgpu_replay_run(const char* dir, unsigned iterations) {
         const double ms =
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         const Counters after = Counters::Now();
+        double gpu_done = 0;
+        if (gpu_wait) {
+            std::string quiet_why;
+            if (!OnGpuThread(*lp, [&] { return rasterizer->QuiesceForCapture(quiet_why); })) {
+                std::fprintf(stderr, "STOP: perf replay: iteration %u's GPU work did not complete: "
+                                     "%s\n", it, quiet_why.c_str());
+                return 3;
+            }
+            gpu_done = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+                                                                 t0).count();
+            done_ms.push_back(gpu_done);
+        }
+        const auto prep_after = prep_totals();
+        const u64 prep_used = prep_after.first - prep_before.first;
+        const u64 prep_all = prep_used + (prep_after.second - prep_before.second);
         const double gpu_cpu = (after.gpu_cpu_us - before.gpu_cpu_us) / 1000.0;
         wall_ms.push_back(ms);
         cpu_ms.push_back(gpu_cpu);
-        fmt::print("Perf replay iteration {}{}: {:.2f} ms submit-to-idle, GPU thread CPU {:.2f} ms "
-                   "(idle {:.2f} ms); {} draws, {} dispatches, {} submissions; images registered "
-                   "{}, image uploads {:.1f} MiB, buffer uploads {:.1f} MiB\n",
-                   it, it == 1 ? " (warm-up)" : "", ms, gpu_cpu,
-                   (after.idle_ns - before.idle_ns) / 1e6, after.draws - before.draws,
+        fmt::print("Perf replay iteration {}{}: {:.2f} ms submit-to-idle{}, GPU thread CPU {:.2f} ms "
+                   "(idle {:.2f} ms); prepared draws used {} of {}; {} draws, {} dispatches, {} "
+                   "submissions; images registered {}, image uploads {:.1f} MiB, buffer uploads "
+                   "{:.1f} MiB\n",
+                   it, it == 1 ? " (warm-up)" : "", ms,
+                   gpu_wait ? fmt::format(", {:.2f} ms submit-to-GPU-done", gpu_done) : std::string{},
+                   gpu_cpu,
+                   (after.idle_ns - before.idle_ns) / 1e6, prep_used, prep_all,
+                   after.draws - before.draws,
                    after.dispatches - before.dispatches, after.submissions - before.submissions,
                    after.images - before.images,
                    (after.image_bytes - before.image_bytes) / 1048576.0,
@@ -709,6 +747,13 @@ extern "C" int bbgpu_replay_run(const char* dir, unsigned iterations) {
                    iterations, median(w), *std::min_element(w.begin(), w.end()),
                    *std::max_element(w.begin(), w.end()), median(c),
                    *std::min_element(c.begin(), c.end()), *std::max_element(c.begin(), c.end()));
+        if (gpu_wait) {
+            std::vector<double> d(done_ms.begin() + 1, done_ms.end());
+            fmt::print("Perf replay steady state, GPU waited per iteration: submit-to-GPU-done median "
+                       "{:.2f} ms [{:.2f}, {:.2f}]\n",
+                       median(d), *std::min_element(d.begin(), d.end()),
+                       *std::max_element(d.begin(), d.end()));
+        }
     }
     std::fflush(stdout);
     return 0;
