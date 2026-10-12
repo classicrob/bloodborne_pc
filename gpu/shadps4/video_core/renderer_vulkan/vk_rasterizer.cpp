@@ -2877,9 +2877,12 @@ std::string DescribeTextureBinding(const void* context) {
         c.prepared ? c.prepared->image_sharps[resource] : res.GetSharp(*c.stage);
     std::array<u32, sizeof(AmdGpu::Image) / 4> words{};
     std::memcpy(words.data(), &sharp, sizeof(words));
-    text += fmt::format("; resource is_written {}, is_atomic {}, is_array {}, is_depth {}; T# "
-                        "data {} number {} {}x{} pitch {} levels {}..{} tiling {} raw",
-                        res.is_written, res.is_atomic, res.is_array, res.is_depth,
+    // The effective T# (as bound: after the r128 pitch repair, cube conversion and validity
+    // handling of GetSharp), not necessarily the guest's descriptor bytes.
+    text += fmt::format("; resource is_written {}, is_atomic {}, is_array {}, is_depth {}, "
+                        "is_r128 {}; effective T# data {} number {} {}x{} pitch {} levels {}..{} "
+                        "tiling {}, words",
+                        res.is_written, res.is_atomic, res.is_array, res.is_depth, res.is_r128,
                         magic_enum::enum_name(sharp.GetDataFmt()),
                         magic_enum::enum_name(sharp.GetNumberFmt()), u32(sharp.width) + 1,
                         u32(sharp.height) + 1, u32(sharp.pitch) + 1, u32(sharp.base_level),
