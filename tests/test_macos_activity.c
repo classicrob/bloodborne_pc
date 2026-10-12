@@ -6,6 +6,7 @@ int main(void) {
     bb_macos_begin_game_activity();
     printf("pid %d\n", (int)getpid());
     fflush(stdout);
-    sleep(3); /* the script reads the power assertions meanwhile */
+    /* Held until the script has read the power assertions and closes stdin. */
+    while (getchar() != EOF) {}
     return 0;
 }
