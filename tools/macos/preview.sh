@@ -65,9 +65,13 @@ for version in $(grep -ho 'ShaderBinaryVersion = [0-9]*u' gpu/shadps4/video_core
     say "shader binary version $version"
 done
 
-smoke=$(VK_DRIVER_FILES=$BB_DEPS_PREFIX/share/vulkan/icd.d/MoltenVK_icd.json \
-    tools/macos/heavy.sh --pool quick "$name smoke" -- "$dest/bb-probe" --vulkan-only 2>&1 | tail -1)
-[[ $smoke == *PASS* ]] || die "smoke: $smoke"
+# heavy.sh's exit, and the probe's own last line (heavy's lines, e.g. "PAUSED ... for perf runs" when a
+# perf run paused the smoke job, come after it).
+VK_DRIVER_FILES=$BB_DEPS_PREFIX/share/vulkan/icd.d/MoltenVK_icd.json \
+    tools/macos/heavy.sh --pool quick "$name smoke" -- "$dest/bb-probe" --vulkan-only > "out/preview-$name-smoke.log" 2>&1
+smoke_status=$?
+smoke=$(grep -v '^heavy: ' "out/preview-$name-smoke.log" | tail -1)
+[[ $smoke_status == 0 && $smoke == *PASS* ]] || die "smoke (exit $smoke_status): $(tail -3 "out/preview-$name-smoke.log" | tr '\n' ' ')"
 say "smoke: $smoke"
 if [[ -n $build_only ]]; then say "test: not run (--build-only)"; exit 0; fi
 
@@ -82,7 +86,8 @@ case $status in
 esac
 say "test: $verdict (build.sh --test-keep-going exit $status, $(( $(date +%s) - started )) s): ${summary:-no summary: a build or non-test step failed, see out/preview-$name-test.log}"
 while read -r line; do say "test ${line#  }"; done < <(grep -E '^  (FAILED|skipped): ' "out/preview-$name-test.log")
-# Paused by a perf run while it ran? heavy.sh's history has the build.sh job's quiet-pause events.
+# Paused or demoted (E-core QoS) by a perf run while it ran? heavy.sh's history has the build.sh
+# job's quiet-pause / quiet-ecore events; either can make a time limit in a test fire.
 history=${BB_HEAVY_DIR:-$HOME/bbport-deps/locks}/history.jsonl
 job="build.sh --test-keep-going in $(basename "$(dirname "$PWD")")/$(basename "$PWD")"
 paused=$(python3 - "$history" "$job" "$started" <<'PY'
@@ -92,16 +97,19 @@ count = 0
 if os.path.exists(path):
     for line in open(path):
         event = json.loads(line)
-        if event.get('event') == 'quiet-pause' and event.get('label') == job and \
+        if event.get('event') in ('quiet-pause', 'quiet-ecore') and event.get('label') == job and \
                 datetime.datetime.fromisoformat(event['time']).timestamp() >= since - 1:
             count += 1
 print(count)
 PY
 )
-say "test paused by perf runs: $paused time(s)"
+say "test paused or demoted by perf runs: $paused time(s)"
 if [[ $status == 1 && $paused != 0 ]]; then
     grep -E '^  FAILED: exit [0-9]+: ' "out/preview-$name-test.log" | sed -E 's/^  FAILED: exit [0-9]+: //' |
     while read -r command; do
+        if [[ $command == spirv-val* ]]; then  # a check of a test's output; its test is listed too
+            say "rerun: not for $command (rerun the test that wrote it)"; continue
+        fi
         one=$(for word in $command; do [[ $word == */* ]] && { echo "$word"; break; }; done)
         [[ -n $one ]] || one=${command%% *}
         log=out/preview-$name-rerun-$(basename "$one").log

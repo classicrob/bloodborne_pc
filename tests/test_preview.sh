@@ -13,7 +13,16 @@ unset ${!BB_HEAVY_@}
 export BB_HEAVY_DIR=$dir/locks BB_HEAVY_SHARED_TREE=1 BB_HEAVY_IDLE_SECONDS=0
 mkdir -p "$BB_HEAVY_DIR" "$dir/stage"
 tree=$dir/trees/t && mkdir -p "$tree/tools/macos" "$tree/out/gpu"
-cp tools/macos/heavy.sh tools/macos/heavy.py tools/macos/preview.sh "$tree/tools/macos/"
+cp tools/macos/heavy.py tools/macos/preview.sh "$tree/tools/macos/"
+# heavy.sh: the real heavy.py; FAKE_SMOKE_PAUSED appends the line heavy prints when a perf run paused the job.
+cat > "$tree/tools/macos/heavy.sh" <<'WRAP'
+#!/bin/sh
+python3 "$(dirname -- "$0")/heavy.py" "$@"; status=$?
+case "$*" in *smoke*) [ -n "${FAKE_SMOKE_PAUSED:-}" ] &&
+    echo "heavy: x smoke: PAUSED 3 s for perf runs (R0); ended with exit $status" >&2 ;; esac
+exit $status
+WRAP
+chmod +x "$tree/tools/macos/heavy.sh"
 printf '#include <stdio.h>\nint main(void){puts("Vulkan: fake; command submission PASS");return 0;}\n' > "$dir/probe.c"
 cc "$dir/probe.c" -o "$dir/bb-probe" && echo 'int bbgpu_fake;' > "$dir/gpu.c" && cc -dynamiclib "$dir/gpu.c" -o "$dir/libbbgpu.dylib"
 cat > "$tree/build.sh" <<FAKE
@@ -53,6 +62,10 @@ set +e; run --stage "$dir/stage" --build-only P1; status=$?; set -e
 (( status == 2 )) && grep -q 'exists (a preview is never overwritten)' "$dir/out" || fail "overwrite ($status)"
 echo "PASS a second preview of the same name and commit is refused (exit 2)"
 
+set +e; FAKE_SMOKE_PAUSED=1 run --stage "$dir/stage" --build-only P1b; status=$?; set -e
+(( status == 0 )) && grep -q '^smoke: Vulkan: fake; command submission PASS' "$dir/stage/$head-P1b/PREVIEW.txt" ||
+    fail "a smoke job paused by a perf run ($status): $(cat "$dir/out")"
+echo "PASS a smoke job paused by a perf run: heavy's PAUSED line after the probe's output, still PASS"
 set +e; FAKE_TEST=pass run --stage "$dir/stage" P2; status=$?; set -e
 (( status == 0 )) && grep -q '^test: PASS (build.sh --test-keep-going exit 0' "$dir/stage/$head-P2/PREVIEW.txt" || fail "pass ($status): $(cat "$dir/out")"
 echo "PASS the gate passes: test: PASS, exit 0"
@@ -67,7 +80,7 @@ PY
 set +e; FAKE_TEST=fail run --stage "$dir/stage" P3; status=$?; set -e
 f=$dir/stage/$head-P3/PREVIEW.txt
 (( status == 1 )) && grep -q '^test: FAILED' "$f" && grep -q '^test FAILED: exit 1: sh tests/test_x.sh' "$f" &&
-    grep -q '^test paused by perf runs: 1 time(s)' "$f" &&
+    grep -q '^test paused or demoted by perf runs: 1 time(s)' "$f" &&
     grep -q '^rerun (paused run) --test-one tests/test_x.sh: exit 0: test-one: tests/test_x.sh: 1 run(s), exit 0' "$f" ||
     fail "a failure in a paused run ($status): $(cat "$dir/out")"
 echo "PASS a failure: FAILED, exit 1, the failure listed, rerun once with --test-one after a pause"
