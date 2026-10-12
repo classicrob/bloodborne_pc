@@ -146,3 +146,44 @@ map and non-finite values; JSON validity/field omission and sequence; loud
 refusals; real Mach reads over a fake mapped image and protected/unmapped pages;
 the rate cap and host/guest errno preservation. Its optional local image argument
 checks the positive code guards without storing game bytes in the repository.
+
+## Initial observation qualification
+
+Playtest reported clean exits and no STOP for PREVIEW-28p (`34e2669`) runs
+`20261012-120428-1080p-POSQUAL-1`, `20261012-120819-1080p-POSQUAL-2`,
+`20261012-121308-1080p-POSQUAL-3` and `20261012-121717-1080p-POSQUAL-4`.
+Their manifests pin bb-probe SHA256
+`b356e62d867cd5dc276669e148265cb4e64d0b8744f368db63b323b8a724350a`
+and libbbgpu SHA256
+`e50c23fcf3c0e123117ec525f47645302fd70369ef1d20c313656e1e9268e348`.
+Samples and screenshot-step associations are in each run's `positions.jsonl`
+and `steps.jsonl` under Playtest's `out/macos_route`.
+
+Reported visual comparisons support the known Central Yharnam spawn XYZ,
+the Dream lantern position, XYZ changes during walking, and the second
+coordinate as height. Left-stick direction changes turn player yaw; a
+right-stick camera turn leaves that yaw unchanged. This supports planar
+steering from `xyz[0]`/`xyz[2]` and keeps player yaw distinct from camera yaw.
+
+Exit Game followed by Continue produced `absent-player-chain` records during
+the title transition, then valid saved-position observations again. **Valid
+can precede visible gameplay**: the first valid record appeared during loading.
+The route must require its world-stage gate separately; validity does not mean
+the player can be controlled. Live map transition and death were still pending
+at this initial handoff, so automated navigation was not yet qualified.
+
+An independent read of those four sample files found 421, 672, 985 and 1254
+records (3332 total), strictly increasing sequences and one run ID per file.
+The maximum publisher-reported age was 245000 ns (0.245 ms); the largest
+interval between recorded sample timestamps was 674084000 ns (0.674 s).
+These are observations, not worst-case freshness guarantees or evidence
+that every pad read produced a file.
+
+Consumer review found a blocker in the initial `PositionReader.fresh()`:
+checking only `sample_age_ns` accepts an old file on first use because that
+field records age at publication. Compute current age with
+`time.clock_gettime_ns(time.CLOCK_MONOTONIC) - sample_monotonic_ns`, reject
+invalid/future timestamps, and latch the run ID and start timestamp in
+addition to PID. Test stale first use, a higher sequence with an old timestamp,
+same-PID process replacement, and a stalled sequence. Playtest owns that
+reader correction; this record does not claim it has landed.
