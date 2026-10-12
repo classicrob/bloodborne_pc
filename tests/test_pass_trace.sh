@@ -81,5 +81,10 @@ assert summary["draw_buckets"] == {"2-3": 0.5, "1": 0.5, "0": 1.5}, summary
 assert "(no draw: 0.5 clear only, 1.0 empty)" in text
 assert "1.0 attachments of unknown views" in text
 assert "1 pass(es) begun before the trace (not counted)" in text
+# Known/all attachments: new = pass 0 (color, depth, stencil) + pass 3 (color); resume = pass 1
+# (color, depth, stencil); same targets = pass 2 (unknown color, depth) + pass 4 (unknown color).
+assert summary["coverage"] == {"new targets": [4, 4], "resume": [3, 3],
+                               "same targets": [1, 3]}, summary["coverage"]
+assert "Attachment coverage: 8 of 10 attachments known (80%)" in text
 EOF
 echo "pass-trace-test: PASS"

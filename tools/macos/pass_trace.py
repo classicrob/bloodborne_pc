@@ -12,7 +12,9 @@ frames):
     not change it), or unused until the trace ends (may be read in a later frame: not dead).
     Candidates only: uses are the accesses requested through Runtime::Transit, so an image use
     recorded without it (a direct command) between the store and the clear is not seen;
-  - attachments of unknown views (redirects, proxies, helpers) are counted but carry no bytes;
+  - attachments of unknown views (redirects, proxies, helpers, passes begun from a cached render
+    state without the rasterizer's full rebuild) are counted but carry no bytes: the coverage
+    line gives known/all by begin kind, so sparse coverage does not read as low traffic;
   - a model: traffic over a bandwidth plus a cost per pass, against the measured GPU busy, and
     what merging resumes, skipping read-only stores and dead stores, and dropping empty passes
     would save.
@@ -269,8 +271,23 @@ def main():
             by_slot[kind][1] += n
             if a["load"] == "load":
                 by_slot[kind][0] += n
-    print(f"\nAttachment traffic per frame: {mib(loaded) / nf:.0f} MiB loaded, "
-          f"{mib(stored) / nf:.0f} MiB stored")
+    # Coverage: traffic counts known attachments only (unknown views carry no bytes), so sparse
+    # coverage must not read as low traffic.
+    coverage = collections.defaultdict(lambda: [0, 0])  # begin kind -> [known, all]
+    for p in ended:
+        b = p["begin"]
+        kind = ("resume" if b["resumed"] else "same targets" if b["same_targets"]
+                else "new targets")
+        for a in b["attachments"]:
+            coverage[kind][0] += 1 if a["known"] else 0
+            coverage[kind][1] += 1
+    known_all = sum(v[0] for v in coverage.values())
+    all_all = sum(v[1] for v in coverage.values())
+    print(f"\nAttachment coverage: {known_all} of {all_all} attachments known "
+          f"({100 * known_all / max(all_all, 1):.0f}%); by begin kind: "
+          + ", ".join(f"{k} {v[0]}/{v[1]}" for k, v in sorted(coverage.items())))
+    print(f"Attachment traffic per frame (known attachments only): {mib(loaded) / nf:.0f} MiB "
+          f"loaded, {mib(stored) / nf:.0f} MiB stored")
     for kind, (l, s) in sorted(by_slot.items()):
         print(f"  {kind:8s} {mib(l) / nf:8.0f} MiB loaded {mib(s) / nf:8.0f} MiB stored")
 
@@ -318,6 +335,7 @@ def main():
             "frames": nf, "passes_per_frame": len(passes) / nf, "partial_ends": partial_ends,
             "begin_kinds": {k: v / nf for k, v in begin_kinds.items()},
             "loaded_mib": mib(loaded) / nf, "stored_mib": mib(stored) / nf,
+            "coverage": {k: v for k, v in coverage.items()},
             "fates_mib": {k: mib(v[1]) / nf for k, v in fates.items()},
             "levers_mib": {name: mib(b) / nf for name, b, _ in levers},
             "draw_buckets": {k: v / nf for k, v in buckets.items()},
