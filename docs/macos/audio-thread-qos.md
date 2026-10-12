@@ -100,3 +100,20 @@ Parent-process policy may still be inherited. A future in-process diagnostic
 at those threads' entry points must record requested QoS and effective Mach
 policy/priority plus the launch policy before claiming their actual classes.
 This is a separate perf lever for PM4/Renderer.
+
+## Power-mode boundary: 2026-10-12 around 05:50 UTC
+
+The orchestrator reports that the user's Mac was in Low Power Mode for the
+measurements before approximately 05:50 UTC on 2026-10-12. With the user's
+approval, it was changed permanently to Automatic (`pmset powermode 0`).
+Earlier frame-rate, producer-gap and CPU-cost numbers are historical evidence
+under the former power policy, not comparable baselines for subsequent runs.
+This includes the Dream/clinic audio observations cited above; functional
+fixture acceptance is unaffected by this timing qualification.
+
+The audio QoS A/B must use fresh paired runs after this boundary, both under
+the same recorded power and launch policy. Record power mode alongside the
+artifact hashes, host load, route and requested thread QoS. Compare inherit
+and interactive only within that controlled pair; do not attribute a change
+from the old Low Power Mode measurements to the QoS hook. Fresh R0/replay
+baselines are owned by Playtest/Verifier, not this audio unit.

@@ -4,16 +4,23 @@
 // unchanged labels, our own writes in any interleaving with parse notes, unreadable memory and
 // mixed widths are not (the latter two are counted). The writes are simulated in the order
 // SignalEop does them: BeforeWrite, the store, AfterWrite.
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <csignal>
+#include <crt_externs.h>
+#include <limits.h>
+#include <mach-o/dyld.h>
+#include <spawn.h>
 #include <sys/mman.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #include <atomic>
 #include <chrono>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <vector>
 #include "bbport_cmd_data.h"
@@ -27,6 +34,8 @@
 #include "video_core/renderer_vulkan/vk_draw_pipe.h"
 #include "bbport_compute_sh.h"
 #include "bbport_frame_marks.h"
+#include "bbport_hot_thread_qos.h"
+#include "../src/macos_ui.h"
 #include "bbport_label_sequencer.h"
 
 namespace {
@@ -34,6 +43,13 @@ unsigned failures = 0;
 void Expect(const char* what, bool ok) {
     std::fprintf(stderr, "%-74s %s\n", what, ok ? "ok" : "FAIL");
     failures += ok ? 0 : 1;
+}
+/// With what was seen, printed when it fails.
+void Expect(const char* what, bool ok, const std::string& seen) {
+    Expect(what, ok);
+    if (!ok) {
+        std::fprintf(stderr, "  seen: %s\n", seen.c_str());
+    }
 }
 
 // SignalEop's order: check, store, completed.
@@ -51,7 +67,131 @@ std::uint64_t Addr(const void* p) {
 
 static int owner_origin_test = 0;
 
-int main() {
+namespace {
+/// The Mach base priority in a BbThreadReport line (-1 if absent).
+int BaseOf(const std::string& line) {
+    const std::size_t at = line.find(", base ");
+    return at == std::string::npos ? -1 : std::atoi(line.c_str() + at + 7);
+}
+
+/// A case of the hot-thread settings in a fresh exec'd child of this test (one process per
+/// case), its output and how it ended.
+struct HotThreadChildResult {
+    bool spawned = false;
+    int status = 0;
+    std::string out, err;
+};
+
+std::string ReadBack(int fd) {
+    std::string text(8192, '\0');
+    const ssize_t n = fd < 0 ? -1 : pread(fd, text.data(), text.size(), 0);
+    text.resize(n > 0 ? static_cast<std::size_t>(n) : 0);
+    return text;
+}
+
+/// Runs this test as `--hot-thread-child <mode>`, with BB_TASK_ROLE=`role` and
+/// BB_HOT_THREAD_QOS=`qos` (each left out when null).
+HotThreadChildResult RunHotThreadChild(const char* mode, const char* role,
+                                       const char* qos = nullptr) {
+    HotThreadChildResult r;
+    char exe[PATH_MAX];
+    std::uint32_t size = sizeof(exe);
+    if (_NSGetExecutablePath(exe, &size) != 0) {
+        return r;
+    }
+    char out_path[] = "/tmp/bb-hot-child-out-XXXXXX", err_path[] = "/tmp/bb-hot-child-err-XXXXXX";
+    const int out_fd = mkstemp(out_path), err_fd = mkstemp(err_path);
+    std::vector<std::string> env;
+    for (char** e = *_NSGetEnviron(); *e; ++e) {
+        if (std::strncmp(*e, "BB_TASK_ROLE=", 13) && std::strncmp(*e, "BB_HOT_THREAD_QOS=", 18)) {
+            env.emplace_back(*e);
+        }
+    }
+    if (role) {
+        env.push_back(std::string("BB_TASK_ROLE=") + role);
+    }
+    if (qos) {
+        env.push_back(std::string("BB_HOT_THREAD_QOS=") + qos);
+    }
+    std::vector<char*> envp;
+    for (std::string& e : env) {
+        envp.push_back(e.data());
+    }
+    envp.push_back(nullptr);
+    char flag[] = "--hot-thread-child";
+    std::string mode_arg = mode;
+    char* argv[] = {exe, flag, mode_arg.data(), nullptr};
+    posix_spawn_file_actions_t actions;
+    if (out_fd >= 0 && err_fd >= 0 && posix_spawn_file_actions_init(&actions) == 0) {
+        pid_t pid = 0;
+        if (posix_spawn_file_actions_adddup2(&actions, out_fd, STDOUT_FILENO) == 0 &&
+            posix_spawn_file_actions_adddup2(&actions, err_fd, STDERR_FILENO) == 0 &&
+            posix_spawn(&pid, exe, &actions, nullptr, argv, envp.data()) == 0) {
+            r.spawned = waitpid(pid, &r.status, 0) == pid;
+        }
+        posix_spawn_file_actions_destroy(&actions);
+    }
+    r.out = ReadBack(out_fd);
+    r.err = ReadBack(err_fd);
+    for (const int fd : {out_fd, err_fd}) {
+        if (fd >= 0) {
+            close(fd);
+        }
+    }
+    unlink(out_path);
+    unlink(err_path);
+    return r;
+}
+
+/// The child's side. A stop case that returns has not stopped (exit 3).
+int HotThreadChild(const std::string& mode) {
+    if (mode == "qos-bad") {
+        BbHotThreadQos::Read("fast");
+        return 3;
+    }
+    if (mode == "role-bad") {
+        BbHotThreadQos::ReadRole("ui");
+        return 3;
+    }
+    if (mode == "role-off-main") {
+        std::thread([] { BbHotThreadQos::ApplyRole(TASK_FOREGROUND_APPLICATION); }).join();
+        return 3;
+    }
+    if (mode == "role-not-applied") {
+        // A known role other than the one BB_TASK_ROLE asks for (foreground), whatever this
+        // process inherited; then Liverpool's check.
+        BbHotThreadQos::ApplyRole(TASK_DEFAULT_APPLICATION);
+        BbHotThreadQos::VerifyConfiguredRole();
+        return 3;
+    }
+    if (mode == "startup-line") {
+        std::thread([] { BbHotThreadQos::Start("hot", BbHotThreadQos::Read("user-initiated")); })
+            .join();
+        return 0;
+    }
+    if (mode == "ui-worker") {
+        std::thread([] {
+            std::printf("%s\n", BbThreadReport::Describe("before").c_str());
+        }).join();
+        BbHotThreadQos::ApplyConfiguredRole(); // what bbgpu_apply_task_role does, from main
+        return bb_macos_ui_run(
+            [](void*) -> int {
+                BbHotThreadQos::VerifyConfiguredRole(); // Liverpool's constructor
+                std::printf("%s\n", BbThreadReport::Describe("worker").c_str());
+                std::thread([] { BbHotThreadQos::Start("stage A"); }).join();
+                std::fflush(stdout);
+                return 0;
+            },
+            nullptr);
+    }
+    return 2;
+}
+} // namespace
+
+int main(int argc, char** argv) {
+    if (argc == 3 && !std::strcmp(argv[1], "--hot-thread-child")) {
+        return HotThreadChild(argv[2]);
+    }
     using namespace BbLabelCheck;
     alignas(16) static std::uint64_t block[6] = {0, 0x1111, 0x2222, 0x3333, 0x4444, 0x5555};
     std::uint64_t* label = &block[0];
@@ -793,7 +933,136 @@ int main() {
                "queryable",
                line.find("Thread test: requested QoS ") == 0 &&
                    line.find("Mach priority current ") != std::string::npos &&
+                   line.find("; task role ") != std::string::npos &&
                    line.find("core cluster not queryable on macOS") != std::string::npos);
+    }
+
+    {
+        // BB_HOT_THREAD_QOS and BB_TASK_ROLE (bbport_hot_thread_qos.h). In this process: the
+        // values, and each class applied on a fresh thread. In fresh exec'd children (one
+        // process per case; Darwin lifts no thread of a forked child): each loud stop by its
+        // reason, the startup line, and the role through bb-probe's startup path.
+        using BbHotThreadQos::Parse;
+        Expect("hot-thread QoS: the three values parse, others do not; unset or empty: inherited",
+               Parse("user-interactive") == QOS_CLASS_USER_INTERACTIVE &&
+                   Parse("user-initiated") == QOS_CLASS_USER_INITIATED &&
+                   Parse("default") == QOS_CLASS_DEFAULT && !Parse("fast") && !Parse("") &&
+                   !BbHotThreadQos::Read(nullptr) && !BbHotThreadQos::Read(""));
+        Expect("  ... BB_TASK_ROLE: the two values, unset or empty: as launched",
+               BbHotThreadQos::ReadRole("foreground") == TASK_FOREGROUND_APPLICATION &&
+                   BbHotThreadQos::ReadRole("default-app") == TASK_DEFAULT_APPLICATION &&
+                   !BbHotThreadQos::ReadRole(nullptr) && !BbHotThreadQos::ReadRole(""));
+        const auto applied = [](qos_class_t qos) {
+            std::string line;
+            std::thread([&] {
+                BbHotThreadQos::Apply(qos);
+                line = BbThreadReport::Describe("hot");
+            }).join();
+            return line;
+        };
+        const std::string interactive = applied(QOS_CLASS_USER_INTERACTIVE);
+        const std::string initiated = applied(QOS_CLASS_USER_INITIATED);
+        const std::string fallback = applied(QOS_CLASS_DEFAULT);
+        Expect("  ... applied: the thread requests that class",
+               interactive.find("requested QoS user-interactive (relative 0)") !=
+                       std::string::npos &&
+                   initiated.find("requested QoS user-initiated (relative 0)") !=
+                       std::string::npos &&
+                   fallback.find("requested QoS default (relative 0)") != std::string::npos,
+               interactive + " / " + initiated + " / " + fallback);
+        if (BaseOf(interactive) > 0 && BaseOf(interactive) == BaseOf(initiated) &&
+            BaseOf(initiated) == BaseOf(fallback)) {
+            // Measured: the requested class does not set the base priority here; the task's
+            // role does (31 in role 0), and a heavy.sh taskpolicy clamp caps both (20 or 4).
+            std::fprintf(stderr, "  ... the Mach base priority rises with the class: SKIPPED, "
+                                 "the task's role or clamp sets it (all at base %d)\n",
+                         BaseOf(interactive));
+        } else {
+            Expect("  ... the Mach base priority rises with the class",
+                   BaseOf(interactive) > BaseOf(initiated) &&
+                       BaseOf(initiated) > BaseOf(fallback) && BaseOf(fallback) > 0,
+                   interactive + " / " + initiated + " / " + fallback);
+        }
+
+        const auto stops = [](const char* mode, const char* role, const char* reason) {
+            const HotThreadChildResult r = RunHotThreadChild(mode, role);
+            return r.spawned && WIFSIGNALED(r.status) && WTERMSIG(r.status) == SIGABRT &&
+                   r.err.find(reason) != std::string::npos;
+        };
+        Expect("  ... stops: BB_HOT_THREAD_QOS not one of the three",
+               stops("qos-bad", nullptr,
+                     "STOP: BB_HOT_THREAD_QOS=fast is not user-interactive, user-initiated or "
+                     "default"));
+        Expect("  ... stops: BB_TASK_ROLE not one of the two",
+               stops("role-bad", nullptr,
+                     "STOP: BB_TASK_ROLE=ui is not foreground or default-app"));
+        Expect("  ... stops: the role applied off the main thread",
+               stops("role-off-main", nullptr,
+                     "STOP: BB_TASK_ROLE must be applied from the main thread"));
+        Expect("  ... stops: BB_TASK_ROLE set but not applied at start (Liverpool's check)",
+               stops("role-not-applied", "foreground",
+                     "STOP: BB_TASK_ROLE asks for foreground application but the task role is "
+                     "default application (7"));
+
+        const HotThreadChildResult line = RunHotThreadChild("startup-line", nullptr);
+        Expect("  ... the startup line: the thread's class and role, then both settings",
+               line.spawned && WIFEXITED(line.status) && WEXITSTATUS(line.status) == 0 &&
+                   line.out.find("Thread hot: requested QoS user-initiated (relative 0)") == 0 &&
+                   line.out.find("; task role ") != std::string::npos &&
+                   line.out.find("; BB_HOT_THREAD_QOS user-initiated; BB_TASK_ROLE unset (as "
+                                 "launched)\n") != std::string::npos,
+               line.out + line.err);
+
+        // bb-probe's path: main applies the role (bbgpu_apply_task_role), then bb_macos_ui_run
+        // starts the worker that runs probe_main (bbgpu_init, Liverpool's check), which starts
+        // the hot threads. Measured there: the role lifts the QoS ceiling (as launched, every
+        // class runs at legacy, 31) and the class sets the tier (user-interactive 47,
+        // user-initiated 37, default 31). Neither alone moves stage A.
+        const auto line_of = [](const HotThreadChildResult& r, const char* name) {
+            const std::size_t at = r.out.find(std::string("Thread ") + name + ":");
+            return at == std::string::npos ? std::string()
+                                           : r.out.substr(at, r.out.find('\n', at) - at);
+        };
+        const HotThreadChildResult both = RunHotThreadChild("ui-worker", "foreground",
+                                                            "user-interactive");
+        const HotThreadChildResult qos_only =
+            RunHotThreadChild("ui-worker", nullptr, "user-interactive");
+        const std::string before = line_of(both, "before"), worker = line_of(both, "worker"),
+                          stage_a = line_of(both, "stage A"),
+                          stage_a_qos_only = line_of(qos_only, "stage A");
+        Expect("  ... the UI-worker path: the worker passes the check, stage A runs with both",
+               both.spawned && WIFEXITED(both.status) && WEXITSTATUS(both.status) == 0 &&
+                   worker.find("; task role foreground application (1);") != std::string::npos &&
+                   stage_a.find(": requested QoS user-interactive (relative 0)") !=
+                       std::string::npos &&
+                   stage_a.find("; task role foreground application (1);") != std::string::npos &&
+                   stage_a.find("; BB_HOT_THREAD_QOS user-interactive; BB_TASK_ROLE foreground "
+                                "application") != std::string::npos,
+               both.out + both.err);
+        Expect("  ... the class alone: the worker path runs, stage A requests it, role as launched",
+               qos_only.spawned && WIFEXITED(qos_only.status) &&
+                   WEXITSTATUS(qos_only.status) == 0 &&
+                   stage_a_qos_only.find(": requested QoS user-interactive (relative 0)") !=
+                       std::string::npos &&
+                   stage_a_qos_only.find("; BB_TASK_ROLE unset (as launched)") !=
+                       std::string::npos,
+               qos_only.out + qos_only.err);
+        Expect("  ... (base priorities read)",
+               BaseOf(before) > 0 && BaseOf(stage_a) > 0 && BaseOf(stage_a_qos_only) > 0,
+               both.out + " / " + qos_only.out);
+        if (BaseOf(before) <= 0) {
+            // Unread: failed above, no clamp decision.
+        } else if (BaseOf(before) < 31) {
+            // A heavy.sh taskpolicy clamp (utility 20, background 4) caps the role too.
+            std::fprintf(stderr, "  ... role and class lift stage A: SKIPPED, the process is "
+                                 "clamped (base %d)\n",
+                         BaseOf(before));
+        } else {
+            Expect("  ... role and class lift stage A above as launched; the class alone does not",
+                   BaseOf(stage_a) > BaseOf(before) &&
+                       BaseOf(stage_a_qos_only) == BaseOf(before),
+                   both.out + " / " + qos_only.out);
+        }
     }
 
     std::fprintf(stderr, "%s: %u failures\n", failures ? "FAIL" : "PASS", failures);

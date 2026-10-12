@@ -2,6 +2,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <atomic>
+#include <cstdio>
+#include <cstring>
 #include <utility>
 #include <boost/container/small_vector.hpp>
 
@@ -40,6 +43,26 @@ GraphicsPipeline::GraphicsPipeline(
     : Pipeline{instance, scheduler, desc_heap, profile, pipeline_cache}, key{key_},
       fetch_shader{std::move(fetch_shader_)} {
     std::ranges::copy(infos, stages.begin());
+    // Without a fragment shader the fragment runtime info must be the default (Build reads it
+    // regardless). The selection resets it (PipelineSelection::ResetStages), so a live pipeline
+    // with a stale one is a selection bug: stop. A preloaded pipeline can carry one from a cache
+    // written before that reset: reset it here, counted.
+    std::array<Shader::RuntimeInfo, MaxShaderStages> checked_infos{};
+    std::ranges::copy(runtime_infos, checked_infos.begin());
+    if (!FragmentInfoMatchesShader(checked_infos, modules)) {
+        ASSERT_MSG(preloading, "graphics pipeline {:#x}: fragment runtime info without a fragment "
+                               "shader (a stale selection)",
+                   std::hash<GraphicsPipelineKey>{}(key));
+        static std::atomic<u32> reset_count{0};
+        const u32 count = reset_count.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (count == 1 || (count & (count - 1)) == 0) {
+            std::printf("Pipeline cache: %u preloaded pipeline(s) without a fragment shader carried "
+                        "a stale fragment runtime info; reset (depth bounds, clip distances)\n",
+                        count);
+        }
+        std::memset(&checked_infos[u32(Shader::SwStage::Fragment)], 0, sizeof(Shader::RuntimeInfo));
+    }
+    runtime_infos = checked_infos;
 #ifdef __APPLE__
     std::ranges::copy(runtime_infos, built_runtime_infos.begin());
     for (size_t i = 0; i < std::min(modules.size(), built_modules.size()); ++i) {

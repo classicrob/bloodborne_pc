@@ -150,6 +150,19 @@ The previous frame's matrices are not there; the port keeps them itself.
   of the dumped frames confirmed the object vectors (luma error 2.5x lower than no motion; the
   camera vectors were worse than no motion). Taking the viewport from the pass removes the
   choice.
+- Object motion history and copies of one mesh (2026-10-12, Motion::History): history is
+  matched per draw identity, which copies of one mesh share; nothing identifies an instance
+  across frames, and the draw order changes with culling. Loading by order gave other copies'
+  positions: pitching up in the clinic, a quarter of the screen got object vectors of +232 px on
+  static geometry (PREVIEW-26 motion gate, motion-003151). Now a mesh seen with two or more
+  copies in any frame (every motion draw is counted, eligible or not; sticky for the run) never
+  loads history and gets camera vectors; the small-skeleton gate compares palette sets, not the
+  copy at the same order position. Residual cases, not ruled out: (a) in the frame in which a
+  mesh first shows a second copy, the copy drawn first may load the previous frame's single
+  copy; (b) a lone visible instance replaced by another instance of the same mesh between two
+  frames loads the other's history. The Object motion line counts the refused draws and, as
+  provenance data for a future instance identity, whether multi-instance meshes keep the same
+  set of palette buffer addresses from frame to frame.
 - FSR 3.1 (`BB_UPSCALER=fsr3`, FireBurn/FSR-Vulkan submodule): scene color before the
   post-processing combine (compute shader 9a9cf8a9), 1:1, RGB written back (the game keeps data
   in the alpha). Toggle 1<<24 switches it off at run time.
