@@ -11,7 +11,8 @@ are guest requests, not measured host priorities.
 
 `runtime_thread.c::create` copies the guest attributes but applies only host
 stack settings before `pthread_create`. `host_start` attaches TLS and names
-the thread; it applies neither QoS nor a Mach time-constraint policy. Later
+the thread; in default/inherit mode it applies neither QoS nor a Mach
+time-constraint policy. Later
 guest priority setters update the stored field only. Therefore the guest's
 requested audio priority distinction is lost. No current log reports the
 actual requested/effective host QoS; do not substitute a guessed inherited
@@ -28,26 +29,30 @@ jobs at nice 5 under `taskpolicy -c utility`. The installed `taskpolicy(8)`
 manual describes this as a process QoS clamp inherited by children. Merely
 requesting user-interactive on a pthread is not evidence of escaping that
 clamp. GPU-exclusive timing jobs are exempt in the existing launcher. The
-DREAM-3 manifest has an empty `heavy` object and no per-thread QoS record,
-so launch-policy attribution for that particular run still needs the job
-history, rather than being inferred from its audio statistics alone.
+DREAM-3 manifest has an empty `heavy` object, but the heavy history closes
+its launch-policy gap: `~/bbport-deps/locks/history.jsonl`, start at
+2026-10-11T23:32:35, PID 87718, records `nice 5, utility QoS` and
+`taskpolicy -c utility .../run.sh`. R0 perf starts at 23:36:54 and
+2026-10-12T00:00:34 record `normal` under the exclusive GPU lane. These
+are actual launch records, not per-thread requested/effective QoS measurements.
 
-## Proposed isolated change, not implemented
+## Opt-in experiment
 
-Add an Apple-only, strictly parsed, opt-in `BB_AUDIO_QOS=interactive` mode
-(`inherit`/unset preserves behavior). In `host_start`, before entering guest
-code, apply `pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0)`
+The Apple-only, strictly parsed, opt-in `BB_AUDIO_QOS=interactive` mode
+(`inherit`/unset preserves behavior) is implemented. In `host_start`, before entering guest
+code, it applies `pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0)`
 to the exact `FMOD AudioOut thread` and `FMOD mixer thread` identities. This
 is a named FMOD experiment, not a complete PS4 priority mapping. Raising only
 the output thread could leave its mixer starved. Do not boost FMOD file or
 stream workers or all guest threads in this first unit.
 
-Log the two selected thread identities, guest priorities, requested host QoS
-before/after, and API results once. Querying pthread QoS records the requested
+It logs the two selected thread identities, guest priorities, requested host QoS
+before/after once, stopping on API errors. Querying pthread QoS records the requested
 class, not proof of the effective scheduling class under process clamps.
 Keep errors loud when the explicit experiment cannot be applied. In stats
-mode, log the actual AudioOut caller once per port too, to confirm this
-name-based selection targets the producer. Preserve host and guest errno.
+mode, it logs the first observed AudioOut caller per port, to confirm this
+name-based selection targets the producer. It does not track subsequent
+producer-thread changes. The startup hook preserves host and guest errno.
 
 Use the documented [pthread QoS API](https://developer.apple.com/library/archive/documentation/Performance/Conceptual/power_efficiency_guidelines_osx/PrioritizeWorkAtTheTaskLevel.html).
 A Mach realtime policy needs a qualified computation budget and bounded
@@ -85,5 +90,13 @@ identical in both arms; no free-running or burst-drain shortcut.
    means fewer/shorter producer gaps and empty observations without broken
    cadence or a material game regression. Listening remains required.
 
-This is a proposal/source audit only. No scheduler policy, runtime behavior,
-launcher setting, or game run was changed for this note.
+No launcher policy or GPU-thread priority is changed. No game A/B has run.
+Actual requested/effective QoS of the GPU parser and recorder in a game has
+not been measured under Rosetta: absence of a source override establishes
+inheritance, not its numeric effective class. An ordinary play_route game
+uses the playtest policy described above; a perf run taking the GPU
+exclusively is launched without that clamp/nice adjustment by heavy.sh.
+Parent-process policy may still be inherited. A future in-process diagnostic
+at those threads' entry points must record requested QoS and effective Mach
+policy/priority plus the launch policy before claiming their actual classes.
+This is a separate perf lever for PM4/Renderer.

@@ -22,6 +22,7 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "bbport_parse_split.h"
+#include "bbport_thread_report.h"
 #include "bbport_threads.h"
 
 namespace Vulkan {
@@ -406,6 +407,7 @@ void Scheduler::SignalAtGpuCompletion(std::function<void()> signal, bool batch) 
         // (SubmitExecution asserts it). FlushLabels makes sure it comes soon.
         if (!labels_unflushed.load(std::memory_order_relaxed)) {
             unflushed_tick = tick;
+            unflushed_first_label = completion_labels.Issued();
             unflushed_since = std::chrono::steady_clock::now();
             labels_unflushed.store(true, std::memory_order_release);
         }
@@ -505,13 +507,19 @@ void Scheduler::WaitLabelsThrough(u64 through) {
     if (completion_labels.CompleteThrough(through)) {
         return;
     }
-    BbStats::WaitTimer timer{BbStats::deferred_signals_wait_ns};
-    BbSplit::Scope split_scope{BbSplit::deferred_site};
-    KickRecording(true);
-    while (!completion_labels.CompleteThrough(through)) {
-        BbCopy::WaitAsync();
-        std::this_thread::yield();
+    const auto start = std::chrono::steady_clock::now();
+    {
+        BbStats::WaitTimer timer{BbStats::deferred_signals_wait_ns};
+        BbSplit::Scope split_scope{BbSplit::deferred_site};
+        KickRecording(true);
+        while (!completion_labels.CompleteThrough(through)) {
+            BbCopy::WaitAsync();
+            std::this_thread::yield();
+        }
     }
+    BbSplit::NoteOrderedWriteWaited(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                        std::chrono::steady_clock::now() - start)
+                                        .count());
 }
 #endif
 
@@ -622,6 +630,7 @@ void Scheduler::RecorderThread(std::stop_token stoken) {
     Common::SetCurrentThreadName("bb:VkRecorder");
 #ifdef __APPLE__
     recording_for = this; // this thread records for this scheduler (StopOnRecorderThread)
+    BbThreadReport::Report("Vulkan recording");
 #endif
 #ifdef __APPLE__
     BbSplit::Attach(BbSplit::recorder, BbSplit::RIdle);

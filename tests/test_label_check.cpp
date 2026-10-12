@@ -22,6 +22,7 @@
 #include "bbport_label_mode.h"
 #include "bbport_label_store.h"
 #include "bbport_parse_split.h"
+#include "bbport_thread_report.h"
 #include "bbport_write_order.h"
 #include "video_core/renderer_vulkan/vk_draw_pipe.h"
 #include "bbport_compute_sh.h"
@@ -649,6 +650,10 @@ int main() {
         NoteLabelBatch(700000);
         NoteLabelWritten(1000000);
         NoteLabelWritten(3000000);
+        NoteOrderedWrite(true, true);   // submitted a batch holding its label
+        NoteOrderedWrite(true, false);  // submitted a batch of later labels only
+        NoteOrderedWrite(false, false); // nothing batched
+        NoteOrderedWriteWaited(400000);
         const std::string line = detail::FlushLine(2);
         Expect("flush census: reasons nest and restore; per frame by reason, passes ended, batch age",
                line.find("2.0 per frame = frame end 1.0, unbatched labels 0.5") != std::string::npos &&
@@ -656,8 +661,12 @@ int main() {
                    line.find("1.0 per frame ended an open render pass") != std::string::npos &&
                    line.find("label batches 1.0 per frame, oldest label's age at submit 500 us "
                              "mean, 700 us max") != std::string::npos &&
-                   line.find("labels written 1.0 per frame, issue to write 2000 us mean, 3000 us "
-                             "max") != std::string::npos &&
+                   line.find("WAIT_REG_MEMs met early 0.0 per frame; labels written 1.0 per "
+                             "frame, issue to write 2000 us mean, 3000 us max") !=
+                       std::string::npos &&
+                   line.find("WRITE_DATAs behind a met-early WAIT 1.5 per frame: submitted the "
+                             "label batch 1.0 (holding only later labels 0.5), waited for labels "
+                             "0.5, 400 us mean wait") != std::string::npos &&
                    flush_reason == FOther);
     }
 
@@ -762,6 +771,7 @@ int main() {
         barrier.AtForwardedWait(7);
         barrier.AtForwardedWait(5);
         Expect("  ... the barrier only rises", barrier.Required() == 7);
+
         {
             using namespace BbSplit;
             DeferredSite outer{KDeferredWriteData};
@@ -775,6 +785,15 @@ int main() {
             Expect("  ... (outer site back)", deferred_site == KDeferredWriteData);
         }
         Expect("  ... (default site back)", BbSplit::deferred_site == BbSplit::KDeferred);
+    }
+
+    {
+        const std::string line = BbThreadReport::Describe("test");
+        Expect("thread report: requested QoS, Mach priorities and policy, cluster stated as not "
+               "queryable",
+               line.find("Thread test: requested QoS ") == 0 &&
+                   line.find("Mach priority current ") != std::string::npos &&
+                   line.find("core cluster not queryable on macOS") != std::string::npos);
     }
 
     std::fprintf(stderr, "%s: %u failures\n", failures ? "FAIL" : "PASS", failures);

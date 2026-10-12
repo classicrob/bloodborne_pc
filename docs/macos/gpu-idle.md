@@ -286,6 +286,7 @@ it, the label only at GPU completion. Toggle bit 63 (WriteDataAfterLabels) resto
 live, for the A/B; with labels at submit (bit 59) nothing changes. The parse split charges these
 waits to their own kinds, "deferred signals before WRITE_DATA" and "deferred signals before a flip".
 
+
 ## Flip publication at GPU retirement (the default on Apple)
 
 A flip tells the guest that its previous display buffer may be reused. That means the flip

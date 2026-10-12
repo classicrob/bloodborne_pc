@@ -305,6 +305,24 @@ void StagingBufferPool::TrimLarge(std::vector<LargeBuffer>& cache) {
     });
 }
 
+std::array<StagingBufferPool::TypeTotals, 3> StagingBufferPool::Totals() {
+    static_assert(NUM_TYPES == 3);
+    std::scoped_lock lk{mutex};
+    std::array<TypeTotals, 3> totals{};
+    for (size_t i = 0; i < NUM_TYPES; ++i) {
+        for (const Block& block : rings[i].blocks) {
+            ++totals[i].ring_blocks;
+            totals[i].ring_bytes += block.buffer->SizeBytes();
+        }
+        for (const LargeBuffer& entry : large_caches[i]) {
+            ++totals[i].large_buffers;
+            totals[i].large_bytes += entry.buffer->SizeBytes();
+            totals[i].large_held += entry.held ? 1 : 0;
+        }
+    }
+    return totals;
+}
+
 void StagingBufferPool::PublishStats() const {
     using namespace Core::Devtools::Widget;
     if (!GpuMemoryViewer::IsEnabled()) {
