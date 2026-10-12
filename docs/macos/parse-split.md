@@ -99,7 +99,9 @@ Every draw-scheduler submission is counted by reason, from a thread-local reason
 - other.
 
 The census also counts how many submissions found a render pass open, and the age of the oldest
-label in each batch at submit. One line is printed in the parse-split block. Renderer's render
+label in each batch at submit. It also gives labels written per frame and their issue-to-write age (mean and
+window maximum): the delay a guest waiting on a label sees. Asynchronous submission and later
+label flushing must keep this within about one submission's encode time. One line is printed in the parse-split block. Renderer's render
 pass census ("Render passes ...") attributes each pass end. A pass counts as ended by a submission
 when it is still open after the submission's barrier flush, which can close passes itself
 (counted there as "barrier"). So "ended an open render pass" here equals that census's "submit"

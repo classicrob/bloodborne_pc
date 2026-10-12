@@ -263,6 +263,13 @@ void Scheduler::FlushLabels(bool idle) {
 }
 
 void Scheduler::SignalAtGpuCompletion(std::function<void()> signal, bool batch) {
+    // Issue-to-write age, the delay the guest sees on a label (parse split's Flushes line).
+    signal = [issued = std::chrono::steady_clock::now(), signal = std::move(signal)] {
+        signal();
+        BbSplit::NoteLabelWritten(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                      std::chrono::steady_clock::now() - issued)
+                                      .count());
+    };
     const u64 tick = CurrentTick(); // the next submission signals this value
     // Issued now, in stream order; the writer takes labels only in this order, whichever
     // becomes ready first (deferred ones after the copy threads, direct ones at once).
