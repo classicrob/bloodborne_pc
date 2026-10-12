@@ -23,6 +23,7 @@
 #include "bbport_label_store.h"
 #include "bbport_parse_split.h"
 #include "bbport_write_order.h"
+#include "video_core/renderer_vulkan/vk_draw_pipe.h"
 #include "bbport_compute_sh.h"
 #include "bbport_frame_marks.h"
 #include "bbport_label_sequencer.h"
@@ -661,17 +662,84 @@ int main() {
     }
 
     {
-        // WRITE_DATA ordering (bbport_write_order.h): no forwarded wait, nothing to wait for; a
-        // forwarded wait raises the barrier to the issue count then; it never goes back.
-        const bool none = BbWriteOrder::Required() == 0;
-        BbWriteOrder::NoteForwardedWait(7);
-        const bool raised = BbWriteOrder::Required() == 7;
-        BbWriteOrder::NoteForwardedWait(5); // an older count, e.g. a concurrent late store
-        const bool monotonic = BbWriteOrder::Required() == 7;
-        BbWriteOrder::NoteForwardedWait(9);
-        Expect("write order: a forwarded WAIT_REG_MEM keeps later WRITE_DATA behind its labels; "
-               "the barrier only rises",
-               none && raised && monotonic && BbWriteOrder::Required() == 9);
+        // WRITE_DATA ordering (bbport_write_order.h) through a real draw pipe: stage A commits
+        // EOP (a completion label), the WAIT_REG_MEM met early (its in-order marker), a later
+        // recorder-side write, then WRITE_DATA. Stage B is held while all are committed, the
+        // recorder write completes at once and the label stays pending: WRITE_DATA must not land
+        // before the label. Without a WAIT, WRITE_DATA does not wait for the label.
+        struct Fixture {
+            BbDeferred::Count labels, recorder;
+            BbWriteOrder::Barrier barrier;
+            std::atomic<bool> hold{true}, written{false};
+        };
+        enum Op : std::uint8_t { Hold, IssueLabel, ForwardedWait, RecorderWrite, WriteData };
+        const auto handler = [](void* context, const std::uint8_t* packet, std::uint32_t) {
+            auto& f = *static_cast<Fixture*>(context);
+            switch (static_cast<Op>(packet[0])) {
+            case Hold:
+                while (f.hold.load()) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                }
+                break;
+            case IssueLabel:
+                f.labels.Issue();
+                break;
+            case ForwardedWait: // the marker at the WAIT's position, after its producer issued
+                f.barrier.AtForwardedWait(f.labels.Issued());
+                break;
+            case RecorderWrite:
+                f.recorder.Issue();
+                f.recorder.Complete(); // completes before the earlier label
+                break;
+            case WriteData:
+                f.barrier.BeforeWriteData([&](std::uint64_t through) {
+                    while (!f.labels.CompleteThrough(through)) {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                    }
+                });
+                f.written.store(true);
+                break;
+            }
+        };
+        const auto run = [&](std::initializer_list<Op> ops, Fixture& f, Vulkan::DrawPipe& pipe) {
+            for (const Op op : ops) {
+                *pipe.Begin(1) = op;
+                pipe.Commit(1);
+            }
+            f.hold.store(false);
+        };
+        bool held_back = false, landed_after = false, no_wait_landed = false;
+        {
+            Fixture f;
+            Vulkan::DrawPipe pipe(handler, &f);
+            run({Hold, IssueLabel, ForwardedWait, RecorderWrite, WriteData}, f, pipe);
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            held_back = !f.written.load() && f.recorder.CompleteThrough(1);
+            f.labels.Complete(); // the label lands
+            for (int i = 0; i < 2000 && !f.written.load(); ++i) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            landed_after = f.written.load();
+        }
+        {
+            Fixture f;
+            Vulkan::DrawPipe pipe(handler, &f);
+            run({Hold, IssueLabel, RecorderWrite, WriteData}, f, pipe);
+            for (int i = 0; i < 2000 && !f.written.load(); ++i) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            no_wait_landed = f.written.load() && !f.labels.CompleteThrough(1);
+            f.labels.Complete();
+        }
+        Expect("write order: after a WAIT_REG_MEM met early, WRITE_DATA waits for its label even "
+               "with stage B held and a later recorder write done first",
+               held_back && landed_after);
+        Expect("  ... without a WAIT, WRITE_DATA does not wait for an earlier completion label",
+               no_wait_landed);
+        BbWriteOrder::Barrier barrier;
+        barrier.AtForwardedWait(7);
+        barrier.AtForwardedWait(5);
+        Expect("  ... the barrier only rises", barrier.Required() == 7);
         {
             using namespace BbSplit;
             DeferredSite outer{KDeferredWriteData};

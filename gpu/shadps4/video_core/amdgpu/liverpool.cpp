@@ -1057,10 +1057,10 @@ void RunWriteData(Vulkan::Rasterizer& rasterizer, const u8* data) {
         // after the recorder-side writes, not after end-of-pipe labels still waiting for the GPU,
         // except the ones an earlier WAIT_REG_MEM met early stands for (bbport_write_order.h).
         rasterizer.WaitRecorderSignals();
-        if (const u64 waited_for = BbWriteOrder::Required()) {
+        rasterizer.WriteBarrier().BeforeWriteData([&](u64 labels) {
             BbSplit::DeferredSite site{BbSplit::KDeferredWriteData};
-            rasterizer.WaitDeferredSignalsThrough(waited_for);
-        }
+            rasterizer.WaitLabelsThrough(labels);
+        });
     } else {
         BbSplit::DeferredSite site{BbSplit::KDeferredWriteData};
         rasterizer.WaitDeferredSignals();
@@ -2162,9 +2162,14 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                                wait_reg_mem->TestValue(value)) {
 #ifdef __APPLE__
                     // Met early from a pending value: later WRITE_DATAs stay behind the label,
-                    // as the CP's wait would keep them (bbport_write_order.h).
+                    // as the CP's wait would keep them. Taken in stream order, after the
+                    // producing EOP/EOS was issued (bbport_write_order.h).
                     if (rasterizer) {
-                        BbWriteOrder::NoteForwardedWait(rasterizer->DeferredSignalsIssued());
+                        rasterizer->RunInOrder(
+                            [](Vulkan::Rasterizer& r, const u8*) {
+                                r.WriteBarrier().AtForwardedWait(r.LabelsIssued());
+                            },
+                            nullptr, 0, BbToggle::PipelinedMemoryWrites);
                     }
 #endif
                     break;

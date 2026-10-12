@@ -397,11 +397,24 @@ bool Scheduler::WaitQuiescentForCapture(std::chrono::milliseconds limit, std::st
 }
 #endif
 
-void Scheduler::WaitDeferredSignals() {
-    WaitDeferredSignalsThrough(deferred_signals_issued.load(std::memory_order_relaxed));
+#ifdef __APPLE__
+void Scheduler::WaitLabelsThrough(u64 through) {
+    // The label writer completes labels in issue order: a prefix (bbport_write_order.h).
+    if (completion_labels.CompleteThrough(through)) {
+        return;
+    }
+    BbStats::WaitTimer timer{BbStats::deferred_signals_wait_ns};
+    BbSplit::Scope split_scope{BbSplit::deferred_site};
+    KickRecording(true);
+    while (!completion_labels.CompleteThrough(through)) {
+        BbCopy::WaitAsync();
+        std::this_thread::yield();
+    }
 }
+#endif
 
-void Scheduler::WaitDeferredSignalsThrough(u64 issued) {
+void Scheduler::WaitDeferredSignals() {
+    const u64 issued = deferred_signals_issued.load(std::memory_order_relaxed);
     if (deferred_signals_done->load(std::memory_order_acquire) >= issued ||
         BbToggle::Disabled(BbToggle::OrderedGuestWrites)) {
         return;
