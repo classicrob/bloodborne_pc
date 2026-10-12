@@ -4038,7 +4038,13 @@ void Rasterizer::BindDepthBoundsSource(const GraphicsPipeline* pipeline) {
     if (!FeatureChecks::DepthBoundsUnsupported(
             regs.depth_control.depth_bounds_enable, regs.depth_buffer.DepthValid(),
             regs.depth_bounds_min, regs.depth_bounds_max, instance.IsDepthBoundsSupported())) {
-        ASSERT_MSG(!set_layout, "depth-bounds pipeline selected for a draw without the test");
+        ASSERT_MSG(!set_layout,
+                   "depth-bounds pipeline selected for a draw without the test: pipeline {:#x}, "
+                   "fragment shader {}, DB enable {}, depth valid {}, bounds [{}, {}]",
+                   std::hash<GraphicsPipelineKey>{}(pipeline->GetGraphicsKey()),
+                   pipeline->GetStages()[u32(Shader::SwStage::Fragment)] ? "present" : "absent",
+                   bool(regs.depth_control.depth_bounds_enable), regs.depth_buffer.DepthValid(),
+                   regs.depth_bounds_min, regs.depth_bounds_max);
         return;
     }
     // The fragment shader kills fragments whose stored depth lies outside the bounds. It reads

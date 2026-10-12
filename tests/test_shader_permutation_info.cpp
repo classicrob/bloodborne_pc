@@ -72,6 +72,29 @@ static GcnAsm::Code Fetch(bool second) {
 }
 
 int main() {
+    {
+        // P0 2026-10-12: a selection forgets the previous draw's stages, runtime infos included
+        // (an FS-less draw after a depth-bounds FS draw built an FS-less pipeline with a
+        // depth-bounds layout).
+        const u32 fs = u32(Shader::SwStage::Fragment);
+        Vulkan::PipelineSelection stale{};
+        stale.runtime_infos[fs].hw.fs.depth_bounds_test = true;
+        stale.runtime_infos[fs].hw.fs.clip_distance_emulation = true;
+        stale.modules[fs] = vk::ShaderModule{reinterpret_cast<VkShaderModule>(uintptr_t(0x10))};
+        stale.ResetStages();
+        assert(stale.runtime_infos[fs] == Shader::RuntimeInfo{} && !stale.modules[fs] &&
+               !stale.infos[fs]);
+        // The pipeline-side check: a fragment runtime info needs a fragment shader.
+        std::array<Shader::RuntimeInfo, Vulkan::MaxShaderStages> infos{};
+        std::array<vk::ShaderModule, Vulkan::MaxShaderStages> modules{};
+        assert(Vulkan::FragmentInfoMatchesShader(infos, modules));
+        infos[fs].hw.fs.depth_bounds_test = true;
+        assert(!Vulkan::FragmentInfoMatchesShader(infos, modules)); // stale, no FS: refused
+        modules[fs] = vk::ShaderModule{reinterpret_cast<VkShaderModule>(uintptr_t(0x10))};
+        assert(Vulkan::FragmentInfoMatchesShader(infos, modules)); // a real depth-bounds FS
+        std::fprintf(stderr, "Stale fragment runtime info: reset by the selection, refused "
+                             "without a fragment shader: PASS\n");
+    }
     std::fprintf(stderr, "Permutation resource metadata: setup\n");
     setenv("BB_PIPELINE_CACHE", "0", 1);
     Vulkan::Instance instance(0, false);

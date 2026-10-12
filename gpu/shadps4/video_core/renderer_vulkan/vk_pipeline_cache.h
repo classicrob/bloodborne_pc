@@ -122,6 +122,15 @@ struct PipelineSelection {
     std::array<vk::ShaderModule, MaxShaderStages> modules{};
     std::optional<Shader::Gcn::FetchShaderData> fetch_shader{};
     GraphicsPipelineKey graphics_key{};
+    /// Forgets the previous draw's stages before a selection binds this one's: a stage that is
+    /// disabled or has no program must not keep the last draw's runtime info (the pipeline
+    /// reads the fragment slot even without a fragment shader: a stale depth_bounds_test gave
+    /// an FS-less pipeline a depth-bounds layout, P0 2026-10-12).
+    void ResetStages() {
+        runtime_infos.fill({});
+        infos.fill(nullptr);
+        modules.fill(nullptr);
+    }
     /// Why RefreshGraphicsKey refused the last draw it refused (BB_FRAME_STATS).
     DrawDrop refusal{DrawDrop::StageCombination};
     bool motion = false;

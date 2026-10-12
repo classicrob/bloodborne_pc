@@ -77,6 +77,16 @@ struct GraphicsPipelineKey {
 
 struct GsEmulationStages;
 
+/// The fragment slot of a pipeline's runtime infos is read whether or not it has a fragment
+/// shader (depth-bounds layout, clip-distance emulation). Without one it must be the default:
+/// true when that holds.
+[[nodiscard]] inline bool FragmentInfoMatchesShader(
+    std::span<const Shader::RuntimeInfo, MaxShaderStages> runtime_infos,
+    std::span<const vk::ShaderModule> modules) {
+    const u32 fs = u32(Shader::SwStage::Fragment);
+    return (fs < modules.size() && modules[fs]) || runtime_infos[fs] == Shader::RuntimeInfo{};
+}
+
 class GraphicsPipeline : public Pipeline {
 public:
     struct SerializationSupport {
