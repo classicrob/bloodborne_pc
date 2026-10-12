@@ -773,7 +773,9 @@ bool Rasterizer::RunInOrder(OrderedTask task, const void* data, u32 size, u64 to
     const u32 total = sizeof(TaskPacket) + AlignPacket(size);
     u8* out = draw_pipe->Begin(total);
     *reinterpret_cast<TaskPacket*>(out) = {PacketKind::Task, size, task};
-    std::memcpy(out + sizeof(TaskPacket), data, size);
+    if (size) { // a task without payload may pass no data
+        std::memcpy(out + sizeof(TaskPacket), data, size);
+    }
     draw_pipe->Commit(total);
     return true;
 }

@@ -362,6 +362,13 @@ void Scheduler::FlushLabels(bool idle) {
 }
 
 void Scheduler::SignalAtGpuCompletion(std::function<void()> signal, bool batch) {
+    // Issue-to-write age, the delay the guest sees on a label (parse split's Flushes line).
+    signal = [issued = std::chrono::steady_clock::now(), signal = std::move(signal)] {
+        signal();
+        BbSplit::NoteLabelWritten(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                      std::chrono::steady_clock::now() - issued)
+                                      .count());
+    };
     const u64 tick = CurrentTick(); // the next submission signals this value
     // Issued now, in stream order; the writer takes labels only in this order, whichever
     // becomes ready first (deferred ones after the copy threads, direct ones at once).
@@ -489,6 +496,22 @@ bool Scheduler::WaitQuiescentForCapture(std::chrono::milliseconds limit, std::st
 }
 #endif
 
+#ifdef __APPLE__
+void Scheduler::WaitLabelsThrough(u64 through) {
+    // The label writer completes labels in issue order: a prefix (bbport_write_order.h).
+    if (completion_labels.CompleteThrough(through)) {
+        return;
+    }
+    BbStats::WaitTimer timer{BbStats::deferred_signals_wait_ns};
+    BbSplit::Scope split_scope{BbSplit::deferred_site};
+    KickRecording(true);
+    while (!completion_labels.CompleteThrough(through)) {
+        BbCopy::WaitAsync();
+        std::this_thread::yield();
+    }
+}
+#endif
+
 void Scheduler::WaitDeferredSignals() {
     const u64 issued = deferred_signals_issued.load(std::memory_order_relaxed);
     if (deferred_signals_done->load(std::memory_order_acquire) >= issued ||
@@ -496,7 +519,9 @@ void Scheduler::WaitDeferredSignals() {
         return;
     }
     BbStats::WaitTimer timer{BbStats::deferred_signals_wait_ns};
-    BB_SPLIT_SCOPE(KDeferred);
+#ifdef __APPLE__
+    BbSplit::Scope split_scope{BbSplit::deferred_site}; // by site (RunWriteData, SignalFlip)
+#endif
     KickRecording(true);
     while (deferred_signals_done->load(std::memory_order_acquire) < issued) {
         // Helps the copy threads the signals wait for.

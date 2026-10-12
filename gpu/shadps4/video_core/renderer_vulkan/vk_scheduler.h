@@ -20,6 +20,7 @@
 #ifdef __APPLE__
 #include "bbport_deferred_counts.h"
 #include "bbport_label_sequencer.h"
+#include "bbport_write_order.h"
 #endif
 #include <thread>
 #include <queue>
@@ -959,6 +960,13 @@ public:
     /// the write cannot overtake an earlier fence. Otherwise the guest, seeing the later value,
     /// may free memory the earlier fence then writes into (corrupted heap, guest fault).
     void WaitDeferredSignals();
+#ifdef __APPLE__
+    /// Waits until the first `through` completion labels are written (their writer completes
+    /// them in issue order). Labels batched by stage B must be submitted first (Rasterizer).
+    void WaitLabelsThrough(u64 through);
+    /// In-order WRITE_DATA's barrier for WAIT_REG_MEMs met early (bbport_write_order.h).
+    BbWriteOrder::Barrier write_barrier;
+#endif
 
     /// Whether a render pass with exactly this state is open.
     [[nodiscard]] bool IsRendering() const {

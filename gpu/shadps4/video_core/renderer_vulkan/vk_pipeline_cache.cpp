@@ -23,6 +23,7 @@
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/info.h"
 #include "shader_recompiler/recompiler.h"
+#include "shader_recompiler/stop_context.h"
 #include "shader_recompiler/runtime_info.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/cache_storage.h"
@@ -1171,6 +1172,22 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
              perm_idx != 0 ? "(permutation)" : "");
     DumpShader(code, info.pgm_hash, info.hw_stage, perm_idx, "bin");
     CompileTimer timer{"shader translation", info.pgm_hash, true};
+    // For loud stops that need the game state (resource_patching_pass.cpp).
+    const Shader::CompileStopContext stop_context{[&] {
+        if (info.hw_stage == Shader::HwStage::Compute) {
+            const auto& cs = liverpool->GetCsRegs();
+            return fmt::format("a dispatch of {}x{}x{} groups of {}x{}x{} (CS at {:#x})",
+                               cs.dim_x, cs.dim_y, cs.dim_z, cs.num_thread_x.full,
+                               cs.num_thread_y.full, cs.num_thread_z.full, cs.Address<u64>());
+        }
+        if (!sel.regs) {
+            return std::string{"a draw (no registers)"};
+        }
+        const auto& regs = *sel.regs;
+        return fmt::format("a draw of {} indices x {} instances, primitive {}, stage enable {:#x}",
+                           regs.num_indices, regs.num_instances.NumInstances(),
+                           u32(regs.primitive_type), u32(regs.stage_enable.raw));
+    }()};
 
     const auto ir_program = Shader::TranslateProgram(code, pools, info, runtime_info, profile);
     auto spv = Shader::Backend::SPIRV::EmitSPIRV(profile, runtime_info, ir_program, binding);
@@ -1299,14 +1316,37 @@ PipelineCache::Result PipelineCache::GetProgram(PipelineSelection& sel, HwStage 
             if (sigsetjmp(recover, 0)) {
                 Shader::Info::num_ud_snapshots = saved_snapshots;
                 runtime_fault_recover = nullptr;
+#ifdef __APPLE__
+                Shader::speculative_selection = false;
+#endif
                 worker.failed = true;
                 return {};
             }
             runtime_fault_recover = &recover;
+#ifdef __APPLE__
+            // Speculative: a descriptor with no conversion abandons the preparation (the GPU
+            // thread selects the draw itself), instead of stopping the game from a worker.
+            bool matched = false;
+            Shader::speculative_selection = true;
+            try {
+                matched = matches_data(*module.info_template, module);
+            } catch (const Shader::SpeculativeDescriptorRejected&) {
+                Shader::speculative_selection = false;
+                runtime_fault_recover = nullptr;
+                worker.failed = true;
+                return {};
+            }
+            Shader::speculative_selection = false;
+            if (!matched) {
+                runtime_fault_recover = nullptr;
+                continue;
+            }
+#else
             if (!matches_data(*module.info_template, module)) {
                 runtime_fault_recover = nullptr;
                 continue;
             }
+#endif
             runtime_fault_recover = nullptr;
             auto it = worker.infos.try_emplace(module.info.get(), *module.info_template).first;
             auto& info = it->second;

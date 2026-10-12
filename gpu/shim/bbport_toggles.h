@@ -93,6 +93,12 @@ enum : std::uint64_t {
     // Apple: bit set always runs the SDK fill kernel 0x8b355b5a, instead of clearing the render
     // target it exactly covers (vk_shader_hle.cpp FillAsImageClear); for before/after A/Bs.
     RtFillKernel = 1ull << 62,
+    // Apple, with labels at GPU completion: bit set makes an in-order WRITE_DATA wait for every
+    // earlier completion label (end of pipe) before it writes, as before. Clear (the default):
+    // it waits only for what is ordered before it at ME time, the host copies and the
+    // recorder-side writes, as on the PS4, where the CP writes it when it parses it. Read per
+    // WRITE_DATA (live A/B).
+    WriteDataAfterLabels = 1ull << 63,
     // Bits 20-29 are used as raw debug toggles by the camera/object motion and the upscaler.
 };
 inline bool Disabled(std::uint64_t bit) {

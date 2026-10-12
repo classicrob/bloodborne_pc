@@ -99,24 +99,36 @@ Every draw-scheduler submission is counted by reason, from a thread-local reason
 - other.
 
 The census also counts how many submissions found a render pass open, and the age of the oldest
-label in each batch at submit. One line is printed in the parse-split block. Renderer's render
-pass census ("Render passes ...") attributes each pass end. A pass counts as ended by a submission
-when it is still open after the submission's barrier flush, which can close passes itself
-(counted there as "barrier"). So "ended an open render pass" here equals that census's "submit"
-enders.
+label in each batch at submit. It also gives labels written per frame and their issue-to-write age
+(mean and window maximum): the delay a guest waiting on a label sees. Asynchronous submission and
+later label flushing must keep this within about one submission's encode time. Compare both the
+mean and the maximum across arms over the same windows, and read the maximum over several windows,
+since one window's maximum is a single extreme.
+
+One line is printed in the parse-split block. Renderer's render pass census ("Render passes ...")
+attributes each pass end. A pass counts as ended by a submission when it is still open after the
+submission's barrier flush, which can close passes itself (counted there as "barrier"). So "ended
+an open render pass" here equals that census's "submit" enders.
 
 ## Output
 
 One block every 600 frame ends, printed from stage A:
 
 ```
-Parse split, last 600 frame ends: <ms> ms per frame, <n> draws per frame; ms per frame by thread (accounted / wall)
-  stage A (GPU command thread, <accounted %>): <bucket ms, ...>; in scopes: <kind ms, ...>
+Parse split, last 600 frame ends: <ms> ms per frame, <n> draws per frame (stage A <us> us per draw); ms per frame by thread (accounted / wall)
+  stage A (GPU command thread, <accounted %>, on CPU <ms> per frame): <bucket ms, ...>; in scopes: <kind ms, ...>
     deferred-signal waits during: <stage A bucket ms, ...>
     stage B drains at other packets during: <stage A bucket ms, ...>
-  stage B (draw recording thread, <%>): ...
-  Vulkan recording thread (<%>): ...
+  stage B (draw recording thread, <%>, on CPU <ms> per frame): ...
+  Vulkan recording thread (<%>, on CPU <ms> per frame): ...
 ```
+
+"stage A us per draw" is stage A's direct-draw bucket over the window's draws (arms with
+different draw counts compare per draw). "on CPU" is the thread's user + system CPU time
+(thread_info) per frame: against its accounted wall time it separates running from blocked or
+waiting for a core. A thread busy in a bucket for X ms but on CPU for much less was blocked (a
+lock) or not scheduled; on CPU for about X but slower per unit of work than another arm points
+at the core or cache it ran on. "n/a" when a thread had not attached or thread_info failed.
 
 How to read it:
 - Stage A charges its open interval before each report, so its window is effectively closed (the
