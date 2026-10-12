@@ -64,7 +64,10 @@ void Scheduler::BeginRendering(const RenderState& new_state) {
     BB_SPLIT_SCOPE(KRenderPassSwitch);
 #ifdef __APPLE__
     EndRenderingFor(BbPassCensus::Why::TargetChange);
-    BbPassCensus::NoteBegin();
+    // A pass with exactly the state of the pass that ended just before it: a split the targets
+    // did not require (render_state still holds the ended pass's state).
+    BbPassCensus::NoteBegin(has_render_state && render_state == new_state);
+    has_render_state = true;
 #else
     EndRendering();
 #endif
