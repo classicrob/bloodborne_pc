@@ -216,6 +216,13 @@ public:
     BbWriteOrder::Barrier& WriteBarrier() noexcept {
         return scheduler.write_barrier;
     }
+    /// At a WAIT_REG_MEM met early: on stage B, submits the batched labels at once, so the
+    /// labels later WRITE_DATAs must wait for reach the GPU without waiting for the batch age.
+    void FlushLabelsForWait() {
+        if (DrawPipe::OnStageB()) {
+            scheduler.FlushLabelsFor(BbSplit::FBatchForWait);
+        }
+    }
 #endif
     /// Runs `signal` after the guest memory copies issued so far, without waiting here.
     void SignalAfterHostCopies(std::function<void()> signal) {
