@@ -309,11 +309,51 @@ def process_states(pids):
     return {int(fields[0]): fields[1] for fields in (line.split() for line in out.splitlines()) if len(fields) == 2}
 
 
+def pause_file(pid):
+    """BB_HEAVY_DIR/paused-<pid>.jsonl: when the job whose slot holder is pid was paused for a perf
+    run and resumed (one line each), read by the job itself at its end."""
+    return os.path.join(lock_dir(), f'paused-{pid}.jsonl')
+
+
+def note_pause(pid, **entry):
+    try:
+        with open(pause_file(pid), 'a') as f:
+            f.write(json.dumps({'time': time.time(), **entry}) + '\n')
+    except OSError as error:
+        print(f'heavy: pause of job {pid} not noted: {error}', file=sys.stderr, flush=True)
+
+
+def pauses(pid):
+    """(seconds paused, [perf runs that paused it]) for the job with slot holder pid, from its
+    pause file (removed); a pause not yet resumed counts until now."""
+    try:
+        with open(pause_file(pid)) as f:
+            entries = [json.loads(line) for line in f if line.strip()]
+        os.unlink(pause_file(pid))
+    except FileNotFoundError:
+        return 0.0, []
+    except (OSError, ValueError) as error:
+        print(f'heavy: pause file of job {pid} unreadable: {error}', file=sys.stderr, flush=True)
+        return 0.0, ['unknown (pause file unreadable)']
+    total, since, by = 0.0, None, []
+    for entry in entries:
+        if 'start' in entry:
+            since = entry['time']
+            if entry['start'] not in by:
+                by.append(entry['start'])
+        elif since is not None:
+            total, since = total + entry['time'] - since, None
+    if since is not None:
+        total += time.time() - since
+    return total, by
+
+
 def pause_quiet_pools(label):
     """SIGSTOPs every running build/quick/sweep job (its whole process tree; for a quick job the
-    command under its supervisor, so its time limit can pause). A process already stopped is left
-    out: another pause (a test's own heavy.sh, a nested perf run) stopped it and resumes it, so
-    this one must not. Returns [(job label, pids it stopped)]."""
+    command under its supervisor, so its time limit can pause) and notes the pause in the job's
+    pause file. A process already stopped is left out: another pause (a test's own heavy.sh, a
+    nested perf run) stopped it and resumes it, so this one must not. Returns [(job label, pids it
+    stopped, slot holder pid)]."""
     paused = []
     names = ['build-priority', 'build-idle'] + [n for pool in QUIET_POOLS for n in slot_names(pool)]
     for name in names:
@@ -343,7 +383,8 @@ def pause_quiet_pools(label):
                     pids.append(pid)
                 except ProcessLookupError:
                     pass
-        paused.append((info.get('label', name), pids))
+        note_pause(root, start=label)
+        paused.append((info.get('label', name), pids, root))
         left = f'; {len(foreign)} already stopped by another pause, left to it' if foreign else ''
         print(f'heavy: {label}: CPU quiet: paused {info.get("label", name)} ({name}, {len(pids)} processes{left})',
               file=sys.stderr, flush=True)
@@ -374,7 +415,8 @@ def start_quiet(label):
     if alive(target):
         print(f'heavy: {label}: CPU QUIET BOUND REACHED after {bound} s: resuming paused jobs while '
               f'this job still runs', file=sys.stderr, flush=True)
-    for job, pids in paused:
+    for job, pids, root in paused:
+        note_pause(root, end=label)  # before resuming: a job that ends at once reads a closed pause
         for pid in reversed(pids):
             try:
                 os.kill(pid, signal.SIGCONT)
@@ -382,7 +424,7 @@ def start_quiet(label):
                 pass
         print(f'heavy: {label}: CPU quiet over: resumed {job}', file=sys.stderr, flush=True)
     record({'event': 'quiet-end', 'by': label, 'seconds': round(time.monotonic() - started, 1),
-            'bound_reached': alive(target), 'resumed': [job for job, _ in paused]})
+            'bound_reached': alive(target), 'resumed': [job for job, _, _ in paused]})
     os._exit(0)
 
 
@@ -435,6 +477,10 @@ def run(pool, priority, gpu, label, command, pool_given=False, quiet=False):
             os.ftruncate(fd, 0)
             os.pwrite(fd, json.dumps(info).encode(), 0)
             os.fsync(fd)
+            try:  # a pause file left by an earlier job with this pid (killed before its end)
+                os.unlink(pause_file(os.getpid()))
+            except FileNotFoundError:
+                pass
             waited = time.monotonic() - started
             command, policy = polite(pool, priority, gpu, command, idle)
             if pool in ('build', 'quick', 'sweep') and not priority and policy != 'normal':
@@ -542,13 +588,23 @@ def seconds(variable, default):
 def record_end(label, pool, status, started, **extra):
     """The job's end event: exit status, or the signal that killed it, and its duration. A job whose
     worktree changed during the run is INVALID: said on stderr and in the event, and a success
-    becomes exit 125 so no caller takes it for a pass."""
+    becomes exit 125 so no caller takes it for a pass. A job paused for perf runs says so on
+    stderr and in the event (paused_s, paused_by): a wall-clock timeout inside it (alarm(), a
+    deadline) may have fired on resume, so a failure is not yet a result."""
     event = {'event': 'end', 'label': label, 'pool': pool,
              'seconds': round(time.monotonic() - started, 1), 'load': [round(x, 2) for x in os.getloadavg()]}
     if status < 0:
         event.update(status=128 - status, signal=signal.Signals(-status).name)
     else:
         event['status'] = status
+    paused, by = pauses(os.getpid())
+    if by:
+        code = event.get('signal') or f'exit {event["status"]}'
+        print(f'heavy: {label}: PAUSED {paused:.0f} s for perf runs ({"; ".join(by)}); ended with {code}'
+              + ('' if event['status'] == 0 else
+                 ': a wall-clock timeout in the job may have fired on resume; rerun before calling it a failure'),
+              file=sys.stderr, flush=True)
+        event.update(paused_s=round(paused, 1), paused_by=by)
     invalid = tree_changed(label)
     if invalid:
         print(f'heavy: {label}: INVALID: {invalid}; the result does not belong to one tree',

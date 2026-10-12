@@ -189,14 +189,79 @@ if [[ $(uname -s) == Darwin ]]; then
 fi
 "$CC" "${platform_flags[@]}" -std=c11 -O2 -Wall -Wextra -Werror tools/gpu_capabilities.c "${includes[@]}" "${libraries[@]}" "${caps_link[@]}" -o out/bb-gpu-capabilities
 sign_darwin out/bb-gpu-capabilities
-if [[ ${1:-} == --test || ${1:-} == --test-dry ]]; then
+if [[ ${1:-} == --test-one && -z ${2:-} ]]; then
+    echo 'usage: build.sh --test-one <test target or script, as build.sh --test runs it>' >&2
+    exit 2
+fi
+if [[ ${1:-} == --test || ${1:-} == --test-dry || ${1:-} == --test-one ]]; then
     # --test-dry builds, links and signs everything --test would run, and runs the static checks
     # (export gate, test wiring), but executes no test: t checks each test binary exists and is
     # signed, and each test script exists. Run it before merging a change to build.sh or a test
     # target. Tests that compile inside their own scripts are only checked to exist.
-    dry=''
+    # --test-one NAME builds only the test target NAME (with the library and probe, as every
+    # build) and runs each test command naming it (an argument NAME or ending in /NAME: a target,
+    # out/gpu/x-test, a script) exactly as --test does: same environment, signing and directories,
+    # with the checks of its outputs (spirv-val, file counts). Each run prints "test-one: exit N";
+    # the exit is the first failure's, or 0. A NAME no test command has is an error that lists them.
+    dry='' one=''
     if [[ $1 == --test-dry ]]; then dry=1; fi
+    if [[ $1 == --test-one ]]; then one=$2; fi
+    one_ran=0 one_failed=0 one_last=0 one_seen=()
+    # --- test runner (tests/test_build_test_one.sh sources this block) ---
+    names() {  # does an argument name the --test-one test?
+        local arg
+        for arg; do [[ $arg == "$one" || $arg == */"$one" ]] && return 0; done
+        return 1
+    }
+    want() {  # build this test (--test-one: only the one, and what the Python tests launch for them)
+        [[ -z $one ]] || names "$@" ||
+            { [[ $one == run_python_tests.sh || $one == */run_python_tests.sh ]] &&
+              [[ $1 == out/runtime-test || $1 == out/sema-test || $1 == out/content-test ]]; }
+    }
+    only_wanted() {  # prints the GPU test targets to build: all, or --test-one's
+        local target
+        for target; do if want "out/gpu/$target"; then echo "$target"; fi; done
+    }
+    # Skip a check of a test's outputs: --test-dry, or --test-one when that test was not selected
+    # or failed (its own exit is the failure; its missing outputs are not a second one).
+    unchecked() { [[ -n $dry ]] || [[ -n $one && $one_last == 0 ]]; }
+    fresh_dir() {  # fresh_dir TEST DIR: an empty output directory for TEST, if TEST runs
+        if want "$1"; then rm -rf "$2" && mkdir -p "$2"; fi
+    }
+    outputs_ok() {  # outputs_ok COUNT EXPECTED MESSAGE: the output count of the test just run
+        unchecked || (($1 == $2)) && return 0
+        echo "$3" >&2
+        [[ -n $one ]] || exit 1
+        echo "test-one: exit 1: output check: $3"
+        if ((!one_failed)); then one_failed=1; fi
+    }
+    test_one_summary() {  # --test-one's end: its runs, or the test commands when none was named
+        if ((!one_ran)); then
+            echo "test-one: no test command names '$one'. The test commands:" >&2
+            printf '  %s\n' "${one_seen[@]}" >&2
+            exit 1
+        fi
+        echo "test-one: $one: $one_ran run(s), exit $one_failed"
+        exit "$one_failed"
+    }
     t() {
+        if [[ -n $one ]]; then
+            if [[ $1 == spirv-val ]]; then
+                ((one_last)) || return 0  # checks the outputs of the test before it
+            elif names "$@"; then
+                one_last=1
+            else
+                one_last=0 one_seen+=("$*")
+                return 0
+            fi
+            local rc=0
+            "$@" || rc=$?
+            ((++one_ran))
+            echo "test-one: exit $rc: $*"
+            if ((rc && !one_failed)); then one_failed=$rc; fi
+            if ((rc)) && [[ $1 != spirv-val ]]; then one_last=0; fi  # no checks of a failed test's outputs
+            return 0
+        fi
         if [[ -z $dry ]]; then "$@"; return; fi
         local program=$1
         case $program in
@@ -211,11 +276,15 @@ if [[ ${1:-} == --test || ${1:-} == --test-dry ]]; then
         fi
         echo "test-dry: would run $*"
     }
+    # --- end test runner ---
     if [[ $(uname -s) == Darwin ]]; then
         # The GPU library has no default user directory on macOS: fixtures get a scratch one.
         export BB_GPU_USER_DIR="$PWD/out/gpu-test-user"
-        ninja -C out/gpu "${ninja_jobs[@]}" null-descriptor-test upscaler-support-test buffer-bounds-test buffer-dead-resources-test host-import-arena-test vertex-pulling-pipeline-test shader-permutation-info-test gpu-user-dir-test push-userdata-test macos-perf-test depth-bounds-shader-test shader-inputs-test flatten-base-shape-test
-        sign_darwin out/gpu/null-descriptor-test out/gpu/upscaler-support-test out/gpu/buffer-bounds-test out/gpu/buffer-dead-resources-test out/gpu/host-import-arena-test out/gpu/vertex-pulling-pipeline-test out/gpu/shader-permutation-info-test out/gpu/gpu-user-dir-test out/gpu/push-userdata-test out/gpu/macos-perf-test out/gpu/depth-bounds-shader-test out/gpu/shader-inputs-test out/gpu/flatten-base-shape-test
+        gpu_tests=($(only_wanted null-descriptor-test upscaler-support-test buffer-bounds-test buffer-dead-resources-test host-import-arena-test vertex-pulling-pipeline-test shader-permutation-info-test gpu-user-dir-test push-userdata-test macos-perf-test depth-bounds-shader-test shader-inputs-test flatten-base-shape-test))
+        if ((${#gpu_tests[@]})); then
+            ninja -C out/gpu "${ninja_jobs[@]}" "${gpu_tests[@]}"
+            sign_darwin "${gpu_tests[@]/#/out/gpu/}"
+        fi
         t out/gpu/gpu-user-dir-test
         t out/gpu/null-descriptor-test
         t out/gpu/upscaler-support-test
@@ -229,15 +298,15 @@ if [[ ${1:-} == --test || ${1:-} == --test-dry ]]; then
         t out/gpu/push-userdata-test out/push-userdata.spv
         t spirv-val --target-env vulkan1.3 out/push-userdata.spv
         # Depth-bounds emulation shaders: 8 permutations + 2 entry-phi cases, each validated.
-        rm -rf out/depth-bounds-shader && mkdir -p out/depth-bounds-shader
+        fresh_dir out/gpu/depth-bounds-shader-test out/depth-bounds-shader
         t out/gpu/depth-bounds-shader-test out/depth-bounds-shader
         depth_spv=(out/depth-bounds-shader/*.spv)
-        [[ -n $dry ]] || [[ ${#depth_spv[@]} == 10 ]] || { echo "depth-bounds-shader-test wrote ${#depth_spv[@]} SPIR-V files, expected 10" >&2; exit 1; }
+        outputs_ok ${#depth_spv[@]} 10 "depth-bounds-shader-test wrote ${#depth_spv[@]} SPIR-V files, expected 10"
         for spv in "${depth_spv[@]}"; do t spirv-val --target-env vulkan1.3 "$spv"; done
-        rm -rf out/shader-inputs-modules && mkdir -p out/shader-inputs-modules
+        fresh_dir out/gpu/shader-inputs-test out/shader-inputs-modules
         t out/gpu/shader-inputs-test out/shader-inputs-modules
         input_spv=(out/shader-inputs-modules/*.spv)
-        [[ -n $dry ]] || [[ ${#input_spv[@]} == 12 ]] || { echo "shader-inputs-test wrote ${#input_spv[@]} SPIR-V files, expected 12" >&2; exit 1; }
+        outputs_ok ${#input_spv[@]} 12 "shader-inputs-test wrote ${#input_spv[@]} SPIR-V files, expected 12"
         for spv in "${input_spv[@]}"; do t spirv-val --target-env vulkan1.3 "$spv"; done
         t out/gpu/flatten-base-shape-test
         # Default allocated descriptor sets only; --push reproduces a MoltenVK bug and exits 2.
@@ -261,8 +330,11 @@ if [[ ${1:-} == --test || ${1:-} == --test-dry ]]; then
             motion-history-test
             motion-shader-test
             ui-composition-test fill-clear-test scene-resolution-test taa-shader-test camera-motion-test)
-        ninja -C out/gpu "${ninja_jobs[@]}" "${unit_tests[@]}"
-        for unit_test in "${unit_tests[@]}"; do sign_darwin "out/gpu/$unit_test"; done
+        unit_tests=($(only_wanted "${unit_tests[@]}"))
+        if ((${#unit_tests[@]})); then
+            ninja -C out/gpu "${ninja_jobs[@]}" "${unit_tests[@]}"
+            for unit_test in "${unit_tests[@]}"; do sign_darwin "out/gpu/$unit_test"; done
+        fi
         t out/gpu/cmd-snapshot-test
         t out/gpu/cond-exec-test
         t out/gpu/label-check-test
@@ -285,12 +357,12 @@ if [[ ${1:-} == --test || ${1:-} == --test-dry ]]; then
         t out/gpu/depth-bounds-probe-test
         t out/gpu/replay-capture-test
         t out/gpu/slot-vector-test
-        rm -rf out/buffer-null && mkdir -p out/buffer-null
+        fresh_dir out/gpu/buffer-null-test out/buffer-null
         t out/gpu/buffer-null-test out/buffer-null
         t spirv-val --target-env vulkan1.3 out/buffer-null/null-buffer.spv
         t spirv-val --target-env vulkan1.3 out/buffer-null/valid-buffer.spv
         t out/gpu/motion-history-test
-        rm -rf out/motion-shaders && mkdir -p out/motion-shaders
+        fresh_dir out/gpu/motion-shader-test out/motion-shaders
         t out/gpu/motion-shader-test out/motion-shaders
         for spv in out/motion-shaders/*.spv; do t spirv-val --target-env vulkan1.3 "$spv"; done
         t out/gpu/ui-composition-test
@@ -300,14 +372,17 @@ if [[ ${1:-} == --test || ${1:-} == --test-dry ]]; then
         t out/gpu/camera-motion-test
         # GCN2 buffer conformance (Opus verification's suite) against this tree's GPU library:
         # exit 0 only (FAIL, INVALID-SPIRV, CRASH and harness errors exit non-zero).
-        BB_GPU_BUILD="$PWD/out/gpu" BB_GPU_THIRD_PARTY="$PWD/gpu/third_party" \
-            bash tests/gcn_buffer_conformance/build.sh --out "$PWD/out/gcnconf"
-        sign_darwin out/gcnconf/gcn-conformance-dylib
+        if want "$PWD/out/gcnconf/gcn-conformance-dylib"; then
+            BB_GPU_BUILD="$PWD/out/gpu" BB_GPU_THIRD_PARTY="$PWD/gpu/third_party" \
+                bash tests/gcn_buffer_conformance/build.sh --out "$PWD/out/gcnconf"
+            sign_darwin out/gcnconf/gcn-conformance-dylib
+        fi
         BB_GPU_USER_DIR="$PWD/out/gcnconf/user" t "$PWD/out/gcnconf/gcn-conformance-dylib" \
             --out "$PWD/out/gcnconf" --label shared
         # Standalone qualification probes and runtime pieces.
         t sh tests/test_guest_alloc_macos.sh
         t bash tests/test_macos_activity.sh
+        t sh tests/test_alarm.sh
         t sh tests/test_memory_clamp.sh
         t sh tests/test_toggle_file.sh
         t sh tests/test_memory_cpu_alias_macos.sh
@@ -336,34 +411,44 @@ if [[ ${1:-} == --test || ${1:-} == --test-dry ]]; then
             bash tests/macos_perf/timestamps.sh
         t out/gpu/macos-perf-test
         BB_GPU_BUILD="$PWD/out/gpu" t sh tests/macos_float_modes/production.sh
-        "$CC" "${platform_flags[@]}" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread -Isrc \
-            tests/test_compat_mac.c src/compat_mac.c -o out/compat-mac-test
-        sign_darwin out/compat-mac-test
+        if want out/compat-mac-test; then
+            "$CC" "${platform_flags[@]}" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread -Isrc \
+                tests/test_compat_mac.c src/compat_mac.c -o out/compat-mac-test
+            sign_darwin out/compat-mac-test
+        fi
         t out/compat-mac-test
-        "$CC" "${platform_flags[@]}" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread -Isrc \
-            tests/test_macos_ui.c src/macos_ui.c -o out/macos-ui-test
-        sign_darwin out/macos-ui-test
+        if want out/macos-ui-test; then
+            "$CC" "${platform_flags[@]}" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread -Isrc \
+                tests/test_macos_ui.c src/macos_ui.c -o out/macos-ui-test
+            sign_darwin out/macos-ui-test
+        fi
         t out/macos-ui-test
-        "$CC" "${platform_flags[@]}" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread \
-            "${includes[@]}" -I. -Isrc tests/test_fault_mac.c src/runtime_cpu_profile.c "${compat[@]}" \
-            -Wl,-dead_strip -o out/fault-mac-test
-        sign_darwin out/fault-mac-test
+        if want out/fault-mac-test; then
+            "$CC" "${platform_flags[@]}" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread \
+                "${includes[@]}" -I. -Isrc tests/test_fault_mac.c src/runtime_cpu_profile.c "${compat[@]}" \
+                -Wl,-dead_strip -o out/fault-mac-test
+            sign_darwin out/fault-mac-test
+        fi
         t out/fault-mac-test
-        read -r -a media_flags <<< "$(pkg-config --cflags --libs libavformat libavcodec libavutil)"
-        "${CXX:-clang++}" "${platform_flags[@]}" -std=c++23 -O2 -g -Wall -Wextra -Werror \
-            -I. tests/test_media_mac.cpp "${media_flags[@]}" "${caps_link[@]}" -o out/media-mac-test
-        sign_darwin out/media-mac-test
+        if want out/media-mac-test; then
+            read -r -a media_flags <<< "$(pkg-config --cflags --libs libavformat libavcodec libavutil)"
+            "${CXX:-clang++}" "${platform_flags[@]}" -std=c++23 -O2 -g -Wall -Wextra -Werror \
+                -I. tests/test_media_mac.cpp "${media_flags[@]}" "${caps_link[@]}" -o out/media-mac-test
+            sign_darwin out/media-mac-test
+        fi
         t out/media-mac-test
-        read -r -a surface_flags <<< "$(pkg-config --cflags --libs vulkan sdl3 fmt)"
-        "$CC" "${platform_flags[@]}" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread -Isrc \
-            -c src/macos_ui.c -o out/macos-ui-surface.o
-        "${CXX:-clang++}" "${platform_flags[@]}" -std=c++23 -O2 -g -Wall -Wextra -Werror \
-            -Wno-unused-parameter -Wno-unused-function -pthread \
-            -Isrc -Igpu/shim -Igpu/shadps4 tests/test_macos_surface.cpp gpu/shim/window.cpp \
-            gpu/shadps4/video_core/renderer_vulkan/vk_platform.cpp gpu/shim/common/logging/log.cpp \
-            gpu/shim/common/assert.cpp gpu/shadps4/common/path_util.cpp out/macos-ui-surface.o \
-            "${surface_flags[@]}" "${caps_link[@]}" -o out/macos-surface-test
-        sign_darwin out/macos-surface-test
+        if want out/macos-surface-test; then
+            read -r -a surface_flags <<< "$(pkg-config --cflags --libs vulkan sdl3 fmt)"
+            "$CC" "${platform_flags[@]}" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread -Isrc \
+                -c src/macos_ui.c -o out/macos-ui-surface.o
+            "${CXX:-clang++}" "${platform_flags[@]}" -std=c++23 -O2 -g -Wall -Wextra -Werror \
+                -Wno-unused-parameter -Wno-unused-function -pthread \
+                -Isrc -Igpu/shim -Igpu/shadps4 tests/test_macos_surface.cpp gpu/shim/window.cpp \
+                gpu/shadps4/video_core/renderer_vulkan/vk_platform.cpp gpu/shim/common/logging/log.cpp \
+                gpu/shim/common/assert.cpp gpu/shadps4/common/path_util.cpp out/macos-ui-surface.o \
+                "${surface_flags[@]}" "${caps_link[@]}" -o out/macos-surface-test
+            sign_darwin out/macos-surface-test
+        fi
         t out/macos-surface-test
         t sh tests/test_memory_macos.sh
         t sh tests/test_memory_lifetime_macos.sh
@@ -372,34 +457,45 @@ if [[ ${1:-} == --test || ${1:-} == --test-dry ]]; then
         t sh tests/macos_spike/test_hle_stack.sh
         t bash tests/test_savedata_macos.sh
         t bash tests/test_heavy.sh
+        t bash tests/test_build_test_one.sh
         t sh tests/test_sync_diagnostics_macos.sh
         t sh tests/test_cond_wake_check_macos.sh
         t python3 tests/test_restart_macos.py
         t python3 tests/test_motion_agree.py
         t python3 tests/test_gpu_modified_setters.py
         # Last: every test file under tests/ is run above or excluded with a reason.
-        python3 tools/macos/check_test_wiring.py
+        [[ -n $one ]] || python3 tools/macos/check_test_wiring.py
     fi
-    "$CC" "${platform_flags[@]}" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread "${includes[@]}" -I. -Isrc tests/test_pad.c "${libraries[@]}" "${caps_link[@]}" -o out/pad-test
-    sign_darwin out/pad-test
+    if want out/pad-test; then
+        "$CC" "${platform_flags[@]}" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread "${includes[@]}" -I. -Isrc tests/test_pad.c "${libraries[@]}" "${caps_link[@]}" -o out/pad-test
+        sign_darwin out/pad-test
+    fi
     t out/pad-test
-    "$CC" "${platform_flags[@]}" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread "${includes[@]}" -I. -Isrc tests/test_runtime.c "${runtime[@]}" out/libatrac9.a -lm "${gpu[@]}" "${libraries[@]}" -o out/runtime-test
-    sign_darwin out/runtime-test
-    if [[ $(uname -s) == Darwin ]]; then
-        python3 packaging/macos/check-exports.py out/gpu/libbbgpu.dylib out/runtime-test
+    if want out/runtime-test; then
+        "$CC" "${platform_flags[@]}" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread "${includes[@]}" -I. -Isrc tests/test_runtime.c "${runtime[@]}" out/libatrac9.a -lm "${gpu[@]}" "${libraries[@]}" -o out/runtime-test
+        sign_darwin out/runtime-test
+        if [[ $(uname -s) == Darwin ]]; then
+            python3 packaging/macos/check-exports.py out/gpu/libbbgpu.dylib out/runtime-test
+        fi
     fi
     t out/runtime-test
-    "$CC" "${platform_flags[@]}" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread -Isrc tests/test_file_mods.c -o out/file-mods-test
-    sign_darwin out/file-mods-test
+    if want out/file-mods-test; then
+        "$CC" "${platform_flags[@]}" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread -Isrc tests/test_file_mods.c -o out/file-mods-test
+        sign_darwin out/file-mods-test
+    fi
     t out/file-mods-test
-    "$CC" "${platform_flags[@]}" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread "${includes[@]}" -I. -Isrc tests/test_sema.c "${runtime[@]}" out/libatrac9.a -lm "${gpu[@]}" "${libraries[@]}" -o out/sema-test
-    sign_darwin out/sema-test
-    if [[ $(uname -s) == Darwin ]]; then
-        python3 packaging/macos/check-exports.py out/gpu/libbbgpu.dylib out/sema-test
+    if want out/sema-test; then
+        "$CC" "${platform_flags[@]}" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread "${includes[@]}" -I. -Isrc tests/test_sema.c "${runtime[@]}" out/libatrac9.a -lm "${gpu[@]}" "${libraries[@]}" -o out/sema-test
+        sign_darwin out/sema-test
+        if [[ $(uname -s) == Darwin ]]; then
+            python3 packaging/macos/check-exports.py out/gpu/libbbgpu.dylib out/sema-test
+        fi
     fi
     t out/sema-test
-    "$CC" "${platform_flags[@]}" -std=c11 -D_GNU_SOURCE -O2 -g -Wall -Wextra -Werror -I. -Isrc tests/test_content.c src/runtime_content.c -o out/content-test
-    sign_darwin out/content-test
+    if want out/content-test; then
+        "$CC" "${platform_flags[@]}" -std=c11 -D_GNU_SOURCE -O2 -g -Wall -Wextra -Werror -I. -Isrc tests/test_content.c src/runtime_content.c -o out/content-test
+        sign_darwin out/content-test
+    fi
     t out/content-test
     if [[ $(uname -s) == Darwin ]]; then
         # Every tests/test_*.py (a skipped test fails). Last: test_runtime.py and test_sema.py run
@@ -407,4 +503,5 @@ if [[ ${1:-} == --test || ${1:-} == --test-dry ]]; then
         # older --test cannot load the current libbbgpu, and stopped the run before the rebuild).
         t bash tests/run_python_tests.sh
     fi
+    if [[ -n $one ]]; then test_one_summary; fi
 fi

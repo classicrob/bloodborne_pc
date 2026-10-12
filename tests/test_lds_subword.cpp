@@ -11,6 +11,7 @@
 #include <unistd.h>
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
 #include "shader_recompiler/backend/spirv/emit_spirv_instructions.h"
+#include "test_alarm.h"
 using namespace Shader;
 using namespace Shader::Backend::SPIRV;
 static constexpr u32 Words = 4096, Bytes = Words * 4;
@@ -81,7 +82,7 @@ static std::vector<u32> shader(bool storage, bool contend) {
 int main(int argc, char** argv) {
 
     assert(argc == 2);
-    alarm(45);
+    test_alarm(45);
     std::fprintf(stderr, "LDS subword test: Vulkan setup\n");
     vk::detail::DynamicLoader loader;
     VULKAN_HPP_DEFAULT_DISPATCHER.init(loader.getProcAddress<PFN_vkGetInstanceProcAddr>("vkGetInstanceProcAddr"));

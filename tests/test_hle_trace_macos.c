@@ -6,6 +6,7 @@
 #include <stdarg.h>
 #include <sys/wait.h>
 #include <sys/resource.h>
+#include "test_alarm.h"
 static _Thread_local int32_t guest_error;
 static int interrupt_publication;
 static volatile sig_atomic_t dump_seen;
@@ -167,7 +168,7 @@ static void benchmark(const char *mode) {
     assert(n==1000000);printf("BENCH %s calls=1000000 elapsed_ns=%llu ns_per_call=%.3f cpu_ns_per_call=%.3f\n",mode,(unsigned long long)elapsed,elapsed/1000000.0,cpu/1000000.0);
 }
 int main(int argc,char **argv) {
-    alarm(120);
+    test_alarm(120);
     if(argc>2&&!strcmp(argv[1],"bench")){if(!strncmp(argv[2],"broad-",6))broad_benchmark(argv[2]);else benchmark(argv[2]);return 0;}
     if(argc>1&&!strcmp(argv[1],"default-summary")) {
         unsetenv("BB_HLE_TRACE");unsetenv("BB_HLE_TRACE_SUMMARY_FILTER");setenv("BB_HLE_TRACE_SUMMARY","600",1);

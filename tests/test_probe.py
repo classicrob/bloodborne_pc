@@ -1,8 +1,8 @@
 """Boundary tests for the native loader; uses tiny synthetic x86-64 images."""
 from paths import ROOT
+import running_time
 from pathlib import Path
 import struct
-import subprocess
 import tempfile
 import unittest
 
@@ -50,8 +50,8 @@ class LoaderTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / 'boot.bin'
             path.write_bytes(data)
-            return subprocess.run([str(EXE.resolve()), str(path), '--cpu-only', *options],
-                                  capture_output=True, text=True, timeout=5)
+            return running_time.run([str(EXE.resolve()), str(path), '--cpu-only', *options], 30,
+                                    capture_output=True, text=True)
 
     def test_original_instruction_reaches_named_import(self):
         # jmp [rip+2]; two padding bytes; relocated function pointer at +8

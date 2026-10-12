@@ -22,6 +22,14 @@ A quick job gets a parallelism hint (`BB_BUILD_JOBS=4`, `CMAKE_BUILD_PARALLEL_LE
 on stderr, and it exits 124. A job that can take that long belongs in the build pool. The quick
 pool exists so one-minute jobs don't wait behind fifteen-minute builds.
 
+To run one test, don't write a runner: `build.sh --test-one <target or script>` builds the
+library and probe as usual, then only that test target, and runs each `--test` command naming
+it with the same environment (`BB_GPU_USER_DIR`, `VK_DRIVER_FILES`, `BB_GPU_BUILD`, ...),
+signing and directories, plus the checks of its outputs. Each run prints `test-one: exit N`, and
+the exit status is the first failure's. A name no test command has fails and lists them. In a
+tree whose library is built it fits the quick pool:
+`tools/macos/heavy.sh --pool quick LABEL -- bash build.sh --test-one capture-quiesce-test`.
+
 That is at most 4 translated (Rosetta) processes from game runs and one build-pool test, which is
 the team limit. Parallel runs are for correctness only; their FPS numbers mean nothing.
 
@@ -90,6 +98,19 @@ time limit pauses too), and no new one is admitted. When the run ends it resumes
 The pause is bounded by `BB_HEAVY_QUIET_MAX` (1200 s); past that the jobs resume with a loud
 "CPU QUIET BOUND REACHED". Each pause and resume is printed in the run's output and recorded in
 the history. Games are not paused (the exclusive GPU hold already keeps them off).
+
+A paused job says so when it ends, with its exit status, and its end event in the history
+carries `paused_s` and `paused_by`:
+
+    heavy: PREVIEW-26 full --test: PAUSED 712 s for perf runs (R0 perf); ended with exit 2: a
+    wall-clock timeout in the job may have fired on resume; rerun before calling it a failure
+
+A test's own `alarm()` kept counting through the stop and fired as soon as it resumed
+(PREVIEW-25a, the fp16 probe). Our tests use `test_alarm()` from `tests/test_alarm.h` instead:
+a forked watchdog that is paused with the test and adds up time with each observed gap clamped
+to half a second, so a pause costs at most 0.5 s of the limit (an approximation: any longer stall
+is clamped too). Python tests that launch our binaries use `tests/running_time.py` the same way.
+A failure in a paused job gets one rerun, and both results are reported.
 
 - Slots are flocks under `~/bbport-deps/locks` (`BB_HEAVY_DIR`). A job waits for a free slot of
   its pool and prints who holds them every 30 s.

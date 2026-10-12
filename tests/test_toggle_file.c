@@ -4,6 +4,7 @@
 #include <signal.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include "test_alarm.h"
 uintptr_t runtime_lookup(const RuntimeExport *table,size_t count,const char *name) {
     for (size_t i=0;i<count;++i) if (!strcmp(table[i].name,name)) return (uintptr_t)table[i].function;
     return 0;
@@ -62,7 +63,7 @@ static void expect(const char *what, uint64_t mask, uint64_t mask2) {
     exit(1);
 }
 int main(void) {
-    alarm(30);
+    test_alarm(30);
     uint64_t m[2];
     assert(!toggle_parse("",m) && m[0]==0 && m[1]==0);
     assert(!toggle_parse("12\n",m) && m[0]==12 && m[1]==0);

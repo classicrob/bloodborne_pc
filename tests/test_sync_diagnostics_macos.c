@@ -6,6 +6,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#include "test_alarm.h"
 
 typedef int32_t (ABI *Op)(void **);
 typedef int32_t (ABI *Init)(void **, void **, const char *);
@@ -28,7 +29,7 @@ static void contains(const char *text, const char *needle) {
     }
 }
 int main(void) {
-    alarm(20);
+    test_alarm(20);
     setvbuf(stdout, NULL, _IONBF, 0);
     puts("Testing runtime sync EINVAL diagnostics");
     FILE *capture = tmpfile();

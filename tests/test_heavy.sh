@@ -82,7 +82,7 @@ q2=$!
 until_held quick0 Q2
 start=$(date +%s)
 "$heavy" --pool quick Q3 -- true
-(( $(date +%s) - start < 10 )) || fail "second quick slot not available"  # the holder sleeps 30 s
+(( $(date +%s) - start < 20 )) || fail "second quick slot not available"  # the holder sleeps 30 s
 marker=bbheavytest$$
 set +e
 BB_HEAVY_QUICK_WARN=1 BB_HEAVY_QUICK_LIMIT=2 "$heavy" --pool quick Q4 -- \
@@ -103,7 +103,7 @@ holder=$!
 until_held build0 C
 start=$(date +%s)
 "$heavy" --priority P -- true
-(( $(date +%s) - start < 10 )) || fail "priority job waited for the ordinary slot"  # the holder sleeps 30 s
+(( $(date +%s) - start < 20 )) || fail "priority job waited for the ordinary slot"  # the holder sleeps 30 s
 # Ordinary jobs never take the priority slot.
 "$heavy" status | grep -q '^build-priority: free' || fail "priority slot not free after P"
 
@@ -198,7 +198,7 @@ long=$!
 until_held build0 LONG
 start=$(date +%s)
 "$heavy" --pool sweep SW1 -- true
-(( $(date +%s) - start < 10 )) || fail "sweep waited for the build slot"  # the holder sleeps 30 s
+(( $(date +%s) - start < 20 )) || fail "sweep waited for the build slot"  # the holder sleeps 30 s
 "$heavy" status | grep -q '^sweep0: free' || fail "sweep slot not listed or not freed"
 kill -9 "$long"; wait "$long" 2>/dev/null || true
 err=$("$heavy" B9 -- "$heavy" --pool sweep SW2 -- true 2>&1 >/dev/null)
@@ -212,7 +212,7 @@ long=$!
 until_held build0 LONG2
 start=$(date +%s)
 out=$(BB_HEAVY_IDLE_SECONDS=4500 "$heavy" IDLE1 -- sh -c 'echo "$(ps -o pri= -p $$) $(ps -o nice= -p $$) $BB_BUILD_JOBS"' 2>"$dir/idle.err")
-(( $(date +%s) - start < 10 )) || fail "idle user: a second build job waited for build0"  # the holder sleeps 30 s
+(( $(date +%s) - start < 20 )) || fail "idle user: a second build job waited for build0"  # the holder sleeps 30 s
 read -r ipri inic ijobs <<< "$out"
 [[ $inic == $(want 5) && $ijobs == 8 ]] || fail "idle admission not nice +5 with 8 jobs ('$out')"
 (( base_pri < 20 || ipri == 20 )) || fail "idle admission not utility QoS (priority $ipri)"
@@ -228,13 +228,24 @@ err=$(BB_HEAVY_IDLE_SECONDS=120 "$heavy" ACTIVE2 -- true 2>&1 >/dev/null)
 
 # --cpu-quiet (perf runs): running build/quick/sweep jobs are paused (whole tree) and resumed after,
 # a new one waits, a quick job's time limit pauses too, the pause is bounded, and the flag needs
-# --gpu exclusive outside any slot.
+# --gpu exclusive outside any slot. A paused job says so at its end, a failed one that a wall-clock
+# timeout may have fired on resume, and its end event carries paused_s and paused_by.
 ticks() { wc -l < "$1" | tr -d ' '; }
 "$heavy" B10 -- sh -c "while :; do echo t >> '$dir/b10'; sleep 0.2; done" &
 b10=$!
-BB_HEAVY_QUICK_LIMIT=4 "$heavy" --pool quick Q10 -- sh -c 'sleep 3' > /dev/null 2>&1 &
+for _ in $(seq 400); do  # Q2's orphaned sleep 30 (killed supervisor) may still hold a quick slot
+    [[ $("$heavy" status | grep -c '^quick[01]: free') == 2 ]] && break; sleep 0.1
+done
+BB_HEAVY_QUICK_LIMIT=4 "$heavy" --pool quick Q10 -- sh -c 'sleep 3' > /dev/null 2> "$dir/q10.err" &
 q10=$!
+"$heavy" --pool quick Q11 -- sh -c 'sleep 3; exit 3' > /dev/null 2> "$dir/q11.err" &
+q11=$!
 for _ in $(seq 50); do [[ -s $dir/b10 ]] && break; sleep 0.1; done
+for _ in $(seq 100); do
+    held=$("$heavy" status)
+    [[ $held == *'held by Q10 '* && $held == *'held by Q11 '* ]] && break; sleep 0.1
+done
+[[ $held == *'held by Q10 '* && $held == *'held by Q11 '* ]] || fail "Q10/Q11 never started: $held"
 "$heavy" --pool playtest --gpu exclusive --cpu-quiet P10 -- sh -c "sleep 0.5; a=\$(wc -l < '$dir/b10'); sleep 2.5; b=\$(wc -l < '$dir/b10'); echo \$a \$b > '$dir/p10'" 2> "$dir/p10.err" &
 p10=$!
 sleep 1
@@ -251,6 +262,22 @@ before=$(ticks "$dir/b10"); sleep 2
 grep -q 'P10: CPU quiet over: resumed B10' "$dir/p10.err" || fail "resume not reported"
 set +e; wait "$q10"; q10_status=$?; set -e
 (( q10_status == 0 )) || fail "the quick job's time limit ran during the pause (exit $q10_status)"
+set +e; wait "$q11"; q11_status=$?; set -e
+(( q11_status == 3 )) || fail "a paused failing job's status changed (exit $q11_status)"
+grep -Eq '^heavy: Q10: PAUSED [0-9]+ s for perf runs \(P10\); ended with exit 0$' "$dir/q10.err" ||
+    fail "paused job's end line: $(cat "$dir/q10.err")"
+grep -Eq '^heavy: Q11: PAUSED [0-9]+ s for perf runs \(P10\); ended with exit 3: a wall-clock timeout in the job may have fired on resume' "$dir/q11.err" ||
+    fail "paused failed job's end line: $(cat "$dir/q11.err")"
+python3 - "$dir/history.jsonl" "$dir" <<'PY' || fail "paused_s/paused_by in the end events, pause files consumed"
+import json, os, sys
+events = [json.loads(line) for line in open(sys.argv[1])]
+ends = {e['label']: e for e in events if e.get('event') == 'end'}
+pids = {e['label']: e['pid'] for e in events if e.get('event') == 'start'}
+for label, status in (('Q10', 0), ('Q11', 3)):
+    e = ends[label]
+    assert e['status'] == status and e['paused_by'] == ['P10'] and 0 < e['paused_s'] <= 10, e  # duration: load-dependent
+    assert not os.path.exists(os.path.join(sys.argv[2], f'paused-{pids[label]}.jsonl')), label
+PY
 wait "$b11"
 (( $(cat "$dir/b11") >= p10_done - 1 )) || fail "a build job started during a CPU-quiet perf run"
 kill "$b10" 2>/dev/null; wait "$b10" 2>/dev/null || true; pkill -f "$dir/b10" 2>/dev/null || true
@@ -284,10 +311,29 @@ kill -CONT "$b13_loop"
 before=$(ticks "$dir/b13"); sleep 1
 (( $(ticks "$dir/b13") > before )) || fail "B13 did not run after its own pauser resumed it"
 kill "$b13" 2>/dev/null; wait "$b13" 2>/dev/null || true; pkill -f "$dir/b13" 2>/dev/null || true
+# A job that ends the moment it is resumed (its sleep ran out during the pause) still reads the
+# whole pause: the end is written before SIGCONT, and no pause file is left behind.
+"$heavy" --pool quick Q14 -- sleep 0.3 2> "$dir/q14.err" &
+q14=$!
+until_held 'quick[01]' Q14
+"$heavy" --pool playtest --gpu exclusive --cpu-quiet P13 -- sleep 2 2> /dev/null
+wait "$q14" || fail "Q14 failed"
+sleep 0.5
+python3 - "$dir/history.jsonl" "$dir" <<'PY' || fail "a job ending at once after its resume lost its pause: $(cat "$dir/q14.err")"
+import json, os, sys
+events = [json.loads(line) for line in open(sys.argv[1])]
+end = [e for e in events if e.get('event') == 'end' and e['label'] == 'Q14'][-1]
+pid = [e for e in events if e.get('event') == 'start' and e['label'] == 'Q14'][-1]['pid']
+assert end['paused_by'] == ['P13'] and end['paused_s'] > 0, end  # the whole pause, closed before the resume
+assert not os.path.exists(os.path.join(sys.argv[2], f'paused-{pid}.jsonl')), 'pause file left behind'
+PY
 if "$heavy" --cpu-quiet K1 -- true 2>/dev/null; then fail "--cpu-quiet without --gpu exclusive accepted"; fi
 if "$heavy" K2 -- "$heavy" --pool playtest --gpu exclusive --cpu-quiet K3 -- true 2>/dev/null; then
     fail "--cpu-quiet inside a slot accepted"
 fi
+
+# (The waits above allow 20 s against a 30 s holder: at load 20-27, from perf A/Bs, starting the
+# heavy.sh calls took over 10 s.)
 
 # Job records: a start event with the command and the directory; an end event for every pool with
 # the exit status, or the signal that killed it (SIGTERM to heavy.sh is forwarded to the command);
@@ -377,4 +423,4 @@ assert any(l['label'] == 'B' and l['waited_s'] >= 1 for l in starts), 'B waited'
 assert all({'pool', 'slot', 'waited_s', 'load', 'held'} <= set(l) for l in starts)
 assert any(l['label'] == 'Q4' and l['status'] == 124 for l in ends), 'Q4 killed'
 PY
-echo "heavy.sh: history log, build/playtest/quick pools, quick hints and time limit, waiting, priority slot, GPU shared/exclusive lock with gate, start announcement, polite scheduling, idle-aware admission, CPU-quiet pause (leaving another pause's processes stopped), job records (command, directory, end status/signal, orphans), one job per worktree and INVALID on a changed tree, sweep lane, release on SIGKILL, nesting, exit status, usage errors PASS"
+echo "heavy.sh: history log, build/playtest/quick pools, quick hints and time limit, waiting, priority slot, GPU shared/exclusive lock with gate, start announcement, polite scheduling, idle-aware admission, CPU-quiet pause (leaving another pause's processes stopped; named at the job's end), job records (command, directory, end status/signal, orphans), one job per worktree and INVALID on a changed tree, sweep lane, release on SIGKILL, nesting, exit status, usage errors PASS"
