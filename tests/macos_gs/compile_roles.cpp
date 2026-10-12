@@ -23,6 +23,7 @@
 #include <vector>
 
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
+#include "shader_recompiler/frontend/tessellation.h"
 #include "shader_recompiler/gs_emulation.h"
 #include "shader_recompiler/info.h"
 #include "shader_recompiler/profile.h"
@@ -143,7 +144,7 @@ std::array<u32, 2> RingStore(u32 offset) {
             (0u) | (1u << 8) | (0u << 16) | (1u << 22) | (128u << 24)};
 }
 
-enum class Role { Es, Gs, Copy, CopyStreamOut };
+enum class Role { Es, Gs, Copy, CopyStreamOut, Hull };
 
 struct Negative {
     const char* name;
@@ -154,6 +155,72 @@ struct Negative {
     std::vector<u32> copy;  // GS role: a copy shader other than the default
     bool so_table = false;  // s[2:3] points at a stream-out table (V# 0: 16-byte vertices)
 };
+
+/// A hull shaped like GXFfxtessellateTracer* (2 GCN threads per patch, quad): an LDS write at the
+/// HsOutputBase tess constant (so TessellationPreprocess finds the constants V# at s[4:7]), then
+/// six tess factor stores of 1.0 at byte offset f(cp) + 4k (offen, soffset = s8, the factor
+/// buffer base after 8 user SGPRs).
+enum class TracerHull { Tracer, UpperUnaligned, UpperFar, MixedValues, NoCover };
+std::vector<u32> TracerHullProgram(TracerHull kind) {
+    using namespace GsAsm;
+    Code c;
+    c.SMovLiteral(VCC_HI, 0);
+    c.SBufferLoadDword(16, 4, 3); // s16 = HsOutputBase
+    c.VMov(20, 16);
+    c.VMov(4, InlineF1);
+    c.VMovLiteral(5, FloatBits(0.5f));
+    c.DsWriteB32(20, 4);
+    c.VBfeU32(0, Vgpr(1), Inline(8), Inline(5)); // control point id
+    switch (kind) {
+    case TracerHull::UpperUnaligned:
+        c.VMov(3, Vgpr(0)); // cp * 1
+        break;
+    case TracerHull::UpperFar:
+        c.VLshlrevB32(3, Inline(9), 0); // cp * 512
+        break;
+    default:
+        c.VLshlrevB32(3, Inline(2), 0); // cp * 4, as the tracer hulls
+        break;
+    }
+    const u32 count = kind == TracerHull::NoCover ? 5 : 6;
+    for (u32 k = 0; k < count; ++k) {
+        const u32 data = kind == TracerHull::MixedValues && k == 5 ? 5 : 4;
+        c.BufferStoreDwordOffen(data, 3, k * 4, 8, 0);
+    }
+    c.SEndpgm();
+    return c.words;
+}
+
+/// User data of a TracerHull: s[4:7] = a V# of the TessellationDataConstantBuffer (non-passthrough).
+std::array<u32, 16> TracerHullUserData() {
+    alignas(16) static Shader::TessellationDataConstantBuffer constants{};
+    constants = {.ls_stride = 64, .hs_cp_stride = 16, .num_patches = 1, .hs_output_base = 128,
+                 .patch_const_size = 96, .patch_const_base = 160, .patch_output_size = 32,
+                 .off_chip_tessellation_factor_threshold = 1.0f,
+                 .first_edge_tess_factor_index = 0};
+    AmdGpu::Buffer sharp{};
+    sharp.base_address = reinterpret_cast<u64>(&constants);
+    sharp.num_records = sizeof(constants);
+    sharp.data_format = u32(AmdGpu::DataFormat::Format32);
+    sharp.num_format = u32(AmdGpu::NumberFormat::Uint);
+    std::array<u32, 16> ud{};
+    std::memcpy(&ud[4], &sharp, sizeof(sharp));
+    return ud;
+}
+
+Shader::RuntimeInfo TracerHullRuntime() {
+    Shader::RuntimeInfo rt{};
+    rt.Initialize(Shader::HwStage::Hull, Shader::SwStage::TessellationControl);
+    rt.props.num_user_data = 8;
+    rt.props.num_allocated_vgprs = 64;
+    rt.sw.tcs.num_threads = 2;
+    rt.sw.tcs.num_input_control_points = 2;
+    rt.sw.tcs.tess_type = AmdGpu::TessellationType::Quad;
+    return rt;
+}
+
+/// The tracer shape compiles: tess factor stores at offsets that depend on the control point.
+int CheckTracerHull(const std::filesystem::path& out);
 
 /// GsEmulationUnsupported's stream-out ABI check: AmdGpu::InputUsageSlots on DeepSnow's copy
 /// shader layout (slots 0x1a, 0x00020018, one padding dword, OrbShdr info with
@@ -283,6 +350,14 @@ int CheckCopyDrawWithoutSubgroups(const std::filesystem::path& out) {
     return pass ? 0 : 1;
 }
 
+int CheckTracerHull(const std::filesystem::path& out) {
+    // Compiled in this process: an assertion stops the controls (and run.sh) loudly.
+    Compile("tracer-hull", TracerHullProgram(TracerHull::Tracer), TracerHullUserData(), 0x7ace,
+            TracerHullRuntime(), out);
+    std::printf("%-44s %s\n", "hull: tracer-shape tess factor stores", "PASS");
+    return 0;
+}
+
 int RunNegatives(const std::string& self, const std::filesystem::path& dir,
                  const std::string& gs_hash, const std::filesystem::path& out, int only) {
     // DIR "-": a minimal synthetic copy shader (the GS role only parses it).
@@ -401,6 +476,14 @@ int RunNegatives(const std::string& self, const std::filesystem::path& dir,
         {"SO kernel: store past the vertex", Role::CopyStreamOut,
          so_address_store(SoAddress::PastVertex), "outside one vertex of its V#", 1, {}, true},
         {"copy draw: live lane id", Role::Copy, lane_id_export, "needs subgroup operations"},
+        {"hull: upper cp unaligned factor", Role::Hull, TracerHullProgram(TracerHull::UpperUnaligned),
+         "control point 1 writes byte 1"},
+        {"hull: upper cp far factor", Role::Hull, TracerHullProgram(TracerHull::UpperFar),
+         "control point 1 writes byte 512"},
+        {"hull: factor values differ", Role::Hull, TracerHullProgram(TracerHull::MixedValues),
+         "not one immediate"},
+        {"hull: cp 0 misses a factor", Role::Hull, TracerHullProgram(TracerHull::NoCover),
+         "does not write every factor"},
         {"GS copy: unknown SGPR + s_addk", Role::Gs, {store[0], store[1], SEndpgm},
          "GSVS load through SGPR 6 of unknown value", 0, unknown_offset_copy(false)},
         {"GS copy: unknown SGPR via s_mov", Role::Gs, {store[0], store[1], SEndpgm},
@@ -423,6 +506,10 @@ int RunNegatives(const std::string& self, const std::filesystem::path& dir,
             ud[3] = u32(at >> 32);
         }
         Shader::RuntimeInfo rt{};
+        if (c.role == Role::Hull) {
+            Compile("neg-hull", c.code, TracerHullUserData(), 0x1234, TracerHullRuntime(), out);
+            return 0;
+        }
         if (c.role == Role::Copy || c.role == Role::CopyStreamOut) {
             rt.Initialize(Shader::HwStage::Vertex, Shader::SwStage::Vertex);
             rt.gs_role = c.role == Role::Copy ? Shader::GsEmulationRole::CopyVertex
@@ -456,7 +543,7 @@ int RunNegatives(const std::string& self, const std::filesystem::path& dir,
                 ud, 0x1234, rt, out);
         return 0;
     }
-    int failures = CheckSoTableSlots() + CheckCopyDrawWithoutSubgroups(out);
+    int failures = CheckSoTableSlots() + CheckCopyDrawWithoutSubgroups(out) + CheckTracerHull(out);
     for (size_t i = 0; i < cases.size(); ++i) {
         const auto& c = cases[i];
         const auto log = out / ("negative-" + std::to_string(i) + ".log");
