@@ -759,6 +759,18 @@ std::string Write(const Liverpool& liverpool, std::span<const std::shared_ptr<Cm
         why = fmt::format("cannot create {}: {}", base.string(), ec.message());
         return {};
     }
+    // A capture that crashed left its *.incomplete directory (never a usable capture): removed
+    // before the free-space check, each named.
+    for (const auto& entry : std::filesystem::directory_iterator(base, ec)) {
+        if (entry.is_directory() && entry.path().extension() == ".incomplete") {
+            std::error_code removed;
+            const auto bytes = std::filesystem::remove_all(entry.path(), removed);
+            fmt::print("  perf capture: removed the partial capture {} ({} entries){}\n",
+                       entry.path().string(), bytes,
+                       removed ? " FAILED: " + removed.message() : std::string{});
+        }
+    }
+    ec.clear();
     u64 estimate = memory.image_size + (u64{2} << 30); // images: ~0.5 GiB in the clinic
     for (const auto& b : memory.blocks) {
         estimate += b.size;
