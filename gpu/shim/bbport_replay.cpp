@@ -21,6 +21,7 @@
 #include <vector>
 #include <fmt/format.h>
 #include <mach/mach.h>
+#include <mach/mach_vm.h>
 #include "bbport_toggles.h"
 #include "core/libraries/gnmdriver/gnmdriver.h"
 #include "video_core/amdgpu/liverpool.h"
@@ -97,6 +98,7 @@ struct Submission {
 struct Reset {
     u64 address;
     std::vector<u8> bytes;
+    bool host; ///< outside the guest views: restored in place (same HLE allocation order)
 };
 
 struct Capture {
@@ -256,7 +258,7 @@ private:
             if (!r.Get(rr, why)) {
                 return false;
             }
-            Reset reset{rr.address, std::vector<u8>(rr.bytes)};
+            Reset reset{rr.address, std::vector<u8>(rr.bytes), rr.host != 0};
             if (!r.Read(reset.bytes.data(), reset.bytes.size(), why)) {
                 return false;
             }
@@ -309,6 +311,28 @@ struct Counters {
 /// Liverpool parse state. The GPU command thread is idle (waiting for a submission).
 bool Restore(AmdGpu::Liverpool& lp, const Capture& c, std::string& why) {
     for (const auto& reset : c.resets) {
+        if (reset.host) {
+            // Host memory (an HLE object the frame's packets write): restored in place when this
+            // process has it mapped writable, as the capture's did.
+            mach_vm_address_t region = reset.address;
+            mach_vm_size_t size = 0;
+            vm_region_basic_info_data_64_t info{};
+            mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+            mach_port_t object = MACH_PORT_NULL;
+            if (mach_vm_region(mach_task_self(), &region, &size, VM_REGION_BASIC_INFO_64,
+                               reinterpret_cast<vm_region_info_t>(&info), &count,
+                               &object) != KERN_SUCCESS ||
+                region > reset.address || reset.address + reset.bytes.size() > region + size ||
+                !(info.protection & VM_PROT_WRITE)) {
+                why = fmt::format("host reset range {:#x} (+{}) is not writable memory in the "
+                                  "replay process (HLE allocations differ from the capture's?)",
+                                  reset.address, reset.bytes.size());
+                return false;
+            }
+            std::memcpy(reinterpret_cast<void*>(reset.address), reset.bytes.data(),
+                        reset.bytes.size());
+            continue;
+        }
         if (!runtime_memory_write_backing(reset.address, reset.bytes.data(), reset.bytes.size())) {
             why = fmt::format("reset range {:#x} (+{}) is not mapped", reset.address,
                               reset.bytes.size());
@@ -550,9 +574,10 @@ extern "C" int bbgpu_replay_run(const char* dir, unsigned iterations) {
                              "iteration (1)\n", window);
         return 2;
     }
-    fmt::print("Perf replay: {} ({} submissions, {} reset ranges), {} iterations; pixel output not "
-               "qualified, iteration 1 is warm-up\n",
-               dir, capture.submissions.size(), capture.resets.size(), iterations);
+    const auto host_resets = std::ranges::count_if(capture.resets, [](const Reset& r) { return r.host; });
+    fmt::print("Perf replay: {} ({} submissions, {} reset ranges, {} of them in host memory restored "
+               "in place), {} iterations; pixel output not qualified, iteration 1 is warm-up\n",
+               dir, capture.submissions.size(), capture.resets.size(), host_resets, iterations);
     std::fflush(stdout);
     // Memory and registers first (RestoreImages needs them), then the images, checked.
     if (!WaitIdle(*lp, std::chrono::seconds(30)) ||

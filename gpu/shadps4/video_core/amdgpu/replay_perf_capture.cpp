@@ -149,22 +149,29 @@ struct Memory {
         return false;
     }
 
-    /// Bytes at a guest VA at the cut, through the backing pool (no guest-view access) or the
-    /// image; false unless one view or the image holds the whole range.
-    bool Read(u64 va, void* out, u64 size) const {
+    /// Bytes at a guest VA at the cut, through the backing pool (no guest-view access), the
+    /// image, or, outside both, host memory (`host` set: e.g. an HLE object in the low arena that
+    /// a packet writes); false when unreadable.
+    bool Read(u64 va, void* out, u64 size, bool* host = nullptr) const {
+        if (host) {
+            *host = false;
+        }
         if (va >= image_start && size <= image_size && va - image_start <= image_size - size) {
             return SafeRead(va, out, size); // protected regions inside the image fail, not fault
         }
         const auto it = std::upper_bound(views.begin(), views.end(), va,
                                          [](u64 a, const RuntimeMemoryView& v) { return a < v.start; });
-        if (it == views.begin()) {
-            return false;
+        const RuntimeMemoryView* v = it == views.begin() ? nullptr : &*(it - 1);
+        if (!v || va >= v->end) {
+            if (host) {
+                *host = true;
+            }
+            return SafeRead(va, out, size);
         }
-        const RuntimeMemoryView& v = *(it - 1);
-        if (va >= v.end || size > v.end - va || v.phys + (va - v.start) + size > total_bytes) {
-            return false;
+        if (size > v->end - va || v->phys + (va - v->start) + size > total_bytes) {
+            return false; // straddles a view's end
         }
-        std::memcpy(out, backing + v.phys + (va - v.start), size);
+        std::memcpy(out, backing + v->phys + (va - v->start), size);
         return true;
     }
 };
@@ -679,7 +686,7 @@ bool WriteImages(const std::filesystem::path& dir, const Liverpool& lp, u64& cou
 }
 
 bool WriteResets(const std::filesystem::path& dir, const Memory& m, ResetWalk& walk,
-                 u64& count, u64& bytes, std::string& why) {
+                 u64& count, u64& bytes, u64& host_count, std::string& why) {
     auto ranges = walk.ranges;
     std::ranges::sort(ranges, [](const auto& a, const auto& b) { return a.address < b.address; });
     std::vector<ResetWalk::Range> merged;
@@ -696,20 +703,22 @@ bool WriteResets(const std::filesystem::path& dir, const Memory& m, ResetWalk& w
         return false;
     }
     std::vector<u8> value;
-    count = bytes = 0;
+    count = bytes = host_count = 0;
     for (const auto& r : merged) {
         if (r.bytes > UINT32_MAX) {
             why = fmt::format("reset range {:#x} is {} bytes", r.address, r.bytes);
             return false;
         }
         value.resize(r.bytes);
-        if (!m.Read(r.address, value.data(), r.bytes)) {
-            why = fmt::format("reset range [{:#x}, +{:#x}) (packet {:#04x}) is outside captured "
-                              "memory",
+        bool host = false;
+        if (!m.Read(r.address, value.data(), r.bytes, &host)) {
+            why = fmt::format("reset range [{:#x}, +{:#x}) (packet {:#04x}) is unreadable or "
+                              "straddles a guest view",
                               r.address, r.bytes, r.opcode);
             return false;
         }
-        if (!f.Put(ResetRecord{r.address, u32(r.bytes), r.kind, r.opcode, 0}, why) ||
+        host_count += host;
+        if (!f.Put(ResetRecord{r.address, u32(r.bytes), r.kind, r.opcode, u32(host)}, why) ||
             !f.Write(value.data(), value.size(), why)) {
             return false;
         }
@@ -786,11 +795,11 @@ std::string Write(const Liverpool& liverpool, std::span<const std::shared_ptr<Cm
     };
 
     u64 backing_bytes = 0, words = 0, resets = 0, reset_bytes = 0, images = 0, texel_bytes = 0,
-        image_readable = 0;
+        image_readable = 0, host_resets = 0;
     if (!WriteViews(dir, memory, why) || !WriteBacking(dir, memory, backing_bytes, why) ||
         !WriteImage(dir, memory, image_readable, why) || !WriteLiverpool(dir, liverpool, why) ||
         !WriteSubmissions(dir, held, words, why) ||
-        !WriteResets(dir, memory, walk, resets, reset_bytes, why) ||
+        !WriteResets(dir, memory, walk, resets, reset_bytes, host_resets, why) ||
         !WriteImages(dir, liverpool, images, texel_bytes, why)) {
         return fail();
     }
@@ -807,11 +816,11 @@ std::string Write(const Liverpool& liverpool, std::span<const std::shared_ptr<Cm
                "  \"backing_payload_bytes\": {},\n  \"image\": [{}, {}],\n"
                "  \"image_readable_bytes\": {},\n"
                "  \"submissions\": {},\n  \"command_dwords\": {},\n"
-               "  \"resets\": {},\n  \"reset_bytes\": {},\n"
+               "  \"resets\": {},\n  \"reset_bytes\": {},\n  \"host_resets\": {},\n"
                "  \"images\": {},\n  \"image_texel_bytes\": {}\n}}\n",
                Version, memory.generation, memory.blocks.size(), memory.views.size(), backing_bytes,
                memory.image_start, memory.image_size, image_readable, held.size(), words, resets,
-               reset_bytes,
+               reset_bytes, host_resets,
                images, texel_bytes);
     if (std::fclose(manifest) != 0) {
         why = "writing manifest.json failed";

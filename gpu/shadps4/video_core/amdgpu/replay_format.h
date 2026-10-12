@@ -107,7 +107,7 @@ struct ResetRecord {
     u32 bytes; ///< payload bytes that follow (the value at the cut)
     ResetKind kind;
     u32 opcode; ///< the PM4 opcode that named it (first one, after merging)
-    u32 reserved;
+    u32 host;   ///< 1: outside the guest views (host memory, e.g. an HLE object in the low arena)
 };
 
 /// images.bin: per GPU-modified image (Rasterizer::CaptureImages), an ImageHeader, its state
