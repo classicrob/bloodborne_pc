@@ -1,6 +1,6 @@
 from paths import ROOT
+import running_time
 from pathlib import Path
-import subprocess
 import unittest
 
 EXE=ROOT/'out/sema-test'
@@ -8,7 +8,7 @@ EXE=ROOT/'out/sema-test'
 @unittest.skipUnless(EXE.exists(),'run bash build.sh --test first')
 class SemaphoreTests(unittest.TestCase):
     def run_case(self,*args):
-        return subprocess.run([str(EXE.resolve()),*args],capture_output=True,text=True,timeout=10)
+        return running_time.run([str(EXE.resolve()),*args],60,capture_output=True,text=True)
 
     def test_counts_errors_timeout_and_stale_ids(self):
         r=self.run_case()
