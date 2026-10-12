@@ -21,6 +21,7 @@
 #include "bbport_deferred_counts.h"
 #include "bbport_label_sequencer.h"
 #include "bbport_write_order.h"
+#include "bbport_parse_split.h"
 #endif
 #include <thread>
 #include <queue>
@@ -877,6 +878,11 @@ public:
     /// Stage B, between packets: submits the labels recorded since the last submission when
     /// `idle` or once the oldest has waited LabelBatchAge.
     void FlushLabels(bool idle);
+#ifdef __APPLE__
+    /// Stage B (the scheduler's owner): submits the batched labels now if any, counted under
+    /// `reason` (a WAIT_REG_MEM met early).
+    void FlushLabelsFor(BbSplit::F reason);
+#endif
 
     /// Waits in slices until the GPU passed timeline value `tick` of this scheduler; false if
     /// `stoken` was stopped first. A failed wait (device loss) stops loudly.

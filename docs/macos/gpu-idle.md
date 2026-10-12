@@ -286,6 +286,16 @@ it, the label only at GPU completion. Toggle bit 63 (WriteDataAfterLabels) resto
 live, for the A/B; with labels at submit (bit 59) nothing changes. The parse split charges these
 waits to their own kinds, "deferred signals before WRITE_DATA" and "deferred signals before a flip".
 
+### Flush at a WAIT_REG_MEM met early (always)
+
+The waits that remain for an in-order WRITE_DATA are required: they are the labels behind a
+WAIT_REG_MEM the CP would have stalled at. Their cost is label latency (issue to write: about
+10 ms at the clinic idle). When stage B runs a met-early WAIT's marker, it submits its batched
+labels at once ("label batch at a WAIT met early" in the census), so the producing label's work
+reaches the GPU without waiting for the batch age or the next idle. This is exact: an earlier
+submission, never an earlier write. The Flushes line counts these WAITs ("WAIT_REG_MEMs met
+early N per frame").
+
 ## Flip publication at GPU retirement (the default on Apple)
 
 A flip tells the guest that its previous display buffer may be reused. That means the flip
