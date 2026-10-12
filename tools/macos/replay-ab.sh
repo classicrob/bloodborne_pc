@@ -79,9 +79,14 @@ for X in A B; do
             merge -q --no-edit "$harness" >/dev/null 2>&1 ||
             die "arm $X: $ref + harness $harness does not merge cleanly: $(git -C "$dir" diff --name-only --diff-filter=U | tr '\n' ' ')"
     fi
-    # Submodules come from this tree's checkouts (no network; build.sh only checks and patches).
+    # Submodules come from this tree's checkouts (no network; build.sh only checks and patches),
+    # their .git files pointed at this tree's submodule repositories by absolute path.
     for sub in $(git config -f .gitmodules --get-regexp 'submodule\..*\.path' | awk '{print $2}'); do
-        [[ -d $ROOT/$sub ]] && rsync -a --delete "$ROOT/$sub/" "$dir/$sub/"
+        [[ -d $ROOT/$sub ]] || continue
+        gitdir=$(git -C "$ROOT/$sub" rev-parse --absolute-git-dir) || die "$sub: no submodule repository"
+        rsync -a --delete --exclude /.git "$ROOT/$sub/" "$dir/$sub/" || die "$sub: copy failed"
+        echo "gitdir: $gitdir" > "$dir/$sub/.git"
+        git -C "$dir/$sub" rev-parse --verify -q HEAD >/dev/null || die "$sub: copied checkout unusable"
     done
     echo "arm $X: $ref -> $(git -C "$dir" log -1 --format=%h) in $dir"
     (cd "$dir" && bash tools/macos/heavy.sh --pool build "$label build $X" -- bash build.sh) \
