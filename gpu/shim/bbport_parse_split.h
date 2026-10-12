@@ -149,6 +149,9 @@ private:
 /// Submissions of the draw scheduler, any thread; read at reports.
 struct FlushCensus {
     std::array<std::atomic<std::uint64_t>, FCount> by_reason{};
+    /// Labels at GPU completion written, their issue-to-write age (the label thread), and the
+    /// window's maximum (reset at each report).
+    std::atomic<std::uint64_t> labels_written{0}, label_age_ns{0}, label_age_window_max_ns{0};
     std::atomic<std::uint64_t> ended_pass{0};       ///< a render pass was open (it ends)
     std::atomic<std::uint64_t> batches{0}, batch_age_ns{0}, batch_age_max_ns{0};
 };
@@ -159,6 +162,16 @@ inline void NoteFlush(bool pass_open) {
     flush_census.by_reason[flush_reason].fetch_add(1, std::memory_order_relaxed);
     if (pass_open) {
         flush_census.ended_pass.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+/// A label at GPU completion written `age_ns` after it was issued (the guest sees it then).
+inline void NoteLabelWritten(std::uint64_t age_ns) {
+    flush_census.labels_written.fetch_add(1, std::memory_order_relaxed);
+    flush_census.label_age_ns.fetch_add(age_ns, std::memory_order_relaxed);
+    std::uint64_t max = flush_census.label_age_window_max_ns.load(std::memory_order_relaxed);
+    while (age_ns > max && !flush_census.label_age_window_max_ns.compare_exchange_weak(
+                               max, age_ns, std::memory_order_relaxed)) {
     }
 }
 
@@ -379,7 +392,8 @@ inline std::string ScopeBy(const Account& a, Previous& previous, K kind, const c
 
 inline Previous previous_a, previous_b, previous_r;
 inline std::array<std::uint64_t, FCount> previous_flushes{};
-inline std::uint64_t previous_ended_pass = 0, previous_batches = 0, previous_batch_age_ns = 0;
+inline std::uint64_t previous_ended_pass = 0, previous_batches = 0, previous_batch_age_ns = 0,
+                     previous_labels_written = 0, previous_label_age_ns = 0;
 
 /// "  Flushes …" for the window: per frame by reason, passes ended, label batch age.
 inline std::string FlushLine(double frames) {
@@ -410,10 +424,24 @@ inline std::string FlushLine(double frames) {
     previous_ended_pass = ended;
     previous_batches = batches;
     previous_batch_age_ns = age;
+    const std::uint64_t written = flush_census.labels_written.load(std::memory_order_relaxed);
+    const std::uint64_t written_age = flush_census.label_age_ns.load(std::memory_order_relaxed);
+    const std::uint64_t window_written = written - previous_labels_written;
+    const std::uint64_t window_max =
+        flush_census.label_age_window_max_ns.exchange(0, std::memory_order_relaxed);
+    char written_text[192];
+    std::snprintf(written_text, sizeof(written_text),
+                  "; labels written %.1f per frame, issue to write %.0f us mean, %.0f us max",
+                  frames ? window_written / frames : 0.0,
+                  window_written ? (written_age - previous_label_age_ns) / 1e3 / window_written
+                                 : 0.0,
+                  window_max / 1e3);
+    previous_labels_written = written;
+    previous_label_age_ns = written_age;
     char head[96];
     std::snprintf(head, sizeof(head), "  Flushes of the draw scheduler: %.1f per frame = ",
                   frames ? total / frames : 0.0);
-    return head + out + tail;
+    return head + out + tail + written_text;
 }
 inline std::uint64_t window_cycles = 0, window_frames = 0, window_draws = 0;
 inline std::chrono::steady_clock::time_point window_start{};

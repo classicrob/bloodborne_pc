@@ -645,6 +645,8 @@ int main() {
         }
         NoteLabelBatch(300000);
         NoteLabelBatch(700000);
+        NoteLabelWritten(1000000);
+        NoteLabelWritten(3000000);
         const std::string line = detail::FlushLine(2);
         Expect("flush census: reasons nest and restore; per frame by reason, passes ended, batch age",
                line.find("2.0 per frame = frame end 1.0, unbatched labels 0.5") != std::string::npos &&
@@ -652,6 +654,8 @@ int main() {
                    line.find("1.0 per frame ended an open render pass") != std::string::npos &&
                    line.find("label batches 1.0 per frame, oldest label's age at submit 500 us "
                              "mean, 700 us max") != std::string::npos &&
+                   line.find("labels written 1.0 per frame, issue to write 2000 us mean, 3000 us "
+                             "max") != std::string::npos &&
                    flush_reason == FOther);
     }
 
