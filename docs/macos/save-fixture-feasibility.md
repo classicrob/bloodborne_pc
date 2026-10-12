@@ -100,3 +100,41 @@ Source-only inspection of Noxde's GPL-3.0 editor, pinned at
 [file and flag access](https://github.com/Noxde/Bloodborne-save-editor/blob/b8eecb5d2a73066954cdb54b65349ea65b1ded62/src-tauri/src/data_handling/file.rs).
 No upstream implementation was copied into production. No save was modified,
 editor executed, game launched, or load-acceptance test claimed.
+
+## Approved fixture tool
+
+`tools/macos/save_fixture.py` now implements the copy-and-edit operation. It is
+deliberately limited to the hashed clinic character above, without an override
+for unknown saves. The source is read only; destination must be new and outside
+the source tree. Symlinks/special files are refused. The complete source is
+hashed before and after creation, the copied output is verified, and backups
+and global data are preserved byte-for-byte.
+
+```sh
+python3 -B tools/macos/save_fixture.py \
+  ~/bbport-game/saves/clinic-start ~/bbport-game/saves/hunters-dream-edited --dry-run
+python3 -B tools/macos/save_fixture.py \
+  ~/bbport-game/saves/clinic-start ~/bbport-game/saves/hunters-dream-edited
+```
+
+Dry-run prints the source fixture hash and both before/after byte strings and
+creates nothing. Creation writes `edited=true`, `validation=pending`, the source
+metadata, every source file's size/hash, the complete fixture hash, edits, output
+character hash and tool-content hash into `fixture.json`. The fixture hash is
+SHA256 of sorted compact ASCII JSON of the file inventory; its definition is
+included in the manifest. Run only against a stopped immutable fixture.
+
+Actual manual checks: `python3 -B tools/macos/save_fixture_check.py`, seven
+checks, exit 0. These use synthetic bytes, with the known-source hash replaced
+only inside the test process. They cover dry-run, exact changed ranges and
+independent output files, ancestry metadata, original preservation, refusal of
+unknown/edited/symlink sources, existing/nested destinations, and failed-copy
+cleanup. The real clinic dry-run also exited 0. No build target or runtime file
+is changed; no game acceptance is implied by these filesystem checks.
+
+Playtest owns preservation of this ancestry on subsequent `save-fixture`
+exports: the source fixture metadata is in the launch manifest's `saves.from`.
+Every descendant must retain `edited=true` and the original edit provenance.
+Until a successful load/walk/normal-save/fresh-reload is recorded, the generated
+fixture remains pending. Weapon acquisition is through the in-game path;
+lamps and clinic events remain unverified.
