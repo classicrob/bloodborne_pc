@@ -86,6 +86,8 @@ struct Reporter {
     std::array<double, 2> stream_ms{};                ///< main, present: sum of submissions
     std::array<uint64_t, 2> stream_submissions{};
     uint64_t deferred_reads = 0; ///< timestamp reads retried: timeline done, results not yet
+    double total_main_ms = 0;          ///< since the start (Totals), never reset
+    uint64_t total_main_submissions = 0;
     Reporter() {
         const char* path = std::getenv("BB_PERF_OUT");
         if (!path || !*path) Fail("BB_PERF=1 requires BB_PERF_OUT (a new JSONL file)");
@@ -247,6 +249,10 @@ struct GpuStream::Impl {
                 report.intervals.emplace_back(begin, begin + ms);
                 report.stream_ms[present] += ms;
                 ++report.stream_submissions[present];
+                if (!present) {
+                    report.total_main_ms += ms;
+                    ++report.total_main_submissions;
+                }
                 report.Add(present ? "gpu_present_submission_ms" : "gpu_main_submission_ms", ms);
                 // One submission per phase (BB_PERF_PHASES): phase times add up per frame.
                 if (report.phases && !present) {
@@ -333,6 +339,12 @@ void GpuStream::Submitted(uint64_t tick) {
     impl->last_tick = tick;
 }
 
+GpuTotals Totals() {
+    if (!Enabled()) return {0, 0};
+    auto& report = Report();
+    std::scoped_lock lock{report.mutex};
+    return {report.total_main_ms, report.total_main_submissions};
+}
 RecorderTimer::RecorderTimer() { if (Enabled()) start = ThreadCpu(); }
 RecorderTimer::~RecorderTimer() {
     if (!start) return;

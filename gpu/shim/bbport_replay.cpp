@@ -23,6 +23,7 @@
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
 #include "bbport_toggles.h"
+#include "macos_perf.h"
 #include "core/libraries/gnmdriver/gnmdriver.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/amdgpu/replay_format.h"
@@ -667,7 +668,8 @@ extern "C" int bbgpu_replay_run(const char* dir, unsigned iterations) {
         });
         return totals;
     };
-    std::vector<double> wall_ms, cpu_ms, done_ms;
+    std::vector<double> wall_ms, cpu_ms, done_ms, busy_ms;
+    BbPerf::GpuTotals gpu_last = BbPerf::Totals();
     for (unsigned it = 1; it <= iterations; ++it) {
         if (!WaitIdle(*lp, std::chrono::seconds(30))) {
             std::fprintf(stderr, "STOP: perf replay: the GPU did not go idle within 30 s before "
@@ -715,6 +717,15 @@ extern "C" int bbgpu_replay_run(const char* dir, unsigned iterations) {
                                                                  t0).count();
             done_ms.push_back(gpu_done);
         }
+        // BB_PERF: GPU execution collected during this iteration's submissions = the previous
+        // iteration's work when it was waited for (BB_REPLAY_GPU_WAIT=1).
+        const BbPerf::GpuTotals gpu_now = BbPerf::Totals();
+        const double prev_busy = gpu_now.main_ms - gpu_last.main_ms;
+        const u64 prev_submissions = gpu_now.main_submissions - gpu_last.main_submissions;
+        gpu_last = gpu_now;
+        if (BbPerf::Enabled() && gpu_wait && it >= 3) {
+            busy_ms.push_back(prev_busy); // iteration it-1 >= 2
+        }
         const auto prep_after = prep_totals();
         const u64 prep_used = prep_after.first - prep_before.first;
         const u64 prep_all = prep_used + (prep_after.second - prep_before.second);
@@ -734,6 +745,11 @@ extern "C" int bbgpu_replay_run(const char* dir, unsigned iterations) {
                    after.images - before.images,
                    (after.image_bytes - before.image_bytes) / 1048576.0,
                    (after.buffer_bytes - before.buffer_bytes) / 1048576.0);
+        if (BbPerf::Enabled() && gpu_wait && it >= 2) {
+            fmt::print("  GPU busy of iteration {} (per-submission timestamps, {} submissions): "
+                       "{:.2f} ms\n",
+                       it - 1, prev_submissions, prev_busy);
+        }
         std::fflush(stdout);
     }
     if (iterations >= 3) {
@@ -747,6 +763,13 @@ extern "C" int bbgpu_replay_run(const char* dir, unsigned iterations) {
                    iterations, median(w), *std::min_element(w.begin(), w.end()),
                    *std::max_element(w.begin(), w.end()), median(c),
                    *std::min_element(c.begin(), c.end()), *std::max_element(c.begin(), c.end()));
+        if (!busy_ms.empty()) {
+            std::vector<double> b = busy_ms;
+            fmt::print("Perf replay steady state, GPU busy per iteration (iterations 2..{}): median "
+                       "{:.2f} ms [{:.2f}, {:.2f}]\n",
+                       iterations - 1, median(b), *std::min_element(b.begin(), b.end()),
+                       *std::max_element(b.begin(), b.end()));
+        }
         if (gpu_wait) {
             std::vector<double> d(done_ms.begin() + 1, done_ms.end());
             fmt::print("Perf replay steady state, GPU waited per iteration: submit-to-GPU-done median "

@@ -33,6 +33,15 @@ public:
     /// After vkQueueSubmit: the submission completes when the timeline reaches `tick`.
     void Submitted(uint64_t tick);
 };
+/// GPU execution of the main stream's completed submissions since the start (sum of each
+/// submission's first-to-last timestamp span, ms) and their count; {0, 0} unless Enabled().
+/// Submissions are collected at later submissions, so a total lags the newest work (the perf
+/// replay waits for each iteration's GPU work and reads the delta at the next one).
+struct GpuTotals {
+    double main_ms;
+    uint64_t main_submissions;
+};
+GpuTotals Totals();
 /// Called once per guest flip, not per draw. Its interval includes blocking and pacing.
 void Flip();
 void ImportWait(uint64_t nanoseconds);
