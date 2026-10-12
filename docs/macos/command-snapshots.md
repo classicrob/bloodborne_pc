@@ -97,6 +97,14 @@ that stopped, **as observed then** (it never re-reads guest memory). The latest 
 before each descriptor is read, so when that descriptor came from direct user data or the
 uninstrumented flat buffer, the stop says so instead of naming an earlier read.
 
+**Draw-preparation workers do not stop.** A worker's selection is speculative: it runs on
+register state the scanner replayed, and the GPU thread re-checks it before using anything
+(vk_draw_prep.h). There, a descriptor with no number conversion abandons the preparation, and
+the GPU thread selects that draw itself, where the stop still applies. The first 8 are logged
+("Draw preparation: a worker's speculative selection abandoned ..."), and the stop line gives
+the count so far. PREVIEW-22's hunt stopped on a worker: the user data it read was not the GPU
+command thread's register file.
+
 The stop line also says:
 - **where the table pointer came from (with `BB_CMD_DATA_CHECK=1`):**
   - The SET_SH_REG that last wrote its low user-data word: the graphics stream or a compute

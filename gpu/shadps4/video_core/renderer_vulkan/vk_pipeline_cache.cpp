@@ -1299,14 +1299,37 @@ PipelineCache::Result PipelineCache::GetProgram(PipelineSelection& sel, HwStage 
             if (sigsetjmp(recover, 0)) {
                 Shader::Info::num_ud_snapshots = saved_snapshots;
                 runtime_fault_recover = nullptr;
+#ifdef __APPLE__
+                Shader::speculative_selection = false;
+#endif
                 worker.failed = true;
                 return {};
             }
             runtime_fault_recover = &recover;
+#ifdef __APPLE__
+            // Speculative: a descriptor with no conversion abandons the preparation (the GPU
+            // thread selects the draw itself), instead of stopping the game from a worker.
+            bool matched = false;
+            Shader::speculative_selection = true;
+            try {
+                matched = matches_data(*module.info_template, module);
+            } catch (const Shader::SpeculativeDescriptorRejected&) {
+                Shader::speculative_selection = false;
+                runtime_fault_recover = nullptr;
+                worker.failed = true;
+                return {};
+            }
+            Shader::speculative_selection = false;
+            if (!matched) {
+                runtime_fault_recover = nullptr;
+                continue;
+            }
+#else
             if (!matches_data(*module.info_template, module)) {
                 runtime_fault_recover = nullptr;
                 continue;
             }
+#endif
             runtime_fault_recover = nullptr;
             auto it = worker.infos.try_emplace(module.info.get(), *module.info_template).first;
             auto& info = it->second;
