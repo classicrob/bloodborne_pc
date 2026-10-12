@@ -113,7 +113,7 @@ struct StageSpecialization {
     template <typename T>
     std::string DescribeFetch(const SharpFetch<T>& fetch) const {
         const auto flat = info->FlatUserData();
-        std::string text = "; its dwords come from:";
+        std::string text = "; its dwords come from (flat inputs, before the post op):";
         for (u32 i = 0; i < SharpFetch<T>::N; ++i) {
             if (!((fetch.load_mask >> i) & 1)) {
                 text += fmt::format(" [{}] immediate {:#x}", i, fetch.immediates[i]);
@@ -130,10 +130,12 @@ struct StageSpecialization {
         return text;
     }
 
+    /// `fetch_source` is called only when the descriptor fails (it formats the stop text).
+    template <typename FetchSource>
     void CheckNumberConversion(const char* kind, u32 index, const void* sharp, size_t size,
                                AmdGpu::NumberFormat num_fmt, AmdGpu::DataFormat data_fmt,
-                               const std::string& fetch_source = {}) const {
-        if (AmdGpu::HasNumberConversion(num_fmt, data_fmt)) {
+                               FetchSource&& fetch_source) const {
+        if (AmdGpu::HasNumberConversion(num_fmt, data_fmt)) [[likely]] {
             return;
         }
         std::string dwords;
@@ -151,9 +153,10 @@ struct StageSpecialization {
         for (size_t i = 0; i < ud.size() && i < NUM_USER_DATA_REGS; ++i) {
             user_data += fmt::format(" s{}={:#x}", i, ud[i]);
         }
-        const std::string source = fetch_source + user_data + BbCmdData::LastRead() +
+        const std::string source = fetch_source() + user_data + BbCmdData::LastRead() +
                                    BbFrameMarks::Describe() + "; " + BbComputeSh::Describe();
 #else
+        (void)fetch_source;
         const std::string source;
 #endif
         UNREACHABLE_MSG("{} shader {:#x}: {} {} (Info index) has data format {} with number format {}, "
@@ -203,15 +206,15 @@ struct StageSpecialization {
                          if (spec.is_formatted) {
                              CheckNumberConversion("buffer", u32(buffers.size() - 1), &sharp, sizeof(sharp),
                                                    AmdGpu::NumberFormat(sharp.num_format),
-                                                   AmdGpu::DataFormat(sharp.data_format),
+                                                   AmdGpu::DataFormat(sharp.data_format), [&] {
 #ifdef __APPLE__
-                                                   DescribeFetch(desc.sharp_fetch) +
-                                                       fmt::format(" (post op {})",
-                                                                   u32(desc.post_op))
+                                                       return DescribeFetch(desc.sharp_fetch) +
+                                                              fmt::format(" (post op {})",
+                                                                          u32(desc.post_op));
 #else
-                                                   std::string{}
+                                                       return std::string{};
 #endif
-                             );
+                                                   });
                              spec.data_format = static_cast<u32>(sharp.GetDataFmt());
                              spec.num_format = static_cast<u32>(sharp.GetNumberFmt());
                              spec.dst_select = sharp.DstSelect();
@@ -235,15 +238,15 @@ struct StageSpecialization {
                          }
                          CheckNumberConversion("image", u32(images.size() - 1), &sharp, sizeof(sharp),
                                                AmdGpu::NumberFormat(sharp.num_format),
-                                               AmdGpu::DataFormat(sharp.data_format),
+                                               AmdGpu::DataFormat(sharp.data_format), [&] {
 #ifdef __APPLE__
-                                               DescribeFetch(desc.sharp_fetch) +
-                                                   fmt::format(" (post op {})",
-                                                               u32(desc.post_op))
+                                                   return DescribeFetch(desc.sharp_fetch) +
+                                                          fmt::format(" (post op {})",
+                                                                      u32(desc.post_op));
 #else
-                                               std::string{}
+                                                   return std::string{};
 #endif
-                         );
+                                               });
                          spec.num_conversion = sharp.GetNumberConversion();
                      });
         // bbport: every image's descriptor count as the emitter declares it (NumBindings),
