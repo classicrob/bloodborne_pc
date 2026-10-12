@@ -33,7 +33,9 @@ class PositionReader:
         self.last_seq = None
         self.identity = None
 
-    def fresh(self, timeout_s=2.0):
+    def fresh(self, timeout_s=2.0, after_ns=None):
+        """after_ns: the sample must have been taken at or after this CLOCK_MONOTONIC time (the stick
+        command it is used to judge), else it is waited past like a stale one."""
         end = self.clock() + timeout_s
         why = 'no record'
         while True:
@@ -46,6 +48,8 @@ class PositionReader:
                 if rec.get('version') != 1 or rec.get('pid') != self.pid:
                     raise GotoError(f'position file is from another process or version: {rec.get("pid")}, v{rec.get("version")}')
                 identity = (rec.get('pid'), rec.get('run_id'), rec.get('started_monotonic_ns'))
+                if not isinstance(identity[1], str) or not identity[1] or type(identity[2]) is not int:
+                    raise GotoError(f'position record lacks run_id/started_monotonic_ns: {identity}')
                 if self.identity is None:
                     self.identity = identity
                 elif identity != self.identity:
@@ -53,16 +57,18 @@ class PositionReader:
                 if not rec.get('valid'):
                     raise GotoError(f'position invalid: {rec.get("reason")}')
                 seq = rec.get('sequence')
-                if not isinstance(seq, int):
+                if type(seq) is not int:
                     raise GotoError(f'position sequence is not an integer: {seq!r}')
                 if self.last_seq is not None and seq < self.last_seq:
                     raise GotoError(f'position sequence went backwards: {seq} after {self.last_seq}')
                 sampled = rec.get('sample_monotonic_ns')
-                if not isinstance(sampled, int):
+                if type(sampled) is not int:
                     raise GotoError(f'position sample time is not an integer: {sampled!r}')
                 age = self.mono_ns() - sampled
                 if age < -self.FUTURE_SLACK_NS:
                     raise GotoError(f'position sample is {-age / 1e9:.3f} s in the future')
+                if type(rec.get('map_raw')) is not int:
+                    raise GotoError(f'position map_raw missing or not an integer: {rec.get("map_raw")!r}')
                 values = list(rec.get('xyz') or []) + [rec.get('player_yaw_rad')]
                 if len(values) != 4 or not all(isinstance(v, (int, float)) and math.isfinite(v) for v in values):
                     raise GotoError(f'position has nonfinite or missing values: {rec.get("xyz")}, {rec.get("player_yaw_rad")}')
@@ -70,6 +76,8 @@ class PositionReader:
                     why = f'sequence stuck at {seq}'
                 elif age > self.max_age_s * 1e9:
                     why = f'newest sample is {age / 1e9:.2f} s old at read time'
+                elif after_ns is not None and sampled < after_ns:
+                    why = f'newest sample predates the command by {(after_ns - sampled) / 1e9:.2f} s'
                 else:
                     self.last_seq = seq
                     return rec
@@ -95,14 +103,17 @@ def goto(reader, stick, target, tol=1.0, settle_s=0.6, measure_s=0.6, slice_s=0.
          stall_slices=8, clock=time.monotonic):
     """stick(lx, ly) holds the left stick (0..255, 128 neutral; ly=0 is forward) until the next call;
     stick(None, None) releases it. The player turns toward the stick before moving, so directions are
-    measured only after settle_s of a continuous hold. target: (x, z) world units (xyz[0], xyz[2]).
-    The stick is released on every exit path."""
+    measured only after settle_s of a continuous hold, from samples taken after the command (fresh
+    after_ns). target: (x, z) world units (xyz[0], xyz[2]). The stick is released on every exit path.
+    Calibration walks about 2 x 1.2 s unattended (forward, then right): start a goto on open ground,
+    away from ledges (a calibration walked off the Central Yharnam lamp-yard balcony, COMBAT-2)."""
     def measure(lx, ly, map0):
         stick(lx, ly)
+        t = reader.mono_ns()
         time.sleep(settle_s)
-        a = reader.fresh()
+        a = reader.fresh(after_ns=t + int(settle_s * 1e9))
         time.sleep(measure_s)
-        b = reader.fresh()
+        b = reader.fresh(after_ns=a['sample_monotonic_ns'] + int(measure_s * 1e9))
         for rec in (a, b):
             if rec['map_raw'] != map0:
                 raise GotoError('map changed during calibration')
@@ -132,8 +143,9 @@ def goto(reader, stick, target, tol=1.0, settle_s=0.6, measure_s=0.6, slice_s=0.
             rel = want - heading
             mag = 1.0 if dist > 3 * tol else 0.6       # slower near the target to avoid overshoot
             stick(round(128 + 127 * mag * math.sin(-m * rel)), round(128 - 127 * mag * math.cos(rel)))
+            t = reader.mono_ns()
             time.sleep(slice_s)
-            rec = reader.fresh()
+            rec = reader.fresh(after_ns=t)
             if rec['map_raw'] != map0:
                 raise GotoError('map changed during goto')
             nxt = planar(rec)

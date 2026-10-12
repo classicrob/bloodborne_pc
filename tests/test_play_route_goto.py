@@ -133,6 +133,27 @@ class GotoTest(unittest.TestCase):
         with self.assertRaisesRegex(goto.GotoError, 'nonfinite'):
             self.reader(w).fresh()
 
+    def test_sample_before_the_command_is_not_used(self):
+        # Opus-GS's probe: fresh by age (0.2 s old, max 1 s) but taken before the stick command
+        w = World(self.path, 0.0, 1, 4.0); r = self.reader(w)
+        command = goto.monotonic_ns()
+        w.write(sampled_ago_ns=200_000_000)
+        with self.assertRaisesRegex(goto.GotoError, 'predates the command'):
+            r.fresh(timeout_s=0.3, after_ns=command)
+        w.write()                                 # a sample taken after the command is accepted
+        self.assertEqual(r.fresh(after_ns=command)['sequence'], w.seq)
+
+    def test_missing_map_or_identity_stops(self):
+        w = World(self.path, 0.0, 1, 4.0)
+        rec = json.loads(open(self.path).read()); del rec['map_raw']
+        with open(self.path, 'w') as f:
+            f.write(json.dumps(rec))
+        with self.assertRaisesRegex(goto.GotoError, 'map_raw'):
+            self.reader(w).fresh()
+        w = World(self.path, 0.0, 1, 4.0, run_id='')
+        with self.assertRaisesRegex(goto.GotoError, 'lacks run_id'):
+            self.reader(w).fresh()
+
     def test_stuck_sequence_stops(self):
         w = World(self.path, 0.0, 1, 4.0)       # no publisher thread: the sequence never advances
         with self.assertRaisesRegex(goto.GotoError, 'sequence stuck'):
