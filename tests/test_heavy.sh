@@ -79,6 +79,8 @@ assert starts and sys.argv[3] in starts[-1]['held'], starts
 PY
 }
 ticks() { wc -l < "$1" | tr -d ' '; }
+# A loop's pid is the OLDEST process with its command line (pgrep -o): each iteration forks a child
+# that carries the same command line for an instant before it execs sleep.
 grew() {  # grew FILE: FILE (a job's tick log) grows within 60 s
     local before; before=$(ticks "$1")
     for _ in $(seq 600); do (( $(ticks "$1") > before )) && return 0; sleep 0.1; done
@@ -342,7 +344,7 @@ kill "$b12" 2>/dev/null; wait "$b12" 2>/dev/null || true; pkill -f "$dir/b12" 2>
 "$heavy" B13 -- sh -c "while :; do echo t >> '$dir/b13'; sleep 0.2; done" &
 b13=$!
 wait_for "B13 never ran" test -s "$dir/b13"
-b13_loop=$(pgrep -f "^sh -c while :; do echo t >> '$dir/b13'" || true)
+b13_loop=$(pgrep -o -f "^sh -c while :; do echo t >> '$dir/b13'" || true)
 [[ -n $b13_loop ]] || fail "B13's loop not found"
 kill -STOP "$b13_loop"
 "$heavy" --pool playtest --gpu exclusive --cpu-quiet P12 -- sh -c "$(hold "grep -q 'paused B13' '$dir/p12.err'")" \
@@ -381,7 +383,7 @@ gone() { ! kill -0 "$1" 2>/dev/null; }
 BB_HEAVY_POLITE=0 "$heavy" B15 -- sh -c "while :; do echo t >> '$dir/b15'; sleep 0.2; done" 2> "$dir/b15.err" &
 b15=$!
 wait_for "B15 never ran" test -s "$dir/b15"
-b15_loop=$(pgrep -f "^sh -c while :; do echo t >> '$dir/b15'" || true)
+b15_loop=$(pgrep -o -f "^sh -c while :; do echo t >> '$dir/b15'" || true)
 [[ -n $b15_loop ]] || fail "B15's loop not found"
 normal=$(pri "$b15_loop")
 (( normal > 4 )) || fail "B15 started in the background already (priority $normal)"
@@ -414,7 +416,7 @@ BB_HEAVY_POLITE=0 "$heavy" B17 -- ninja -C "$dir/nj" -j1 a b > /dev/null 2>&1 &
 b17=$!
 until_held build0 B17
 b17_ninja=''
-ninja_job_running() { b17_ninja=$(pgrep -f "^ninja -C $dir/nj" | head -1 || true); [[ -n $b17_ninja ]] && pgrep -P "$b17_ninja" > /dev/null; }
+ninja_job_running() { b17_ninja=$(pgrep -o -f "^ninja -C $dir/nj" || true); [[ -n $b17_ninja ]] && pgrep -P "$b17_ninja" > /dev/null; }
 wait_for "B17's ninja never started its first job" ninja_job_running
 "$heavy" --pool playtest --gpu exclusive --cpu-quiet=ecore P16 -- sh -c "$(hold "[ -e '$dir/p16-release' ]")" 2> /dev/null &
 p16=$!
@@ -422,7 +424,7 @@ wait_for "B17's ninja not demoted" pri_is "$b17_ninja" 4
 touch "$dir/nj/a-go"
 job_b_running() { pgrep -f "wait.sh $dir/nj/b-go" > /dev/null; }
 wait_for "ninja never started job b" job_b_running
-job_b=$(pgrep -f "wait.sh $dir/nj/b-go" | head -1)
+job_b=$(pgrep -o -f "wait.sh $dir/nj/b-go")
 [[ $(pri "$job_b") == 4 ]] || fail "a job ninja spawned during the E-core quiet is not in the background (priority $(pri "$job_b"))"
 touch "$dir/nj/b-go" "$dir/p16-release"
 wait "$p16" || fail "P16 failed"
@@ -433,7 +435,7 @@ wait "$b17" || fail "B17 (ninja) failed"
 BB_HEAVY_POLITE=0 "$heavy" B18 -- sh -c "(sh -c 'while :; do echo t >> $dir/b18; sleep 0.2; done' &); while :; do sleep 0.5; done" &
 b18=$!
 wait_for "B18 never ran" test -s "$dir/b18"
-orphan=$(pgrep -f "^sh -c while :; do echo t >> $dir/b18" || true)
+orphan=$(pgrep -o -f "^sh -c while :; do echo t >> $dir/b18" || true)
 [[ -n $orphan && $(ps -o ppid= -p "$orphan" | tr -d ' ') == 1 ]] || fail "B18's loop is not an orphan (pid '$orphan')"
 "$heavy" --pool playtest --gpu exclusive --cpu-quiet P21 -- sh -c "
     $(hold "grep -q 'paused B18' '$dir/p21.err'")
@@ -458,7 +460,7 @@ for pool in build quick; do
         sh -c "while :; do echo t >> '$dir/$tag'; sleep 0.2; done" 2> /dev/null &
     launcher=$!
     wait_for "K20$pool's command never ran" test -s "$dir/$tag"
-    loop=$(pgrep -f "^sh -c while :; do echo t >> '$dir/$tag'" || true)
+    loop=$(pgrep -o -f "^sh -c while :; do echo t >> '$dir/$tag'" || true)
     [[ -n $loop ]] || fail "K20$pool's command not found"
     kill -KILL -- -"$launcher"
     wait_for "$pool job's command survived a SIGKILL to the caller's group" gone "$loop"
@@ -471,7 +473,7 @@ done
 "$heavy" --priority B19 -- sh -c "while :; do echo t >> '$dir/b19'; sleep 0.2; done" 2> /dev/null &
 b19=$!
 wait_for "B19 never ran" test -s "$dir/b19"
-b19_loop=$(pgrep -f "^sh -c while :; do echo t >> '$dir/b19'" || true)
+b19_loop=$(pgrep -o -f "^sh -c while :; do echo t >> '$dir/b19'" || true)
 [[ -n $b19_loop ]] || fail "B19's loop not found"
 b19_before="$(ps -o pri=,nice= -p "$b19_loop" | tr -s ' ')"
 "$heavy" --pool playtest --gpu exclusive --cpu-quiet=ecore P23 -- sh -c "$(hold "[ -e '$dir/p23-release' ]")" 2> /dev/null &
