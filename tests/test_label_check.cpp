@@ -22,6 +22,7 @@
 #include "bbport_label_mode.h"
 #include "bbport_label_store.h"
 #include "bbport_parse_split.h"
+#include "bbport_write_order.h"
 #include "bbport_compute_sh.h"
 #include "bbport_frame_marks.h"
 #include "bbport_label_sequencer.h"
@@ -657,6 +658,33 @@ int main() {
                    line.find("labels written 1.0 per frame, issue to write 2000 us mean, 3000 us "
                              "max") != std::string::npos &&
                    flush_reason == FOther);
+    }
+
+    {
+        // WRITE_DATA ordering (bbport_write_order.h): no forwarded wait, nothing to wait for; a
+        // forwarded wait raises the barrier to the issue count then; it never goes back.
+        const bool none = BbWriteOrder::Required() == 0;
+        BbWriteOrder::NoteForwardedWait(7);
+        const bool raised = BbWriteOrder::Required() == 7;
+        BbWriteOrder::NoteForwardedWait(5); // an older count, e.g. a concurrent late store
+        const bool monotonic = BbWriteOrder::Required() == 7;
+        BbWriteOrder::NoteForwardedWait(9);
+        Expect("write order: a forwarded WAIT_REG_MEM keeps later WRITE_DATA behind its labels; "
+               "the barrier only rises",
+               none && raised && monotonic && BbWriteOrder::Required() == 9);
+        {
+            using namespace BbSplit;
+            DeferredSite outer{KDeferredWriteData};
+            const bool set = deferred_site == KDeferredWriteData;
+            {
+                DeferredSite inner{KDeferredFlip};
+                Expect("  ... deferred-signal waits are charged to their named site, nesting "
+                       "restored",
+                       set && deferred_site == KDeferredFlip);
+            }
+            Expect("  ... (outer site back)", deferred_site == KDeferredWriteData);
+        }
+        Expect("  ... (default site back)", BbSplit::deferred_site == BbSplit::KDeferred);
     }
 
     std::fprintf(stderr, "%s: %u failures\n", failures ? "FAIL" : "PASS", failures);

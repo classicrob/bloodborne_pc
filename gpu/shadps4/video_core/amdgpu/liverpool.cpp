@@ -41,6 +41,7 @@
 #include "bbport_compute_sh.h"
 #include "bbport_frame_marks.h"
 #include "bbport_parse_split.h"
+#include "bbport_write_order.h"
 #include "bbport_pass_census.h"
 #include "video_core/amdgpu/pm4_cmds.h"
 #include "video_core/renderdoc.h"
@@ -1037,6 +1038,7 @@ void RunDmaData(Vulkan::Rasterizer& rasterizer, const u8* data) {
 void SignalFlip(Vulkan::Rasterizer& rasterizer, const u8*) {
 #ifdef __APPLE__
     rasterizer.DrawBisectOnFlip();
+    BbSplit::DeferredSite site{BbSplit::KDeferredFlip};
 #endif
     rasterizer.WaitDeferredSignals();
     Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxFlip);
@@ -1048,7 +1050,24 @@ void RunWriteData(Vulkan::Rasterizer& rasterizer, const u8* data) {
     // Copies deferred to the recording thread, and fences deferred to it (RecorderFences),
     // precede writes the guest sees.
     rasterizer.WaitHostCopies();
+#ifdef __APPLE__
+    if (Vulkan::Scheduler::LabelsAtGpuComplete() &&
+        !BbToggle::Disabled(BbToggle::WriteDataAfterLabels)) {
+        // ME-time order (the CP writes WRITE_DATA when it parses it, ahead of the pipeline):
+        // after the recorder-side writes, not after end-of-pipe labels still waiting for the GPU,
+        // except the ones an earlier WAIT_REG_MEM met early stands for (bbport_write_order.h).
+        rasterizer.WaitRecorderSignals();
+        if (const u64 waited_for = BbWriteOrder::Required()) {
+            BbSplit::DeferredSite site{BbSplit::KDeferredWriteData};
+            rasterizer.WaitDeferredSignalsThrough(waited_for);
+        }
+    } else {
+        BbSplit::DeferredSite site{BbSplit::KDeferredWriteData};
+        rasterizer.WaitDeferredSignals();
+    }
+#else
     rasterizer.WaitDeferredSignals();
+#endif
     BbWriteLog::Note(write_data->Address<u64>(), write_data->data,
                      (header->type3.count.Value() - 2) * sizeof(u32), BbWriteLog::WriteData);
 #ifdef __APPLE__
@@ -2141,6 +2160,13 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                                !BbToggle::Disabled(BbToggle::PendingFenceWaits) &&
                                PendingFenceValue(wait_reg_mem->Address<VAddr>(), value) &&
                                wait_reg_mem->TestValue(value)) {
+#ifdef __APPLE__
+                    // Met early from a pending value: later WRITE_DATAs stay behind the label,
+                    // as the CP's wait would keep them (bbport_write_order.h).
+                    if (rasterizer) {
+                        BbWriteOrder::NoteForwardedWait(rasterizer->DeferredSignalsIssued());
+                    }
+#endif
                     break;
                 }
                 // Else the value may come from a fence that thread has yet to write: let it

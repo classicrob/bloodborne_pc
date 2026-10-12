@@ -102,6 +102,8 @@ enum K : std::uint32_t {
     KEncRendering,   ///< recorder: vkCmdBeginRendering / vkCmdEndRendering
     KEncBarrier,     ///< recorder: pipeline barriers from Runtime::FlushBarriers
     KEncCopy,        ///< recorder: copies, fills, clears (Runtime)
+    KDeferredWriteData, ///< deferred-signal waits before an in-order WRITE_DATA (RunWriteData)
+    KDeferredFlip,      ///< deferred-signal waits before a flip's interrupt (SignalFlip)
     KCount
 };
 inline constexpr const char* k_names[KCount] = {
@@ -111,7 +113,28 @@ inline constexpr const char* k_names[KCount] = {
     "queue submit", "image refresh", "texel sync (image tiled to memory)", "pipeline build wait", "descriptor build",
     "dynamic state", "barrier flush", "render pass switch", "encode pipeline bind",
     "encode descriptors", "encode draws", "encode dispatches", "encode rendering begin/end",
-    "encode barriers", "encode copies"};
+    "encode barriers", "encode copies", "deferred signals before WRITE_DATA",
+    "deferred signals before a flip"};
+
+/// The scope kind WaitDeferredSignals charges on this thread (KDeferred unless a caller names
+/// its site).
+inline thread_local K deferred_site = KDeferred;
+
+/// Names the caller of the WaitDeferredSignals calls in its lifetime.
+class DeferredSite {
+public:
+    explicit DeferredSite(K site) : previous{deferred_site} {
+        deferred_site = site;
+    }
+    ~DeferredSite() {
+        deferred_site = previous;
+    }
+    DeferredSite(const DeferredSite&) = delete;
+    DeferredSite& operator=(const DeferredSite&) = delete;
+
+private:
+    K previous;
+};
 
 /// Why the draw scheduler submitted (Flush census, docs/macos/parse-split.md).
 enum F : std::uint32_t {

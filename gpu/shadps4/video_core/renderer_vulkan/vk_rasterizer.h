@@ -195,6 +195,18 @@ public:
 #endif
         scheduler.WaitDeferredSignals();
     }
+    /// As WaitDeferredSignals, for the first `issued` deferred signals only.
+    void WaitDeferredSignalsThrough(u64 issued) {
+#ifdef __APPLE__
+        if (DrawPipe::OnStageB()) {
+            scheduler.FlushLabels(true);
+        }
+#endif
+        scheduler.WaitDeferredSignalsThrough(issued);
+    }
+    [[nodiscard]] u64 DeferredSignalsIssued() const noexcept {
+        return scheduler.DeferredSignalsIssued();
+    }
     /// Runs `signal` after the guest memory copies issued so far, without waiting here.
     void SignalAfterHostCopies(std::function<void()> signal) {
         scheduler.SignalAfterHostCopies(std::move(signal));

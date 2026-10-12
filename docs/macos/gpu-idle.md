@@ -252,6 +252,30 @@ the two modes never reorder labels. The switch is logged as
 `Labels at GPU completion: ON|OFF at <UTC time> (switched; ...)`. One run can therefore alternate
 the modes, say every 60 s, and compare its halves under the same load, cache and location.
 
+### In-order WRITE_DATA: ME-time order (default; toggle bit 63 restores the old wait)
+
+Before this change, a WRITE_DATA run in order on the draw recording thread (RunWriteData) first
+waited for **every earlier deferred signal**. With labels at GPU completion that is every earlier
+EOP/EOS/RELEASE_MEM label, i.e. GPU completion. That rule is stricter than the PS4: there the CP
+writes WRITE_DATA when it parses it, ahead of the pipeline, and earlier end-of-pipe labels may land
+after it. In the async A/B the stall was 20-34 ms per frame of stage B.
+
+Now, with labels at GPU completion, a WRITE_DATA waits for what is ordered before it at ME time:
+- the host copies (as before);
+- the recorder-side writes (WaitRecorderSignals);
+- **and the labels behind any WAIT_REG_MEM that stage A met early** from a pending fence value
+  (PendingFenceValue). On the PS4 that WAIT would have blocked the CP until the label landed, so a
+  later WRITE_DATA must not pass it. The guest has such pairs (EOS/EOP L=1 then WAIT_REG_MEM L==1,
+  0x26b08e0 / 0x26b09e0, Astra-2's deferred-signal audit). Stage A records the deferred signals
+  issued at each such wait (gpu/shim/bbport_write_order.h); a WRITE_DATA waits through that count.
+  The count only rises, so a WRITE_DATA may wait for a later barrier than its own position needed:
+  longer, never shorter.
+
+A WRITE_DATA before a later completion label stays visible first: it is written when stage B runs
+it, the label only at GPU completion. Toggle bit 63 (WriteDataAfterLabels) restores the old wait
+live, for the A/B; with labels at submit (bit 59) nothing changes. The parse split charges these
+waits to their own kinds, "deferred signals before WRITE_DATA" and "deferred signals before a flip".
+
 ## Flip publication at GPU retirement (the default on Apple)
 
 A flip tells the guest that its previous display buffer may be reused. That means the flip

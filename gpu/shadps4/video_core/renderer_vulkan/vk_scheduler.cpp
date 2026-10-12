@@ -398,13 +398,18 @@ bool Scheduler::WaitQuiescentForCapture(std::chrono::milliseconds limit, std::st
 #endif
 
 void Scheduler::WaitDeferredSignals() {
-    const u64 issued = deferred_signals_issued.load(std::memory_order_relaxed);
+    WaitDeferredSignalsThrough(deferred_signals_issued.load(std::memory_order_relaxed));
+}
+
+void Scheduler::WaitDeferredSignalsThrough(u64 issued) {
     if (deferred_signals_done->load(std::memory_order_acquire) >= issued ||
         BbToggle::Disabled(BbToggle::OrderedGuestWrites)) {
         return;
     }
     BbStats::WaitTimer timer{BbStats::deferred_signals_wait_ns};
-    BB_SPLIT_SCOPE(KDeferred);
+#ifdef __APPLE__
+    BbSplit::Scope split_scope{BbSplit::deferred_site}; // by site (RunWriteData, SignalFlip)
+#endif
     KickRecording(true);
     while (deferred_signals_done->load(std::memory_order_acquire) < issued) {
         // Helps the copy threads the signals wait for.
