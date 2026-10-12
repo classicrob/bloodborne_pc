@@ -53,8 +53,7 @@ int main() {
         u32 mode;
     };
     static_assert(sizeof(Params)==140); // over 128: the device must offer it (CameraMotion)
-    assert(instance.GetPhysicalDevice().getProperties().limits.maxPushConstantsSize>=
-           sizeof(Params));
+    assert(instance.MaxPushConstantsSize()>=sizeof(Params));
     const vk::PushConstantRange push{vk::ShaderStageFlagBits::eCompute,0,sizeof(Params)};
     auto layout=device.createPipelineLayoutUnique({.setLayoutCount=1,.pSetLayouts=&*descriptors,
         .pushConstantRangeCount=1,.pPushConstantRanges=&push},nullptr,d).value;

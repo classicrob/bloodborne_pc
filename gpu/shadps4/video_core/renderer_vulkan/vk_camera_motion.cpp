@@ -68,10 +68,9 @@ CameraMotion::CameraMotion(const Instance& instance_, Scheduler& scheduler_,
     for_upscaler = !(upscaler && std::strcmp(upscaler, "none") == 0);
     const auto device = instance.GetDevice();
     // Above Vulkan's guaranteed 128 bytes (the two scene viewports).
-    const u32 max_push = instance.GetPhysicalDevice().getProperties().limits.maxPushConstantsSize;
-    ASSERT_MSG(max_push >= sizeof(PushConstants),
+    ASSERT_MSG(instance.MaxPushConstantsSize() >= sizeof(PushConstants),
                "camera motion needs {} bytes of push constants, the device offers {}",
-               sizeof(PushConstants), max_push);
+               sizeof(PushConstants), instance.MaxPushConstantsSize());
     if (for_upscaler) {
         const std::array<vk::DescriptorSetLayoutBinding, 3> motion_bindings = {{
             {.binding = 0,
