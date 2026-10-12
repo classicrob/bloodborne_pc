@@ -425,7 +425,8 @@ bool PrintOf(const VideoCore::CapturedImage& image, ImageKey& key, ImagePrint& p
     return true;
 }
 
-/// The fields of two captures of one image that differ ("" when none).
+/// The fields of two captures of one image that differ ("" when none). The uids are identities a
+/// fresh cache assigns anew; they are compared through the uid mapping instead (depth links).
 std::string Differences(const ImagePrint& a, const ImagePrint& b) {
     std::string out;
     const auto add = [&](const char* name) { out += out.empty() ? name : fmt::format(", {}", name); };
@@ -437,8 +438,6 @@ std::string Differences(const ImagePrint& a, const ImagePrint& b) {
     if (s.num_mip_hashes != t.num_mip_hashes ||
         std::memcmp(s.mip_hashes, t.mip_hashes, sizeof(s.mip_hashes))) add("mip hashes");
     if (s.tracked != t.tracked) add("tracking");
-    if (s.image_uid != t.image_uid) add("image uid");
-    if (s.depth_uid != t.depth_uid) add("depth uid");
     if (s.hash != t.hash) add("hash");
     if (a.aspects.size() != b.aspects.size()) {
         add("aspect count");
@@ -548,12 +547,37 @@ bool RestoreImagesChecked(AmdGpu::Liverpool& lp, const std::filesystem::path& di
         return false;
     }
     std::vector<std::string> diffs;
+    std::map<std::string, u64> by_field;
+    std::map<u64, u64> uid_map; // captured uid -> restored uid
     for (const auto& [key, print] : captured) {
         const auto it = again.find(key);
         if (it == again.end()) {
             diffs.push_back(fmt::format("image {:#x}: missing after restore", key.first));
-        } else if (const std::string d = Differences(print, it->second); !d.empty()) {
+            ++by_field["missing"];
+            continue;
+        }
+        if (!uid_map.emplace(print.state.image_uid, it->second.state.image_uid).second) {
+            diffs.push_back(fmt::format("image {:#x}: captured uid {} recorded twice", key.first,
+                                        print.state.image_uid));
+            ++by_field["duplicate uid"];
+        }
+        if (const std::string d = Differences(print, it->second); !d.empty()) {
             diffs.push_back(fmt::format("image {:#x}: {} differ", key.first, d));
+            ++by_field[d];
+        }
+    }
+    // Depth links: the restored image's depth uid must be the restored uid of the captured link.
+    for (const auto& [key, print] : captured) {
+        const auto it = again.find(key);
+        if (it == again.end() || (!print.state.depth_uid && !it->second.state.depth_uid)) {
+            continue;
+        }
+        const auto mapped = uid_map.find(print.state.depth_uid);
+        if (!print.state.depth_uid || mapped == uid_map.end() ||
+            mapped->second != it->second.state.depth_uid) {
+            diffs.push_back(fmt::format("image {:#x}: depth link {} -> {} after restore", key.first,
+                                        print.state.depth_uid, it->second.state.depth_uid));
+            ++by_field["depth link"];
         }
     }
     for (const auto& [key, print] : again) {
@@ -565,7 +589,11 @@ bool RestoreImagesChecked(AmdGpu::Liverpool& lp, const std::filesystem::path& di
         diffs.push_back("the metadata surfaces differ");
     }
     if (!diffs.empty()) {
-        why = fmt::format("the image round trip is not exact ({} differences):", diffs.size());
+        why = fmt::format("the image round trip is not exact ({} differences; by kind:", diffs.size());
+        for (const auto& [field, n] : by_field) {
+            why += fmt::format(" {} x{};", field, n);
+        }
+        why += ")";
         for (size_t i = 0; i < diffs.size() && i < 16; ++i) {
             why += "\n  " + diffs[i];
         }
