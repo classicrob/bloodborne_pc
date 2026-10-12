@@ -1,7 +1,7 @@
 # Live player-position probe: feasibility
 
 Status: source-qualified candidate for a read-only, opt-in navigation observer.
-No game run, coordinate/yaw calibration, or publisher implementation is claimed.
+The publisher is implemented below; game observation and coordinate/yaw calibration remain pending.
 Astra-2 owns the runtime observer; Playtest owns the route controller.
 
 ## Source and address spaces

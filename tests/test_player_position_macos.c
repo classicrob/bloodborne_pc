@@ -35,11 +35,18 @@ static char *read_output(void) {
     size_t n=fread(text,1,sizeof(text)-1,f); text[n]=0;
     assert(!ferror(f)); assert(fclose(f)==0); return text;
 }
-static void expect_stop(void (*fn)(void)) {
+static void expect_stop(void (*fn)(void),const char *message) {
+    int fds[2]; assert(pipe(fds)==0);
     pid_t p=fork(); assert(p>=0);
-    if (!p) { fn(); _Exit(0); }
+    if (!p) { close(fds[0]); assert(dup2(fds[1],STDERR_FILENO)>=0); close(fds[1]); fn(); _Exit(0); }
+    close(fds[1]);
+    char text[4096]; size_t used=0; ssize_t n;
+    while ((n=read(fds[0],text+used,sizeof(text)-1-used))>0) used+=(size_t)n;
+    text[used]=0; close(fds[0]);
     int status; assert(waitpid(p,&status,0)==p);
     assert(WIFEXITED(status) && WEXITSTATUS(status)==23);
+    assert(strstr(text,message));
+    printf("PASS: refusal reason %s\n",message);
 }
 static void bad_guard(void) { setenv("BB_PLAYER_POS_FILE",output,1); runtime_player_position_init(0,0); }
 static void bad_path(void) { setenv("BB_PLAYER_POS_FILE","relative",1); runtime_player_position_init(0,0); }
@@ -72,10 +79,15 @@ int main(int argc,char **argv) {
     setup(); assert(player_observe(fake_read,NULL,IMAGE,&o)==PLAYER_OK);
     player_publish(PLAYER_OK,&o,player_now());
     char *text=read_output(); assert(strstr(text,"\"valid\":true") && strstr(text,"\"sequence\":1") && strstr(text,"\"xyz\":["));
+    puts(text);
     player_publish(PLAYER_ABSENT,&o,player_now());
     text=read_output(); assert(strstr(text,"\"valid\":false") && strstr(text,"\"sequence\":2") && !strstr(text,"\"xyz\""));
     assert(strstr(text,"sample_monotonic_ns") && strstr(text,"run_id") && strstr(text,"pad_reads"));
-    expect_stop(bad_guard); expect_stop(bad_path); expect_stop(bad_file); expect_stop(bad_sample);
+    puts(text);
+    expect_stop(bad_guard,"unsupported image: player position code guard failed");
+    expect_stop(bad_path,"requires an absolute bounded path");
+    expect_stop(bad_file,"cannot create output temporary file");
+    expect_stop(bad_sample,"PLAYER-POS STOP: unreadable-player-chain");
     text=read_output(); assert(strstr(text,"unreadable-player-chain") && !strstr(text,"\"xyz\""));
     /* Real self-read over a sparse fake image, exercising the production sampler. */
     size_t n=0x553f000;
