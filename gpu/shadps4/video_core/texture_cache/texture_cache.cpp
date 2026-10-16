@@ -805,11 +805,13 @@ void TextureCache::MarkAsMaybeDirty(ImageId image_id, Image& image) {
 
 void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
     std::scoped_lock lock{mutex};
-#ifdef __APPLE__
-    InvalidateBc4FloatRange(addr, size);
-#endif
     const auto pages_start = PageManager::GetPageAddr(addr);
     const auto pages_end = PageManager::GetNextPageAddr(addr + size - 1);
+#ifdef __APPLE__
+    // Unprotecting a shared page permits later writes anywhere on that page without a
+    // second fault. A linked parent therefore loses backing freshness on page overlap.
+    InvalidateBc4FloatRange(pages_start, pages_end - pages_start);
+#endif
     ForEachImageInRegion(pages_start, pages_end - pages_start, [&](ImageId image_id, Image& image) {
         const auto image_begin = image.info.guest_address;
         const auto image_end = image.info.guest_address + image.info.guest_size;
@@ -1477,6 +1479,7 @@ ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc, Vi
         ValidateFloatParent(*expected);
         if (desc.type == BindingType::Storage) {
             image.bc4_float_pending = true;
+            image.flags |= ImageFlagBits::GpuModified;
             slot_images[relation->parent.parent_id].bc4_float_pending = true;
         }
         refresh = false;
@@ -1494,6 +1497,9 @@ ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc, Vi
     }
 #endif
     if (desc.type == BindingType::Storage) {
+#ifdef __APPLE__
+        if (!image.bc4_float_companion)
+#endif
         image.flags |= ImageFlagBits::GpuModified;
         if (
 #ifdef __APPLE__
