@@ -26,6 +26,9 @@ EXCLUDED = {
                               'from a local game asset',
     'tests/test_buffer_bounds_benchmark.cpp': 'benchmark (buffer-bounds-benchmark target): timings, '
                                               'no pass/fail; the bounds behaviour is buffer-bounds-test',
+    'tests/test_bc4_integer_copy.cpp': 'manual BC4/integer-copy hardware capability probe; '
+                                        'the optional target requires ordinary and three mutation '
+                                        'device arms before it can become an automatic gate',
     'tests/macos_gs/bench/': 'design measurement of the render-pass split cost (docs/macos/'
                              'geometry-shaders.md): timings, no pass/fail',
     'tests/macos_spike/run.sh': 'the original Rosetta feasibility spike (historical); the TLS and HLE '
