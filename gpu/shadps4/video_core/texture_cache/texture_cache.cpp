@@ -286,7 +286,8 @@ void TextureCache::MaterializeBc4AliasesAfterCommand() {
     SCOPE_EXIT { materializing = false; };
     runtime.BeforeImageAccess();
     for (const auto [id, uid] : pending) {
-        Vulkan::StagingBufferRef download;
+        Image* pinned_image{};
+        vk::BufferImageCopy region{};
         VAddr address{};
         u64 bytes{};
         {
@@ -295,31 +296,35 @@ void TextureCache::MaterializeBc4AliasesAfterCommand() {
                            bc4_alias_images.contains(id), "BC4 image retired before readback");
             auto& image = slot_images[id];
             ASSERT_MSG(image.SafeToDownload(), "BC4 authority changed before readback");
+            pinned_image = &image;
             address = image.info.guest_address;
             bytes = image.info.guest_size;
-            // A deferred allocation cannot be reused while Finish runs pending operations.
-            download = runtime.GetStagingPool().Request(bytes, MemoryType::HostCached,
-                                                       instance.StorageMinAlignment(), true);
-            vk::BufferImageCopy region{
+            region = vk::BufferImageCopy{
                 .bufferRowLength = image.info.pitch,
                 .bufferImageHeight = image.info.size.height,
                 .imageSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
                 .imageExtent = {image.info.size.width, image.info.size.height, 1}};
-            // TileImage normalizes compressed pitch/height into blocks and uses the actual
-            // guest layout; a raw image download would corrupt tile13 backing bytes.
-            tile_manager.TileImage(image, std::span{&region, 1}, download.buffer, download.offset);
-            runtime.FlushBarriers();
-            scheduler.Record([](vk::CommandBuffer cmd) {
-                const vk::MemoryBarrier2 barrier{
-                    .srcStageMask = vk::PipelineStageFlagBits2::eCopy |
-                                    vk::PipelineStageFlagBits2::eComputeShader,
-                    .srcAccessMask = vk::AccessFlagBits2::eTransferWrite |
-                                     vk::AccessFlagBits2::eShaderWrite,
-                    .dstStageMask = vk::PipelineStageFlagBits2::eHost,
-                    .dstAccessMask = vk::AccessFlagBits2::eHostRead};
-                cmd.pipelineBarrier2({.memoryBarrierCount = 1, .pMemoryBarriers = &barrier});
-            });
         }
+        // The joined helper and Stage-B/VM mutation exclusion keep this active image alive.
+        // TileImage's parameter stream can wait or flush when it wraps, so recording as
+        // well as the final Finish must run without the texture mutex or a VMA lock.
+        // A deferred allocation cannot be reused while Finish runs pending operations.
+        const auto download = runtime.GetStagingPool().Request(
+            bytes, MemoryType::HostCached, instance.StorageMinAlignment(), true);
+        // TileImage normalizes compressed pitch/height into blocks and uses the actual
+        // guest layout; a raw image download would corrupt tile13 backing bytes.
+        tile_manager.TileImage(*pinned_image, std::span{&region, 1}, download.buffer, download.offset);
+        runtime.FlushBarriers();
+        scheduler.Record([](vk::CommandBuffer cmd) {
+            const vk::MemoryBarrier2 barrier{
+                .srcStageMask = vk::PipelineStageFlagBits2::eCopy |
+                                vk::PipelineStageFlagBits2::eComputeShader,
+                .srcAccessMask = vk::AccessFlagBits2::eTransferWrite |
+                                 vk::AccessFlagBits2::eShaderWrite,
+                .dstStageMask = vk::PipelineStageFlagBits2::eHost,
+                .dstAccessMask = vk::AccessFlagBits2::eHostRead};
+            cmd.pipelineBarrier2({.memoryBarrierCount = 1, .pMemoryBarriers = &barrier});
+        });
         // Neither the texture mutex nor a VMA read/write lock may span this wait.
         scheduler.Finish();
         download.Invalidate();

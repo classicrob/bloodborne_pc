@@ -25,9 +25,12 @@ execute. A converted-image registry survives ResetBindings. Actual command-exit
 hooks materialize any pending converted images: preflight every marked layout and
 authority, copy/retile through TileManager into held staging, transfer/compute to
 host barrier, Finish, invalidate, exact TryWriteBacking, then clear GPU authority.
-No texture or VMA lock is held across Finish, and image UID/authority is checked
-again after it. No pending converted image means no submission or wait. This is a
-conservative correctness path, with no speedup claim.
+No texture or VMA lock is held across tiling/recording or Finish: the tiling
+parameter stream can itself wait on wrap. After joining the binding helper, the
+Stage-B/VM mutation protocol keeps the selected active image alive outside the
+texture lock; image UID/authority is checked again before publication. No pending
+converted image means no submission or wait. This is a conservative correctness
+path, with no speedup claim.
 
 The guarantee is publication before command recording completion and later ordered
 labels/fences/flip; it does not promise visibility to unsynchronized CPU reads
@@ -36,6 +39,14 @@ work is drained and its helper joined, all marked authority is materialized, all
 converted images are evicted, then Finish/PopPendingOperations retire the deferred
 resources. This prevents later mapping aliases from inheriting stale image state.
 No synchronous work is added to ResetBindings or submission/retirement callbacks.
+
+Stage A classifies potential admitted integer-image writes from the selected
+stage descriptors, including ES/GS stages. After committing the producer packet,
+it records the producer-end cursor and byte ranges. Before the next draw/dispatch
+pipeline selection, any outstanding candidate producer is drained, so SRT walkers,
+fetch/tessellation reads and prepared-data revalidation see published backing.
+No candidate or an already consumed producer adds no drain. The range notes also
+cover parser-read overlap checks; ordinary buffer-write tracking is unchanged.
 
 ## Evidence and remaining validation
 
