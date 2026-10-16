@@ -6,6 +6,15 @@
 
 #include <cerrno>
 #include <cstdint>
+#include <atomic>
+#include "bbport_replay_active.h"
+
+namespace {
+std::atomic<bool> measurement_active{false};
+}
+namespace BbReplay {
+bool MeasurementActive() { return measurement_active.load(std::memory_order_acquire); }
+}
 
 #ifdef __APPLE__
 
@@ -276,7 +285,7 @@ private:
         if (!r.Open(dir / "resets.bin", ResetsMagic, why, ResetsVersion)) {
             return false;
         }
-        if (r.records > 1000000) {
+        if (r.records > MaxResetRecords) {
             why = "resets.bin: more than 1000000 ranges";
             return false;
         }
@@ -286,7 +295,7 @@ private:
             if (!r.Get(rr, why)) {
                 return false;
             }
-            if (rr.host > 1 || !rr.bytes || rr.bytes > (256u << 20) ||
+            if (rr.host > 1 || !rr.bytes || rr.bytes > MaxResetBytes ||
                 rr.address > UINT64_MAX - rr.bytes || rr.kind < ResetKind::Written ||
                 rr.kind > ResetKind::Indirect || rr.address < previous_end) {
                 why = "resets.bin: invalid host flag, kind, size or wrapping span";
@@ -847,6 +856,10 @@ extern "C" int bbgpu_replay_run(const char* dir, unsigned iterations) {
     };
     std::vector<double> wall_ms, cpu_ms, done_ms, busy_ms;
     BbPerf::GpuTotals gpu_last = BbPerf::Totals();
+    struct MeasurementScope {
+        MeasurementScope() { measurement_active.store(true, std::memory_order_release); }
+        ~MeasurementScope() { measurement_active.store(false, std::memory_order_release); }
+    };
     for (unsigned it = 1; it <= iterations; ++it) {
         // Untimed: the previous iteration's GPU work completes before its bytes are rewritten.
         if (!QuiesceForRestore(*lp, why)) {
@@ -864,6 +877,7 @@ extern "C" int bbgpu_replay_run(const char* dir, unsigned iterations) {
             std::fprintf(stderr, "STOP: perf replay: %s\n", why.c_str());
             return 3;
         }
+        MeasurementScope measurement_scope;
         const auto t0 = std::chrono::steady_clock::now();
         for (const auto& sub : capture.submissions) {
             const u32* dcb[1] = {sub.dcb};

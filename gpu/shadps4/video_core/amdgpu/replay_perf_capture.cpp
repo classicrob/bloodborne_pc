@@ -39,7 +39,7 @@ using AmdGpu::CmdSnapshot;
 using AmdGpu::Liverpool;
 using AmdGpu::ReplayStateAccess;
 
-constexpr u64 MinFreeAfter = u64{55} << 30; // 50 GiB hard floor plus 5 GiB buffer
+constexpr u64 MinFreeAfter = u64{40} * 1000000000; // 35 GB hard floor plus 5 GB buffer
 
 /// One capture file: a FileHeader (record count patched at Close) and its records.
 class File {
@@ -476,6 +476,10 @@ bool WriteResets(const std::filesystem::path& dir, const Memory& m, ResetWalk& w
             merged.push_back(r);
         }
     }
+    if (merged.size() > MaxResetRecords) {
+        why = "more than 1000000 reset ranges";
+        return false;
+    }
     File f;
     if (!f.Open(dir / "resets.bin", ResetsMagic, why, ResetsVersion)) {
         return false;
@@ -483,7 +487,7 @@ bool WriteResets(const std::filesystem::path& dir, const Memory& m, ResetWalk& w
     std::vector<u8> value;
     count = bytes = host_count = 0;
     for (const auto& r : merged) {
-        if (r.bytes > UINT32_MAX) {
+        if (!r.bytes || r.bytes > MaxResetBytes) {
             why = fmt::format("reset range {:#x} is {} bytes", r.address, r.bytes);
             return false;
         }

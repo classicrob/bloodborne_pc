@@ -12,6 +12,8 @@
 namespace ReplayFormat {
 
 constexpr u32 Version = 2; ///< unchanged layouts for every file except resets.bin
+constexpr u64 MaxResetRecords = 1000000;
+constexpr u32 MaxResetBytes = 256u << 20;
 constexpr u32 ResetsVersion = 3; ///< named host objects; legacy allocator identity is refused
 
 struct FileHeader {

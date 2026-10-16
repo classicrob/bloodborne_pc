@@ -6,18 +6,27 @@ status, 124 after a watchdog kill."""
 import os, signal, subprocess, sys, threading, time
 log, first, quiet = sys.argv[1], float(sys.argv[2]), float(sys.argv[3])
 cmd = sys.argv[sys.argv.index('--') + 1:]
-start = time.time(); last = [None]
+start = time.monotonic(); last = [None]; overflow = threading.Event()
 with open(log, 'wb') as out:
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     def pump():
+        size = 0
         for line in iter(p.stdout.readline, b''):
-            out.write(line); out.flush(); last[0] = time.time()
+            size += len(line)
+            if size > 16 * 1024 * 1024:
+                overflow.set()
+            else:
+                out.write(line); out.flush()
+            last[0] = time.monotonic()
+        p.stdout.close()
     t = threading.Thread(target=pump, daemon=True); t.start()
     killed = None
     while p.poll() is None:
         time.sleep(1)
-        now = time.time()
-        if last[0] is None and now - start > first:
+        now = time.monotonic()
+        if overflow.is_set():
+            killed = 'log exceeds 16 MiB budget'
+        elif last[0] is None and now - start > first:
             killed = f'no output within {first:.0f} s of launch'
         elif last[0] is not None and now - last[0] > quiet:
             killed = f'no output for {quiet:.0f} s'

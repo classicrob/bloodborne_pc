@@ -214,8 +214,8 @@ Steady state means iterations 2..N agree within noise, on times and on the "imag
 registered" / "image uploads" counters.
 
 Capture (`BB_REPLAY_CAPTURE=perf:<frames>`, trigger as for inventory), at the end of the hold,
-after the inventory, into `out/replay/<id>/` (`BB_REPLAY_DIR` overrides the base). The capture refuses to start unless at least 40 GiB
-(the team's disk floor) would stay free after its estimated size; keep one capture at a time.
+after the inventory, into `out/replay/<id>/` (`BB_REPLAY_DIR` overrides the base). The capture refuses to start unless at least 40 decimal GB
+(35 GB hard floor plus 5 GB safety margin) would stay free after its estimated size; keep one capture at a time.
 - `manifest.json`: version, frame, settings, the sizes and checksums of every file, and
   "perf replay: pixel output not qualified".
 - `views.bin`: every committed direct/flexible view (VA range, kind, protection, memory
@@ -251,11 +251,9 @@ iteration's GPU work and report submit -> GPU done), `BB_SPLIT_WINDOW` (the repl
 "Parse split" block per iteration), and with `BB_PERF=1` the GPU busy time of each iteration
 (per-submission timestamps). State the power mode (`pmset -g custom`) with any timing.
 
-A/B runs for anyone: `bash tools/macos/replay-ab.sh A_REF B_REF [--iters N] [--order ABBA]
-[--env "K=V ..."] [--env-a ...] [--env-b ...]` (from a tree root) merges each ref with the harness
-when it lacks it, builds it in its own scratch worktree, replays the newest capture interleaved
-under heavy.sh (playtest slot, GPU exclusive, CPU quiet), records the host state before each run
-and prints the per-arm table (`replay_summary.py --arms`); `--help` lists the options.
+A/B runs use two existing pinned build manifests; they never create worktrees or build/copy/delete
+inputs. See [replay qualification](replay-qualification.md) for exact usage, legacy identity
+migration, source-gate requirements, controls and limits. `replay-ab.sh --help` lists options.
 
 Capture tools (`tools/macos/`, read a capture directory; no replay run): `pm4find.py` (the
 WRITE_DATA packets covering an address, with context, and the view holding it), `pm4dump.py`
@@ -275,8 +273,10 @@ What the replay checks before it writes anything (Sol-2's review):
   It is a repeated workload, not a restored-frame replay: only the command processor's reset
   ranges, the command words and the Liverpool state are restored; shader-written buffers and
   images and the renderer's caches carry over between iterations.
-- A reset range in host memory is restored only into the live guest-heap object with the
-  captured identity (payload range, allocation ordinal, allocating code address), never by address.
+- `resets.bin` alone uses format version 3: a host reset names a registered live semantic
+  range, its base/size, and reset offset. Every host name and guest mapping is preflighted before
+  reset writes; the base must match because packets embed it. Legacy v2 resets fail loudly and
+  require an explicit metadata-only identity assertion. Other capture files retain version 2.
 - The capture's reset walk (`replay_reset_walk.h`) passes only decoded writers and packets that
   write no memory; truncated packets and wrapping ranges are blockers; a wait counts as
   satisfied by the frame only after an unconditional drawing-engine write (not one inside a
