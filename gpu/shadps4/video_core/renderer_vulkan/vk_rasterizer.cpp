@@ -4077,6 +4077,7 @@ void Rasterizer::BeginImportedMemoryMutation() {
         Finish();
         scheduler.PopPendingOperations();
         JoinBindHelper(this);
+        texture_cache.PrepareBc4AliasesForMemoryMutation();
         imported_memory_mutating.store(true, std::memory_order_release);
         return;
     }
@@ -4089,6 +4090,7 @@ void Rasterizer::BeginImportedMemoryMutation() {
         Finish();
         scheduler.PopPendingOperations();
         JoinBindHelper(this);
+        texture_cache.PrepareBc4AliasesForMemoryMutation();
         std::unique_lock lock{import_pause_mutex};
         imported_memory_mutating.store(true, std::memory_order_release);
         import_pause_ready = true;
