@@ -389,7 +389,7 @@ int Run(Vulkan::Instance& instance, Vulkan::Scheduler& scheduler, Vulkan::Runtim
     Cache::ViewMemo memo{};
     const auto select_parent = [&] {
         parent_id = cache.FindImage(parent_desc);
-        cache.FindTexture(parent_id, parent_desc);
+        (void)cache.FindTexture(parent_id, parent_desc);
         parent_uid = cache.GetImage(parent_id).image_uid;
     };
     const auto read_parent = [&](unsigned generation, bool written) {
@@ -416,9 +416,19 @@ int Run(Vulkan::Instance& instance, Vulkan::Scheduler& scheduler, Vulkan::Runtim
         {
             const std::array selected{child_desc};
             auto snapshot = cache.InspectBc4FloatParents(selected);
-            Expect("Float preflight authenticates existing parent identity",
-                   snapshot.parents.size() == 1 && snapshot.parents[0].parent_id == parent_id &&
-                   snapshot.parents[0].parent_uid == parent_uid && snapshot.parents[0].mip == TargetMip);
+            Expect("Float preflight authenticates request and full protected parent range",
+                   snapshot.parents.size() == 1 && [&] {
+                       const auto& record = snapshot.parents[0];
+                       return record.selected_index == 0 && record.request.type == child_desc.type &&
+                              record.request.view_info == child_desc.view_info &&
+                              record.request.info.guest_address == child_desc.info.guest_address &&
+                              VideoCore::Bc4Alias::IsFloatTailCandidate(record.request.info) &&
+                              record.parent_id == parent_id && record.parent_uid == parent_uid &&
+                              record.parent_address == base && record.parent_size == GuestSize &&
+                              record.tail_address == base + Tail && record.tail_size == 512 &&
+                              record.visible_address == base + Tail && record.visible_size == 8 &&
+                              record.mip == TargetMip && record.layer == 0;
+                   }());
             RequireNegativeSetup();
             auto scope = cache.UseBc4FloatPreflight(snapshot);
             child_id = cache.FindImage(child_desc);
@@ -530,7 +540,7 @@ int Run(Vulkan::Instance& instance, Vulkan::Scheduler& scheduler, Vulkan::Runtim
     std::memcpy(guest, seed2.data(), MapSize);
     Expect("linked CPU rewrite traversed real fault", write_faults > faults2);
     on_a([&] { select_parent(); command(2, false, true); read_parent(2, false); });
-    Expect("memo reuse/no-store preserves new complete CPU seed", !std::memcmp(guest, seed2.data(), MapSize));
+    Expect("memo-compatible reselection/no-store preserves new complete CPU seed", !std::memcmp(guest, seed2.data(), MapSize));
     if (failures) return complete();
     on_a([&] { command(2, true, false); });
     Expect("VM phase leaves completed Float store unpublished", !std::memcmp(guest, seed2.data(), MapSize));
@@ -557,8 +567,8 @@ int Run(Vulkan::Instance& instance, Vulkan::Scheduler& scheduler, Vulkan::Runtim
     // exercised until release/reallocation restores unique backing ownership.
     on_a([&] { select_parent(); read_parent(3, false); });
     if (failures) return complete();
-    const auto prior_parent = parent_id, prior_child = child_id;
-    const auto prior_parent_uid = parent_uid, prior_child_uid = child_uid;
+    const auto prior_parent = parent_id;
+    const auto prior_parent_uid = parent_uid;
     assert(!release(physical, MapSize));
     int64_t replacement = -1;
     assert(!allocate(physical, physical + MapSize, MapSize, Page, 0, &replacement));
@@ -569,8 +579,8 @@ int Run(Vulkan::Instance& instance, Vulkan::Scheduler& scheduler, Vulkan::Runtim
     const auto seed4 = Seed(4);
     std::memcpy(guest, seed4.data(), MapSize);
     on_a([&] {
-        Expect("same-VA reuse cannot reuse either old linked identity",
-               !cache.TryGetImage(prior_parent, prior_parent_uid) && !cache.TryGetImage(prior_child, prior_child_uid));
+        Expect("same-VA reuse retires prior BC parent and cannot resurrect earlier retired Float child",
+               !cache.TryGetImage(prior_parent, prior_parent_uid) && !cache.TryGetImage(old_child, old_child_uid));
         select_parent(); command(4, false, true); read_parent(4, false);
     });
     Expect("same-VA new Float relation preserves entire new seed", !std::memcmp(guest, seed4.data(), MapSize));
