@@ -553,7 +553,9 @@ int Run(Vulkan::Instance& instance, Vulkan::Scheduler& scheduler, Vulkan::Runtim
     const auto seed3 = Seed(3);
     std::memcpy(alias, seed3.data(), MapSize);
     Expect("Float alias CPU write visible across full original mapping", !std::memcmp(guest, seed3.data(), MapSize));
-    on_a([&] { select_parent(); command(3, false, true); read_parent(3, false); });
+    // A physical alias forbids a new Float relation. Only ordinary BC reads are
+    // exercised until release/reallocation restores unique backing ownership.
+    on_a([&] { select_parent(); read_parent(3, false); });
     if (failures) return complete();
     const auto prior_parent = parent_id, prior_child = child_id;
     const auto prior_parent_uid = parent_uid, prior_child_uid = child_uid;
