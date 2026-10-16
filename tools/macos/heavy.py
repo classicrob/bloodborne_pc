@@ -67,6 +67,69 @@ def lock_dir():
 POOLS = {'build': ('BB_HEAVY_BUILD_SLOTS', 1), 'playtest': ('BB_HEAVY_PLAYTEST_SLOTS', 2),
          'quick': ('BB_HEAVY_QUICK_SLOTS', 2), 'sweep': ('BB_HEAVY_SWEEP_SLOTS', 1)}
 QUICK_JOBS = '4'
+GB = 1000 ** 3
+DISK_FLOOR = 50 * GB
+DISK_BUFFER = 5 * GB
+DISK_BUDGET_GB = {'build': 5, 'playtest': 5, 'quick': 1, 'sweep': 2}
+
+
+def disk_free():
+    disk = os.statvfs(os.getcwd())
+    return disk.f_bavail * disk.f_frsize
+
+
+def disk_budget(pool):
+    value = os.environ.get('BB_HEAVY_DISK_BUDGET_GB', str(DISK_BUDGET_GB[pool]))
+    if not value.isdigit() or int(value) < 1:
+        fail('BB_HEAVY_DISK_BUDGET_GB must be a positive whole number')
+    return int(value) * GB
+
+
+def disk_reservations(excluding):
+    reserved = 0
+    for name in ['build-priority', 'build-idle'] + [slot for pool in POOLS for slot in slot_names(pool)]:
+        if name == excluding:
+            continue
+        fd = try_lock(name)
+        if fd is None:
+            info = holder(name)
+            reserved += info.get('disk_budget', DISK_BUDGET_GB.get(info.get('pool'), 5) * GB)
+        else:
+            os.close(fd)
+    return reserved
+
+
+def disk_preflight(label, pool, slot, budget):
+    gate = lock_file('disk-admission')
+    try:
+        fcntl.flock(gate, fcntl.LOCK_EX)
+        free = disk_free()
+        other = disk_reservations(slot)
+        needed = DISK_FLOOR + DISK_BUFFER + budget + other
+        if free < needed:
+            record({'event': 'disk-refused', 'label': label, 'pool': pool, 'free': free,
+                    'required': needed, 'budget': budget, 'other_reservations': other})
+            fail(f'{label}: disk preflight refuses {pool}: {free / GB:.1f} GB free; '
+                 f'need {needed / GB:.1f} GB (50 floor + 5 buffer + '
+                 f'{budget / GB:.0f} job budget + {other / GB:.1f} other reservations)', 75)
+    finally:
+        os.close(gate)
+
+
+def disk_low(label):
+    try:
+        free = disk_free()
+    except OSError as error:
+        print(f'heavy: {label}: disk guard cannot read free space: {error}; stopping job',
+              file=sys.stderr, flush=True)
+        record({'event': 'disk-floor-stop', 'label': label, 'error': str(error)})
+        return True
+    if free >= DISK_FLOOR + DISK_BUFFER:
+        return False
+    print(f'heavy: {label}: disk guard stops job at {free / GB:.1f} GB free '
+          '(55 GB stop threshold; 50 GB hard floor)', file=sys.stderr, flush=True)
+    record({'event': 'disk-floor-stop', 'label': label, 'free': free})
+    return True
 
 
 def slot_names(pool):
@@ -366,6 +429,33 @@ def process_start(pid):
     if size.value == 0:
         return None
     return struct.unpack_from('qi', buffer.raw, 0)
+
+
+def watch_exec_disk(label):
+    """The exec-in-place game keeps its pid; a child watches only that pid and its start time."""
+    target = os.getpid()
+    start = process_start(target)
+    if start is None:
+        fail(f'{label}: cannot identify process for disk guard', 75)
+    if os.fork():
+        return
+    os.setsid()
+    while os.getppid() == target:
+        time.sleep(1)
+        try:
+            if process_start(target) != start:
+                break
+        except OSError:
+            break
+        if disk_low(label):
+            os.kill(target, signal.SIGTERM)
+            for _ in range(10):
+                time.sleep(1)
+                if os.getppid() != target or process_start(target) != start:
+                    os._exit(0)
+            os.kill(target, signal.SIGKILL)
+            break
+    os._exit(0)
 
 
 def start_or_none(pid, problems):
@@ -698,6 +788,7 @@ def run(pool, priority, gpu, label, command, pool_given=False, quiet=False, sett
             take_gpu(gpu, label)
         announce(label)
         os.execvp(command[0], command)
+    budget = disk_budget(pool)
     started, reported = time.monotonic(), time.monotonic()
     idle, idle_checked = (False, ''), None
     queued = False
@@ -729,10 +820,11 @@ def run(pool, priority, gpu, label, command, pool_given=False, quiet=False, sett
                 continue
             info = {'label': label, 'pid': os.getpid(), 'pool': pool, 'priority': priority,
                     'since': datetime.datetime.now().isoformat(timespec='seconds'),
-                    'command': command}
+                    'command': command, 'disk_budget': budget}
             os.ftruncate(fd, 0)
             os.pwrite(fd, json.dumps(info).encode(), 0)
             os.fsync(fd)
+            disk_preflight(label, pool, name, budget)
             for kind in ('paused', 'ecore'):  # left by an earlier job with this pid (killed before its end)
                 try:
                     os.unlink(pause_file(os.getpid(), kind))
@@ -769,6 +861,7 @@ def run(pool, priority, gpu, label, command, pool_given=False, quiet=False, sett
                 supervise_quick(label, command, fd, info)
             if not in_place:
                 supervise(label, pool, command, fd, info)
+            watch_exec_disk(label)
             try:
                 os.execvp(command[0], command)
             except OSError as error:
@@ -935,6 +1028,21 @@ def session_info(info, child):
     return {**info, 'command_pid': child.pid, 'command_start': list(start) if start else None}
 
 
+def stop_for_disk(child, label):
+    if not disk_low(label):
+        return False
+    try:
+        os.killpg(child.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return True
+    try:
+        child.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        os.killpg(child.pid, signal.SIGKILL)
+        child.wait()
+    return True
+
+
 def supervise(label, pool, command, fd=None, info=None):
     """Runs the job's command as a child in its own session (its own process group, so CPU quiet
     finds every process of the job, including ones whose parent exited, and none of the caller's),
@@ -958,7 +1066,15 @@ def supervise(label, pool, command, fd=None, info=None):
             pass
     for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
         signal.signal(signum, forward)
-    sys.exit(record_end(label, pool, child.wait(), started))
+    while True:
+        try:
+            status = child.wait(timeout=1)
+            if disk_low(label):
+                sys.exit(record_end(label, pool, 75, started, disk_floor=True))
+            sys.exit(record_end(label, pool, status, started))
+        except subprocess.TimeoutExpired:
+            if stop_for_disk(child, label):
+                sys.exit(record_end(label, pool, 75, started, disk_floor=True))
 
 
 def supervise_quick(label, command, fd=None, info=None):
@@ -983,9 +1099,13 @@ def supervise_quick(label, command, fd=None, info=None):
     last = time.monotonic()
     while True:
         try:
-            finish(child.wait(timeout=1))
+            status = child.wait(timeout=1)
+            low = disk_low(label)
+            finish(75 if low else status, disk_floor=low)
         except subprocess.TimeoutExpired:
             pass
+        if stop_for_disk(child, label):
+            finish(75, disk_floor=True)
         now = time.monotonic()
         if quiet_mode() == 'stop':
             started += now - last  # paused for a perf run: the time limit pauses too
