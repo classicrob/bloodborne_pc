@@ -59,9 +59,13 @@ performance acceptance needs a separately qualified run with tracing off.
 
 ## Validation status
 
-Source-only under the 2026-10-15 disk hold. Sampler state-change/heartbeat/cap
-controls are in the existing `upscaler-support-test`; not executed yet. Require
-that test, exact-tree keep-going, native scene runtime observations and a
+Renderer source review passed `7186cf24`; the follow-up also instruments the
+scaled TAA recording branch. After disk-hold release, the existing
+`upscaler-support-test` passed as a native arm64 standalone build of the test
+and production settings source, including state-change/heartbeat/cap controls,
+with `-Wall -Wextra -Werror`. The CLT installation required an explicit SDK
+`usr/include/c++/v1` include path. No renderer TU or GPU execution was tested.
+Require the production build, exact-tree keep-going, native scene runtime observations and a
 deliberately reduced/disabled control after release. The control must reach the
 changed path and must be rejected by the acceptance analysis. No runtime PASS
 or performance result is claimed.

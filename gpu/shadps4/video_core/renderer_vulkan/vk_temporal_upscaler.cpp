@@ -1726,6 +1726,9 @@ void TemporalUpscaler::RunScaled() {
         bool ok4 = true;
         if (BbSettings::Get().upscaler == BbSettings::UpscalerTaa) {
             RecordTaa(cmdbuf, color_view, depth_view);
+#ifdef __APPLE__
+            QualityDispatch(BbSettings::UpscalerTaa, w, h, ow, oh, false);
+#endif
         } else {
             ok4 = RecordFsr4(cmdbuf, {color_image, color_view, source_width, source_height},
                             {depth_image, depth_view, source_width, source_height}, w, h, ow,
