@@ -94,7 +94,6 @@ int main() {
 }
 #else
 #include <sirit/sirit.h>
-#include <vk_mem_alloc.h>
 #include "test_alarm.h"
 #include "common/slot_vector.h"
 #include "shader_recompiler/resource.h"
@@ -104,6 +103,7 @@ int main() {
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/texture_cache/blit_helper.h"
 #include "video_core/texture_cache/image.h"
+#include <vk_mem_alloc.h>
 
 namespace {
 unsigned failures = 0;
