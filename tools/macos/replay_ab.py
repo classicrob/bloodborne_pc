@@ -69,7 +69,8 @@ def env_items(items):
 def diagnostic_reasons(environment):
     return sorted(key for key, value in environment.items()
                   if value not in ('', '0') and
-                  (key == 'BB_PERF_PHASES' or re.search(r'TRACE|RING|REFRESH', key)))
+                  (key == 'BB_PERF_PHASES' or re.search(r'TRACE|RING|REFRESH', key) or
+                   (key == 'BB_REPLAY_GPU_PROBE' and value.lower() != 'off')))
 
 
 def perf_perturbed(path):
@@ -82,8 +83,17 @@ def perf_perturbed(path):
 
 
 def finish_results(logs, results, context):
+    for result in results:
+        with Path(result['path']).open() as source:
+            if any(line.startswith(VERDICT_PREFIX) for line in source):
+                raise ValueError('runner refuses a preexisting qualification record in game output')
     context = dict(context, comparison_status=compare_work(results),
                    reference_workload=results[0]['workload_signatures'])
+    if context.get('destructive_probe'):
+        context['comparison_status'] = 'INCOMPARABLE'
+    if any(r.get('invalid_for_correctness_quality') for r in results):
+        context['diagnostic_reasons'] = sorted(set(context.get('diagnostic_reasons', [])) |
+                                               {'raw INVALID_FOR_CORRECTNESS_QUALITY marker'})
     for result in results:
         qualify(result, context)
         with Path(result['path']).open('a') as stream:
@@ -97,7 +107,7 @@ def finish_results(logs, results, context):
     write_json(logs / 'results.json', results)
     print(f"Final verdict: {' | '.join(sorted({r['qualification'] for r in results}))}; "
           f'artifacts: {logs}; pixels/live FPS and per-iteration GPU busy unqualified', flush=True)
-    return 2 if context['comparison_status'] == 'INCOMPARABLE' else 0
+    return 2 if any(r['comparison_status'] == 'INCOMPARABLE' for r in results) else 0
 
 
 def capture_inputs(capture):
@@ -175,6 +185,7 @@ def main():
                'source_manifests': {arm: {key: builds[arm][key] for key in ('head', 'manifest', 'manifest_sha256')}
                                     for arm in ('A', 'B')},
                'qualification_only': args.qualification_only, 'diagnostic': args.diagnostic,
+               'expected_iterations': args.iters, 'destructive_probe': 'BB_REPLAY_GPU_PROBE' in reasons,
                'diagnostic_reasons': reasons + (['explicit --diagnostic'] if args.diagnostic else [])}
     capture, data = args.capture.resolve(strict=True), args.data.resolve(strict=True)
     deps = Path(os.environ.get('BB_DEPS_PREFIX', str(Path.home() / 'bbport-deps/x86_64')))

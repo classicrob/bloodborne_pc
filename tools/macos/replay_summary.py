@@ -24,6 +24,9 @@ def qualify(result, context=None):
     source_pass = (set(gates) == {'A', 'B'} and all(v == 'PASS' for v in gates.values()) and
                    context.get('qualification_only') is False)
     comparison = context.get('comparison_status', 'NOT_EVALUATED')
+    invalid = result.get('invalid_for_correctness_quality', False)
+    if invalid or context.get('destructive_probe'):
+        comparison = 'INCOMPARABLE'
     reference = context.get('reference_workload')
     if comparison == 'MATCHED' and (not reference or result['workload_signatures'] != reference):
         comparison = 'INCOMPARABLE'
@@ -32,8 +35,14 @@ def qualify(result, context=None):
     labels = []
     if not source_pass:
         labels.append('SOURCE GATE UNQUALIFIED')
-    if context.get('diagnostic') or context.get('diagnostic_reasons'):
+    if context.get('diagnostic') or context.get('diagnostic_reasons') or invalid:
         labels.append('DIAGNOSTIC PERTURBED')
+    if invalid:
+        labels.append('INVALID FOR CORRECTNESS/QUALITY')
+    if (not result['run_evidence_complete'] or
+            type(context.get('expected_iterations')) is not int or
+            context['expected_iterations'] != result['expected_iterations']):
+        labels.append('RUN EVIDENCE UNQUALIFIED')
     if result['wall_metric'] != 'submit_to_gpu_done_wall_ms':
         labels.append('GPU-DONE WALL UNQUALIFIED')
     if comparison == 'INCOMPARABLE':
@@ -52,7 +61,8 @@ def qualify(result, context=None):
 def compare_work(results):
     signatures = {tuple(signature) for result in results for signature in result['workload_signatures']}
     return ('MATCHED' if len(results) >= 2 and len(signatures) == 1 and
-            all(r['workload_consistent'] for r in results) else 'INCOMPARABLE')
+            all(r['workload_consistent'] and not r.get('invalid_for_correctness_quality') for r in results)
+            else 'INCOMPARABLE')
 
 
 def verdict_text(result):
@@ -112,6 +122,16 @@ def summarize(path, expected=None, require_busy=False):
                                     'submissions': int(submissions[1]) if submissions else None}
     if len(contexts) > 1:
         raise ValueError(f'{path}: duplicate qualification context')
+    context = contexts[0] if contexts else {}
+    if not isinstance(context, dict):
+        raise ValueError(f'{path}: qualification context must be an object')
+    stored_expected = context.get('expected_iterations')
+    for value in (expected, stored_expected):
+        if value is not None and (type(value) is not int or not 3 <= value <= 10000):
+            raise ValueError(f'{path}: expected iterations must be an integer 3..10000')
+    if expected is not None and stored_expected is not None and expected != stored_expected:
+        raise ValueError(f'{path}: explicit expected iterations differ from detached qualification record')
+    expected = expected if expected is not None else stored_expected
     if not rows or max(rows) < 2:
         raise ValueError(f'{path}: no steady-state iterations')
     count = expected if expected is not None else max(rows)
@@ -138,6 +158,8 @@ def summarize(path, expected=None, require_busy=False):
               'p90_ms': percentile(wall, .9), 'p95_ms': percentile(wall, .95), 'p99_ms': percentile(wall, .99),
               'max_ms': max(wall), 'gpu_thread_cpu_median_ms': st.median(rows[i][1] for i in range(2, count + 1)),
               'wall_metric': 'submit_to_gpu_done_wall_ms' if done_complete else 'submit_to_idle_wall_ms',
+              'expected_iterations': expected, 'run_evidence_complete': expected is not None,
+              'invalid_for_correctness_quality': bool(re.search(r'\bINVALID_FOR_CORRECTNESS_QUALITY\s*=\s*(?:[1-9][0-9]*|true)\b', text, re.I)),
               'gpu_busy_samples': 0, 'gpu_busy_median_ms': None,
               'gpu_collection_window_samples': list(collection.values()),
               'gpu_collection_window_median_ms': st.median(gpu) if gpu else None,
@@ -146,7 +168,7 @@ def summarize(path, expected=None, require_busy=False):
                          for key, _ in FIELDS if any(key in fields[i] for i in range(2, count + 1))},
               'work_per_iteration': work, 'workload_signatures': signatures,
               'workload_consistent': len(signatures) == 1 and len(work) == count}
-    return qualify(result, contexts[0] if contexts else None)
+    return qualify(result, context)
 
 
 def main():

@@ -40,7 +40,12 @@ Per-run result JSON, per-run/final console output and a qualification record
 appended to each successful raw log carry the verdict. Copying a log and running
 `replay_summary.py` retains its source gates, qualification-only flag, diagnostic
 reasons and cross-run comparison status. A raw historical log without that
-record is `SOURCE GATE UNQUALIFIED` and `COMPARISON NOT EVALUATED`.
+record is `SOURCE GATE UNQUALIFIED` and `COMPARISON NOT EVALUATED`. The record
+persists `expected_iterations` and the matched workload signature; detached
+summaries revalidate exact iteration coverage, steady-state completion, image
+round-trip proof and positive GPU-done wall samples against that count. Missing
+iteration-count provenance cannot qualify a run. The runner refuses any game
+output containing a preexisting qualification record before appending its own.
 
 - `QUALIFIED RELATIVE ATTRIBUTION`: both source gates PASS, qualification-only
   is false, no diagnostic mode/perturbed schema, complete positive GPU-done wall
@@ -60,6 +65,13 @@ record is `SOURCE GATE UNQUALIFIED` and `COMPARISON NOT EVALUATED`.
   between runs. Retain per-run and combined result JSON and diagnostic timings,
   print this verdict and exit 2, including intentional diagnostic ablations.
   Independent correctness proof is required before interpreting changed work.
+
+Any enabled `BB_REPLAY_GPU_PROBE` requires `--diagnostic` and makes results
+incomparable for normal timing, even if draw counts match. Empty/0/off probe
+values are inactive. A raw `INVALID_FOR_CORRECTNESS_QUALITY=1` marker independently
+forces `DIAGNOSTIC PERTURBED`, `INVALID FOR CORRECTNESS/QUALITY` and `INCOMPARABLE`
+with a nonzero exit, regardless of a claimed clean context. Diagnostic ablation
+measurements remain available in retained results, never correctness evidence.
 
 Labels can coexist. Before all runs complete, output says comparison pending;
 no provisional measurement is accepted. Logs are bounded to 16 MiB per run,

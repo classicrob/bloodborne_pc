@@ -119,7 +119,8 @@ class ReplayTools(unittest.TestCase):
     def context(self, **changes):
         value = {'version': 1, 'source_gates': {'A': 'PASS', 'B': 'PASS'},
                  'qualification_only': False, 'diagnostic': False, 'diagnostic_reasons': [],
-                 'comparison_status': 'MATCHED', 'reference_workload': [[1487, 160, 74]]}
+                 'comparison_status': 'MATCHED', 'reference_workload': [[1487, 160, 74]],
+                 'expected_iterations': 3, 'destructive_probe': False}
         value.update(changes)
         return value
 
@@ -153,6 +154,60 @@ class ReplayTools(unittest.TestCase):
             result = summary.qualify(self.result(), context)
             self.assertIn('DIAGNOSTIC PERTURBED', summary.verdict_text(result))
             self.assertFalse(result['timing_qualified'])
+
+    def test_enabled_replay_probe_requires_diagnostic_and_stays_incomparable(self):
+        for value in ('', '0', 'off', 'OFF'):
+            self.assertEqual(ab.diagnostic_reasons({'BB_REPLAY_GPU_PROBE': value}), [])
+        self.assertEqual(ab.diagnostic_reasons({'BB_REPLAY_GPU_PROBE': 'scissor-1px'}), ['BB_REPLAY_GPU_PROBE'])
+        with mock.patch.object(sys, 'argv', ['runner', 'A', 'B', '--capture', '/unused',
+                                            '--env', 'BB_REPLAY_GPU_PROBE=scissor-1px']), \
+                mock.patch.object(ab, 'build_manifest', return_value={'gate': 'PASS'}), \
+                mock.patch.object(ab.shutil, 'disk_usage', return_value=SimpleNamespace(free=50 * 10**9)), \
+                mock.patch.dict(ab.os.environ, {}, clear=True), self.assertRaisesRegex(ValueError, '--diagnostic'):
+            ab.main()
+        results = [self.result(name=f'run-{i}-{arm}.log') for i, arm in ((1, 'A'), (2, 'B'))]
+        _, status, console = self.finish(results, self.context(diagnostic=True, destructive_probe=True))
+        self.assertEqual(status, 2)
+        self.assertIn('DIAGNOSTIC PERTURBED', console)
+        self.assertIn('INCOMPARABLE', console)
+
+    def test_raw_destructive_marker_overrides_clean_context(self):
+        results = [self.result(name=f'run-{i}-{arm}.log') for i, arm in ((1, 'A'), (2, 'B'))]
+        path = Path(results[0]['path'])
+        path.write_text(path.read_text() + '\nprobe: INVALID_FOR_CORRECTNESS_QUALITY=1\n')
+        results[0] = summary.summarize(path, 3)
+        _, status, console = self.finish(results, self.context())
+        self.assertEqual(status, 2)
+        self.assertIn('INVALID FOR CORRECTNESS/QUALITY', console)
+        self.assertTrue(all(not r['timing_qualified'] for r in results))
+        detached = summary.summarize(path)
+        self.assertTrue(detached['invalid_for_correctness_quality'])
+        self.assertFalse(detached['timing_qualified'])
+
+    def test_detached_expected_count_and_proofs_cannot_be_truncated(self):
+        results = [self.result(name=f'run-{i}-{arm}.log') for i, arm in ((1, 'A'), (2, 'B'))]
+        self.finish(results, self.context())
+        path = Path(results[0]['path']); original = path.read_text()
+        self.assertTrue(summary.summarize(path)['timing_qualified'])
+        for removed in ('Perf replay iteration 3', 'capture -> restore -> capture again is exact',
+                        'Perf replay steady state'):
+            path.write_text('\n'.join(line for line in original.splitlines() if removed not in line))
+            with self.subTest(removed=removed), self.assertRaises(ValueError):
+                summary.summarize(path)
+        path.write_text(original)
+        with self.assertRaises(ValueError): summary.summarize(path, 4)
+        context = self.context(); del context['expected_iterations']
+        result = summary.qualify(self.result(name='unbounded.log'), context)
+        self.assertFalse(result['timing_qualified'])
+        self.assertIn('RUN EVIDENCE UNQUALIFIED', result['qualification'])
+
+    def test_runner_refuses_preexisting_qualification_marker(self):
+        results = [self.result(name=f'run-{i}-{arm}.log') for i, arm in ((1, 'A'), (2, 'B'))]
+        path = Path(results[0]['path'])
+        path.write_text(path.read_text() + '\n' + summary.VERDICT_PREFIX + json.dumps(self.context()) + '\n')
+        with self.assertRaisesRegex(ValueError, 'preexisting qualification'):
+            self.finish(results, self.context())
+        self.assertFalse((self.root / 'results/results.json').exists())
 
     def finish(self, results, context):
         out = self.root / 'results'; out.mkdir()
