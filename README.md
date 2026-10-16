@@ -118,7 +118,9 @@ differences from Linux (TLS, guest memory, exceptions):
 
 By default the game folder is expected next to the repository (`../CUSA03173`). Saves and the
 shader cache go to `user/` (the launcher lets you choose another folder); settings to
-`bbport.ini`. A gamepad is used through SDL3; there is a keyboard fallback.
+`bbport.ini`. A gamepad is used through SDL3. Keyboard and mouse follow Elden Ring's PC defaults
+(click the window to capture the mouse, Cmd releases it):
+[keyboard and mouse](docs/macos/keyboard-mouse.md).
 
 **Resolution and preset changes:** for outputs other than 1080p (720p on the Steam Deck,
 1440p, 4K) the whole game renders at the preset's resolution, set by a patch at start — the
@@ -150,7 +152,7 @@ switched on and off in the launcher. See [mods and patches](docs/MODS.md).
 **Free camera and game debug menu** (v1.09): enable the corresponding switches in the
 launcher or in-game menu and restart. Free camera uses Lance McDonald's
 [GoldHEN patch](https://github.com/GoldHEN/GoldHEN_Patch_Repository/blob/main/patches/xml/Bloodborne-Orbis.xml):
-hold Cross and press L3 to cycle modes (keyboard: hold Space and press Z). It needs no fonts
+hold Cross and press L3 to cycle modes (keyboard: hold E and press X). It needs no fonts
 and conflicts with *Enemy Control*.
 For the game debug menu, install `DbgFont14h.ccm` and `DbgFont14h.tpf` from
 [Debug Menu and XML Patch](https://www.nexusmods.com/bloodborne/mods/253) into the game's

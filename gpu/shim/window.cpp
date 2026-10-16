@@ -225,6 +225,74 @@ WindowSDL::~WindowSDL() {
     SDL_DestroyWindow(window);
 }
 
+MouseCapture::Change MouseCapture::OnEvent(const SDL_Event& event, bool shift, bool blocked) {
+    std::scoped_lock lock{mutex};
+    if (!captured) {
+        return !blocked && event.type == SDL_EVENT_MOUSE_BUTTON_DOWN &&
+                       event.button.button == SDL_BUTTON_LEFT
+                   ? Change::Capture
+                   : Change::None;
+    }
+    if (blocked) {
+        return Change::Release;
+    }
+    switch (event.type) {
+    case SDL_EVENT_MOUSE_MOTION:
+        dx += event.motion.xrel;
+        dy += event.motion.yrel;
+        break;
+    case SDL_EVENT_MOUSE_BUTTON_DOWN:
+    case SDL_EVENT_MOUSE_BUTTON_UP: {
+        const u8 button = event.button.button;
+        const u32 bits = button == SDL_BUTTON_LEFT     ? Left | LeftShift
+                         : button == SDL_BUTTON_RIGHT  ? Right | RightShift
+                         : button == SDL_BUTTON_MIDDLE ? Middle
+                                                       : 0;
+        held &= ~bits;
+        if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN) {
+            const u32 bit = bits & (shift ? LeftShift | RightShift | Middle : Left | Right | Middle);
+            held |= bit;
+            pressed |= bit;
+        }
+        break;
+    }
+    case SDL_EVENT_KEY_DOWN:
+        if (event.key.key == SDLK_LGUI || event.key.key == SDLK_RGUI) {
+            return Change::Release;
+        }
+        break;
+    case SDL_EVENT_WINDOW_FOCUS_LOST:
+    case SDL_EVENT_WINDOW_HIDDEN:
+    case SDL_EVENT_WINDOW_MINIMIZED:
+        return Change::Release;
+    default:
+        break;
+    }
+    return Change::None;
+}
+
+void MouseCapture::SetCaptured(bool value) {
+    std::scoped_lock lock{mutex};
+    captured = value;
+    dx = dy = 0;
+    held = pressed = 0;
+}
+
+bool MouseCapture::Captured() const {
+    std::scoped_lock lock{mutex};
+    return captured;
+}
+
+bool MouseCapture::Take(float& out_dx, float& out_dy, u32& buttons) {
+    std::scoped_lock lock{mutex};
+    out_dx = dx;
+    out_dy = dy;
+    buttons = held | pressed;
+    dx = dy = 0;
+    pressed = 0;
+    return captured;
+}
+
 void WindowSDL::BeginTextInput(const std::string& initial, const std::string& prompt) {
     std::scoped_lock lock{text_mutex};
     text = initial;
@@ -241,9 +309,24 @@ int WindowSDL::PollTextInput(std::string& out) {
 
 void WindowSDL::UpdateTextTitle() {
     const std::string title = text_active ? base_title + " \u2014 " + text_prompt + ": " + text + "_  (Enter = OK, Esc = cancel)"
-                                          : base_title;
+                              : mouse.Captured() ? base_title + " \u2014 mouse captured (Cmd releases)"
+                                                 : base_title;
     SDL_SetWindowTitle(window, title.c_str());
     BbOverlay::SetTextEntry(text_active, text_prompt, text);
+}
+
+void WindowSDL::SetMouseCaptured(bool value) {
+    if (!SDL_SetWindowRelativeMouseMode(window, value)) {
+        std::fprintf(stderr, "Input: mouse %s failed: %s\n", value ? "capture" : "release", SDL_GetError());
+        if (value) {
+            return;
+        }
+    }
+    mouse.SetCaptured(value);
+    std::printf("Input: mouse %s\n", value ? "captured for the camera (Cmd releases)"
+                                          : "released (click the window to capture)");
+    std::fflush(stdout);
+    UpdateTextTitle();
 }
 
 bool WindowSDL::PollEvents() {
@@ -261,6 +344,9 @@ bool WindowSDL::PollEvents() {
     }
     if (!text_active) {
         BbOverlay::UpdateTextInput(window);
+    }
+    if (mouse.Captured() && (text_active || BbOverlay::CapturesInput())) {
+        SetMouseCaptured(false);
     }
     SDL_Event event;
     while (SDL_PollEvent(&event)) {
@@ -292,7 +378,21 @@ bool WindowSDL::PollEvents() {
             continue;
         }
         if (BbOverlay::HandleEvent(event)) {
+            if (mouse.Captured() && BbOverlay::CapturesInput()) {
+                SetMouseCaptured(false); // the settings menu opened
+            }
             continue;
+        }
+        const bool shift = (SDL_GetModState() & SDL_KMOD_SHIFT) != 0;
+        switch (mouse.OnEvent(event, shift, text_active || BbOverlay::CapturesInput())) {
+        case MouseCapture::Change::Capture:
+            SetMouseCaptured(true);
+            continue; // the capturing click is not the game's
+        case MouseCapture::Change::Release:
+            SetMouseCaptured(false);
+            break;
+        case MouseCapture::Change::None:
+            break;
         }
         switch (event.type) {
         case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:

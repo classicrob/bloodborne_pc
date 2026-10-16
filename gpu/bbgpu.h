@@ -38,6 +38,12 @@ int bbgpu_text_input_begin(const char *initial_utf8, const char *prompt_utf8);
 int bbgpu_text_input_poll(char *out_utf8, uint64_t size);
 /* 1 while the in-game settings menu is open: the game's pad input is held neutral. */
 int bbgpu_overlay_captures_input(void);
+/* Mouse for keyboard-and-mouse play (a click in the game window captures it): 1 while captured,
+ * with the motion in points and the BBGPU_MOUSE_* buttons since the previous call; 0 and nothing
+ * while released or without a window. */
+enum { BBGPU_MOUSE_LEFT=1, BBGPU_MOUSE_RIGHT=2, BBGPU_MOUSE_MIDDLE=4,
+       BBGPU_MOUSE_LEFT_SHIFT=8, BBGPU_MOUSE_RIGHT_SHIFT=16 }; /* Shift held at the press */
+int bbgpu_mouse_take(float *dx, float *dy, uint32_t *buttons);
 /* Number of symbols registered by the vendored libraries (diagnostics). */
 unsigned bbgpu_symbol_count(void);
 #ifdef __cplusplus

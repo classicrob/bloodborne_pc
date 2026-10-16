@@ -432,6 +432,21 @@ extern "C" int bbgpu_overlay_captures_input(void) {
     return BbOverlay::CapturesInput() ? 1 : 0;
 }
 
+extern "C" int bbgpu_mouse_take(float* dx, float* dy, uint32_t* buttons) {
+    static_assert(u32{Frontend::MouseCapture::Left} == BBGPU_MOUSE_LEFT &&
+                  u32{Frontend::MouseCapture::Right} == BBGPU_MOUSE_RIGHT &&
+                  u32{Frontend::MouseCapture::Middle} == BBGPU_MOUSE_MIDDLE &&
+                  u32{Frontend::MouseCapture::LeftShift} == BBGPU_MOUSE_LEFT_SHIFT &&
+                  u32{Frontend::MouseCapture::RightShift} == BBGPU_MOUSE_RIGHT_SHIFT);
+    *dx = *dy = 0;
+    *buttons = 0;
+    if (!g_window) return 0;
+    u32 bits = 0;
+    const bool captured = g_window->TakeMouse(*dx, *dy, bits);
+    *buttons = bits;
+    return captured ? 1 : 0;
+}
+
 extern "C" int bbgpu_text_input_begin(const char* initial, const char* prompt) {
     if (!g_window) return 0;
     g_window->BeginTextInput(initial ? initial : "", prompt ? prompt : "Text");

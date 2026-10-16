@@ -1,11 +1,12 @@
-/* libScePad on SDL3 gamepads, with a keyboard fallback. SDL events are pumped
+/* libScePad on SDL3 gamepads plus keyboard and mouse (both at once). SDL events are pumped
  * by the window thread (gpu/shim/window.cpp); here state is only sampled.
  *
- * Keyboard layout (when no gamepad is connected):
- *   WASD left stick, arrow keys right stick, Space Cross, LShift Circle,
- *   E Square, Q Triangle, 1 L1, 3 R1, R L2, F R2, Z L3, C R3,
- *   Enter Options, Tab left touchpad, Backspace right touchpad,
- *   IJKL d-pad (I up, K down, J left, L right). */
+ * Keyboard and mouse follow Elden Ring's PC defaults (docs/macos/keyboard-mouse.md):
+ *   WASD left stick (Alt walks), mouse or IJKL right stick, left click R1, Shift+left click R2,
+ *   right click L2, Shift+right click L1, Space Circle, E and Enter Cross, R Triangle,
+ *   F Square, Q and middle click R3, X L3, arrow keys d-pad, Esc Options,
+ *   Tab left touchpad, Backspace right touchpad. The mouse counts once a click in the window
+ *   captured it. */
 #define _GNU_SOURCE
 #include "runtime.h"
 #include "gpu/bbgpu.h"
@@ -132,6 +133,81 @@ static SDL_Gamepad *current_gamepad(void) {
     }
     return gamepad;
 }
+/* Mouse motion becomes right-stick deflection: its speed over at least MOUSE_WINDOW_US (the
+ * game may read twice a frame) relative to MOUSE_FULL_SPEED points/s times BB_MOUSE_SENSITIVITY,
+ * past the stick dead zone, so that small motion still turns the camera. */
+#define MOUSE_WINDOW_US 8000
+#define MOUSE_FULL_SPEED 800.0f
+#define MOUSE_DEAD_ZONE 20.0f
+static struct { float dx, dy, sensitivity; uint64_t since; uint8_t x, y; } mouse_cam={.x=128,.y=128};
+/* |(x, y)| by Newton's method from above, without libm (the Linux pad test links none). */
+static float magnitude(float x, float y) {
+    x=x<0 ? -x : x; y=y<0 ? -y : y;
+    const float sq=x*x+y*y;
+    float m=x>y ? x+y/2 : y+x/2;
+    for (int i=0;i<4 && m>0;++i) m=(m+sq/m)/2;
+    return m;
+}
+static void mouse_camera(float dx, float dy, uint64_t now) {
+    if (!mouse_cam.sensitivity) {
+        const char *e=getenv("BB_MOUSE_SENSITIVITY");
+        char *end=NULL;
+        float v=e && *e ? strtof(e,&end) : 1.0f;
+        if (e && *e && (*end || !(v>0.0f && v<=100.0f))) {
+            fprintf(stderr,"Runtime: BB_MOUSE_SENSITIVITY=%s must be a number in (0, 100]\n",e);
+            exit(1);
+        }
+        mouse_cam.sensitivity=v;
+        mouse_cam.since=now;
+    }
+    mouse_cam.dx+=dx; mouse_cam.dy+=dy;
+    if (now-mouse_cam.since<MOUSE_WINDOW_US) return; /* keep the last deflection */
+    const float seconds=(float)(now-mouse_cam.since)*1e-6f;
+    const float scale=mouse_cam.sensitivity/(MOUSE_FULL_SPEED*(seconds<0.1f ? seconds : 0.1f));
+    const float vx=mouse_cam.dx*scale, vy=mouse_cam.dy*scale, speed=magnitude(vx,vy);
+    mouse_cam.x=mouse_cam.y=128;
+    if (speed>0.0f) {
+        const float r=(MOUSE_DEAD_ZONE+(127.0f-MOUSE_DEAD_ZONE)*(speed<1.0f ? speed : 1.0f))/speed;
+        mouse_cam.x=(uint8_t)(int)(128.5f+vx*r); /* in 1..255: truncation rounds */
+        mouse_cam.y=(uint8_t)(int)(128.5f+vy*r);
+    }
+    mouse_cam.dx=mouse_cam.dy=0;
+    mouse_cam.since=now;
+}
+/* Keyboard and mouse on top of the gamepad (or neutral) state: buttons add, a deflected key
+ * stick or a moving mouse replaces the stick. Shift at a click's press picks the strong
+ * attack / transform for the whole hold. Nothing is held by this layer itself: released keys
+ * (SDL releases all on focus loss) and a released mouse (bbgpu_mouse_take) are neutral. */
+static void keyboard_mouse(PadData *d, const bool *k, float dx, float dy, uint32_t mouse, uint64_t now) {
+    static const struct { uint32_t bit, ps; } clicks[]={
+        {BBGPU_MOUSE_LEFT,BTN_R1}, {BBGPU_MOUSE_LEFT_SHIFT,BTN_R2}, {BBGPU_MOUSE_RIGHT,BTN_L2},
+        {BBGPU_MOUSE_RIGHT_SHIFT,BTN_L1}, {BBGPU_MOUSE_MIDDLE,BTN_R3},
+    };
+    for (size_t i=0;i<sizeof(clicks)/sizeof(*clicks);++i) if (mouse & clicks[i].bit) d->buttons|=clicks[i].ps;
+    mouse_camera(dx,dy,now);
+    if (mouse_cam.x!=128 || mouse_cam.y!=128) { d->right_x=mouse_cam.x; d->right_y=mouse_cam.y; }
+    if (k) {
+        static const struct { SDL_Scancode key; uint32_t ps; } keys[]={
+            {SDL_SCANCODE_SPACE,BTN_CIRCLE}, {SDL_SCANCODE_E,BTN_CROSS}, {SDL_SCANCODE_RETURN,BTN_CROSS},
+            {SDL_SCANCODE_KP_ENTER,BTN_CROSS}, {SDL_SCANCODE_R,BTN_TRIANGLE}, {SDL_SCANCODE_F,BTN_SQUARE},
+            {SDL_SCANCODE_Q,BTN_R3}, {SDL_SCANCODE_X,BTN_L3}, {SDL_SCANCODE_ESCAPE,BTN_OPTIONS},
+            {SDL_SCANCODE_UP,BTN_UP}, {SDL_SCANCODE_DOWN,BTN_DOWN}, {SDL_SCANCODE_LEFT,BTN_LEFT},
+            {SDL_SCANCODE_RIGHT,BTN_RIGHT},
+        };
+        for (size_t i=0;i<sizeof(keys)/sizeof(*keys);++i) if (k[keys[i].key]) d->buttons|=keys[i].ps;
+        if (k[SDL_SCANCODE_TAB]) touch_click(d,0);
+        if (k[SDL_SCANCODE_BACKSPACE]) touch_click(d,1);
+        const int walk=k[SDL_SCANCODE_LALT] || k[SDL_SCANCODE_RALT];
+        const int lx=(k[SDL_SCANCODE_D] ? 127 : 0)-(k[SDL_SCANCODE_A] ? 128 : 0);
+        const int ly=(k[SDL_SCANCODE_S] ? 127 : 0)-(k[SDL_SCANCODE_W] ? 128 : 0);
+        if (lx || ly) { d->left_x=(uint8_t)(128+(walk ? lx*2/5 : lx)); d->left_y=(uint8_t)(128+(walk ? ly*2/5 : ly)); }
+        const int rx=(k[SDL_SCANCODE_L] ? 127 : 0)-(k[SDL_SCANCODE_J] ? 128 : 0);
+        const int ry=(k[SDL_SCANCODE_K] ? 127 : 0)-(k[SDL_SCANCODE_I] ? 128 : 0);
+        if (rx || ry) { d->right_x=(uint8_t)(128+rx); d->right_y=(uint8_t)(128+ry); }
+    }
+    if (d->buttons & BTN_L2) d->l2=255;
+    if (d->buttons & BTN_R2) d->r2=255;
+}
 static void sample_host(PadData *d) {
     memset(d,0,sizeof(*d));
     d->left_x=d->left_y=d->right_x=d->right_y=128;
@@ -174,27 +250,11 @@ static void sample_host(PadData *d) {
         }
         // Back/Select on pads without a touch surface is a left-side click.
         if ((d->buttons & BTN_TOUCHPAD) && !d->touch_count) touch_click(d,0);
-        if (k && k[SDL_SCANCODE_TAB]) touch_click(d,0);
-        if (k && k[SDL_SCANCODE_BACKSPACE]) touch_click(d,1);
-        return;
     }
-    if (!k) return;
-    static const struct { SDL_Scancode key; uint32_t ps; } keys[]={
-        {SDL_SCANCODE_SPACE,BTN_CROSS}, {SDL_SCANCODE_LSHIFT,BTN_CIRCLE}, {SDL_SCANCODE_E,BTN_SQUARE},
-        {SDL_SCANCODE_Q,BTN_TRIANGLE}, {SDL_SCANCODE_1,BTN_L1}, {SDL_SCANCODE_3,BTN_R1},
-        {SDL_SCANCODE_R,BTN_L2}, {SDL_SCANCODE_F,BTN_R2}, {SDL_SCANCODE_Z,BTN_L3}, {SDL_SCANCODE_C,BTN_R3},
-        {SDL_SCANCODE_RETURN,BTN_OPTIONS},
-        {SDL_SCANCODE_I,BTN_UP}, {SDL_SCANCODE_K,BTN_DOWN}, {SDL_SCANCODE_J,BTN_LEFT}, {SDL_SCANCODE_L,BTN_RIGHT},
-    };
-    for (size_t i=0;i<sizeof(keys)/sizeof(*keys);++i) if (k[keys[i].key]) d->buttons|=keys[i].ps;
-    if (k[SDL_SCANCODE_TAB]) touch_click(d,0);
-    if (k[SDL_SCANCODE_BACKSPACE]) touch_click(d,1);
-    if (d->buttons & BTN_L2) d->l2=255;
-    if (d->buttons & BTN_R2) d->r2=255;
-    d->left_x=(uint8_t)(128-(k[SDL_SCANCODE_A] ? 128 : 0)+(k[SDL_SCANCODE_D] ? 127 : 0));
-    d->left_y=(uint8_t)(128-(k[SDL_SCANCODE_W] ? 128 : 0)+(k[SDL_SCANCODE_S] ? 127 : 0));
-    d->right_x=(uint8_t)(128-(k[SDL_SCANCODE_LEFT] ? 128 : 0)+(k[SDL_SCANCODE_RIGHT] ? 127 : 0));
-    d->right_y=(uint8_t)(128-(k[SDL_SCANCODE_UP] ? 128 : 0)+(k[SDL_SCANCODE_DOWN] ? 127 : 0));
+    float dx=0, dy=0;
+    uint32_t mouse=0;
+    bbgpu_mouse_take(&dx,&dy,&mouse);
+    keyboard_mouse(d,k,dx,dy,mouse,d->timestamp);
 }
 
 /* BB_PAD_FILE=<file>: scripted input for automated runs. The file holds whitespace-separated
@@ -336,7 +396,7 @@ static void sample(PadData *d) {
     uint8_t *axes[4]={&d->left_x,&d->left_y,&d->right_x,&d->right_y};
     for (int i=0;i<4;++i) if (injected.stick[i]>=0) *axes[i]=(uint8_t)injected.stick[i];
     if (hold_after_capture) {
-        if (d->buttons) d->buttons=0;
+        if (d->buttons) { d->buttons=0; d->l2=d->r2=0; }
         else hold_after_capture=0;
     }
 }
