@@ -281,7 +281,10 @@ int main(int argc, char** argv) {
             cmd.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *layout, 0, write, d);
             cmd.dispatch(1, 1, 1, d);
         });
-        else std::puts("MUTATION skip-store");
+        else {
+            RequireNegativeSetup();
+            std::puts("MUTATION skip-store");
+        }
         scheduler.Finish(); // also holds the descriptor view through GPU completion
     };
     on_a([&] { select(bc); read_image(cache.GetImage(image_id), Seed(0)); });
@@ -294,7 +297,11 @@ int main(int argc, char** argv) {
         read_image(cache.GetImage(image_id), Seed(1));
         store();
         if (!is("--skip-materialize") && !is("--mixed-authority")) cache.MaterializeBc4AliasesAfterCommand();
-        else if (is("--skip-materialize")) std::puts("MUTATION skip-materialize");
+        else if (is("--skip-materialize")) {
+            read_image(cache.GetImage(image_id), Seed(1, true));
+            RequireNegativeSetup();
+            std::puts("MUTATION skip-materialize");
+        }
     });
     if (is("--mixed-authority")) {
         RequireNegativeSetup();
