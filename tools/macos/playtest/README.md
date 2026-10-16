@@ -8,8 +8,9 @@ For native 1920x1080 acceptance use `play_route.py --native-1080p` on the
 `launch` or `route` subcommand; see `docs/macos/native-1080p-acceptance.md`.
 The historical timed movement loops below require visual supervision and do
 not establish safe traversal from coordinates. Their default 960x540 window
-also does not qualify native output. Measurements remain blocked by the disk
-hold until explicitly released by Build and lead.
+also does not qualify native output. Coordinate named measurement/build jobs
+with Build under the current 35 GB decimal floor plus peak reservations and
+default 5 GB safety margin; the lead has lifted the general disk hold.
 
 - `r0.sh PROBE`: quiet R0 perf run (5 min clinic idle + 5 min walk), FPS and parse split per segment. Env `R0_LABEL`, `R0_EXTRA` (e.g. `--perf`), `R0_FLIP_AT`/`R0_FLIP_VALUE` (live toggle flip). Writes `host.txt` (thermal, memory pressure, load; before and after) into the run dir.
 - `ab.sh NAME "A B B A" A=BUILD_DIR B=BUILD_DIR`: interleaved quiet R0 A/B with BB_PERF; output in `out/macos_route/ab-NAME/`.

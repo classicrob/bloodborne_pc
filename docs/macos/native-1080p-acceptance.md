@@ -1,8 +1,10 @@
 # Native 1080p acceptance plan
 
-Status, 2026-10-15: source preparation only. Disk hold is active at about 40 GiB
-free. No new measurement, capture, build or gameplay result is claimed. The 4K
-baseline queue is retired. Goal remains sustained 60 FPS with existing quality.
+Status, 2026-10-15: 15 deterministic Python tooling tests passed; C++ execution,
+shared-preview and runtime acceptance are pending. The lead lifted the general
+disk hold under the user's new 35 GB decimal floor. No new measurement, capture,
+build or gameplay result is claimed. The 4K baseline queue is retired. Goal
+remains sustained 60 FPS with existing quality.
 
 ## Exact preset and output evidence
 
@@ -45,11 +47,17 @@ and compositor scaling and cannot replace render/swapchain extent evidence.
 
 ## Release, preservation and quiet run prerequisites
 
-Both Build and lead must explicitly release the disk hold and supply the signed
-shared preview and executed full-gate summary. Check `df` before every job that
-can grow files. Budget measured peak growth above the 50 GiB hard floor with a
-further 5 GiB buffer; a provisional 1 GiB job requires at least 56 GiB free.
-Build's operating target is 60 GiB. Refuse an unbudgeted capture/build.
+The lead has released the general disk hold. Coordinate named jobs with Build;
+the first priority is Replay's incremental build, loader negative/cross-build
+qualification and small attribution run, then the shared preview in a permitted
+slot. Do not duplicate that build or create new captures before capture
+reuse/migration is qualified and budgeted. Live acceptance requires the signed
+shared preview and executed full-gate summary. Check raw available bytes before
+every job that can grow files. Budget measured peak growth above the hard floor
+of 35,000,000,000 bytes plus the default 5,000,000,000-byte safety margin: a
+1,000,000,000-byte job needs at least 41,000,000,000 bytes available, including
+other active reservations. An older 50 GB floor or 60 GB target is superseded.
+Refuse an unbudgeted capture/build. Do not duplicate the user's broader cleanup.
 
 Use current macos `heavy.sh`, one heavy job per worktree, exclusive GPU,
 `--cpu-quiet` stop mode and `--settle 4,30` agreed with Build. Retain top-process,
