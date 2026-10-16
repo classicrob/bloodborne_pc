@@ -85,6 +85,7 @@ static void touch_click(PadData *d, int right) {
 #ifdef __APPLE__
 static SDL_Gamepad *current_gamepad(void);
 #include "runtime_pad_motion_mac.h"
+#include "runtime_player_position_mac.h"
 #endif
 
 /* Opens the first gamepad SDL knows about; called under lock. */
@@ -364,6 +365,9 @@ static ABI int32_t pad_read_state(int32_t handle, PadData *data) {
     pthread_mutex_lock(&lock);
     sample(data); ++reads;
     pthread_mutex_unlock(&lock);
+#ifdef __APPLE__
+    player_position_sample();
+#endif
     return 0;
 }
 /* Buffered read: the port samples once per call, so one entry is returned. */

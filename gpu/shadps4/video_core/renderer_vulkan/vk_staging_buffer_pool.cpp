@@ -235,8 +235,14 @@ void StagingBufferPool::Retire(const VideoCore::Buffer* buffer, u64 offset) {
     }
     // Runs where the commands before it are recorded. CurrentTick() there is the submission
     // they land in, or the next one while a submission is syncing: never an earlier one.
+    // bbport (Apple, asynchronous submission): the owner's open value can be several
+    // submissions ahead of the recording thread; RecordingTick() is the one recorded into.
     scheduler.Record([this, buffer](vk::CommandBuffer) {
+#ifdef __APPLE__
+        const u64 tick = scheduler.RecordingTick();
+#else
         const u64 tick = scheduler.CurrentTick();
+#endif
         std::scoped_lock lk{mutex};
         for (auto& cache : large_caches) {
             for (auto& entry : cache) {

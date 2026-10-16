@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include "bbport_lock_wait.h"
 #include <mutex>
 
 #include <array>
@@ -118,7 +119,7 @@ private:
     std::vector<RingRetire> released_at_request;
     /// bbport: FreeDeferred runs on the priority runner, Retire's marker on the recording
     /// thread, the rest on the thread recording commands.
-    std::mutex mutex;
+    BB_TIMED_LOCK(std::mutex, KLockStaging) mutex;
     u64 late_retires = 0; ///< uses recorded two or more submissions after their Request tick
 };
 

@@ -86,7 +86,7 @@ struct Fsr4Upscaler::Impl {
             return;
         }
         if (recording) {
-            scheduler.WaitSubmitted();
+            scheduler.WaitPreviousRetired();
         } else {
             scheduler.Finish();
         }

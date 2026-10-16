@@ -6,6 +6,8 @@
 // the compacted points, before the draw.
 #pragma once
 
+#include <utility>
+
 #include <memory>
 #include <optional>
 #include "shader_recompiler/gs_emulation.h"
@@ -58,6 +60,13 @@ const char* GsEmulationUnsupported(const AmdGpu::Regs& regs);
 
 /// Input vertices per primitive of a supported GS input topology.
 u32 GsEmulationVerticesPerPrimitive(const AmdGpu::Regs& regs);
+
+/// The bytes the ES kernel loads for `bytes` of guest indices at buffer offset `offset`:
+/// [begin, end). Emit::LoadIndex reads whole dwords (u16 indices in pairs), so a range that
+/// starts or ends mid-dword also reads the other halfword.
+constexpr std::pair<u64, u64> GsIndexLoadRange(u64 offset, u64 bytes) {
+    return {offset & ~u64{3}, (offset + bytes + 3) & ~u64{3}};
+}
 
 /// Ranges bound to the GsScratch and GsIndexInput buffers of the draw being recorded.
 struct GsEmulationBinding {

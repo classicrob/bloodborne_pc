@@ -19,6 +19,7 @@
 #endif
 #include "common/debug.h"
 #include "common/types.h"
+#include "bbport_lock_wait.h"
 #include "video_core/buffer_cache/region_definitions.h"
 #include "video_core/page_manager.h"
 
@@ -190,7 +191,7 @@ public:
         return bits.AnyInRange(start_page, end_page);
     }
 
-    LockType lock;
+    BB_TIMED_LOCK(LockType, KLockRegions) lock;
 
 private:
     /**

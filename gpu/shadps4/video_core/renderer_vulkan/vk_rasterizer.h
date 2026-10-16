@@ -8,6 +8,7 @@
 #ifdef __APPLE__
 #include <condition_variable>
 #include <mutex>
+#include "bbport_pass_trace.h"
 #endif
 #include "common/shared_first_mutex.h"
 #include "video_core/buffer_cache/buffer_cache.h"
@@ -297,6 +298,14 @@ private:
         u32 scene_size = 0;
         std::array<float, 2> target_scale{};
     } begin_memo;
+#ifdef __APPLE__
+    // The pass trace (BB_PASS_TRACE): the targets the last full render state resolved, and the
+    // snapshot kept with begin_memo, provided again for a pass begun from a memo hit.
+    std::array<BbPassTrace::Entry, 9> trace_views{};
+    u32 num_trace_views = 0;
+    std::array<BbPassTrace::Entry, 9> begin_memo_trace{};
+    u32 num_begin_memo_trace = 0;
+#endif
     u64 begin_memo_hits = 0, begin_memo_misses = 0;
     void Resolve();
     void DepthStencilCopy(bool is_depth, bool is_stencil);
@@ -337,6 +346,35 @@ private:
     /// BB_GPU_READ_CHECK (diagnostic): hashes what the draw just recorded reads, to compare at
     /// GPU retirement.
     void GpuReadCheck(const GraphicsPipeline* pipeline, bool is_indexed, u32 index_offset);
+    /// Reads of a draw's or dispatch's fixed-function inputs (the index range, indirect
+    /// arguments; the GS index buffer its ES kernel reads), noted when resolved and recorded in
+    /// the barrier tracker by ResetBindings, after the draw or dispatch that reads them: a later
+    /// write to them then gets its barrier (WAR). Recorded earlier, a FlushBarriers between could
+    /// clear them before the draw. Vertex data needs no entry on Apple: vertex fetch is emulated
+    /// (pulled through stage.buffers, recorded with the descriptor buffers).
+    struct InputRead {
+        const VideoCore::Buffer* buffer;
+        u64 offset;
+        u64 size;
+        vk::PipelineStageFlags2 stage;
+        vk::AccessFlags2 access;
+    };
+    std::vector<InputRead> input_reads;
+    void NoteInputRead(const VideoCore::Buffer* buffer, u64 offset, u64 size,
+                       vk::PipelineStageFlags2 stage, vk::AccessFlags2 access) {
+        input_reads.push_back({buffer, offset, size, stage, access});
+    }
+    /// BB_INPUT_READ_VERIFY=1: an ordinary indexed draw's index range, and an ordinary indirect
+    /// draw's or dispatch's arguments (and count), as bound, must be among the noted input reads;
+    /// a gap stops, naming the binding. GS-emulated draws (ES index reads) and descriptor buffers
+    /// are not checked.
+    struct InputBinding {
+        const char* what;
+        vk::Buffer handle;
+        u64 offset;
+        u64 size;
+    };
+    void VerifyInputReads(std::span<const InputBinding> bindings);
 #endif
     void DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_indexed,
                             const IndirectDraw& indirect);
@@ -673,7 +711,8 @@ private:
     mutable vk::Viewport capture_viewport{};
     mutable vk::Rect2D capture_scissor{};
     void DumpSampledImages();
-    bool PendingWriteOverlaps(VAddr address, u64 size);
+    /// `matched_span` (optional): the size of the merged pending range that overlapped.
+    bool PendingWriteOverlaps(VAddr address, u64 size, u64* matched_span = nullptr);
     /// Stage B: the ring bindings of the stages of the packet being recorded.
     struct RingStage {
         const Shader::Info* info;

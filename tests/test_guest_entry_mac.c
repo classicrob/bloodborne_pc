@@ -27,6 +27,7 @@ static void *runtime_low_map_named(size_t size,int prot,const char *owner) {
     return p==MAP_FAILED ? NULL : p;
 }
 #include "../src/probe_entry_trace_mac.h"
+#include "test_alarm.h"
 extern unsigned char entry_body[],entry_body_end[],entry_return[];
 extern void entry_call(uint64_t *);
 void *entry_code;
@@ -120,7 +121,7 @@ static void check_refusal(unsigned char *image,Segment *segment) {
 int main(int argc,char **argv) {
     (void)argv;
     int delayed=argc>1;
-    alarm(30);
+    test_alarm(30);
     assert(!pthread_key_create(&key,NULL));
     size_t page=(size_t)sysconf(_SC_PAGESIZE);
     unsigned char *image=mmap(NULL,page,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANON,-1,0);

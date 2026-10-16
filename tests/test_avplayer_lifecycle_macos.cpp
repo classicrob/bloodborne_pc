@@ -7,6 +7,7 @@
 #include <cstring>
 #include <pthread.h>
 #include <unistd.h>
+#include "test_alarm.h"
 
 extern "C" {
 void runtime_set_main_tls(const void*, uint64_t, uint64_t, uint64_t);
@@ -211,7 +212,7 @@ static void state_lifecycle(void* path) {
 
 int main(int argc, char** argv) {
     assert(argc == 2);
-    alarm(45);
+    test_alarm(45);
     runtime_set_main_tls(nullptr, 0, 64, 16);
     for (unsigned i = 0; i < 12; ++i) {
         Run run{argv[1], i % 3 == 0, i % 3 == 2};

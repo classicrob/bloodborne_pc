@@ -28,6 +28,7 @@ static int audio_test_sleep(clockid_t clock,int flags,const struct timespec *at,
 #undef clock_nanosleep
 #include <math.h>
 #include <signal.h>
+#include "test_alarm.h"
 
 uintptr_t runtime_lookup(const RuntimeExport *table,size_t count,const char *name) {
     for (size_t i=0;i<count;++i) if (!strcmp(table[i].name,name)) return (uintptr_t)table[i].function;
@@ -73,7 +74,7 @@ static void check_null_clock(void) {
     puts("PASS: null virtual-clock exact periods, EINTR deadline, batch pacing and stall reset");
 }
 int main(int argc,char **argv) {
-    alarm(90);
+    test_alarm(90);
     if (argc>1 && !strcmp(argv[1],"--null-clock")) { check_null_clock();return 0; }
     int null_sink=argc>1 && !strcmp(argv[1],"--null");
     int timer=null_sink || (argc>1 && !strcmp(argv[1],"--timer"));

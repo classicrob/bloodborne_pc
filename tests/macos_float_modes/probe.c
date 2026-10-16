@@ -6,6 +6,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <vulkan/vulkan.h>
+#include "../test_alarm.h"
 #define CHECK(call) do { VkResult r_=(call); if(r_) { fprintf(stderr,"FAIL %s: %d\n",#call,r_); exit(1); } } while(0)
 static VkDevice device;
 static VkPhysicalDevice physical;
@@ -97,7 +98,7 @@ int main(int argc,char **argv) {
     assert(argc==2 || (argc==3 && !strcmp(argv[2],"--benchmark")));
     const int benchmark=argc==3;
 #endif
-    alarm(45); setbuf(stdout,NULL); puts("float modes probe: start");
+    test_alarm(45); setbuf(stdout,NULL); puts("float modes probe: start");
     VkApplicationInfo app={.sType=VK_STRUCTURE_TYPE_APPLICATION_INFO,.pApplicationName="Float modes probe",.apiVersion=VK_API_VERSION_1_3};
     VkInstanceCreateInfo ic={.sType=VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,.pApplicationInfo=&app};
 #ifdef __APPLE__

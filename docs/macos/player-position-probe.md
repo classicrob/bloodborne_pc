@@ -1,7 +1,7 @@
 # Live player-position probe: feasibility
 
 Status: source-qualified candidate for a read-only, opt-in navigation observer.
-No game run, coordinate/yaw calibration, or publisher implementation is claimed.
+The publisher is implemented below; game observation and coordinate/yaw calibration remain pending.
 Astra-2 owns the runtime observer; Playtest owns the route controller.
 
 ## Source and address spaces
@@ -102,3 +102,118 @@ or warp is part of this tool. The likely implementation is one small runtime
 module plus startup/input integration and a fixture for read failures, changing
 chains, non-finite fields and atomic publication; it does not require renderer
 or GPU-library changes.
+
+## Implemented observer (qualification pending)
+
+Set `BB_PLAYER_POS_FILE` to an absolute output path. Startup checks six short
+1.09 code ranges after patches and before entry probes are installed. Each
+successful pad read calls the observer **after unlocking the pad mutex**. It
+samples at most every 100 ms; it does not create a timer or worker thread. File
+creation/write/close/rename runs on that caller, so this diagnostic can add I/O
+latency and is not recommended for performance captures.
+
+Each observation uses two complete non-faulting self reads and requires equal
+pointer chains, map and transform. This reduces inconsistent observations; it
+does not establish guest object lifetime, simulation advancement, or input
+controllability. Non-null unreadable pointers and non-finite XYZ/yaw publish
+invalid output and terminate with exit 23. Null chain members, map `0xffffffff`,
+and changing observations publish invalid output and a loud state-change line;
+these are expected during loads. Invalid records omit player/XYZ/yaw/map fields.
+File failure or code-guard mismatch also stops with exit 23. A failed write may
+leave the previous file intact, so consumers must enforce freshness/process
+identity regardless of the last record's validity.
+
+Schema version 1 uses `pid`, a random hex `run_id`, `started_monotonic_ns`,
+`sequence`, `sample_monotonic_ns`, `published_monotonic_ns`, `sample_age_ns`,
+`pad_reads`, `valid`, `reason`, and `source="pad-read-observation"`. Valid records
+add `player` (hex string), `xyz` (three floats), `player_yaw_rad`, and `map_raw`
+(unsigned integer). Times use host CLOCK_MONOTONIC nanoseconds; sample age is
+measured at formatting, before file I/O. `pad_reads` counts valid API calls, not
+simulation frames. Consumers compute current age from the sample timestamp;
+they must not treat a recent file mtime or repeated stationary XYZ as progress.
+
+Playtest's agreed `goto` design does not need camera telemetry: it calibrates
+left-stick forward against observed world displacement, keeps the right stick
+untouched, then refines the stick-to-world mapping from later movements. It
+must still detect camera auto-follow/collision effects through that feedback.
+`face` is dropped. The first run remains observation-only before automated
+steering is qualified. Camera-independent yaw sign calibration can be recorded
+in that same run but is not required by `goto`.
+
+The signed unit fixture exercises the production chain walk against fake
+memory, null members, failed/overflowing reads, changing observations, invalid
+map and non-finite values; JSON validity/field omission and sequence; loud
+refusals; real Mach reads over a fake mapped image and protected/unmapped pages;
+the rate cap and host/guest errno preservation. Its optional local image argument
+checks the positive code guards without storing game bytes in the repository.
+
+## Initial observation qualification
+
+Playtest reported clean exits and no STOP for PREVIEW-28p (`34e2669`) runs
+`20261012-120428-1080p-POSQUAL-1`, `20261012-120819-1080p-POSQUAL-2`,
+`20261012-121308-1080p-POSQUAL-3` and `20261012-121717-1080p-POSQUAL-4`.
+Their manifests pin bb-probe SHA256
+`b356e62d867cd5dc276669e148265cb4e64d0b8744f368db63b323b8a724350a`
+and libbbgpu SHA256
+`e50c23fcf3c0e123117ec525f47645302fd70369ef1d20c313656e1e9268e348`.
+Samples and screenshot-step associations are in each run's `positions.jsonl`
+and `steps.jsonl` under Playtest's `out/macos_route`.
+
+Reported visual comparisons support the known Central Yharnam spawn XYZ,
+the Dream lantern position, XYZ changes during walking, and the second
+coordinate as height. Left-stick direction changes turn player yaw; a
+right-stick camera turn leaves that yaw unchanged. This supports planar
+steering from `xyz[0]`/`xyz[2]` and keeps player yaw distinct from camera yaw.
+
+Exit Game followed by Continue produced `absent-player-chain` records during
+the title transition, then valid saved-position observations again. **Valid
+can precede visible gameplay**: the first valid record appeared during loading.
+The route must require its world-stage gate separately; validity does not mean
+the player can be controlled. Live map transition and death were still pending
+at this initial handoff, so automated navigation was not yet qualified.
+
+An independent read of those four sample files found 421, 672, 985 and 1254
+records (3332 total), strictly increasing sequences and one run ID per file.
+The maximum publisher-reported age was 245000 ns (0.245 ms); the largest
+interval between recorded sample timestamps was 674084000 ns (0.674 s).
+These are observations, not worst-case freshness guarantees or evidence
+that every pad read produced a file.
+
+Consumer review found a blocker in the initial `PositionReader.fresh()`:
+checking only `sample_age_ns` accepts an old file on first use because that
+field records age at publication. Compute current age with
+`time.clock_gettime_ns(time.CLOCK_MONOTONIC) - sample_monotonic_ns`, reject
+invalid/future timestamps, and latch the run ID and start timestamp in
+addition to PID. Test stale first use, a higher sequence with an old timestamp,
+same-PID process replacement, and a stalled sequence. Playtest owns that
+reader correction; this record does not claim it has landed.
+
+### Map transition and death observations
+
+Playtest subsequently qualified both on the same PREVIEW-28p artifact:
+
+- `20261012-122354-1080p-POSQUAL-5`: Dream headstone travel to the 1st Floor
+  Sickroom. Samples changed from valid map `0x15000000`, through
+  `absent-player-chain`, to valid map `0x18010000` at approximately
+  `(-199.74,-50.76,179.42)`, matching the sickroom lamp in captures.
+  The clinic and Central Yharnam share that map value; it is not an area-name
+  discriminator within the map.
+- `20261012-122807-1080p-POSQUAL-6`: enemy damage and death at the coffin
+  arch, then respawn at the lit Central Yharnam lamp. Samples became invalid
+  during the transition and returned at approximately `(-193.4,-28.65,68.5)`.
+  Valid coordinates returned while the loading tip was still visible.
+
+Independent inspection found 1050 and 1470 logged samples respectively,
+with increasing sequences. The largest sample-timestamp gaps were 4.135163 s
+in travel and 2.454132 s during the death run. Playtest observed the travel
+file remaining valid but unchanged during the white dissolve. Thus an invalid
+record is not guaranteed to arrive before a period of uncontrollability;
+read-time age and non-advancing sequence must stop steering independently.
+Do not relax the freshness threshold to span these transitions. After a stop,
+starting another route requires a fresh world-stage check and calibration.
+
+These observations qualify the publisher's observed spawn, motion, yaw,
+null-chain, map-transition and death/respawn behavior on the tested fixtures.
+They do not qualify closed-loop route accuracy, combat behavior, or all
+loading paths. Playtest owns the reader correction/tests and the subsequent
+goto qualification authorized by the orchestrator.

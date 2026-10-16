@@ -7,6 +7,7 @@
 #include <sys/resource.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include "../test_alarm.h"
 extern "C" {
 void *runtime_low_map(size_t,int);
 void runtime_set_main_tls(const void *,uint64_t,uint64_t,uint64_t);
@@ -25,7 +26,7 @@ static void check_stack(void *) {
     assert(reinterpret_cast<uintptr_t>(runtime_errno())<(UINT64_C(1)<<40));
 }
 int main() {
-    alarm(30);
+    test_alarm(30);
     rlimit lim{0,0}; assert(!setrlimit(RLIMIT_CORE,&lim));
     const unsigned char op[]{0x65,0x48,0x8b,0x04,0x25,0,0,0,0,0xc3};
     auto code=static_cast<unsigned char *>(runtime_low_map(4096,PROT_READ|PROT_WRITE));
@@ -121,6 +122,6 @@ int main() {
         while(!destructor_ready.load()) std::this_thread::yield();
     }
     assert(callback_destroyed.load());
-    alarm(0);
+    test_alarm(0);
     std::puts("macOS HLE stacks: real low allocator/TLS, reuse, 3 workers, stop/join, self-stop, concurrent/repeated joins, destruction order, loud exception passed");
 }

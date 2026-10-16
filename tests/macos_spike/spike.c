@@ -18,6 +18,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #include <sys/ucontext.h>
+#include "../test_alarm.h"
 #if !defined(__APPLE__) || !defined(__x86_64__)
 #error Build with clang -arch x86_64 against the macOS SDK.
 #endif
@@ -280,7 +281,7 @@ static void bmi1_bextr(void) {
 static int run(const char *name,void (*fn)(void)) {
     printf("\n=== %s ===\n",name); fflush(NULL);
     pid_t pid=fork(); CHECK(pid>=0);
-    if (!pid) { alarm(20); fn(); fflush(NULL); _exit(0); }
+    if (!pid) { test_alarm(20); fn(); fflush(NULL); _exit(0); }
     int status; CHECK(waitpid(pid,&status,0)==pid);
     if (WIFSIGNALED(status)) printf("RESULT %s: SIGNAL %d (%s)\n",name,WTERMSIG(status),strsignal(WTERMSIG(status)));
     else printf("RESULT %s: %s (exit %d)\n",name,WEXITSTATUS(status) ? "FAIL" : "PASS",WEXITSTATUS(status));

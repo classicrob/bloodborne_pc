@@ -2,6 +2,7 @@
 #include "../src/runtime_memory.c"
 #include <assert.h>
 #include <signal.h>
+#include "test_alarm.h"
 uintptr_t runtime_lookup(const RuntimeExport *table,size_t count,const char *name) {
     for (size_t i=0;i<count;++i) if (!strcmp(table[i].name,name)) return (uintptr_t)table[i].function;
     return 0;
@@ -32,7 +33,7 @@ static void *consume(void *unused) {
     return NULL;
 }
 int main(void) {
-    alarm(30);
+    test_alarm(30);
     puts("CPU alias visibility: actual Mach backend, synchronized producer/consumer"); fflush(stdout);
     int64_t physical;
     assert(!direct_allocate(0,POOL_SIZE,PAGE,PAGE,0,&physical));

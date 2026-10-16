@@ -4,6 +4,7 @@
 #include <signal.h>
 #include <sys/wait.h>
 #include <sys/resource.h>
+#include "test_alarm.h"
 uintptr_t runtime_lookup(const RuntimeExport *table,size_t count,const char *name) {
     for (size_t i=0;i<count;++i) if (!strcmp(table[i].name,name)) return (uintptr_t)table[i].function;
     return 0;
@@ -205,7 +206,7 @@ static void mapping_audit_test(void) {
     puts("PASS: nonfixed hints, NO_OVERWRITE rejection, exact FIXED replacement, reservation stops, VMA/backing guards, alias remap writes");
 }
 int main(void) {
-    alarm(30);
+    test_alarm(30);
     runtime_memory_reserve();
     alias_diagnostic_test();
     mapping_audit_test();

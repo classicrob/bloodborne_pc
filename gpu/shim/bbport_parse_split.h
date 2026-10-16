@@ -107,6 +107,14 @@ enum K : std::uint32_t {
     KEncCopy,        ///< recorder: copies, fills, clears (Runtime)
     KDeferredWriteData, ///< deferred-signal waits before an in-order WRITE_DATA (RunWriteData)
     KDeferredFlip,      ///< deferred-signal waits before a flip's interrupt (SignalFlip)
+    // Contended acquisitions of our own locks (bbport_lock_wait.h): the wait, not the hold.
+    KLockTextureCache, ///< TextureCache::mutex
+    KLockSamplers,     ///< TextureCache::samplers_mutex
+    KLockRegions,      ///< buffer cache RegionManager::lock
+    KLockPages,        ///< PageManager's range locks
+    KLockStaging,      ///< StagingBufferPool::mutex
+    KLockDrawPrep,     ///< draw preparation (DrawPrep) mutex
+    KLockPrograms,     ///< PipelineCache::programs_mutex (shared or exclusive)
     KCount
 };
 inline constexpr const char* k_names[KCount] = {
@@ -117,7 +125,9 @@ inline constexpr const char* k_names[KCount] = {
     "dynamic state", "barrier flush", "render pass switch", "encode pipeline bind",
     "encode descriptors", "encode draws", "encode dispatches", "encode rendering begin/end",
     "encode barriers", "encode copies", "deferred signals before WRITE_DATA",
-    "deferred signals before a flip"};
+    "deferred signals before a flip", "lock wait: texture cache", "lock wait: samplers",
+    "lock wait: buffer regions", "lock wait: pages", "lock wait: staging pool",
+    "lock wait: draw preparation", "lock wait: pipeline programs"};
 
 /// The scope kind WaitDeferredSignals charges on this thread (KDeferred unless a caller names
 /// its site).
@@ -566,6 +576,81 @@ inline std::uint64_t previous_cpu_a = ~0ull, previous_cpu_b = ~0ull, previous_cp
 inline std::chrono::steady_clock::time_point window_start{};
 } // namespace detail
 
+/// Stage A's constant ring (Rasterizer::CollectRingBindings): small read-only buffer resources
+/// and flat user data copied at decode; buffer resources skipped (bound through ObtainBuffer at
+/// stage B instead); and the pending GPU-write notes that make it skip. Overlapping notes merge
+/// into one pending range; a range of HugeNote bytes or more (a written V# of a whole arena)
+/// covers every constant in it while unreached.
+enum class RingSkip : std::uint32_t { None, Large, GpuModified, Pending };
+inline constexpr std::uint64_t HugeNote = 64ull << 20;
+struct RingCounters {
+    std::atomic<std::uint64_t> copies{0}, copy_bytes{0}, ring_full{0}, skip_large{0},
+        skip_gpu_modified{0}, skip_pending{0}, skip_pending_huge{0}, notes{0}, notes_huge{0},
+        notes_huge_shader{0};
+};
+inline RingCounters ring;
+/// `behind_huge_note`: the merged pending range that decided a Pending skip is >= HugeNote.
+inline void NoteRingSkip(RingSkip skip, bool behind_huge_note) {
+    auto& c = skip == RingSkip::Large         ? ring.skip_large
+              : skip == RingSkip::GpuModified ? ring.skip_gpu_modified
+                                              : ring.skip_pending;
+    c.fetch_add(1, std::memory_order_relaxed);
+    if (behind_huge_note) {
+        ring.skip_pending_huge.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+inline void NoteRingCopy(std::uint64_t bytes, bool copied) {
+    if (copied) {
+        ring.copies.fetch_add(1, std::memory_order_relaxed);
+        ring.copy_bytes.fetch_add(bytes, std::memory_order_relaxed);
+    } else {
+        ring.ring_full.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+/// A pending GPU-write note (Rasterizer::NotePendingGpuWrite).
+inline void NotePendingNote(std::uint64_t bytes) {
+    ring.notes.fetch_add(1, std::memory_order_relaxed);
+    if (bytes >= HugeNote) {
+        ring.notes_huge.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+/// A written V# of HugeNote bytes or more is about to be noted (counted in NotePendingNote too).
+inline void NoteHugeShaderNote() {
+    ring.notes_huge_shader.fetch_add(1, std::memory_order_relaxed);
+}
+
+namespace detail {
+inline std::array<std::uint64_t, 10> ring_previous{};
+inline std::array<std::uint64_t, 10> RingNow() {
+    return {ring.copies.load(),       ring.copy_bytes.load(),        ring.ring_full.load(),
+            ring.skip_large.load(),   ring.skip_gpu_modified.load(), ring.skip_pending.load(),
+            ring.skip_pending_huge.load(), ring.notes.load(),        ring.notes_huge.load(),
+            ring.notes_huge_shader.load()};
+}
+/// The window's start: counts before it are not reported.
+inline void RingBaseline() {
+    ring_previous = RingNow();
+}
+inline std::string RingLine(double frames) {
+    auto& previous = ring_previous;
+    const std::array<std::uint64_t, 10> now = RingNow();
+    std::array<double, 10> d{};
+    for (std::size_t i = 0; i < d.size(); ++i) {
+        d[i] = double(now[i] - previous[i]) / frames;
+    }
+    previous = now;
+    char text[512];
+    std::snprintf(text, sizeof(text),
+                  "  Constant ring per frame: %.0f copied at stage A (%.0f KiB; buffer resources "
+                  "and flat user data), %.1f not copied (ring full); buffer resources skipped to "
+                  "ObtainBuffer: large %.1f, GPU-modified %.1f, pending write %.1f (behind a "
+                  "merged pending range >= 64 MiB %.1f); pending-write notes %.0f (>= 64 MiB "
+                  "%.1f, of which written V#s %.1f)",
+                  d[0], d[1] / 1024.0, d[2], d[3], d[4], d[5], d[6], d[7], d[8], d[9]);
+    return text;
+}
+} // namespace detail
+
 /// Frame ends per window: BB_SPLIT_WINDOW (1..100000, default 600; the perf replay uses 1 for a
 /// line per iteration). A malformed value stops.
 inline std::uint64_t WindowFrames() {
@@ -610,6 +695,7 @@ inline void NoteFrameEnd(std::uint64_t draws) {
         OnCpu(stage_a, previous_cpu_a, 0);
         OnCpu(stage_b, previous_cpu_b, 0);
         OnCpu(recorder, previous_cpu_r, 0);
+        detail::RingBaseline();
         for (std::uint32_t k = 0; k < KCount; ++k) {
             ScopeBy(stage_a, previous_a, static_cast<K>(k), a_names, ACount, 0, 1);
             ScopeBy(stage_b, previous_b, static_cast<K>(k), b_names, BCount, 0, 1);
@@ -665,13 +751,14 @@ inline void NoteFrameEnd(std::uint64_t draws) {
                 "    stage B drains at other packets during: %s\n"
                 "  stage B (draw recording thread, %.0f%%, %s per frame): %s\n"
                 "  Vulkan recording thread (%.0f%%, %s per frame): %s\n"
-                "%s\n",
+                "%s\n%s\n",
                 static_cast<unsigned long long>(window_frames),
                 frame_ms, double(window_draw_count) / frames, a_us_per_draw,
                 100.0 * a_cycles * ms_per_cycle / wall_ms, a_cpu.c_str(), a_line.c_str(),
                 a_deferred.c_str(), a_drain.c_str(), 100.0 * b_cycles * ms_per_cycle / wall_ms,
                 b_cpu.c_str(), b_line.c_str(), 100.0 * r_cycles * ms_per_cycle / wall_ms,
-                r_cpu.c_str(), r_line.c_str(), flush_line.c_str());
+                r_cpu.c_str(), r_line.c_str(), flush_line.c_str(),
+                detail::RingLine(frames).c_str());
     std::fflush(stdout);
     window_cycles = now_cycles;
     window_start = now;

@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <cstddef>
 #include <optional>
 
@@ -15,12 +16,17 @@ ResourcePool::ResourcePool(Semaphore* work_semaphore_, std::size_t grow_step_)
     : work_semaphore{work_semaphore_}, grow_step{grow_step_} {}
 
 std::size_t ResourcePool::CommitResource() {
+    return CommitResource(work_semaphore->CurrentTick());
+}
+
+std::size_t ResourcePool::CommitResource(u64 tick) {
     u64 gpu_tick = work_semaphore->KnownGpuTick();
-    const auto search = [this, gpu_tick](std::size_t begin,
+    // gpu_tick by reference: the refresh and the cap wait below update it.
+    const auto search = [this, &gpu_tick, tick](std::size_t begin,
                                          std::size_t end) -> std::optional<std::size_t> {
         for (std::size_t iterator = begin; iterator < end; ++iterator) {
             if (gpu_tick >= ticks[iterator]) {
-                ticks[iterator] = work_semaphore->CurrentTick();
+                ticks[iterator] = tick;
                 return iterator;
             }
         }
@@ -38,11 +44,21 @@ std::size_t ResourcePool::CommitResource() {
     if (!found) {
         // Search from beginning to the hinted position.
         found = search(0, hint_iterator);
+#ifdef __APPLE__
+        // bbport: a bounded pool waits for the GPU to retire the oldest resource instead of
+        // growing (asynchronous submission can submit far ahead of a stalled GPU).
+        while (!found && max_resources && ticks.size() >= max_resources) {
+            published.waits_at_cap.fetch_add(1, std::memory_order_release);
+            work_semaphore->Wait(*std::ranges::min_element(ticks));
+            gpu_tick = work_semaphore->KnownGpuTick();
+            found = search(0, ticks.size());
+        }
+#endif
         if (!found) {
             // Both searches failed, the pool is full; handle it.
             const std::size_t free_resource = ManageOverflow();
 
-            ticks[free_resource] = work_semaphore->CurrentTick();
+            ticks[free_resource] = tick;
             found = free_resource;
         }
     }
@@ -55,6 +71,7 @@ std::size_t ResourcePool::CommitResource() {
 std::size_t ResourcePool::ManageOverflow() {
     const std::size_t old_capacity = ticks.size();
     ticks.resize(old_capacity + grow_step);
+    published.size.store(ticks.size(), std::memory_order_release);
     Allocate(old_capacity, old_capacity + grow_step);
     return old_capacity;
 }
@@ -74,9 +91,21 @@ CommandPool::CommandPool(const Instance& instance, Semaphore* work_semaphore)
                vk::to_string(pool_result));
     cmd_pool = std::move(pool);
     SetObjectName(device, *cmd_pool, "CommandPool");
+#ifdef __APPLE__
+    max_resources = MaxBuffers;
+    const std::size_t pools = live_command_pools.fetch_add(1) + 1;
+    ASSERT_MSG(pools * MaxBuffers + MetalCommandBufferHeadroom <= MaxActiveMetalCommandBuffers,
+               "{} command pools of {} buffers exceed MoltenVK's {} Metal command buffers in "
+               "flight: vkQueueSubmit would block under the submit mutex before the pool cap",
+               pools, MaxBuffers, MaxActiveMetalCommandBuffers);
+#endif
 }
 
-CommandPool::~CommandPool() = default;
+CommandPool::~CommandPool() {
+#ifdef __APPLE__
+    live_command_pools.fetch_sub(1);
+#endif
+}
 
 void CommandPool::Allocate(std::size_t begin, std::size_t end) {
     cmd_buffers.resize(end);
@@ -99,6 +128,11 @@ void CommandPool::Allocate(std::size_t begin, std::size_t end) {
 
 vk::CommandBuffer CommandPool::Commit() {
     const std::size_t index = CommitResource();
+    return cmd_buffers[index];
+}
+
+vk::CommandBuffer CommandPool::Commit(u64 tick) {
+    const std::size_t index = CommitResource(tick);
     return cmd_buffers[index];
 }
 

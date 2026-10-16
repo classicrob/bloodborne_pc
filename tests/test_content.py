@@ -1,7 +1,7 @@
 from paths import ROOT
+import running_time
 from pathlib import Path
 import struct
-import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -27,7 +27,7 @@ class ProfileTests(unittest.TestCase):
 @unittest.skipUnless(EXE.exists(),'run bash build.sh --test first')
 class ContentTests(unittest.TestCase):
     def run_case(self,*args):
-        return subprocess.run([str(EXE.resolve()),*args],capture_output=True,text=True,timeout=5)
+        return running_time.run([str(EXE.resolve()),*args],30,capture_output=True,text=True)
 
     def test_lifecycle_and_output_boundaries(self):
         r=self.run_case();self.assertEqual(r.returncode,0,r.stdout+r.stderr)

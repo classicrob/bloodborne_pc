@@ -16,6 +16,9 @@ static bool virtual_rumble(void *user,Uint16 low,Uint16 high) {
 }
 
 static int capture;
+#ifdef __APPLE__
+int32_t *runtime_errno(void) { static _Thread_local int32_t value; return &value; }
+#endif
 int bbgpu_overlay_captures_input(void) { return capture; }
 uintptr_t runtime_lookup(const RuntimeExport *table, size_t count, const char *name) {
     (void)table; (void)count; (void)name;

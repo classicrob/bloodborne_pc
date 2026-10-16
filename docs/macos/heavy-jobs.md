@@ -22,6 +22,14 @@ A quick job gets a parallelism hint (`BB_BUILD_JOBS=4`, `CMAKE_BUILD_PARALLEL_LE
 on stderr, and it exits 124. A job that can take that long belongs in the build pool. The quick
 pool exists so one-minute jobs don't wait behind fifteen-minute builds.
 
+To run one test, don't write a runner: `build.sh --test-one <target or script>` builds the
+library and probe as usual, then only that test target, and runs each `--test` command naming
+it with the same environment (`BB_GPU_USER_DIR`, `VK_DRIVER_FILES`, `BB_GPU_BUILD`, ...),
+signing and directories, plus the checks of its outputs. Each run prints `test-one: exit N`, and
+the exit status is the first failure's. A name no test command has fails and lists them. In a
+tree whose library is built it fits the quick pool:
+`tools/macos/heavy.sh --pool quick LABEL -- bash build.sh --test-one capture-quiesce-test`.
+
 That is at most 4 translated (Rosetta) processes from game runs and one build-pool test, which is
 the team limit. Parallel runs are for correctness only; their FPS numbers mean nothing.
 
@@ -90,6 +98,58 @@ time limit pauses too), and no new one is admitted. When the run ends it resumes
 The pause is bounded by `BB_HEAVY_QUIET_MAX` (1200 s); past that the jobs resume with a loud
 "CPU QUIET BOUND REACHED". Each pause and resume is printed in the run's output and recorded in
 the history. Games are not paused (the exclusive GPU hold already keeps them off).
+
+`--cpu-quiet=ecore` is **not for perf A/Bs; correctness runs only**. Measured 2026-10-12 (replay,
+clinic, 100 iterations, A/B/A with stop mode): median +2.1%, p90 +2.7%, and one 72.7 ms
+iteration against about 43.6 in both stop arms. Perf runs keep `--cpu-quiet` (stop). What it does
+(an option; `--cpu-quiet` and `--cpu-quiet=stop` stay as above): it does not
+pause anything. While the run lasts, the watcher moves each running build, quick and sweep process
+to darwin background QoS every second (`setpriority(PRIO_DARWIN_PROCESS, PRIO_DARWIN_BG)`, as
+`taskpolicy -b`: efficiency cores, low CPU and I/O priority; `ps -o pri` shows 4), and processes
+they start meanwhile, including ninja's compiles, inherit it. New jobs start at once, under
+`taskpolicy -b`, instead of waiting. At the end, the processes it demoted, and those that
+inherited it from them, are restored; a job started in the background stays there. A job that ran
+at E-core QoS says so at its end (`ran N s at E-core QoS for perf runs (...)`; `ecore_s`,
+`ecore_by` in its end event). Every job's command runs in its own session (its own process group) under a reaper (`heavy.py
+--reap-for`), the group's leader: it waits for the command, and when heavy.sh dies for any reason
+(a SIGKILL to the caller's group, a stopped task) it SIGKILLs the job's group, so a job never
+outlives the slot it holds. Only if the reaper dies too does a process of the job keep the slot;
+status then says ORPHANED. Each job therefore has one more python3 process (the reaper, a
+0.1 s poll). Stop and ecore act on the job's tree and on every member of its group
+(also after an intermediate parent exited, re-parented to launchd, and after the leader exited:
+a pid is not reused while its group lives), and SIGINT/SIGTERM/SIGHUP reach the whole group. The
+leader is recorded with its start time; a live leader pid with another start is a stranger (tree
+only). Limits: a group left behind after the job ends is not covered, and neither is a process
+in a group of its own (ninja starts each command in one: covered while ninja is its parent). Under
+ecore, a child forked by a demoted process whose parent already exited is not known as inherited
+and stays at background QoS after the quiet (until it ends); a job admitted during an ecore quiet
+runs under taskpolicy -b for its whole life, also after the quiet. A process whose identity the
+kernel will not give is skipped and reported (`quiet-problem`), never left half-handled for the
+others. Processes are
+remembered as (pid, start time from the kernel), so a pid reused by another process is never
+resumed or restored.
+
+`--settle LOAD,SECONDS` (with `--cpu-quiet` only): after the other jobs are paused or demoted
+and before the perf run starts, wait until the 1-minute load average is below LOAD; past SECONDS
+the run is refused (exit 75) with the load and the top CPU processes. Every quiet start records
+the top 5 CPU processes in the history (`quiet-start`, `top`: CPU, pid, process group, command,
+working directory), so a stray hog shows there with its owner. A job that has to wait records a `queued` event once
+(reason, command, directory), so one that vanishes while waiting still shows. GPU
+lock requests are recorded too (`gpu-request` before the `gpu` grant): a job that ended while
+waiting has a request and no grant.
+
+A paused job says so when it ends, with its exit status, and its end event in the history
+carries `paused_s` and `paused_by`:
+
+    heavy: PREVIEW-26 full --test: PAUSED 712 s for perf runs (R0 perf); ended with exit 2: a
+    wall-clock timeout in the job may have fired on resume; rerun before calling it a failure
+
+A test's own `alarm()` kept counting through the stop and fired as soon as it resumed
+(PREVIEW-25a, the fp16 probe). Our tests use `test_alarm()` from `tests/test_alarm.h` instead:
+a forked watchdog that is paused with the test and adds up time with each observed gap clamped
+to half a second, so a pause costs at most 0.5 s of the limit (an approximation: any longer stall
+is clamped too). Python tests that launch our binaries use `tests/running_time.py` the same way.
+A failure in a paused job gets one rerun, and both results are reported.
 
 - Slots are flocks under `~/bbport-deps/locks` (`BB_HEAVY_DIR`). A job waits for a free slot of
   its pool and prints who holds them every 30 s.

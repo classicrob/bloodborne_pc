@@ -12,6 +12,7 @@
 #include <thread>
 #include <unistd.h>
 #include "core/libraries/kernel/equeue.h"
+#include "test_alarm.h"
 
 using namespace Libraries::Kernel;
 using namespace std::chrono_literals;
@@ -155,7 +156,7 @@ static void ProtectedOutput(bool poll) {
     const pid_t child = fork();
     Check(child >= 0, "fork protected output control");
     if (!child) {
-        alarm(5);
+        test_alarm(5);
         EqueueInternal q{4, "protected-output"};
         Add(q, 1, OrbisKernelEvent::GraphicsCore);
         Add(q, 2, OrbisKernelEvent::GraphicsCore);
@@ -258,7 +259,7 @@ static void MixedConsumers() {
 }
 
 int main() {
-    alarm(30);
+    test_alarm(30);
     std::puts("Equeue concurrency fixture starting");
     std::fflush(stdout);
     PollMustTakeLock();

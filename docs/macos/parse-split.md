@@ -118,6 +118,31 @@ attributes each pass end. A pass counts as ended by a submission when it is stil
 submission's barrier flush, which can close passes itself (counted there as "barrier"). So "ended
 an open render pass" here equals that census's "submit" enders.
 
+## Constant ring (stage A's copies of small constants)
+
+Stage A copies small read-only buffer resources, and each stage's flat user data, into the
+constant ring at decode (`Rasterizer::CollectRingBindings`), so stage B binds them without
+`ObtainBuffer`. A resource is
+skipped, and bound through `ObtainBuffer` at stage B, when:
+- it is larger than the stream threshold;
+- it is GPU-modified;
+- an unreached pending GPU-write note overlaps it.
+
+Notes come from `WRITE_DATA`, DMA and written V#s (`NotePendingGpuWrite`). Overlapping notes
+merge into one pending range, and each new one moves the range's position on. The "Constant ring per frame" line in the
+block gives:
+- the copies (and KiB, buffer resources and flat user data), and copies that did not fit (ring
+  full);
+- the buffer-resource skips by reason. Pending-write skips are counted apart when the merged
+  pending range that decided them is 64 MiB or more (a merged range need not equal any one note);
+- the notes per frame, with those of 64 MiB or more and how many of them were written V#s.
+
+The counts start at the block's first frame end. A written V# of a whole arena (the clinic replay
+notes ~2.18 GB ones) covers every constant in its range while unreached. If the "behind a merged
+pending range >= 64 MiB" count is a real share of the copies, narrowing such notes is a lever.
+It is only correct if the shader's write bounds are proven: these counts size it, they do not
+justify it.
+
 ## Output
 
 One block every 600 frame ends (`BB_SPLIT_WINDOW=<n>`, 1..100000, changes the window, for this
@@ -157,3 +182,27 @@ How to read it:
   well as carry-out. Their accounted percentage is close to 100%, not exactly 100%.
 - Waits overlap across threads. For example, stage A waits in a drain while stage B waits on the
   recorder. Read each thread's line on its own.
+
+## Lock waits (gpu/shim/bbport_lock_wait.h)
+
+Scopes named "lock wait: <lock>" are contended acquisitions of our own locks, charged to the
+thread that waited:
+- the texture cache mutex and its samplers mutex;
+- the buffer cache's region locks and the page manager's range locks;
+- the staging pool mutex and the draw preparation mutex;
+- the pipeline programs lock (shared or exclusive).
+
+A lock tries first. Only a failed try opens the scope, for the time lock() / lock_shared()
+then takes: spinning and scheduling delay included, not necessarily sleeping. The hold is not
+measured.
+
+What it does not cover (read a zero line accordingly: it does not rule out all contention):
+- try_lock() / try_lock_shared() themselves are not timed. So the retries of Common::LockRange /
+  TryLockRange (the page manager's range locks) leave part of their acquisition outside the
+  scope.
+- Only threads attached to the parse split (stage A, stage B, the recording thread) contribute.
+- The scheduler's mutexes are not wrapped: their waits show partly as "recorder sync" and the
+  related scopes, not as every acquisition.
+- MoltenVK's internal locks are not visible here.
+
+A controlled held-lock test would pin the attribution if this diagnostic is extended.

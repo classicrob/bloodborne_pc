@@ -19,6 +19,7 @@ EXCLUDED = {
                                    'run by hand via tests/bench_parse_split.sh',
     'tests/bench_parse_split.sh': 'builds and runs the parse-split overhead benchmark by hand',
     'tests/paths.py': 'helper module imported by the Python tests, not a test',
+    'tests/running_time.py': 'helper module imported by the Python tests (time limits without pauses), not a test',
     'tests/compare_atrac9_asset.py': 'manual tool: compares against a local game asset that the '
                                      'repository does not ship',
     'tests/test_ajm_asset.c': 'diagnostic decoder for compare_atrac9_asset.py: needs ATRAC9 frames '

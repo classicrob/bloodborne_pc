@@ -5,6 +5,7 @@
 #include "../src/runtime_cpu_profile.c"
 #include "../src/runtime_kernel.c"
 #include "../src/runtime_sema.c"
+#include "test_alarm.h"
 static _Thread_local int32_t fixture_errno;
 int32_t *runtime_errno(void) { return &fixture_errno; }
 void runtime_thread_set_profile_hook(void (*hook)(const char *,void *,size_t)) { (void)hook; }
@@ -171,7 +172,7 @@ static void safety_controls(void) {
     assert(tracking_faults==1000);assert(!munmap(tracking_page,page_size));tracking_page=NULL;
 }
 int main(int argc,char **argv) {
-    alarm(90);page_size=(size_t)sysconf(_SC_PAGESIZE);
+    test_alarm(90);page_size=(size_t)sysconf(_SC_PAGESIZE);
     if(argc>1 && !strcmp(argv[1],"bench-off")) {
         unsetenv("BB_CPU_PROFILE");runtime_cpu_profile_init();
         double start=seconds(),cpu=cpu_seconds();result=hot_beta(250000000);printf("BENCH %.9f %.9f\n",seconds()-start,cpu_seconds()-cpu);return 0;

@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "bbport_lock_wait.h"
 #include <boost/container/small_vector.hpp>
 #include "bbport_toggles.h"
 #include "common/assert.h"
@@ -268,7 +269,7 @@ struct PageManager::Impl {
 #else
     using LockType = Common::SpinLock;
 #endif
-    std::array<LockType, NUM_ADDRESS_LOCKS> locks{};
+    std::array<BB_TIMED_LOCK(LockType, KLockPages), NUM_ADDRESS_LOCKS> locks{};
 };
 
 #ifdef __linux__
