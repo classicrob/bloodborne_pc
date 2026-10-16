@@ -291,6 +291,11 @@ void Runtime::UploadImage(VideoCore::Image* dst, const VideoCore::Buffer* src,
                      vk::AccessFlagBits2::eTransferRead);
     }
 
+#ifdef __APPLE__
+    // Linked refresh publishes dirty state only after its unlocked work completes and the
+    // cache rechecks the CPU-write epoch under its mutex.
+    if (dst->bc4_float_parent && dst->bc4_float_internal_write) return;
+#endif
     dst->flags &= ~VideoCore::ImageFlagBits::Dirty;
 }
 

@@ -89,11 +89,13 @@ public:
         ImageInfo info;
         ImageViewInfo view_info;
         BindingType type{BindingType::Texture};
+        bool is_atomic = false;
 
         ImageDesc() = default;
         ImageDesc(const AmdGpu::Image& image, const Shader::ImageResource& desc)
             : info{image, desc}, view_info{image, desc},
-              type{desc.is_written ? BindingType::Storage : BindingType::Texture} {}
+              type{desc.is_written ? BindingType::Storage : BindingType::Texture},
+              is_atomic{desc.is_atomic} {}
         ImageDesc(const AmdGpu::ColorBuffer& buffer, AmdGpu::CbDbExtent hint)
             : info{buffer, hint}, view_info{buffer}, type{BindingType::RenderTarget} {}
         ImageDesc(const AmdGpu::DepthBuffer& buffer, AmdGpu::DepthView view,
@@ -184,7 +186,7 @@ public:
     struct Bc4FloatPreflight {
         std::vector<Bc4FloatParentRecord> parents;
     };
-    // Stage B only. Empty candidates do not join helpers, lock or wait. Nonempty inspection
+    // Record owner (B or drained synchronous A). Empty candidates do not join, lock or wait. Inspection
     // joins helpers before the registry lock, and never refreshes or mutates an image.
     [[nodiscard]] Bc4FloatPreflight InspectBc4FloatParents(std::span<const ImageDesc> selected);
     class Bc4FloatCommandScope {
@@ -249,6 +251,9 @@ public:
 
     /// Updates image contents if it was modified by CPU.
     void UpdateImage(ImageId image_id) {
+#ifdef __APPLE__
+        if (UpdateBc4FloatImage(image_id)) return;
+#endif
         // bbport: a clean image already tracked and touched in this GC period needs nothing.
         // Every texture binding comes here; the mutex (shared with the fault handlers of the
         // guest threads) was ~3% of the GPU thread. Flags are read atomically: an invalidation
@@ -471,6 +476,9 @@ private:
     void TouchImage(const Image& image);
 
     void FreeImage(ImageId image_id) {
+#ifdef __APPLE__
+        if (FreeBc4FloatPair(image_id)) return;
+#endif
         UntrackImage(image_id);
         UnregisterImage(image_id);
         DeleteImage(image_id);
@@ -495,6 +503,26 @@ private:
 #ifdef __APPLE__
     // Registered converted images only; protected by mutex, independent of binding resets.
     std::unordered_set<ImageId> bc4_alias_images;
+    struct Bc4FloatRelation {
+        Bc4FloatParentRecord parent;
+        ImageId companion_id{};
+        u64 companion_uid{}, companion_revision{};
+        const void* companion_backing{};
+        bool initialized = false;
+    };
+    std::vector<Bc4FloatRelation> bc4_float_relations;
+    std::atomic<bool> bc4_float_present{false};
+    const Bc4FloatPreflight* bc4_float_preflight = nullptr;
+    Bc4FloatRelation* FloatRelation(ImageId id);
+    void ValidateFloatRelation(const Bc4FloatRelation& relation);
+    void ValidateFloatParent(const Bc4FloatParentRecord& parent);
+    const Bc4FloatParentRecord* FloatExpectation(const ImageDesc& desc) const;
+    std::optional<ImageId> FindBc4FloatImage(const ImageDesc& desc);
+    bool UpdateBc4FloatImage(ImageId id);
+    bool FreeBc4FloatPair(ImageId id);
+    void CheckBc4FloatOverlap(const ImageDesc& desc);
+    void InvalidateBc4FloatRange(VAddr address, u64 size);
+    void MaterializeBc4FloatTails();
 #endif
     u64 total_used_memory = 0;
     u64 gc_evictions = 0, gc_downloads = 0; ///< bbport: pressure report

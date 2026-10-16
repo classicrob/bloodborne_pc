@@ -6,6 +6,7 @@
 #include <chrono>
 #include <unordered_map>
 #include <vector>
+#include <utility>
 #include <xxhash.h>
 
 #include "bbport_toggles.h"
@@ -223,10 +224,11 @@ TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler&
 TextureCache::~TextureCache() = default;
 
 void TextureCache::ProcessDownloadImages() {
+#ifdef __APPLE__
+    MaterializeBc4FloatTails();
+#endif
     std::unique_lock lk{download_images_mutex};
-    for (const ImageId image_id : download_images) {
-        DownloadImageMemory(image_id, true);
-    }
+    for (const ImageId image_id : download_images) DownloadImageMemory(image_id, true);
     download_images.clear();
 }
 
@@ -236,7 +238,7 @@ void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
         return;
     }
 #ifdef __APPLE__
-    ASSERT_MSG(!image.bc4_integer_alias,
+    ASSERT_MSG(!image.bc4_integer_alias && !image.bc4_float_parent && !image.bc4_float_companion,
                "Converted BC4 authority must be published at the command boundary");
 #endif
     const u32 download_size = image.info.pitch * image.info.size.height * image.info.size.depth *
@@ -277,8 +279,397 @@ void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
 }
 
 #ifdef __APPLE__
+namespace {
+bool SameFloatInfo(const ImageInfo& a, const ImageInfo& b) {
+    if (a.guest_address != b.guest_address || a.guest_size != b.guest_size ||
+        a.pixel_format != b.pixel_format || a.type != b.type || a.size != b.size ||
+        a.resources != b.resources || a.pitch != b.pitch || a.num_bits != b.num_bits ||
+        a.num_samples != b.num_samples || a.tile_mode != b.tile_mode ||
+        a.array_mode != b.array_mode || a.bank_swizzle != b.bank_swizzle ||
+        a.alt_tile != b.alt_tile || a.props.is_pow2 != b.props.is_pow2 ||
+        a.props.is_tiled != b.props.is_tiled || a.props.is_block != b.props.is_block ||
+        a.props.is_volume != b.props.is_volume || a.props.is_depth != b.props.is_depth ||
+        a.props.has_stencil != b.props.has_stencil || a.stencil_addr != b.stencil_addr ||
+        a.stencil_size != b.stencil_size || a.meta_info.cmask_addr != b.meta_info.cmask_addr ||
+        a.meta_info.fmask_addr != b.meta_info.fmask_addr ||
+        a.meta_info.htile_addr != b.meta_info.htile_addr) return false;
+    for (u32 m = 0; m < a.resources.levels; ++m) {
+        const auto& x = a.mips_layout[m]; const auto& y = b.mips_layout[m];
+        if (x.offset != y.offset || x.size != y.size || x.pitch != y.pitch || x.height != y.height)
+            return false;
+    }
+    return true;
+}
+bool SameFloatRequest(const TextureCache::ImageDesc& a, const TextureCache::ImageDesc& b) {
+    return SameFloatInfo(a.info, b.info) && a.type == b.type && a.is_atomic == b.is_atomic &&
+           a.view_info == b.view_info;
+}
+RuntimeMemoryAliasSnapshot FloatMapping(VAddr address, u64 size) {
+    RuntimeMemoryInventory inventory{};
+    RuntimeMemoryAliasSnapshot mapping{};
+    ASSERT_MSG(runtime_memory_inventory(&inventory) == 0 && !inventory.shared_backing_views &&
+                   runtime_memory_alias_snapshot(address, nullptr, 0, &mapping) == 1 &&
+                   inventory.generation == mapping.generation && !(mapping.generation & 1) &&
+                   address < mapping.end && size <= mapping.end - address && (mapping.prot & 1),
+               "BC4 Float tail requires unique committed parent backing");
+    return mapping;
+}
+void CheckFloatView(const TextureCache::ImageDesc& desc) {
+    ASSERT_MSG(!desc.is_atomic &&
+                   (desc.type == TextureCache::BindingType::Texture ||
+                    desc.type == TextureCache::BindingType::Storage) &&
+                   desc.view_info.format == vk::Format::eR32G32Sfloat &&
+                   desc.view_info.type == AmdGpu::ImageType::Color2D &&
+                   desc.view_info.is_storage == (desc.type == TextureCache::BindingType::Storage) &&
+                   !desc.view_info.is_depth_write && !desc.view_info.min_lod &&
+                   Bc4Alias::CompleteSubresource(desc.view_info.range.base.level,
+                       desc.view_info.range.base.layer, desc.view_info.range.extent.levels,
+                       desc.view_info.range.extent.layers),
+               "BC4 Float tail requires an exact non-atomic typed view");
+}
+}
+
+TextureCache::Bc4FloatPreflight TextureCache::InspectBc4FloatParents(
+    std::span<const ImageDesc> selected) {
+    Bc4FloatPreflight result;
+    for (u32 i = 0; i < selected.size(); ++i) {
+        if (Bc4Alias::IsFloatTailCandidate(selected[i].info)) {
+            auto& record = result.parents.emplace_back();
+            record.selected_index = i;
+            record.request = selected[i];
+            record.tail_address = record.visible_address = selected[i].info.guest_address;
+        }
+    }
+    if (result.parents.empty()) return result;
+    runtime.BeforeImageAccess();
+    std::scoped_lock lock{mutex};
+    for (auto& record : result.parents) {
+        const auto& info = record.request.info;
+        ForEachImageInRegion(info.guest_address, info.guest_size, [&](ImageId id, Image& image) {
+            if (image.info.pixel_format != vk::Format::eBc4UnormBlock) return;
+            const auto mip = info.MipOf(image.info);
+            if (mip < 0) return;
+            const char* reject = Bc4Alias::RejectFloatTail(info, image.info, mip);
+            ASSERT_MSG(!reject && !record.parent_id, "BC4 Float prospective parent: {}",
+                       reject ? reject : "ambiguous parents");
+            CheckFloatView(record.request);
+            ASSERT_MSG(!image.bc4_integer_alias && !image.scene_proxy &&
+                           !image.binding.is_bound && !image.binding.is_target &&
+                           !image.binding.needs_rebind &&
+                           False(image.flags & (ImageFlagBits::GpuModified | ImageFlagBits::GpuDirty)),
+                       "BC4 Float parent requires complete backing authority before binding");
+            record.parent_id = id; record.parent_uid = image.image_uid;
+            record.backing = image.backing; record.backing_revision = image.backing_revision;
+            record.parent_address = image.info.guest_address; record.parent_size = image.info.guest_size;
+            record.mip = mip;
+        });
+        record.registry_generation = RegistryGeneration();
+        if (!record.parent_id) continue;
+        ASSERT_MSG(!buffer_cache.IsRegionGpuModified(record.parent_address, record.parent_size),
+                   "BC4 Float parent has prior raw-buffer GPU authority");
+        const auto mapping = FloatMapping(record.parent_address, record.parent_size);
+        record.vm_generation = mapping.generation; record.backing_byte = mapping.backing_byte;
+        ForEachImageInRegion(record.parent_address, record.parent_size, [&](ImageId id, Image&) {
+            const auto* relation = FloatRelation(id);
+            ASSERT_MSG(id == record.parent_id ||
+                           (relation && relation->parent.parent_id == record.parent_id &&
+                            id == relation->companion_id),
+                       "BC4 Float parent overlaps another registered image");
+        });
+        if (auto* relation = FloatRelation(record.parent_id)) {
+            ValidateFloatRelation(*relation);
+            ASSERT_MSG(!slot_images[relation->companion_id].bc4_float_pending,
+                       "BC4 Float prior command has unpublished authority");
+        }
+    }
+    return result;
+}
+
+TextureCache::Bc4FloatCommandScope::Bc4FloatCommandScope(Bc4FloatCommandScope&& other) noexcept
+    : owner{std::exchange(other.owner, nullptr)} {}
+TextureCache::Bc4FloatCommandScope::~Bc4FloatCommandScope() {
+    if (owner) owner->bc4_float_preflight = nullptr;
+}
+TextureCache::Bc4FloatCommandScope TextureCache::UseBc4FloatPreflight(
+    const Bc4FloatPreflight& snapshot) {
+    if (snapshot.parents.empty()) return Bc4FloatCommandScope{nullptr};
+    ASSERT_MSG(!bc4_float_preflight, "Nested BC4 Float command preflight");
+    bc4_float_preflight = &snapshot;
+    return Bc4FloatCommandScope{this};
+}
+const TextureCache::Bc4FloatParentRecord* TextureCache::FloatExpectation(const ImageDesc& desc) const {
+    if (!bc4_float_preflight) return nullptr;
+    for (const auto& record : bc4_float_preflight->parents)
+        if (SameFloatRequest(record.request, desc)) return &record;
+    return nullptr;
+}
+TextureCache::Bc4FloatRelation* TextureCache::FloatRelation(ImageId id) {
+    for (auto& relation : bc4_float_relations)
+        if (relation.parent.parent_id == id || relation.companion_id == id) return &relation;
+    return nullptr;
+}
+void TextureCache::ValidateFloatParent(const Bc4FloatParentRecord& record) {
+    ASSERT_MSG(slot_images.is_allocated(record.parent_id), "BC4 Float parent retired");
+    const auto& parent = slot_images[record.parent_id];
+    ASSERT_MSG(True(parent.flags & ImageFlagBits::Registered) && parent.image_uid == record.parent_uid &&
+                   parent.backing == record.backing && parent.backing_revision == record.backing_revision &&
+                   !parent.scene_proxy && parent.info.guest_address == record.parent_address &&
+                   parent.info.guest_size == record.parent_size &&
+                   !Bc4Alias::RejectFloatTail(record.request.info, parent.info, record.mip),
+               "BC4 Float parent identity or layout changed");
+    ASSERT_MSG(!buffer_cache.IsRegionGpuModified(record.parent_address, record.parent_size),
+               "BC4 Float parent gained raw-buffer GPU authority");
+    const auto mapping = FloatMapping(record.parent_address, record.parent_size);
+    ASSERT_MSG(mapping.generation == record.vm_generation && mapping.backing_byte == record.backing_byte,
+               "BC4 Float parent mapping generation changed");
+}
+void TextureCache::ValidateFloatRelation(const Bc4FloatRelation& relation) {
+    ValidateFloatParent(relation.parent);
+    ASSERT_MSG(slot_images.is_allocated(relation.companion_id), "BC4 Float companion retired");
+    const auto& child = slot_images[relation.companion_id];
+    ASSERT_MSG(True(child.flags & ImageFlagBits::Registered) && child.bc4_float_companion &&
+                   child.image_uid == relation.companion_uid && child.backing == relation.companion_backing &&
+                   child.backing_revision == relation.companion_revision &&
+                   SameFloatInfo(child.info, relation.parent.request.info),
+               "BC4 Float companion identity changed");
+}
+
+std::optional<ImageId> TextureCache::FindBc4FloatImage(const ImageDesc& desc) {
+    if (!Bc4Alias::IsFloatTailCandidate(desc.info)) return {};
+    ImageId child_id{};
+    {
+        std::scoped_lock lock{mutex};
+        ImageId parent_id{};
+        ForEachImageInRegion(desc.info.guest_address, desc.info.guest_size, [&](ImageId id, Image& image) {
+            if (image.info.pixel_format == vk::Format::eBc4UnormBlock && desc.info.MipOf(image.info) >= 0) {
+                ASSERT_MSG(!parent_id, "BC4 Float parent became ambiguous"); parent_id = id;
+            }
+        });
+        const auto* expected = FloatExpectation(desc);
+        if (!parent_id) {
+            ASSERT_MSG(!expected || !expected->parent_id, "BC4 Float expected parent disappeared");
+            return {};
+        }
+        ASSERT_MSG(expected && expected->parent_id == parent_id,
+                   "BC4 Float conversion requires matching whole-command parent preflight");
+        ValidateFloatParent(*expected); CheckFloatView(desc);
+        auto& parent = slot_images[parent_id];
+        ASSERT_MSG(False(parent.flags & (ImageFlagBits::GpuModified | ImageFlagBits::GpuDirty)) &&
+                       !parent.binding.is_bound && !parent.binding.is_target && !parent.binding.needs_rebind,
+                   "BC4 Float parent authority or binding changed after preflight");
+        if (auto* relation = FloatRelation(parent_id)) {
+            ValidateFloatRelation(*relation);
+            ASSERT_MSG(SameFloatInfo(desc.info, relation->parent.request.info),
+                       "BC4 Float parent already has another tail companion");
+            child_id = relation->companion_id;
+        } else {
+            ForEachImageInRegion(parent.info.guest_address, parent.info.guest_size,
+                [&](ImageId id, Image&) { ASSERT_MSG(id == parent_id,
+                    "BC4 Float conversion gained another cached overlap"); });
+            // All structural/authority checks precede allocation. Insertion may move the parent.
+            child_id = slot_images.insert(instance, runtime, slot_image_views, desc.info);
+            RegisterImage(child_id);
+            auto& child = slot_images[child_id];
+            child.bc4_float_companion = true;
+            slot_images[parent_id].bc4_float_parent = true;
+            bc4_float_relations.push_back({.parent = *expected, .companion_id = child_id,
+                .companion_uid = child.image_uid, .companion_revision = child.backing_revision,
+                .companion_backing = child.backing});
+            bc4_float_present.store(true, std::memory_order_release);
+        }
+    }
+    UpdateBc4FloatImage(child_id);
+    slot_images[child_id].tick_accessed_last = scheduler.CurrentTick();
+    return child_id;
+}
+
+bool TextureCache::UpdateBc4FloatImage(ImageId id) {
+    if (!slot_images[id].bc4_float_parent && !slot_images[id].bc4_float_companion) return false;
+    runtime.BeforeImageAccess();
+    Bc4FloatRelation saved;
+    u64 parent_epoch{}, child_epoch{};
+    bool refresh{};
+    {
+        std::scoped_lock lock{mutex};
+        auto* relation = FloatRelation(id); ASSERT(relation);
+        ValidateFloatRelation(*relation);
+        auto& parent = slot_images[relation->parent.parent_id];
+        auto& child = slot_images[relation->companion_id];
+        const bool dirty = True((parent.flags | child.flags) & ImageFlagBits::Dirty);
+        ASSERT_MSG(!child.bc4_float_pending || !dirty,
+                   "BC4 Float refresh has mixed pending and backing authority");
+        ASSERT_MSG(!parent.bc4_float_pending || id == relation->companion_id,
+                   "BC4 Float parent read precedes companion publication");
+        ASSERT_MSG(False(parent.flags & (ImageFlagBits::GpuModified | ImageFlagBits::GpuDirty)),
+                   "BC4 Float refresh parent has independent GPU authority");
+        TrackImage(relation->parent.parent_id); TrackImage(relation->companion_id);
+        TouchImage(parent); TouchImage(child);
+        if (relation->initialized && !dirty) return true;
+        ASSERT_MSG(!child.bc4_float_pending, "BC4 Float cannot initialize pending companion");
+        // MaybeCpuDirty's small-prefix hash cannot establish full-parent backing authority.
+        refresh = True(parent.flags & ImageFlagBits::Dirty);
+        if (refresh) parent.flags |= ImageFlagBits::CpuDirty;
+        saved = *relation;
+        parent_epoch = parent.bc4_float_dirty_epoch; child_epoch = child.bc4_float_dirty_epoch;
+    }
+    auto& parent = slot_images[saved.parent.parent_id];
+    auto& child = slot_images[saved.companion_id];
+    // Record owners (B, or drained synchronous A), joined helpers and the existing VM/flip
+    // protocol exclude slot insertion/retirement. Copy guest bytes under the fault mutex;
+    // no cache/VMA lock spans allocation, detiling, recording or GPU completion.
+    if (refresh) {
+        const auto input = runtime.GetStagingPool().Request(parent.info.guest_size,
+            MemoryType::HostCached, instance.UniformMinAlignment(), true);
+        {
+            std::scoped_lock lock{mutex}; ValidateFloatRelation(saved);
+            ASSERT_MSG(parent.bc4_float_dirty_epoch == parent_epoch && child.bc4_float_dirty_epoch == child_epoch,
+                       "BC4 Float backing changed before refresh snapshot");
+            std::memcpy(input.mapped, reinterpret_cast<const void*>(parent.info.guest_address),
+                        parent.info.guest_size);
+        }
+        input.Flush();
+        const auto [linear, offset] = tile_manager.DetileImage(input.buffer, input.offset, parent.info);
+        std::vector<vk::BufferImageCopy> copies;
+        for (u32 mip = 0; mip < parent.info.resources.levels; ++mip) {
+            const auto& layout = parent.info.mips_layout[mip];
+            copies.push_back({.bufferOffset = offset + layout.offset,
+                .bufferRowLength = layout.pitch, .bufferImageHeight = layout.height,
+                .imageSubresource = {vk::ImageAspectFlagBits::eColor, mip, 0, 1},
+                .imageExtent = {std::max(parent.info.size.width >> mip, 1u),
+                                std::max(parent.info.size.height >> mip, 1u), 1}});
+        }
+        parent.bc4_float_internal_write = true;
+        { SCOPE_EXIT { parent.bc4_float_internal_write = false; };
+          runtime.UploadImage(&parent, linear, copies); }
+        runtime.GetStagingPool().Retire(linear, offset);
+        scheduler.Finish();
+        runtime.GetStagingPool().FreeDeferred(input);
+    }
+    const auto bridge = runtime.GetStagingPool().Request(8, MemoryType::HostCached, 8, true);
+    runtime.CopyBc4FloatTail(&parent, &child, saved.parent.mip, bridge.buffer, bridge.offset, true);
+    scheduler.Finish();
+    {
+        std::scoped_lock lock{mutex};
+        auto* relation = FloatRelation(id); ASSERT(relation);
+        ValidateFloatRelation(*relation);
+        ASSERT_MSG(parent.bc4_float_dirty_epoch == parent_epoch && child.bc4_float_dirty_epoch == child_epoch,
+                   "BC4 Float backing changed during initialization");
+        ASSERT_MSG(False(parent.flags & (ImageFlagBits::GpuModified | ImageFlagBits::GpuDirty)),
+                   "BC4 Float parent refresh did not establish backing authority");
+        parent.flags &= ~ImageFlagBits::Dirty;
+        child.flags &= ~(ImageFlagBits::Dirty | ImageFlagBits::GpuModified);
+        child.hash = 0; std::ranges::fill(child.mip_hashes, 0);
+        relation->initialized = true;
+    }
+    runtime.GetStagingPool().FreeDeferred(bridge);
+    return true;
+}
+
+void TextureCache::MaterializeBc4FloatTails() {
+    if (!bc4_float_present.load(std::memory_order_acquire)) return;
+    runtime.BeforeImageAccess();
+    std::vector<Bc4FloatRelation> pending;
+    {
+        std::scoped_lock lock{mutex};
+        for (const auto& relation : bc4_float_relations) {
+            ValidateFloatRelation(relation);
+            const auto& parent = slot_images[relation.parent.parent_id];
+            const auto& child = slot_images[relation.companion_id];
+            if (!child.bc4_float_pending) continue;
+            ASSERT_MSG(relation.initialized && parent.bc4_float_pending &&
+                           False((parent.flags | child.flags) & ImageFlagBits::Dirty) &&
+                           False(parent.flags & ImageFlagBits::GpuModified),
+                       "BC4 Float publication has mixed pending and backing authority");
+            pending.push_back(relation);
+        }
+    }
+    if (pending.empty()) return;
+    static thread_local bool publishing = false;
+    ASSERT_MSG(!publishing, "Recursive BC4 Float publication");
+    publishing = true; SCOPE_EXIT { publishing = false; };
+    runtime.BeforeImageAccess();
+    for (const auto& saved : pending) {
+        auto& parent = slot_images[saved.parent.parent_id];
+        auto& child = slot_images[saved.companion_id];
+        u64 parent_epoch{}, child_epoch{};
+        {
+            std::scoped_lock lock{mutex}; ValidateFloatRelation(saved);
+            parent_epoch = parent.bc4_float_dirty_epoch; child_epoch = child.bc4_float_dirty_epoch;
+        }
+        const auto bridge = runtime.GetStagingPool().Request(8, MemoryType::HostCached, 8, true);
+        runtime.CopyBc4FloatTail(&parent, &child, saved.parent.mip, bridge.buffer, bridge.offset, false);
+        scheduler.Record([](vk::CommandBuffer cmd) {
+            const vk::MemoryBarrier2 barrier{.srcStageMask = vk::PipelineStageFlagBits2::eCopy,
+                .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+                .dstStageMask = vk::PipelineStageFlagBits2::eHost,
+                .dstAccessMask = vk::AccessFlagBits2::eHostRead};
+            cmd.pipelineBarrier2({.memoryBarrierCount = 1, .pMemoryBarriers = &barrier});
+        });
+        scheduler.Finish(); bridge.Invalidate();
+        {
+            std::scoped_lock lock{mutex}; ValidateFloatRelation(saved);
+            ASSERT_MSG(parent.bc4_float_dirty_epoch == parent_epoch && child.bc4_float_dirty_epoch == child_epoch &&
+                           False((parent.flags | child.flags) & ImageFlagBits::Dirty),
+                       "BC4 Float backing changed before selective publication");
+            ASSERT_MSG(Core::Memory::Instance()->TryWriteBacking(
+                           std::bit_cast<u8*>(saved.parent.visible_address), bridge.mapped, 8),
+                       "BC4 Float selective eight-byte publication failed");
+            parent.bc4_float_pending = child.bc4_float_pending = false;
+            child.flags &= ~ImageFlagBits::GpuModified;
+            parent.hash = child.hash = 0;
+            std::ranges::fill(parent.mip_hashes, 0); std::ranges::fill(child.mip_hashes, 0);
+        }
+        runtime.GetStagingPool().FreeDeferred(bridge);
+    }
+}
+
+void TextureCache::InvalidateBc4FloatRange(VAddr address, u64 size) {
+    // Called under mutex by fault handling; never joins or waits.
+    for (auto& relation : bc4_float_relations) {
+        if (!Bc4Alias::RangesOverlap(address, size, relation.parent.parent_address, relation.parent.parent_size)) continue;
+        for (const auto id : {relation.parent.parent_id, relation.companion_id}) {
+            auto& image = slot_images[id]; ++image.bc4_float_dirty_epoch;
+            image.flags |= ImageFlagBits::CpuDirty;
+            UntrackImage(id);
+        }
+        relation.initialized = false;
+    }
+}
+void TextureCache::CheckBc4FloatOverlap(const ImageDesc& desc) {
+    for (const auto& relation : bc4_float_relations) {
+        if (!Bc4Alias::RangesOverlap(desc.info.guest_address, desc.info.guest_size,
+                                    relation.parent.parent_address, relation.parent.parent_size)) continue;
+        ValidateFloatRelation(relation);
+        const auto& parent = slot_images[relation.parent.parent_id];
+        ASSERT_MSG(desc.type == BindingType::Texture && !desc.is_atomic &&
+                       SameFloatInfo(desc.info, parent.info) && !parent.bc4_float_pending,
+                   "BC4 Float linked parent overlaps another selected image or writer");
+    }
+}
+bool TextureCache::FreeBc4FloatPair(ImageId id) {
+    auto* relation = FloatRelation(id);
+    if (!relation) return false;
+    const auto saved = *relation;
+    ASSERT_MSG(!slot_images[saved.companion_id].bc4_float_pending,
+               "BC4 Float pair retirement precedes publication");
+    std::erase_if(bc4_float_relations, [&](const auto& item) { return item.companion_id == saved.companion_id; });
+    if (bc4_float_relations.empty()) bc4_float_present.store(false, std::memory_order_release);
+    for (const auto member : {saved.parent.parent_id, saved.companion_id}) {
+        auto& image = slot_images[member];
+        image.bc4_float_parent = image.bc4_float_companion = false;
+        UntrackImage(member); UnregisterImage(member); DeleteImage(member);
+    }
+    return true;
+}
+
 void TextureCache::RejectBc4AliasBufferWrite(VAddr address, u64 size) {
     std::scoped_lock lock{mutex};
+    for (const auto& relation : bc4_float_relations) {
+        ASSERT_MSG(!Bc4Alias::RangesOverlap(address, size, relation.parent.parent_address,
+                                           relation.parent.parent_size),
+                   "Raw GPU buffer write overlaps BC4 Float protected parent: buffer={:#x}+{} parent={:#x}+{}",
+                   address, size, relation.parent.parent_address, relation.parent.parent_size);
+    }
     for (const auto id : bc4_alias_images) {
         const auto& image = slot_images[id];
         ASSERT_MSG(!Bc4Alias::RangesOverlap(address, size, image.info.guest_address,
@@ -290,6 +681,7 @@ void TextureCache::RejectBc4AliasBufferWrite(VAddr address, u64 size) {
 }
 
 void TextureCache::MaterializeBc4AliasesAfterCommand() {
+    MaterializeBc4FloatTails();
     std::vector<std::pair<ImageId, u64>> pending;
     {
         std::scoped_lock lock{mutex};
@@ -375,7 +767,8 @@ void TextureCache::PrepareBc4AliasesForMemoryMutation() {
     MaterializeBc4AliasesAfterCommand();
     {
         std::scoped_lock lock{mutex};
-        if (bc4_alias_images.empty()) return;
+        if (bc4_alias_images.empty() && bc4_float_relations.empty()) return;
+        while (!bc4_float_relations.empty()) FreeImage(bc4_float_relations.back().companion_id);
         // The mutation protocol has drained recording and joined the helper. Materialization
         // above checked every layout/authority before any writes; CPU-authoritative images
         // need only eviction. New aliases cannot inherit a cache entry for the old mapping.
@@ -392,6 +785,12 @@ void TextureCache::PrepareBc4AliasesForMemoryMutation() {
 #endif
 
 void TextureCache::MarkAsMaybeDirty(ImageId image_id, Image& image) {
+#ifdef __APPLE__
+    if (image.bc4_float_parent || image.bc4_float_companion) {
+        InvalidateBc4FloatRange(image.info.guest_address, image.info.guest_size);
+        return;
+    }
+#endif
     if (image.hash == 0) {
         // Initialize hash
         const u8* addr = std::bit_cast<u8*>(image.info.guest_address);
@@ -406,6 +805,9 @@ void TextureCache::MarkAsMaybeDirty(ImageId image_id, Image& image) {
 
 void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
     std::scoped_lock lock{mutex};
+#ifdef __APPLE__
+    InvalidateBc4FloatRange(addr, size);
+#endif
     const auto pages_start = PageManager::GetPageAddr(addr);
     const auto pages_end = PageManager::GetNextPageAddr(addr + size - 1);
     ForEachImageInRegion(pages_start, pages_end - pages_start, [&](ImageId image_id, Image& image) {
@@ -440,6 +842,9 @@ void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
 
 void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size,
                                            [[maybe_unused]] u64 shader) {
+#ifdef __APPLE__
+    RejectBc4AliasBufferWrite(address, max_size);
+#endif
     std::scoped_lock lock{mutex};
     ForEachImageInRegion(address, max_size, [&](ImageId image_id, Image& image) {
         // Only consider images that match base address.
@@ -461,6 +866,8 @@ void TextureCache::UnmapMemory(VAddr cpu_addr, size_t size) {
     ImageIds deleted_images;
     ForEachImageInRegion(cpu_addr, size, [&](ImageId id, Image&) { deleted_images.push_back(id); });
     for (const ImageId id : deleted_images) {
+        // A linked pair may already have retired this entry through its other member.
+        if (False(slot_images[id].flags & ImageFlagBits::Registered)) continue;
         // TODO: Download image data back to host.
         FreeImage(id);
     }
@@ -777,6 +1184,15 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
 }
 
 ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId image_id) {
+#ifdef __APPLE__
+    if (auto* relation = FloatRelation(image_id)) {
+        ValidateFloatRelation(*relation);
+        ASSERT_MSG(image_id == relation->parent.parent_id &&
+                       !slot_images[relation->companion_id].bc4_float_pending &&
+                       False(slot_images[image_id].flags & ImageFlagBits::Dirty),
+                   "BC4 Float linked backing replacement requires a published clean parent");
+    }
+#endif
     const auto new_image_id = slot_images.insert(instance, runtime, slot_image_views, info);
     RegisterImage(new_image_id);
 
@@ -798,8 +1214,13 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId image_id) {
 ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     const auto& info = desc.info;
     ASSERT(info.guest_address != 0);
-
+#ifdef __APPLE__
+    if (auto child = FindBc4FloatImage(desc)) return *child;
+#endif
     std::scoped_lock lock{mutex};
+#ifdef __APPLE__
+    CheckBc4FloatOverlap(desc);
+#endif
 
     u64 key_hash = info.guest_address ^ info.guest_size << 17 ^ u64(info.pixel_format) << 40 ^
                    u64(info.size.width) << 24 ^ info.size.height ^ u64(desc.type) << 58 ^
@@ -1044,6 +1465,24 @@ ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc, Vi
                                      bool refresh) {
     Image& image = slot_images[image_id];
 #ifdef __APPLE__
+    if (image.bc4_float_companion) {
+        UpdateBc4FloatImage(image_id);
+        std::scoped_lock lock{mutex};
+        auto* relation = FloatRelation(image_id); ASSERT(relation);
+        ValidateFloatRelation(*relation); CheckFloatView(desc);
+        const auto* expected = FloatExpectation(desc);
+        ASSERT_MSG(expected && expected->parent_id == relation->parent.parent_id &&
+                       expected->parent_uid == relation->parent.parent_uid,
+                   "BC4 Float binding requires its selected parent preflight");
+        ValidateFloatParent(*expected);
+        if (desc.type == BindingType::Storage) {
+            image.bc4_float_pending = true;
+            slot_images[relation->parent.parent_id].bc4_float_pending = true;
+        }
+        refresh = false;
+    }
+    ASSERT_MSG(!image.bc4_float_parent || desc.type == BindingType::Texture,
+               "BC4 Float parent cannot bind as another image writer");
     if (image.bc4_integer_alias) {
         CheckBc4AliasUse(image, desc);
         if (refresh) {
@@ -1058,7 +1497,7 @@ ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc, Vi
         image.flags |= ImageFlagBits::GpuModified;
         if (
 #ifdef __APPLE__
-            !image.bc4_integer_alias &&
+            !image.bc4_integer_alias && !image.bc4_float_companion && !image.bc4_float_parent &&
 #endif
             readback_linear_images && (!image.info.props.is_tiled || image.info.size.width <= 8) &&
             image.info.guest_address != 0) {
@@ -1089,6 +1528,8 @@ ImageView& TextureCache::FindRenderTarget(ImageId image_id, const ImageDesc& des
     Image& image = slot_images[image_id];
 #ifdef __APPLE__
     ASSERT_MSG(!image.bc4_integer_alias, "Converted BC4 render targets are unsupported");
+    ASSERT_MSG(!image.bc4_float_parent && !image.bc4_float_companion,
+               "BC4 Float linked image cannot become a render target");
 #endif
     image.flags |= ImageFlagBits::GpuModified;
     if (readback_linear_images && (!image.info.props.is_tiled || image.info.size.width <= 8)) {
@@ -1116,6 +1557,10 @@ ImageView& TextureCache::FindRenderTarget(ImageId image_id, const ImageDesc& des
 
 ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc) {
     Image& image = slot_images[image_id];
+#ifdef __APPLE__
+    ASSERT_MSG(!image.bc4_float_parent && !image.bc4_float_companion,
+               "BC4 Float linked image cannot become a depth target");
+#endif
     image.flags |= ImageFlagBits::GpuModified;
     image.usage.depth_target = 1u;
     UpdateImage(image_id);
@@ -1158,6 +1603,9 @@ void TextureCache::RefreshImage(Image& image) {
         return;
     }
 #ifdef __APPLE__
+    ASSERT_MSG(!image.bc4_float_companion &&
+                   (!image.bc4_float_parent || image.bc4_float_internal_write),
+               "BC4 Float refresh must use linked initialization");
     ASSERT_MSG(!image.bc4_integer_alias || False(image.flags & ImageFlagBits::GpuModified),
                "BC4 integer alias refresh cannot merge dirty guest bytes with GPU-written blocks");
 #endif
@@ -1476,6 +1924,10 @@ void TextureCache::GarbageCollectImages() {
             return true;
         }
         auto& image = slot_images[image_id];
+#ifdef __APPLE__
+        // Retiring a linked pair can remove the iterator's previously saved next member.
+        if (False(image.flags & ImageFlagBits::Registered)) return false;
+#endif
         const bool download = image.SafeToDownload();
         const bool tiled = image.info.IsTiled();
         if (tiled && download) {
@@ -1633,6 +2085,10 @@ void TextureCache::DeleteImage(ImageId image_id) {
 void TextureCache::MarkGpuWritten(ImageId image_id) {
     std::scoped_lock lock{mutex};
     Image& image = slot_images[image_id];
+#ifdef __APPLE__
+    ASSERT_MSG(!image.bc4_float_parent && !image.bc4_float_companion,
+               "BC4 Float linked image has another GPU writer");
+#endif
     image.flags |= ImageFlagBits::GpuModified;
     image.flags &= ~ImageFlagBits::Dirty;
     TrackImage(image_id);
