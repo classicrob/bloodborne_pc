@@ -19,7 +19,7 @@ import sys
 import time
 
 from replay_identity import FILES, digest
-from replay_summary import summarize
+from replay_summary import VERDICT_PREFIX, compare_work, qualify, summarize, verdict_text
 
 ROOT = Path(__file__).resolve().parents[2]
 PROTECTED = {'BB_REPLAY_RUN', 'BB_REPLAY_ITERATIONS', 'BB_REPLAY_GPU_WAIT', 'BB_PERF', 'BB_PERF_OUT',
@@ -64,6 +64,40 @@ def env_items(items):
                 raise ValueError(f'unsupported or protected environment override: {key}')
             result[key] = value
     return result
+
+
+def diagnostic_reasons(environment):
+    return sorted(key for key, value in environment.items()
+                  if value not in ('', '0') and
+                  (key == 'BB_PERF_PHASES' or re.search(r'TRACE|RING|REFRESH', key)))
+
+
+def perf_perturbed(path):
+    with path.open() as source:
+        schemas = [row for row in (json.loads(line) for line in source if line.strip())
+                   if row.get('type') == 'schema']
+    if len(schemas) != 1 or type(schemas[0].get('perturbed')) is not bool:
+        raise ValueError(f'{path}: missing/ambiguous BB_PERF perturbation schema')
+    return schemas[0]['perturbed']
+
+
+def finish_results(logs, results, context):
+    context = dict(context, comparison_status=compare_work(results),
+                   reference_workload=results[0]['workload_signatures'])
+    for result in results:
+        qualify(result, context)
+        with Path(result['path']).open('a') as stream:
+            stream.write('\n' + VERDICT_PREFIX + json.dumps(context, separators=(',', ':')) + '\n')
+        write_json(logs / f"result-{result['run']}-{result['arm']}.json", result)
+        gpu = result['gpu_collection_window_median_ms']
+        print(f"{result['run']}-{result['arm']}: {verdict_text(result)} | "
+              f"submit-to-GPU-done median {result['median_ms']:.2f} ms; "
+              f"GPU collection-window DIAGNOSTIC {f'{gpu:.2f} ms' if gpu is not None else 'MISSING'} "
+              '(not per-iteration busy)', flush=True)
+    write_json(logs / 'results.json', results)
+    print(f"Final verdict: {' | '.join(sorted({r['qualification'] for r in results}))}; "
+          f'artifacts: {logs}; pixels/live FPS and per-iteration GPU busy unqualified', flush=True)
+    return 2 if context['comparison_status'] == 'INCOMPARABLE' else 0
 
 
 def capture_inputs(capture):
@@ -119,6 +153,8 @@ def main():
     p.add_argument('--settle', default='6,120')
     p.add_argument('--label', default=time.strftime('replay-ab-%Y%m%d-%H%M%S'))
     p.add_argument('--qualification-only', action='store_true', help='permit unexecuted/skipped source gates for correctness qualification; timings unqualified')
+    p.add_argument('--diagnostic', action='store_true',
+                   help='permit phase/pass/ring/refresh traces or timing-only ablations; incomparable for correctness/acceptance')
     args = p.parse_args()
     if not 3 <= args.iters <= 10000 or not re.fullmatch('[AB]+', args.order) or set(args.order) != {'A', 'B'}:
         raise ValueError('iters must be 3..10000; order must include both A and B')
@@ -132,6 +168,14 @@ def main():
               'B': build_manifest(args.b, args.qualification_only)}
     common = env_items(args.env)
     overrides = {'A': env_items(args.env_a), 'B': env_items(args.env_b)}
+    reasons = sorted({reason for arm in ('A', 'B') for reason in diagnostic_reasons(dict(common, **overrides[arm]))})
+    if reasons and not args.diagnostic:
+        raise ValueError(f"{', '.join(reasons)} requires --diagnostic; perturbed timings cannot qualify normal comparisons")
+    context = {'version': 1, 'source_gates': {arm: builds[arm]['gate'] for arm in ('A', 'B')},
+               'source_manifests': {arm: {key: builds[arm][key] for key in ('head', 'manifest', 'manifest_sha256')}
+                                    for arm in ('A', 'B')},
+               'qualification_only': args.qualification_only, 'diagnostic': args.diagnostic,
+               'diagnostic_reasons': reasons + (['explicit --diagnostic'] if args.diagnostic else [])}
     capture, data = args.capture.resolve(strict=True), args.data.resolve(strict=True)
     deps = Path(os.environ.get('BB_DEPS_PREFIX', str(Path.home() / 'bbport-deps/x86_64')))
     game = Path(os.environ.get('BB_GAME_DIR', str(Path.home() / 'CUSA03173')))
@@ -146,6 +190,7 @@ def main():
     ini.write_text('preset=0\noutput_res=1920x1080\nupscaler=off\nobject_motion=0\nlive_resolution=0\n')
     provenance = {'version': 1, 'qualification': 'repeated-workload relative attribution; pixels/live FPS unqualified',
                   'builds': builds, 'data_sha256': data_hashes, 'config_sha256': digest(ini),
+                  'qualification_context': context,
                   'qualification_only': args.qualification_only, 'order': args.order, 'iterations': args.iters, 'env_common': common, 'env_arms': overrides}
     # Hash once in a build slot; full capture reads are outside all timed/quiet intervals.
     hash_path = logs / 'capture-inputs.json'
@@ -185,13 +230,18 @@ def main():
             raise ValueError(f'run {tag} failed with exit {status}; see {logs}')
         if re.search(r'INVALID|CPU QUIET BOUND REACHED|identity unreadable|not resumed', (logs / f'heavy-{tag}.log').read_text()):
             raise ValueError(f'run {tag}: heavy qualification failed')
-        result = summarize(Path(plan['log']), args.iters, True)
+        result = summarize(Path(plan['log']), args.iters)
+        if perf_perturbed(Path(environment['BB_PERF_OUT'])):
+            context['diagnostic_reasons'] = sorted(set(context['diagnostic_reasons']) | {'BB_PERF schema perturbed=true'})
         result.update(arm=arm, run=number); results.append(result)
-        write_json(logs / f'result-{tag}.json', result)
-        print(f"{tag}: submit-to-idle median {result['median_ms']:.2f} ms; GPU busy {result['gpu_busy_median_ms']:.2f} ms", flush=True)
-    write_json(logs / 'results.json', results)
-    print(f'Attribution artifacts: {logs}; replay does not establish live FPS')
-    return 0
+        print(f'{tag}: measurement collected; comparison pending; '
+              f"{'SOURCE GATE UNQUALIFIED' if args.qualification_only or any(b['gate'] != 'PASS' for b in builds.values()) else 'SOURCE GATES PASS'}; "
+              f"{'DIAGNOSTIC PERTURBED' if context['diagnostic_reasons'] else 'timing qualification pending'}", flush=True)
+    status = finish_results(logs, results, context)
+    if context['diagnostic_reasons'] and not args.diagnostic:
+        print('STOP: unexpected perturbed BB_PERF schema; results retained as DIAGNOSTIC PERTURBED', file=sys.stderr)
+        return 2
+    return status
 
 
 if __name__ == '__main__':
