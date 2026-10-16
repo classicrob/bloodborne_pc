@@ -293,6 +293,11 @@ static int Run(Vulkan::Scheduler& scheduler, AmdGpu::Liverpool& liverpool,
     output[0] = output[1] = 0xa5a5a5a5;
     auto output_sharp = AmdGpu::Buffer::Placeholder(8);
     output_sharp.base_address = uintptr_t(output);
+    output_sharp.data_format = u32(AmdGpu::DataFormat::Format32);
+    output_sharp.num_format = u32(AmdGpu::NumberFormat::Uint);
+    assert(output_sharp.Valid() && output_sharp.GetDataFmt() == AmdGpu::DataFormat::Format32 &&
+           output_sharp.GetNumberFmt() == AmdGpu::NumberFormat::Uint &&
+           output_sharp.stride == 0 && output_sharp.num_records == 8 && output_sharp.GetSize() == 8);
     auto input_sharp = AmdGpu::Buffer::Placeholder(8);
     input_sharp.base_address = tail;
     GcnAsm::Code writer;
