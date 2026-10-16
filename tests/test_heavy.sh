@@ -44,14 +44,18 @@ import fcntl
 import json
 import os
 import runpy
+import subprocess
+import sys
+import tempfile
+import time
 
 h = runpy.run_path('tools/macos/heavy.py')
 g = h['disk_preflight'].__globals__
-g['disk_free'] = lambda: 60 * h['GB']
-g['disk_preflight']('disk boundary', 'build', 'build0', 5 * h['GB'])
-g['disk_free'] = lambda: 60 * h['GB'] - 1
+g['disk_free'] = lambda: h['DISK_FLOOR'] + 10 * h['GB']
+g['disk_preflight']('disk boundary', 'build', 'build0', 5 * h['GB'], 5 * h['GB'])
+g['disk_free'] = lambda: h['DISK_FLOOR'] + 10 * h['GB'] - 1
 try:
-    g['disk_preflight']('disk boundary', 'build', 'build0', 5 * h['GB'])
+    g['disk_preflight']('disk boundary', 'build', 'build0', 5 * h['GB'], 5 * h['GB'])
 except SystemExit as error:
     assert error.code == 75
 else:
@@ -59,18 +63,65 @@ else:
 fd = os.open(os.path.join(os.environ['BB_HEAVY_DIR'], 'quick0'), os.O_RDWR | os.O_CREAT, 0o644)
 fcntl.flock(fd, fcntl.LOCK_EX)
 os.write(fd, json.dumps({'pool': 'quick', 'disk_budget': h['GB']}).encode())
-g['disk_free'] = lambda: 60 * h['GB']
+g['disk_free'] = lambda: h['DISK_FLOOR'] + 10 * h['GB']
 try:
-    g['disk_preflight']('disk reservation', 'build', 'build0', 5 * h['GB'])
+    g['disk_preflight']('disk reservation', 'build', 'build0', 5 * h['GB'], 5 * h['GB'])
 except SystemExit as error:
     assert error.code == 75
 else:
     raise AssertionError('another job budget was ignored')
+os.ftruncate(fd, 0)
+g['disk_free'] = lambda: 100 * h['GB']
+try:
+    g['disk_preflight']('unreadable reservation', 'build', 'build0', 5 * h['GB'], 5 * h['GB'])
+except SystemExit as error:
+    assert error.code == 75
+else:
+    raise AssertionError('unreadable held slot was admitted')
 os.close(fd)
-g['disk_free'] = lambda: 55 * h['GB'] - 1
-assert g['disk_low']('disk boundary')
-g['disk_free'] = lambda: 55 * h['GB']
-assert not g['disk_low']('disk boundary')
+g['disk_free'] = lambda: h['DISK_FLOOR'] + 5 * h['GB'] - 1
+assert g['disk_low']('disk boundary', 5 * h['GB'])
+g['disk_free'] = lambda: h['DISK_FLOOR'] + 5 * h['GB']
+assert not g['disk_low']('disk boundary', 5 * h['GB'])
+with open(os.path.join(os.environ['BB_HEAVY_DIR'], 'build0'), 'w') as f:
+    json.dump({'disk_budget': 5 * h['GB'], 'disk_buffer': 5 * h['GB']}, f)
+os.environ['BB_HEAVY_HELD'] = 'build0:outer'
+os.environ['BB_HEAVY_DISK_BUDGET_GB'] = '20'
+try:
+    g['run']('build', False, None, 'nested', ['true'])
+except SystemExit as error:
+    assert error.code == 75
+else:
+    raise AssertionError('larger nested budget ran inside smaller parent reservation')
+del os.environ['BB_HEAVY_HELD'], os.environ['BB_HEAVY_DISK_BUDGET_GB']
+with tempfile.TemporaryDirectory() as temp:
+    child_pid_file = os.path.join(temp, 'stubborn.pid')
+    code = '''import os, signal, sys, time
+if os.fork() == 0:
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    open(sys.argv[1], 'w').write(str(os.getpid()))
+while True: time.sleep(1)
+'''
+    job = subprocess.Popen([sys.executable, '-c', code, child_pid_file], start_new_session=True)
+    for _ in range(100):
+        if os.path.exists(child_pid_file):
+            break
+        time.sleep(0.02)
+    else:
+        raise AssertionError('stubborn descendant did not start')
+    descendant = int(open(child_pid_file).read())
+    descendant_start = g['process_start'](descendant)
+    try:
+        g['stop_for_disk'](job, 'disk stubborn descendant')
+        assert g['disk_group_running'](job.pid) is False, 'disk stop left a descendant running'
+    finally:
+        if g['process_start'](descendant) == descendant_start:
+            os.kill(descendant, 9)
+        try:
+            job.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            os.kill(job.pid, 9)
+            job.wait()
 print('heavy disk floor: PASS')
 PY
 # The slot tests below run several jobs from this one checkout; the worktree rule has its own
