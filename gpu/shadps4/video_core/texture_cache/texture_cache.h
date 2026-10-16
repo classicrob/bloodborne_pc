@@ -171,6 +171,38 @@ public:
     void ProcessDownloadImages();
 
 #ifdef __APPLE__
+    struct Bc4FloatParentRecord {
+        u32 selected_index{};
+        ImageDesc request{};
+        ImageId parent_id{};
+        u64 parent_uid{}, backing_revision{}, registry_generation{}, vm_generation{}, backing_byte{};
+        const void* backing{};
+        VAddr parent_address{}, tail_address{}, visible_address{};
+        u64 parent_size{}, tail_size{512}, visible_size{8};
+        u32 mip{}, layer{};
+    };
+    struct Bc4FloatPreflight {
+        std::vector<Bc4FloatParentRecord> parents;
+    };
+    // Stage B only. Empty candidates do not join helpers, lock or wait. Nonempty inspection
+    // joins helpers before the registry lock, and never refreshes or mutates an image.
+    [[nodiscard]] Bc4FloatPreflight InspectBc4FloatParents(std::span<const ImageDesc> selected);
+    class Bc4FloatCommandScope {
+    public:
+        Bc4FloatCommandScope(const Bc4FloatCommandScope&) = delete;
+        Bc4FloatCommandScope& operator=(const Bc4FloatCommandScope&) = delete;
+        Bc4FloatCommandScope(Bc4FloatCommandScope&& other) noexcept;
+        Bc4FloatCommandScope& operator=(Bc4FloatCommandScope&&) = delete;
+        ~Bc4FloatCommandScope();
+    private:
+        friend class TextureCache;
+        explicit Bc4FloatCommandScope(TextureCache* owner) : owner{owner} {}
+        TextureCache* owner{};
+    };
+    // The snapshot must outlive the scope. Nested nonempty scopes are rejected. Construct
+    // after the command's materialize exit guard; publication uses the persisted relation.
+    [[nodiscard]] Bc4FloatCommandScope UseBc4FloatPreflight(const Bc4FloatPreflight& snapshot);
+
     /// Publish converted image writes before the recording command returns. Keeps images alive.
     void MaterializeBc4AliasesAfterCommand();
     void RejectBc4AliasBufferWrite(VAddr address, u64 size);

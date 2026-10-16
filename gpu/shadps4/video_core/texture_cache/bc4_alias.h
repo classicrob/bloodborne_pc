@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #pragma once
 
+#include <algorithm>
 #include <initializer_list>
 
 #include "video_core/amdgpu/resource.h"
@@ -35,6 +36,50 @@ inline bool NeedsAliasPreflight(const ImageInfo& request, const ImageInfo& cache
             (request.guest_address == cached.guest_address ||
              request.pixel_format == vk::Format::eR32G32Uint ||
              cached.pixel_format == vk::Format::eR32G32Uint));
+}
+
+// Prospective Stage-A hazard classification; no cache registry or guest reads.
+inline bool IsFloatTailCandidate(const ImageInfo& info) {
+    return info.guest_address && info.pixel_format == vk::Format::eR32G32Sfloat &&
+           info.type == AmdGpu::ImageType::Color2D && info.size == Extent3D{1, 1, 1} &&
+           info.resources.levels == 1 && info.resources.layers == 1 && info.num_samples == 1 &&
+           info.num_bits == 64 && info.pitch == 8 && info.guest_size == 512 &&
+           info.tile_mode == AmdGpu::TileMode::Thin1DThin &&
+           info.array_mode == AmdGpu::ArrayMode::Array1DTiledThin1 && info.props.is_tiled &&
+           !info.props.is_block && !info.props.is_volume && !info.props.is_depth &&
+           !info.props.has_stencil && !info.bank_swizzle && !info.alt_tile &&
+           !info.stencil_addr && !info.stencil_size && !info.meta_info.cmask_addr &&
+           !info.meta_info.fmask_addr && !info.meta_info.htile_addr &&
+           info.mips_layout[0].offset == 0 && info.mips_layout[0].size == 512 &&
+           info.mips_layout[0].pitch == 8 && info.mips_layout[0].height == 8;
+}
+
+// The first route is one complete 64-bit block in an exact 2x1 BC mip. Padding has
+// backing authority only; it is never uploaded from or published by the Float image.
+inline const char* RejectFloatTail(const ImageInfo& child, const ImageInfo& parent, u32 mip) {
+    if (!IsFloatTailCandidate(child)) return "unsupported Float tail descriptor";
+    if (parent.pixel_format != vk::Format::eBc4UnormBlock || !parent.props.is_block ||
+        parent.type != AmdGpu::ImageType::Color2D || parent.resources.layers != 1 ||
+        parent.resources.levels < 2 || parent.resources.levels > parent.mips_layout.size() ||
+        parent.num_samples != 1 || parent.num_bits != 64 || parent.size.depth != 1 ||
+        parent.tile_mode != AmdGpu::TileMode::Thin1DThin ||
+        parent.array_mode != AmdGpu::ArrayMode::Array1DTiledThin1 || !parent.props.is_tiled ||
+        parent.props.is_volume || parent.props.is_depth || parent.props.has_stencil ||
+        parent.stencil_addr || parent.stencil_size || parent.meta_info.cmask_addr ||
+        parent.meta_info.fmask_addr || parent.meta_info.htile_addr || parent.bank_swizzle ||
+        parent.alt_tile || !parent.guest_address || mip >= parent.resources.levels)
+        return "unsupported BC parent layout";
+    if (std::max(parent.size.width >> mip, 1u) != 2 ||
+        std::max(parent.size.height >> mip, 1u) != 1)
+        return "requires exact 2x1 BC mip";
+    const auto& tail = parent.mips_layout[mip];
+    if (tail.size != 512 || tail.pitch != 32 || tail.height != 32 ||
+        tail.offset > parent.guest_size || 512 > parent.guest_size - tail.offset ||
+        child.guest_address < parent.guest_address ||
+        child.guest_address - parent.guest_address != tail.offset ||
+        child.MipOf(parent) != s32(mip) || child.SliceOf(parent, mip) != 0)
+        return "not the exact first block of the selected tail allocation";
+    return nullptr;
 }
 
 // A deliberately complete, unpadded block grid. No min-mip/min-layer copy or assumption that
