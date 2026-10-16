@@ -6,6 +6,9 @@
 #include <deque>
 
 #include <condition_variable>
+#ifdef __APPLE__
+#include "bbport_quality_verify.h"
+#endif
 
 #include "core/libraries/videoout/buffer.h"
 #include "video_core/renderer_vulkan/host_passes/fsr_pass.h"
@@ -119,6 +122,10 @@ private:
     u32 expected_frame_height{1080};
 
     Frontend::WindowSDL& window;
+#ifdef __APPLE__
+    BbQuality::Trace<7> quality_copy{"copy"};
+    BbQuality::Trace<4> quality_present{"present"};
+#endif
     Instance instance;
     HostPasses::FsrPass fsr_pass;
     HostPasses::FsrPass::Settings fsr_settings{};

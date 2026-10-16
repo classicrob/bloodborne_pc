@@ -19,6 +19,9 @@
 #include <vector>
 
 #include "common/types.h"
+#ifdef __APPLE__
+#include "bbport_quality_verify.h"
+#endif
 #include "video_core/renderer_vulkan/vk_common.h"
 #include "video_core/renderer_vulkan/vk_fsr4.h"
 #include "video_core/texture_cache/image.h"
@@ -122,6 +125,15 @@ public:
     bool DisplayOverride(VAddr address, Display& display);
 
 private:
+#ifdef __APPLE__
+    void QualityDispatch(u32 provider, u32 w, u32 h, u32 ow, u32 oh, bool hdr);
+    BbQuality::Trace<6> quality_scene{"scene", false};
+    BbQuality::Trace<6> quality_dispatch{"dispatch"};
+    BbQuality::Trace<12> quality_frames{"frames"};
+    unsigned long long quality_scene_frames = 0, quality_recorded_frames = 0;
+    unsigned long long quality_failed_frames = 0, quality_inactive_frames = 0;
+    unsigned long long quality_missing_frames = 0;
+#endif
     /// bbport: views of guest images the upscaler reads, kept across frames: FSR 4 registers
     /// images by view in a registry of eight (a new view per frame filled it at Native AA).
     vk::ImageView CachedView(const VideoCore::Image& image, vk::Format format,

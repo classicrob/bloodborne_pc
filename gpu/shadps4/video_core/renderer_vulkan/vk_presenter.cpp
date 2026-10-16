@@ -457,6 +457,17 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
         runtime.FlushBarriers();
     }
     expected_ratio = static_cast<float>(image_size.width) / static_cast<float>(image_size.height);
+#ifdef __APPLE__
+    if (BbQuality::Enabled() &&
+        quality_copy.Note({image_size.width, image_size.height, frame->width, frame->height,
+                           upscaled, fsr_settings.enable, frame->is_hdr})) {
+        std::fprintf(stderr, "QUALITY stream=copy observed=%llu source=%ux%u frame=%ux%u "
+                             "display_override=%u fsr1_enabled=%u hdr=%u\n",
+                     quality_copy.Observed(), image_size.width, image_size.height,
+                     frame->width, frame->height, unsigned(upscaled),
+                     unsigned(fsr_settings.enable), unsigned(frame->is_hdr));
+    }
+#endif
 
     image_view = fsr_pass.Render(cmdbuf, image_view, image_size, {frame->width, frame->height},
                                  fsr_settings, frame->is_hdr);
@@ -632,6 +643,15 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
 
     {
         const vk::Extent2D extent = swapchain.GetExtent();
+#ifdef __APPLE__
+        if (BbQuality::Enabled() &&
+            quality_present.Note({frame->width, frame->height, extent.width, extent.height})) {
+            std::fprintf(stderr, "QUALITY stream=present observed=%llu frame=%ux%u "
+                                 "swapchain=%ux%u\n",
+                         quality_present.Observed(), frame->width, frame->height,
+                         extent.width, extent.height);
+        }
+#endif
         SetExpectedGameSize(s32(extent.width), s32(extent.height));
         const vk::ImageSubresourceRange color_range{
             .aspectMask = vk::ImageAspectFlagBits::eColor,

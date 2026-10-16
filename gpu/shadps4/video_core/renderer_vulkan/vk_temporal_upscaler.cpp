@@ -273,7 +273,34 @@ bool TemporalUpscaler::ReactiveOn() const {
 
 void TemporalUpscaler::OnSceneColor(VideoCore::ImageId color) {
     scene_color = color;
+#ifdef __APPLE__
+    if (BbQuality::Enabled()) {
+        const auto& image = texture_cache.GetImage(color);
+        const auto native = image.info.size;
+        const bool proxy = ReducedScene(image);
+        const auto raster = proxy ? scene_targets.Size()
+                                  : SceneResolution::Size{native.width, native.height};
+        if (quality_scene.Note({native.width, native.height, raster.width, raster.height,
+                                proxy, scaled_session})) {
+            std::fprintf(stderr, "QUALITY stream=scene observed=%llu native=%ux%u "
+                                 "raster=%ux%u proxy=%u fixed_session=%u\n",
+                         quality_scene.Observed(), native.width, native.height,
+                         raster.width, raster.height, unsigned(proxy), unsigned(scaled_session));
+        }
+    }
+#endif
 }
+
+#ifdef __APPLE__
+void TemporalUpscaler::QualityDispatch(u32 provider, u32 w, u32 h, u32 ow, u32 oh, bool hdr) {
+    if (BbQuality::Enabled() && quality_dispatch.Note({provider, w, h, ow, oh, hdr})) {
+        std::fprintf(stderr, "QUALITY stream=dispatch recorded=%llu provider=%s "
+                             "render=%ux%u output=%ux%u hdr=%u\n",
+                     quality_dispatch.Observed(), BbSettings::UpscalerName(provider),
+                     w, h, ow, oh, unsigned(hdr));
+    }
+}
+#endif
 
 namespace {
 float Halton(u32 index, u32 base) {
@@ -295,6 +322,32 @@ bool TemporalUpscaler::RasterScaling() const {
 }
 
 bool TemporalUpscaler::OnFrameStart() {
+#ifdef __APPLE__
+    if (BbQuality::Enabled() && applied_preset >= 0) {
+        const bool scene = bool(scene_color);
+        const bool problem = failed || fsr4_failed;
+        quality_scene_frames += scene;
+        quality_recorded_frames += dispatched_last_frame;
+        quality_failed_frames += problem;
+        quality_inactive_frames += !last_active;
+        quality_missing_frames += scene && !dispatched_last_frame;
+        if (quality_frames.Note({u32(applied_upscaler), u32(applied_preset), render_width,
+                                 render_height, target_width, target_height, enabled, last_active,
+                                 problem, dispatched_last_frame, scene, scaled_session})) {
+            std::fprintf(stderr, "QUALITY stream=frames ended=%llu scene=%llu recorded=%llu "
+                                 "failed=%llu inactive=%llu scene_without_dispatch=%llu "
+                                 "provider=%s preset=%d render=%ux%u output=%ux%u "
+                                 "enabled=%u active=%u last_failed=%u last_recorded=%u "
+                                 "last_scene=%u fixed_session=%u\n",
+                         quality_frames.Observed(), quality_scene_frames, quality_recorded_frames,
+                         quality_failed_frames, quality_inactive_frames, quality_missing_frames,
+                         BbSettings::UpscalerName(applied_upscaler), applied_preset, render_width,
+                         render_height, target_width, target_height, unsigned(enabled),
+                         unsigned(last_active), unsigned(problem), unsigned(dispatched_last_frame),
+                         unsigned(scene), unsigned(scaled_session));
+        }
+    }
+#endif
     // bbport: BB_PRESET_FILE=<file> holding a preset number, read about once a second: switches
     // the preset like the menu does (scripted tests of live preset changes).
     static const char* preset_file = std::getenv("BB_PRESET_FILE");
@@ -1121,6 +1174,9 @@ void TemporalUpscaler::Run() {
     if (BbSettings::Get().upscaler == BbSettings::UpscalerTaa) {
         RecordTaa(cmdbuf, input_color_view, input_depth_view);
         dispatched = true;
+#ifdef __APPLE__
+        QualityDispatch(BbSettings::UpscalerTaa, w, h, ow, oh, true);
+#endif
     } else if (UseFsr4()) {
         dispatched = RecordFsr4(cmdbuf, {input_color, input_color_view, w, h},
                                 {input_depth, input_depth_view, w, h}, w, h, ow, oh, frame_ms);
@@ -1191,6 +1247,9 @@ void TemporalUpscaler::Run() {
             failed = true;
         } else {
             dispatched = true;
+#ifdef __APPLE__
+            QualityDispatch(BbSettings::UpscalerFsr3, w, h, ow, oh, true);
+#endif
         }
     }
     if (dispatched) {
@@ -1781,6 +1840,9 @@ void TemporalUpscaler::RunScaled() {
         ok = true;
         reset = false;
         dispatched_last_frame = true;
+#ifdef __APPLE__
+        QualityDispatch(BbSettings::UpscalerFsr3, w, h, ow, oh, false);
+#endif
         ExtraSharpen(cmdbuf, vk::Image(ui_image), true, ow, oh);
         DumpUpscalerFrame(cmdbuf, {.input = color_image,
                                    .input_width = source_width,

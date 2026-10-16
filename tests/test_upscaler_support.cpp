@@ -7,6 +7,7 @@
 #include <initializer_list>
 #include <unistd.h>
 #ifdef __APPLE__
+#include "bbport_quality_verify.h"
 #include <csignal>
 #include <sys/resource.h>
 #include <sys/wait.h>
@@ -15,6 +16,33 @@
 
 int main() {
     using namespace BbSettings;
+#ifdef __APPLE__
+    {
+        BbQuality::Trace<1> trace{"test-state"};
+        assert(trace.Note({1}));
+        for (unsigned i = 2; i < 120; ++i) assert(!trace.Note({1}));
+        assert(trace.Note({1}));
+        // An earlier successful frame must not hide the first missing/disabled frame.
+        assert(trace.Note({0}));
+        assert(trace.Observed() == 121 && trace.Changes() == 2);
+        assert(!trace.Truncated());
+    }
+    {
+        BbQuality::Trace<1> trace{"test-draw", false};
+        assert(trace.Note({1920}));
+        for (unsigned i = 0; i < 300; ++i) assert(!trace.Note({1920}));
+        assert(trace.Note({960}));
+        assert(trace.Note({1920}));
+        assert(trace.Changes() == 3);
+    }
+    {
+        BbQuality::Trace<1> trace{"test-cap"};
+        for (unsigned i = 0; i < 1024; ++i) assert(trace.Note({i % 2}));
+        assert(!trace.Note({0}) && trace.Truncated());
+        for (unsigned i = 0; i < 240; ++i) assert(!trace.Note({i % 2}));
+        assert(trace.Observed() == 1265);
+    }
+#endif
     char path[] = "/tmp/bbport-upscaler-test-XXXXXX";
     const int fd = mkstemp(path);
     assert(fd >= 0);
