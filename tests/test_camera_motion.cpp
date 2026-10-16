@@ -11,11 +11,13 @@
 #include <string>
 #include <tuple>
 #include "video_core/renderer_vulkan/vk_camera_motion.h"
+#ifndef BB_CAMERA_HISTORY_CPU_ONLY
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/texture_cache/image.h"
 #include "video_core/host_shaders/camera_motion_comp.h"
 #include <vk_mem_alloc.h>
+#endif
 
 namespace {
 // The frame's scene viewport state machine and the readiness every camera-motion consumer
@@ -83,10 +85,78 @@ void LatchControls() {
               !Vulkan::CameraMotionReady(true,false,usable,usable,true));
     }
 }
+
+void NativeHistoryControls() {
+    using History = Vulkan::NativeSceneCameraHistory;
+    using Camera = History::Camera;
+    const Vulkan::SceneViewportLatch::Viewport scene{960,-540,960,540};
+    const Vulkan::SceneViewportLatch::Viewport status{280,-384,280,384};
+    const auto check = [](const char* label, bool ok) {
+        std::printf("Native scene camera history: %s %s\n", label, ok ? "PASS" : "FAIL");
+        if (!ok) std::abort();
+    };
+    const auto make = [&](float marker) {
+        Camera camera;
+        camera.valid = true;
+        camera.view.fill(marker);
+        camera.inv_view.fill(marker + 1);
+        camera.proj.fill(marker + 2);
+        camera.viewport.Add(scene);
+        return camera;
+    };
+    {
+        History history;
+        Camera current = make(10), previous;
+        history.Capture(current);
+        check("capture leaves current and missing previous unchanged",
+              current.viewport.Usable() && !previous.valid);
+        current.viewport.Add(status);
+        current.view.fill(99);
+        history.Capture(current);
+        previous = history.Consume(current);
+        check("late Status conflict stays invalid in current", !current.viewport.Usable());
+        check("next camera gets whole native epoch despite duplicate capture",
+              previous.valid && previous.viewport.Value() == scene &&
+              previous.view == make(10).view && previous.inv_view == make(10).inv_view &&
+              previous.proj == make(10).proj);
+        check("previous-only missing history recovers next frame",
+              Vulkan::CameraMotionReady(true, previous.valid, make(20).viewport,
+                                        previous.viewport, true));
+        const auto fallback = history.Consume(current);
+        check("consumption prevents reuse in a no-trigger frame",
+              !fallback.viewport.Usable() && fallback.view == current.view);
+    }
+    {
+        History history;
+        auto conflicted = make(30);
+        conflicted.viewport.Add(status);
+        history.Capture(conflicted);
+        const auto previous = history.Consume(make(40));
+        check("genuine pre-trigger conflict remains rejected",
+              !Vulkan::CameraMotionReady(true, previous.valid, make(40).viewport,
+                                         previous.viewport, true));
+    }
+    {
+        History history;
+        history.Capture(make(50));
+        history.Reset();
+        Camera invalid;
+        const auto previous = history.Consume(invalid);
+        check("history invalidation clears pending camera and viewport",
+              !previous.valid && !previous.viewport.Usable());
+        const auto fallback = history.Consume(make(60));
+        check("no snapshot preserves original whole-camera fallback",
+              fallback.view == make(60).view && fallback.viewport.Value() == scene);
+    }
+}
 } // namespace
 
 int main() {
     LatchControls();
+    NativeHistoryControls();
+#ifdef BB_CAMERA_HISTORY_CPU_ONLY
+    return 0;
+#else
     Vulkan::Instance instance(0, false);
     static vk::detail::DynamicLoader loader;
     vk::detail::DispatchLoaderDynamic d;
@@ -284,4 +354,5 @@ int main() {
     // Jitter cancels with an offset viewport too (static camera).
     run("static camera cancels jitter, offset viewport",distant,0,0,0,0,0,true,0,0,0,nullptr,1,sub);
     vmaDestroyBuffer(instance.GetAllocator(),staging,allocation);
+#endif
 }

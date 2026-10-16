@@ -261,7 +261,7 @@ void CameraMotion::OnConstants(const float* data) {
     if (frame_has_camera) {
         return; // the first one of a frame is the main camera
     }
-    previous = current;
+    previous = native_scene_history.Consume(current);
     std::memcpy(current.view.data(), data + 8, 12 * sizeof(float));
     std::memcpy(current.inv_view.data(), data + 180, 12 * sizeof(float));
     current.proj = {data[52], data[57], data[62], data[63]};

@@ -481,6 +481,18 @@ void TemporalUpscaler::OnDispatch(u64 cs_hash) {
         return;
     }
     done_this_frame = true;
+    // Preserve this native scene before later menu G-buffer draws, even when only the
+    // previous camera is not ready. A conflict already in current remains invalid.
+    if (scene_color && camera_motion.Depth() && Active()) {
+        const auto& color = texture_cache.GetImage(scene_color);
+        const auto& depth = texture_cache.GetImage(camera_motion.Depth());
+        if (color.info.pixel_format == vk::Format::eR16G16B16A16Sfloat &&
+            depth.info.size.width == color.info.size.width &&
+            depth.info.size.height == color.info.size.height &&
+            (color.usage_flags & vk::ImageUsageFlagBits::eStorage)) {
+            camera_motion.CaptureNativeScene();
+        }
+    }
     if (!scene_color || !camera_motion.Ready() || !Active()) {
         reset = true;
         return;

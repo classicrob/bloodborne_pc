@@ -91,6 +91,32 @@ inline SceneViewportLatch::Note SceneViewportLatch::Add(
            previous_viewport.Usable() && depth;
 }
 
+// A native scene ends before later menu G-buffer draws may change the current viewport.
+// Preserve the complete camera epoch for the next accepted camera, without repairing current.
+class NativeSceneCameraHistory {
+public:
+    struct Camera {
+        std::array<float, 12> view{};     ///< world to view, 3x4 rows
+        std::array<float, 12> inv_view{}; ///< view to world, 3x4 rows
+        std::array<float, 4> proj{};      ///< x scale, y scale, z scale, z offset
+        bool valid = false;
+        SceneViewportLatch viewport;
+    };
+
+    void Capture(const Camera& camera) {
+        if (!pending) pending = camera;
+    }
+    [[nodiscard]] Camera Consume(const Camera& fallback) {
+        const Camera result = pending ? *pending : fallback;
+        pending.reset();
+        return result;
+    }
+    void Reset() { pending.reset(); }
+
+private:
+    std::optional<Camera> pending;
+};
+
 class Instance;
 class Scheduler;
 class Runtime;
@@ -101,7 +127,13 @@ public:
     CameraMotion(const Instance& instance, Scheduler& scheduler,
                  VideoCore::TextureCache& texture_cache, Runtime& runtime);
     ~CameraMotion();
-    void InvalidateHistory() { current.valid = previous.valid = false; }
+    void InvalidateHistory() {
+        current.valid = previous.valid = false;
+        native_scene_history.Reset();
+    }
+    void CaptureNativeScene() {
+        if (frame_has_camera) native_scene_history.Capture(current);
+    }
     void SetObjectMotion(ObjectMotion* motion) noexcept {
         object_motion = motion;
     }
@@ -183,13 +215,7 @@ public:
     void OnDisplayPass(VideoCore::ImageId frame);
 
 private:
-    struct Camera {
-        std::array<float, 12> view{};     ///< world to view, 3x4 rows
-        std::array<float, 12> inv_view{}; ///< view to world, 3x4 rows
-        std::array<float, 4> proj{};      ///< x scale, y scale, z scale, z offset
-        bool valid = false;
-        SceneViewportLatch viewport; ///< the frame's scene pass viewport (OnGBufferViewport)
-    };
+    using Camera = NativeSceneCameraHistory::Camera;
 
     void Overlay(VideoCore::ImageId frame);
 
@@ -207,6 +233,7 @@ private:
 
     ObjectMotion* object_motion = nullptr;
     Camera current, previous;
+    NativeSceneCameraHistory native_scene_history;
     bool frame_has_camera = false;
     std::array<float, 2> jitter{}, previous_jitter{};
     std::array<u32, 2> render_size{};
