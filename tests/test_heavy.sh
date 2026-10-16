@@ -48,6 +48,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from unittest import mock
 
 h = runpy.run_path('tools/macos/heavy.py')
 g = h['disk_preflight'].__globals__
@@ -107,6 +108,24 @@ except SystemExit as error:
 else:
     raise AssertionError('larger nested budget ran inside smaller parent reservation')
 del os.environ['BB_HEAVY_HELD'], os.environ['BB_HEAVY_DISK_BUDGET_GB']
+with mock.patch.object(subprocess, 'run', side_effect=OSError('ps unavailable')):
+    assert g['owned_running']({999999: (1, 1)}) is None
+original_descendants, original_start = g['descendants'], g['process_start']
+try:
+    g['descendants'] = lambda _pid: [999999]
+    def unreadable(_pid):
+        raise OSError('identity unavailable')
+    g['process_start'] = unreadable
+    assert g['owned_descendants'](123) == ({}, True)
+finally:
+    g['descendants'], g['process_start'] = original_descendants, original_start
+try:
+    def cannot_enumerate(_pid):
+        raise OSError('pgrep unavailable')
+    g['descendants'] = cannot_enumerate
+    assert g['owned_descendants'](123) == ({}, True)
+finally:
+    g['descendants'] = original_descendants
 with tempfile.TemporaryDirectory() as temp:
     child_pid_file = os.path.join(temp, 'stubborn.pid')
     code = '''import os, signal, sys, time
