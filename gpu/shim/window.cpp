@@ -226,8 +226,14 @@ WindowSDL::~WindowSDL() {
     SDL_DestroyWindow(window);
 }
 
-MouseCapture::Change MouseCapture::OnEvent(const SDL_Event& event, bool shift, bool blocked) {
+MouseCapture::Change MouseCapture::OnEvent(const SDL_Event& event, bool blocked) {
     std::scoped_lock lock{mutex};
+    if (event.type == SDL_EVENT_KEY_DOWN || event.type == SDL_EVENT_KEY_UP) {
+        // A Shift key's own event decides by down/up, whether or not its mod includes itself.
+        const SDL_Scancode code = event.key.scancode;
+        left_shift = code == SDL_SCANCODE_LSHIFT ? event.key.down : (event.key.mod & SDL_KMOD_LSHIFT) != 0;
+        right_shift = code == SDL_SCANCODE_RSHIFT ? event.key.down : (event.key.mod & SDL_KMOD_RSHIFT) != 0;
+    }
     if (!captured) {
         return !disabled && !blocked && event.type == SDL_EVENT_MOUSE_BUTTON_DOWN &&
                        event.button.button == SDL_BUTTON_LEFT
@@ -251,6 +257,7 @@ MouseCapture::Change MouseCapture::OnEvent(const SDL_Event& event, bool shift, b
                                                        : 0;
         held &= ~bits;
         if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN) {
+            const bool shift = left_shift || right_shift;
             const u32 bit = bits & (shift ? LeftShift | RightShift | Middle : Left | Right | Middle);
             held |= bit;
             pressed |= bit;
@@ -272,9 +279,13 @@ MouseCapture::Change MouseCapture::OnEvent(const SDL_Event& event, bool shift, b
     return Change::None;
 }
 
-void MouseCapture::SetCaptured(bool value) {
+void MouseCapture::SetCaptured(bool value, bool shift) {
     std::scoped_lock lock{mutex};
     captured = value;
+    if (value) {
+        left_shift = shift;
+        right_shift = false;
+    }
     dx = dy = 0;
     held = pressed = 0;
 }
@@ -331,7 +342,7 @@ void WindowSDL::SetMouseCaptured(bool value) {
             return;
         }
     }
-    mouse.SetCaptured(value);
+    mouse.SetCaptured(value, (SDL_GetModState() & SDL_KMOD_SHIFT) != 0);
     std::printf("Input: mouse %s\n", value ? "captured for the camera (Cmd releases)"
                                           : "released (click the window to capture)");
     std::fflush(stdout);
@@ -392,8 +403,7 @@ bool WindowSDL::PollEvents() {
             }
             continue;
         }
-        const bool shift = (SDL_GetModState() & SDL_KMOD_SHIFT) != 0;
-        switch (mouse.OnEvent(event, shift, text_active || BbOverlay::CapturesInput())) {
+        switch (mouse.OnEvent(event, text_active || BbOverlay::CapturesInput())) {
         case MouseCapture::Change::Capture:
             SetMouseCaptured(true);
             continue; // the capturing click is not the game's

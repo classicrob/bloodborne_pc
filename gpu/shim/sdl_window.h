@@ -28,10 +28,13 @@ public:
     /// Button bits; the Shift variants mean Shift was held when the button went down.
     enum : u32 { Left = 1, Right = 2, Middle = 4, LeftShift = 8, RightShift = 16 };
     enum class Change { None, Capture, Release };
-    /// Records one window event. `shift`: Shift is down; `blocked`: the settings menu or the text
-    /// dialog has the input. The caller applies a returned change (relative mode, SetCaptured).
-    Change OnEvent(const SDL_Event& event, bool shift, bool blocked);
-    void SetCaptured(bool value);
+    /// Records one window event. `blocked`: the settings menu or the text dialog has the input.
+    /// The caller applies a returned change (relative mode, SetCaptured). Shift is followed
+    /// through the key events in queue order, so a click sees Shift as it was at that click.
+    Change OnEvent(const SDL_Event& event, bool blocked);
+    /// `shift`: Shift now (SDL_GetModState), when capturing: key events the menu or the text
+    /// dialog consumed while released did not pass through OnEvent.
+    void SetCaptured(bool value, bool shift = false);
     bool Captured() const;
     /// Never captures again (a background window: scripted input only).
     void Disable();
@@ -41,7 +44,7 @@ public:
 
 private:
     mutable std::mutex mutex;
-    bool captured{}, disabled{};
+    bool captured{}, disabled{}, left_shift{}, right_shift{};
     float dx{}, dy{};
     u32 held{}, pressed{};
 };

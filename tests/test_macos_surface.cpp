@@ -40,29 +40,67 @@ static void mouse_capture() {
     u32 buttons = 0;
     const auto take = [&] { return mouse.Take(dx, dy, buttons); };
     using C = MouseCapture::Change;
-    assert(mouse.OnEvent(event(SDL_EVENT_MOUSE_BUTTON_DOWN, SDL_BUTTON_RIGHT), false, false) == C::None);
-    assert(mouse.OnEvent(motion(5, 5), false, false) == C::None);
-    assert(mouse.OnEvent(event(SDL_EVENT_MOUSE_BUTTON_DOWN, SDL_BUTTON_LEFT), false, true) == C::None);
+    assert(mouse.OnEvent(event(SDL_EVENT_MOUSE_BUTTON_DOWN, SDL_BUTTON_RIGHT), false) == C::None);
+    assert(mouse.OnEvent(motion(5, 5), false) == C::None);
+    assert(mouse.OnEvent(event(SDL_EVENT_MOUSE_BUTTON_DOWN, SDL_BUTTON_LEFT), true) == C::None);
     assert(!take() && dx == 0 && dy == 0 && buttons == 0);
-    assert(mouse.OnEvent(event(SDL_EVENT_MOUSE_BUTTON_DOWN, SDL_BUTTON_LEFT), false, false) == C::Capture);
+    assert(mouse.OnEvent(event(SDL_EVENT_MOUSE_BUTTON_DOWN, SDL_BUTTON_LEFT), false) == C::Capture);
     mouse.SetCaptured(true);
-    assert(mouse.OnEvent(event(SDL_EVENT_MOUSE_BUTTON_UP, SDL_BUTTON_LEFT), false, false) == C::None);
+    assert(mouse.OnEvent(event(SDL_EVENT_MOUSE_BUTTON_UP, SDL_BUTTON_LEFT), false) == C::None);
     assert(take() && buttons == 0);
-    mouse.OnEvent(motion(3, -2), false, false);
-    mouse.OnEvent(motion(3, -2), false, false);
+    mouse.OnEvent(motion(3, -2), false);
+    mouse.OnEvent(motion(3, -2), false);
     assert(take() && dx == 6 && dy == -4 && buttons == 0);
     assert(take() && dx == 0 && dy == 0);
     // Shift at the press picks the variant for the whole hold.
-    mouse.OnEvent(event(SDL_EVENT_MOUSE_BUTTON_DOWN, SDL_BUTTON_LEFT), true, false);
-    mouse.OnEvent(event(SDL_EVENT_MOUSE_BUTTON_DOWN, SDL_BUTTON_RIGHT), false, false);
+    const auto key = [](SDL_Scancode code, bool down, SDL_Keymod mod) {
+        SDL_Event e{};
+        e.type = down ? SDL_EVENT_KEY_DOWN : SDL_EVENT_KEY_UP;
+        e.key.scancode = code;
+        e.key.down = down;
+        e.key.mod = mod;
+        return e;
+    };
+    mouse.OnEvent(key(SDL_SCANCODE_LSHIFT, true, SDL_KMOD_LSHIFT), false);
+    mouse.OnEvent(event(SDL_EVENT_MOUSE_BUTTON_DOWN, SDL_BUTTON_LEFT), false);
+    mouse.OnEvent(key(SDL_SCANCODE_LSHIFT, false, SDL_KMOD_NONE), false);
+    mouse.OnEvent(event(SDL_EVENT_MOUSE_BUTTON_DOWN, SDL_BUTTON_RIGHT), false);
     assert(take() && buttons == (MouseCapture::LeftShift | MouseCapture::Right));
-    mouse.OnEvent(event(SDL_EVENT_MOUSE_BUTTON_UP, SDL_BUTTON_LEFT), false, false);
+    mouse.OnEvent(event(SDL_EVENT_MOUSE_BUTTON_UP, SDL_BUTTON_LEFT), false);
     assert(take() && buttons == MouseCapture::Right);
-    mouse.OnEvent(event(SDL_EVENT_MOUSE_BUTTON_UP, SDL_BUTTON_RIGHT), true, false);
+    mouse.OnEvent(event(SDL_EVENT_MOUSE_BUTTON_UP, SDL_BUTTON_RIGHT), false);
     assert(take() && buttons == 0);
+    // Queue order, not the state after the queue: Shift down, click, Shift up all before one
+    // poll is a strong click; Shift up before the click is a plain one. Right Shift counts, a
+    // Shift key's own event counts whether or not its mod includes it, and other keys carry mod.
+    mouse.OnEvent(key(SDL_SCANCODE_RSHIFT, true, SDL_KMOD_NONE), false);
+    mouse.OnEvent(event(SDL_EVENT_MOUSE_BUTTON_DOWN, SDL_BUTTON_LEFT), false);
+    mouse.OnEvent(event(SDL_EVENT_MOUSE_BUTTON_UP, SDL_BUTTON_LEFT), false);
+    mouse.OnEvent(key(SDL_SCANCODE_RSHIFT, false, SDL_KMOD_RSHIFT), false);
+    mouse.OnEvent(event(SDL_EVENT_MOUSE_BUTTON_DOWN, SDL_BUTTON_RIGHT), false);
+    mouse.OnEvent(event(SDL_EVENT_MOUSE_BUTTON_UP, SDL_BUTTON_RIGHT), false);
+    assert(take() && buttons == (MouseCapture::LeftShift | MouseCapture::Right));
+    mouse.OnEvent(key(SDL_SCANCODE_LSHIFT, true, SDL_KMOD_NONE), false);
+    mouse.OnEvent(event(SDL_EVENT_MOUSE_BUTTON_DOWN, SDL_BUTTON_LEFT), false);
+    mouse.OnEvent(event(SDL_EVENT_MOUSE_BUTTON_UP, SDL_BUTTON_LEFT), false);
+    mouse.OnEvent(key(SDL_SCANCODE_LSHIFT, false, SDL_KMOD_LSHIFT), false);
+    assert(take() && buttons == MouseCapture::LeftShift);
+    mouse.OnEvent(key(SDL_SCANCODE_W, true, SDL_KMOD_LSHIFT), false);
+    mouse.OnEvent(event(SDL_EVENT_MOUSE_BUTTON_DOWN, SDL_BUTTON_RIGHT), false);
+    mouse.OnEvent(key(SDL_SCANCODE_W, false, SDL_KMOD_NONE), false);
+    mouse.OnEvent(event(SDL_EVENT_MOUSE_BUTTON_UP, SDL_BUTTON_RIGHT), false);
+    assert(take() && buttons == MouseCapture::RightShift);
+    // Capturing takes Shift as it is then (key events the menu consumed never arrived here).
+    mouse.SetCaptured(true, true);
+    mouse.OnEvent(event(SDL_EVENT_MOUSE_BUTTON_DOWN, SDL_BUTTON_LEFT), false);
+    assert(take() && buttons == MouseCapture::LeftShift);
+    mouse.SetCaptured(true, false);
+    mouse.OnEvent(event(SDL_EVENT_MOUSE_BUTTON_DOWN, SDL_BUTTON_LEFT), false);
+    assert(take() && buttons == MouseCapture::Left);
+    mouse.OnEvent(event(SDL_EVENT_MOUSE_BUTTON_UP, SDL_BUTTON_LEFT), false);
     // A click between two takes is reported once.
-    mouse.OnEvent(event(SDL_EVENT_MOUSE_BUTTON_DOWN, SDL_BUTTON_MIDDLE), false, false);
-    mouse.OnEvent(event(SDL_EVENT_MOUSE_BUTTON_UP, SDL_BUTTON_MIDDLE), false, false);
+    mouse.OnEvent(event(SDL_EVENT_MOUSE_BUTTON_DOWN, SDL_BUTTON_MIDDLE), false);
+    mouse.OnEvent(event(SDL_EVENT_MOUSE_BUTTON_UP, SDL_BUTTON_MIDDLE), false);
     assert(take() && buttons == MouseCapture::Middle);
     assert(take() && buttons == 0);
     // Every release path, with a button held and motion pending.
@@ -76,10 +114,10 @@ static void mouse_capture() {
     for (int blocked = 0; blocked < 2; ++blocked) {
         for (const SDL_Event& release : releases) {
             mouse.SetCaptured(true);
-            mouse.OnEvent(event(SDL_EVENT_MOUSE_BUTTON_DOWN, SDL_BUTTON_LEFT), false, false);
-            mouse.OnEvent(motion(1, 1), false, false);
-            assert(mouse.OnEvent(other_key, false, false) == C::None);
-            assert(mouse.OnEvent(blocked ? other_key : release, false, blocked) == C::Release);
+            mouse.OnEvent(event(SDL_EVENT_MOUSE_BUTTON_DOWN, SDL_BUTTON_LEFT), false);
+            mouse.OnEvent(motion(1, 1), false);
+            assert(mouse.OnEvent(other_key, false) == C::None);
+            assert(mouse.OnEvent(blocked ? other_key : release, blocked) == C::Release);
             mouse.SetCaptured(false);
             assert(!mouse.Captured() && !take() && dx == 0 && dy == 0 && buttons == 0);
         }
@@ -88,7 +126,7 @@ static void mouse_capture() {
     mouse.SetCaptured(true);
     mouse.Disable();
     assert(!mouse.Captured() && !take() && buttons == 0);
-    assert(mouse.OnEvent(event(SDL_EVENT_MOUSE_BUTTON_DOWN, SDL_BUTTON_LEFT), false, false) == C::None);
+    assert(mouse.OnEvent(event(SDL_EVENT_MOUSE_BUTTON_DOWN, SDL_BUTTON_LEFT), false) == C::None);
     assert(!take() && buttons == 0);
     std::puts("PASS: mouse capture, Shift-latched clicks, short clicks, release on Cmd/focus/hide/menu, "
               "never in background windows");
