@@ -325,6 +325,7 @@ int main(int argc, char** argv) {
         rasterizer.reset();
         // All cache producers are gone; stop the persistent IO worker while its
         // synchronization globals are still alive, before normal static teardown.
+        Expect("cache storage initialized before explicit close", Storage::DataBase::Instance().IsOpened());
         Storage::DataBase::Instance().Close();
         Expect("cache storage worker explicitly closed", !Storage::DataBase::Instance().IsOpened());
         test_alarm(0);
