@@ -316,6 +316,7 @@ def translated_games():
 
 
 def launch(args):
+    settings, window_size, expected_pixels = launch_display(args)
     if args.perf_phases and not args.perf:
         die('--perf-phases requires --perf')
     dyld = sorted(k for k in os.environ if k.startswith('DYLD_'))
@@ -373,13 +374,6 @@ def launch(args):
                   f'this build is {artifacts["libbbgpu.dylib"]["sha256"][:12]}', file=sys.stderr)
     (run / 'shots').mkdir()
     (run / 'pad.txt').write_text('\n')
-    settings = SETTINGS[args.output]
-    for item in args.ini:  # --ini KEY=VALUE overrides (or adds) one bbport.ini line
-        key, sep, value = item.partition('=')
-        if not sep or not re.fullmatch(r'[a-z_]+', key):
-            die(f'--ini needs KEY=VALUE with a lowercase bbport.ini key: {item}')
-        lines = [l for l in settings.splitlines() if not l.startswith(key + '=')]
-        settings = '\n'.join(lines + [f'{key}={value}']) + '\n'
     (run / 'bbport.ini').write_text(settings)
     # run.sh regenerates boot images and patches at every launch: one directory per output size, and
     # launches serialized (see below) so a starting game never reads a half-written file.
@@ -391,6 +385,11 @@ def launch(args):
                BB_CONFIG=str(run / 'bbport.ini'),
                BB_PAD_FILE=str(run / 'pad.txt'), BB_IME_TEXT=args.name, BB_FPS=args.fps,
                BB_FRAME_STATS='1', BB_MODS_ENABLED='0', BB_TIMEOUT=str(args.timeout))
+    if args.native_1080p:
+        (run / 'external-patches-empty').mkdir()
+        (run / 'external-patches.json').write_text('{"enabled":[],"disabled":[]}\n')
+        env.update(BB_PATCHES_DIR=str(run / 'external-patches-empty'),
+                   BB_PATCHES_CONFIG=str(run / 'external-patches.json'))
     # The user works on this Mac while games run: the game is an accessory app (no Dock icon,
     # never activated) and its window does not take focus when shown. SDL3 reads hints from the
     # environment. Input comes from BB_PAD_FILE, so the window never needs keyboard focus.
@@ -398,7 +397,7 @@ def launch(args):
     # A small window in the bottom-right corner of the main display (window-code flags; the render
     # size is unchanged). Builds without the flags ignore them: the launch then says so.
     screen_w, screen_h = map(int, run_checked([str(window_tool()), 'screen'], 'reading the screen size').split('x'))
-    win_w, win_h = 960, 540
+    win_w, win_h = window_size
     env.update(BB_WINDOW_SIZE=f'{win_w}x{win_h}', BB_WINDOW_BACKGROUND='1',
                BB_WINDOW_POS=f'{max(0, screen_w - win_w - 12)},{max(0, screen_h - win_h - 12)}')
     if args.gpu_log:
@@ -441,7 +440,9 @@ def launch(args):
                               else 'empty (fresh user directory)',
               'saves': {'fixture': args.fixture, 'from': fixture} if args.fixture else 'none (fresh user directory)',
               'host': {'load_average': os.getloadavg(), 'other_bb_probe': running},
-              'heavy': heavy}
+              'heavy': heavy, 'display': {'window_points': list(window_size),
+                                         'expected_pixels': expected_pixels,
+                                         'native_1080p_requested': args.native_1080p}}
     (run / 'manifest.json').write_text(json.dumps(record, indent=2) + '\n')
     current = BASE / 'current'
     if current.is_symlink() or current.exists():
@@ -484,28 +485,82 @@ def launch(args):
         if (run / 'exit.json').exists():
             give_up(f'game exited during startup: {(run / "exit.json").read_text().strip()}; log {run / "game.log"}')
         if info.get('pid') and any(l.startswith('Runtime:') for l in log_lines(run)):
+            if args.native_1080p:
+                patches = data / 'out' / 'patches.bin'
+                if not patches.is_file():
+                    give_up('native preflight failed: missing generated patches.bin')
+                info['launch_input_hashes'] = {'bbport.ini': sha256(run / 'bbport.ini'),
+                                              'patches.bin': sha256(patches),
+                                              'external-patches.json': sha256(run / 'external-patches.json')}
+                (run / 'manifest.json').write_text(json.dumps(info, indent=2) + '\n')
             fcntl.flock(lock, fcntl.LOCK_UN)
-            report_window(run)
+            try:
+                report_window(run)
+            except ValueError as e:
+                give_up(str(e))
             print(json.dumps({'run': str(run), 'pid': info['pid'], 'log': str(run / 'game.log')}))
             return run
     give_up(f'no runtime output within 60 s (Rosetta rule: report, do not retry); run {run}')
+
+
+def dimensions(value):
+    if not re.fullmatch(r'[1-9][0-9]*x[1-9][0-9]*', value):
+        raise argparse.ArgumentTypeError('size must be positive WIDTHxHEIGHT')
+    return tuple(map(int, value.split('x')))
+
+
+def launch_display(args):
+    settings = SETTINGS[args.output]
+    size = args.window_size or (960, 540)
+    expected = None
+    if args.native_1080p:
+        if args.output != '1080p' or args.ini or args.fps != '60':
+            die('--native-1080p requires --output 1080p, --fps 60 and no --ini overrides')
+        if args.window_size and args.window_size != (1920, 1080):
+            die('--native-1080p requires a 1920x1080 window')
+        allowed = {'BB_PLAYER_POS_FILE', 'BB_PIPE_VERIFY', 'BB_FLIP_TRACE', 'BB_QUALITY_VERIFY',
+                   'BB_FRAMES_AHEAD', 'BB_PERF_FRAMES'}
+        if any(item.partition('=')[0] not in allowed for item in args.diag_env):
+            die('--native-1080p refuses unreviewed diagnostic overrides')
+        if args.disable_optimizations not in (None, 0):
+            die('--native-1080p refuses a nonzero disabled-optimization mask')
+        settings = (Path(__file__).parent / 'playtest/native-1080p.ini').read_text()
+        size, expected = (1920, 1080), [1920, 1080]
+    for item in args.ini:
+        key, sep, value = item.partition('=')
+        if not sep or not re.fullmatch(r'[a-z_]+', key):
+            die(f'--ini needs KEY=VALUE with a lowercase bbport.ini key: {item}')
+        lines = [l for l in settings.splitlines() if not l.startswith(key + '=')]
+        settings = '\n'.join(lines + [f'{key}={value}']) + '\n'
+    return settings, size, expected
 
 
 def report_window(run, wait=60):
     """Says whether the game honoured the small background window (BB_WINDOW_*): older builds
     ignore the flags and open a full-size window, which is reported, not hidden."""
     deadline = time.time() + wait
+    expected = manifest(run).get('display', {}).get('expected_pixels')
     while time.time() < deadline and not (run / 'exit.json').exists():
         lines = log_lines(run, full=True)  # never the incremental reader: the route's waits read after this
         window = [l for l in lines if l.startswith('Window: ')]
         if window:
+            if expected:
+                m = re.search(r'\(([0-9]+)x([0-9]+) pixels\)', window[0])
+                actual = [int(m[1]), int(m[2])] if m else None
+                if actual != expected:
+                    raise ValueError(f'native output preflight failed: expected {expected}, got {window[0]}')
+                event(run, 'window-pixels-verified', pixels=actual, evidence=window[0])
             print(f'play_route: {window[0].strip()}', file=sys.stderr)
             return
         if any(l.startswith('GPU: window and Vulkan presenter ready') for l in lines):
+            if expected:
+                raise ValueError('native output preflight failed: build did not report window pixel dimensions')
             print('play_route: this build has no window flags (BB_WINDOW_*): the window is full size '
                   'and centred; it still does not take focus', file=sys.stderr)
             return
         time.sleep(1)
+    if expected:
+        raise ValueError('native output preflight failed: no window pixel evidence before timeout/exit')
 
 
 def supervise(run):
@@ -904,6 +959,10 @@ def main():
         p = sub.add_parser(command)
         p.add_argument('--probe', required=True, help='signed production bb-probe (gpu/libbbgpu.dylib beside it)')
         p.add_argument('--output', choices=sorted(SETTINGS), default='1080p')
+        p.add_argument('--window-size', type=dimensions, metavar='WIDTHxHEIGHT',
+                       help='window size in points (default 960x540; render size is separate)')
+        p.add_argument('--native-1080p', action='store_true',
+                       help='pin existing quality at 1920x1080 and require 1920x1080 window pixels')
         p.add_argument('--label', default='')
         p.add_argument('--ini', action='append', default=[], metavar='KEY=VALUE',
                        help='override a bbport.ini setting (e.g. upscaler=off, object_motion=0)')
