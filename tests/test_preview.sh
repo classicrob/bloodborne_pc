@@ -79,7 +79,7 @@ for name in ('bb-probe', 'libbbgpu.dylib'):
 PY
 echo 'PASS manifest identifies staged, hashed binaries and unrun gate'
 set +e; FAKE_MUTATE_SOURCE=1 run --stage "$dir/stage" --build-only P1c; status=$?; set -e
-(( status == 1 )) && grep -q 'source tree changed during build' "$dir/out" ||
+(( status == 1 )) && grep -q 'source tree or FSR submodule changed during build' "$dir/out" ||
     fail "a source edit during build ($status): $(cat "$dir/out")"
 git -C "$tree" checkout -q tools/macos/preview.sh
 echo 'PASS a source edit during build is refused before staging'

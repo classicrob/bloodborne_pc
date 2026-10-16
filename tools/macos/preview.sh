@@ -58,6 +58,7 @@ source_fsr() {
     fi
 }
 root_stamp=$(source_root) || die 'cannot pin source tree'
+fsr_stamp=$(source_fsr) || die 'cannot pin FSR source state'
 full_head=$(git rev-parse HEAD)
 head=$(git rev-parse --short HEAD)
 dest=$stage/$head-$name
@@ -72,8 +73,8 @@ export BB_DEPS_PREFIX=${BB_DEPS_PREFIX:-$HOME/bbport-deps/x86_64}
 started=$(date +%s)
 BB_HEAVY_PRIORITY=$priority bash build.sh > "out/preview-$name-build.log" 2>&1 ||
     die "build (log: out/preview-$name-build.log): $(tail -3 "out/preview-$name-build.log" | tr '\n' ' ')"
-[[ $(source_root) == "$root_stamp" ]] || die 'source tree changed during build'
-fsr_stamp=$(source_fsr) || die 'cannot pin FSR source state'
+[[ $(source_root) == "$root_stamp" && $(source_fsr) == "$fsr_stamp" ]] ||
+    die 'source tree or FSR submodule changed during build'
 verify_source() {
     [[ $(source_root) == "$root_stamp" && $(source_fsr) == "$fsr_stamp" ]] ||
         die 'source tree or FSR submodule changed after build'
