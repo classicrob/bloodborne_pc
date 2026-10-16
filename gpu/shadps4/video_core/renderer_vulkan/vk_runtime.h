@@ -74,6 +74,12 @@ public:
     void CopyImage(VideoCore::Image* src, VideoCore::Image* dst);
     void CopyImageWithBuffer(VideoCore::Image* src, VideoCore::Image* dst,
                              const VideoCore::Buffer* buffer, u64 offset);
+#ifdef __APPLE__
+    // Records exactly one block through an explicit buffer. Caller owns its lifetime and
+    // cache authority; this never changes image flags or copies padding/sibling mips.
+    void CopyBc4FloatTail(VideoCore::Image* parent, VideoCore::Image* companion, u32 mip,
+                         const VideoCore::Buffer* bridge, u64 offset, bool to_float);
+#endif
     void CopyMip(VideoCore::Image* src, VideoCore::Image* dst, u32 mip, u32 slice);
 
     void CopyColorAndDepth(VideoCore::Image* src, VideoCore::Image* dst);

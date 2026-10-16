@@ -3,6 +3,10 @@
 
 #include <boost/container/small_vector.hpp>
 #include "bbport_toggles.h"
+#include "common/scope_exit.h"
+#ifdef __APPLE__
+#include "video_core/texture_cache/bc4_alias.h"
+#endif
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -200,6 +204,20 @@ bool Runtime::Transit(VideoCore::Image* image, vk::ImageLayout dst_layout,
                       vk::PipelineStageFlags2 dst_stage, vk::AccessFlags2 dst_access,
                       std::optional<VideoCore::SubresourceRange> subres_range) {
     BeforeImageAccess();
+#ifdef __APPLE__
+    constexpr auto writes = vk::AccessFlagBits2::eTransferWrite | vk::AccessFlagBits2::eShaderWrite |
+        vk::AccessFlagBits2::eShaderStorageWrite | vk::AccessFlagBits2::eColorAttachmentWrite |
+        vk::AccessFlagBits2::eDepthStencilAttachmentWrite | vk::AccessFlagBits2::eMemoryWrite;
+    ASSERT_MSG(!image->bc4_float_parent || image->bc4_float_internal_write ||
+                   (!bool(dst_access & writes) && !image->bc4_float_pending),
+               "BC4 Float linked parent access conflicts with protected authority");
+    ASSERT_MSG(!image->bc4_float_companion || image->bc4_float_internal_write ||
+                   !bool(dst_access & writes) ||
+                   (image->bc4_float_pending &&
+                    !bool(dst_access & (writes & ~(vk::AccessFlagBits2::eShaderWrite |
+                                                   vk::AccessFlagBits2::eShaderStorageWrite)))),
+               "BC4 Float companion write is outside its selected storage command");
+#endif
     if (scene_targets) scene_targets->NativeAccess(*image, dst_access);
 #ifdef __APPLE__
     if (BbPassTrace::Enabled()) {
@@ -472,6 +490,52 @@ void Runtime::CopyImageWithBuffer(VideoCore::Image* src, VideoCore::Image* dst,
     dst->flags &= ~VideoCore::ImageFlagBits::Dirty;
 }
 
+#ifdef __APPLE__
+void Runtime::CopyBc4FloatTail(VideoCore::Image* parent, VideoCore::Image* companion, u32 mip,
+                              const VideoCore::Buffer* bridge, u64 offset, bool to_float) {
+    BeforeImageAccess();
+    const char* reject = VideoCore::Bc4Alias::RejectFloatTail(companion->info, parent->info, mip);
+    ASSERT_MSG(!reject && offset % 8 == 0, "BC4 Float bridge layout: {}", reject ? reject : "offset");
+    ASSERT(parent->backing->num_samples == 1 && companion->backing->num_samples == 1);
+    ASSERT(!parent->bc4_float_internal_write && !companion->bc4_float_internal_write);
+    parent->bc4_float_internal_write = companion->bc4_float_internal_write = true;
+    SCOPE_EXIT { parent->bc4_float_internal_write = companion->bc4_float_internal_write = false; };
+    auto* src = to_float ? parent : companion;
+    auto* dst = to_float ? companion : parent;
+    scheduler.EndRendering();
+    Transit(src, vk::ImageLayout::eTransferSrcOptimal, vk::PipelineStageFlagBits2::eCopy,
+            vk::AccessFlagBits2::eTransferRead);
+    Transit(dst, vk::ImageLayout::eTransferDstOptimal, vk::PipelineStageFlagBits2::eCopy,
+            vk::AccessFlagBits2::eTransferWrite);
+    IsBufferAccessed(bridge, offset, 8, true);
+    FlushBarriers();
+    const vk::BufferImageCopy source{
+        .bufferOffset = offset,
+        .imageSubresource = {vk::ImageAspectFlagBits::eColor, to_float ? mip : 0, 0, 1},
+        .imageExtent = {to_float ? 2u : 1u, 1, 1}};
+    const vk::BufferImageCopy destination{
+        .bufferOffset = offset,
+        .imageSubresource = {vk::ImageAspectFlagBits::eColor, to_float ? 0 : mip, 0, 1},
+        .imageExtent = {to_float ? 1u : 2u, 1, 1}};
+    scheduler.Record([src_image = src->GetImage(), dst_image = dst->GetImage(),
+                      buffer = bridge->Handle(), source, destination, offset](vk::CommandBuffer cmd) {
+        cmd.copyImageToBuffer(src_image, vk::ImageLayout::eTransferSrcOptimal, buffer, source);
+        const vk::BufferMemoryBarrier2 barrier{
+            .srcStageMask = vk::PipelineStageFlagBits2::eCopy,
+            .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eCopy,
+            .dstAccessMask = vk::AccessFlagBits2::eTransferRead,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .buffer = buffer, .offset = offset, .size = 8};
+        cmd.pipelineBarrier2({.bufferMemoryBarrierCount = 1, .pBufferMemoryBarriers = &barrier});
+        cmd.copyBufferToImage(buffer, dst_image, vk::ImageLayout::eTransferDstOptimal, destination);
+    });
+    AccessBuffer(bridge, offset, 8, vk::PipelineStageFlagBits2::eCopy,
+                 vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eTransferWrite);
+}
+#endif
+
 void Runtime::CopyMip(VideoCore::Image* src, VideoCore::Image* dst, u32 mip, u32 slice) {
     const auto dst_dim = dst->info.props.is_block ? 2 : 0;
     const auto mip_block_w = std::max(dst->info.size.width >> (mip + dst_dim), 1u);
@@ -712,6 +776,11 @@ void Runtime::SetBackingSamples(VideoCore::Image* image, u32 num_samples, bool c
     if (!backing || backing->num_samples == num_samples) {
         return;
     }
+#ifdef __APPLE__
+    ASSERT_MSG(!image->bc4_float_parent && !image->bc4_float_companion,
+               "BC4 Float linked backing replacement requires pair retirement");
+    ++image->backing_revision;
+#endif
     ASSERT_MSG(!image->info.props.is_depth, "Swapping samples is only valid for color images");
     VideoCore::Image::BackingImage* new_backing;
     auto it = std::ranges::find(backing_images, num_samples,
