@@ -63,6 +63,11 @@ void Expect(const char* label, bool ok) {
     std::printf("%s: %s\n", label, ok ? "ok" : "FAIL");
     failures += !ok;
 }
+void RequireNegativeSetup() {
+    if (!failures) return;
+    std::fputs("SETUP FAIL: earlier oracle failed; negative target not reached\n", stderr);
+    _exit(2);
+}
 void Fault(int signal, siginfo_t* info, void* context) {
     if (bbgpu_handle_fault(context, info->si_addr)) {
         write_faults = write_faults + 1;
@@ -198,6 +203,9 @@ int main(int argc, char** argv) {
     d.init(loader.getProcAddress<PFN_vkGetInstanceProcAddr>("vkGetInstanceProcAddr"));
     d.init(instance.GetInstance()); d.init(instance.GetDevice());
     const auto device = instance.GetDevice();
+    const auto properties = instance.GetPhysicalDevice().getProperties(d);
+    std::printf("device=%s vendor=%#x driver=%#x\n", properties.deviceName.data(),
+                properties.vendorID, properties.driverVersion);
     const auto transfer = vk::FormatFeatureFlagBits2::eTransferSrc | vk::FormatFeatureFlagBits2::eTransferDst;
     assert(instance.IsFormatSupported(vk::Format::eBc4UnormBlock, transfer));
     assert(instance.IsFormatSupported(vk::Format::eR32G32Uint, transfer | vk::FormatFeatureFlagBits2::eStorageImage));
@@ -219,6 +227,14 @@ int main(int argc, char** argv) {
     auto bc = Desc(address, true), integer = Desc(address, false);
     assert(!VideoCore::Bc4Alias::RejectLayout(bc.info, integer.info));
     assert(bc.info.guest_size == Bytes && integer.info.guest_size == Bytes);
+    for (const auto* info : {&bc.info, &integer.info}) {
+        assert(info->props.is_tiled && info->tile_mode == AmdGpu::TileMode::Thin1DThin &&
+               info->array_mode == AmdGpu::ArrayMode::Array1DTiledThin1 && info->num_bits == 64 &&
+               info->resources.levels == 1 && info->resources.layers == 1 &&
+               info->mips_layout[0].offset == 0 && info->mips_layout[0].size == Bytes &&
+               info->mips_layout[0].pitch == info->size.width &&
+               info->mips_layout[0].height == info->size.height);
+    }
     VideoCore::ImageId image_id{};
     u64 image_uid = 0;
     const auto read_image = [&](VideoCore::Image& image, const Payload& expected) {
@@ -281,6 +297,7 @@ int main(int argc, char** argv) {
         else if (is("--skip-materialize")) std::puts("MUTATION skip-materialize");
     });
     if (is("--mixed-authority")) {
+        RequireNegativeSetup();
         guest[Offset] ^= 1;
         std::puts("NEGATIVE mixed-authority: next production materialization must stop");
         on_a([&] { cache.MaterializeBc4AliasesAfterCommand(); });
@@ -291,6 +308,7 @@ int main(int argc, char** argv) {
     Expect("publication preserves full guest page canaries", Canaries(guest));
     on_a([&] {
         if (is("--raw-interior") || is("--raw-full")) {
+            RequireNegativeSetup();
             std::puts("NEGATIVE converted raw write: next production ObtainBuffer must stop");
             (void)rasterizer->GetBufferCache().ObtainBuffer(address + (is("--raw-interior") ? 8 : 0),
                 is("--raw-interior") ? 8 : Bytes, true);
