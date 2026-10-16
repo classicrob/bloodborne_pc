@@ -4,6 +4,7 @@
 #include <bit>
 #include <xxhash.h>
 #ifdef __APPLE__
+#include "common/scope_exit.h"
 #include <sys/stat.h>
 #include <map>
 #include <thread>
@@ -150,6 +151,9 @@ bool IsKnownFormat(AmdGpu::DataFormat data_fmt, AmdGpu::NumberFormat num_fmt) {
 } // namespace
 
 bool Rasterizer::FilterDraw() {
+#ifdef __APPLE__
+    SCOPE_EXIT { texture_cache.MaterializeBc4AliasesAfterCommand(); };
+#endif
     const auto& regs = Regs();
     if (regs.color_control.mode == AmdGpu::ColorControl::OperationMode::EliminateFastClear) {
         // Clears the render target if FCE is launched before any draws
@@ -1102,6 +1106,9 @@ void Rasterizer::NoteRecordContext(const char* kind, const Pipeline* pipeline) {
 
 void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw* used_prepared,
                             bool is_indexed, u32 index_offset) {
+#ifdef __APPLE__
+    SCOPE_EXIT { texture_cache.MaterializeBc4AliasesAfterCommand(); };
+#endif
     BB_SPLIT_MARK_ON(stage_b, BDrawSetup);
     NoteRecordContext("draw", pipeline);
 #ifdef __APPLE__
@@ -1471,6 +1478,9 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
 
 void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_indexed,
                                     const IndirectDraw& indirect) {
+#ifdef __APPLE__
+    SCOPE_EXIT { texture_cache.MaterializeBc4AliasesAfterCommand(); };
+#endif
     NoteRecordContext("indirect draw", pipeline);
 #ifdef __APPLE__
     input_reads.clear(); // a rejected draw or dispatch before this one executed nothing
@@ -1672,6 +1682,9 @@ void Rasterizer::DispatchDirect() {
 }
 
 void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
+#ifdef __APPLE__
+    SCOPE_EXIT { texture_cache.MaterializeBc4AliasesAfterCommand(); };
+#endif
     NoteRecordContext("dispatch", pipeline);
     FrameCapture::Poll();
     gbuffer_draw = false;
@@ -1752,6 +1765,9 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
 
 void Rasterizer::DispatchIndirectRecord(const ComputePipeline* pipeline, VAddr address,
                                         u32 size) {
+#ifdef __APPLE__
+    SCOPE_EXIT { texture_cache.MaterializeBc4AliasesAfterCommand(); };
+#endif
     NoteRecordContext("indirect dispatch", pipeline);
 #ifdef __APPLE__
     input_reads.clear(); // a rejected draw or dispatch before this one executed nothing
