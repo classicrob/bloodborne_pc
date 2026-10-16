@@ -73,6 +73,24 @@ smoke_status=$?
 smoke=$(grep -v '^heavy: ' "out/preview-$name-smoke.log" | tail -1)
 [[ $smoke_status == 0 && $smoke == *PASS* ]] || die "smoke (exit $smoke_status): $(tail -3 "out/preview-$name-smoke.log" | tr '\n' ' ')"
 say "smoke: $smoke"
+write_manifest() {
+    python3 - "$dest" "$(git rev-parse HEAD)" "$1" <<'PY'
+import hashlib
+import json
+import pathlib
+import sys
+
+stage = pathlib.Path(sys.argv[1]).resolve()
+artifacts = {}
+for name, relative in (('bb-probe', 'bb-probe'), ('libbbgpu.dylib', 'gpu/libbbgpu.dylib')):
+    path = stage / relative
+    artifacts[name] = {'path': str(path), 'sha256': hashlib.sha256(path.read_bytes()).hexdigest()}
+manifest = {'source_tree': {'head': sys.argv[2]}, 'artifacts': artifacts,
+            'qualification': {'test_gate': sys.argv[3]}}
+(stage / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
+PY
+}
+write_manifest NOT_RUN
 if [[ -n $build_only ]]; then say "test: not run (--build-only)"; exit 0; fi
 
 started=$(date +%s)
@@ -85,6 +103,7 @@ case $status in
 *) verdict=FAILED ;;
 esac
 say "test: $verdict (build.sh --test-keep-going exit $status, $(( $(date +%s) - started )) s): ${summary:-no summary: a build or non-test step failed, see out/preview-$name-test.log}"
+case $status in 0) write_manifest PASS ;; 3) write_manifest SKIPPED ;; *) write_manifest FAILED ;; esac
 while read -r line; do say "test ${line#  }"; done < <(grep -E '^  (FAILED|skipped): ' "out/preview-$name-test.log")
 # Paused or demoted (E-core QoS) by a perf run while it ran? heavy.sh's history has the build.sh
 # job's quiet-pause / quiet-ecore events; either can make a time limit in a test fire.

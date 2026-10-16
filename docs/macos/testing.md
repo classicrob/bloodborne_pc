@@ -22,3 +22,7 @@ heavy.sh quick slot, then runs the gate (`build.sh --test-keep-going`; a failure
 a perf run is rerun once with `--test-one`, both results kept). `PREVIEW.txt` in the stage
 directory holds every fact for the post. Exit 0 passed, 1 failed, 3 skips, 2 usage. A preview that
 fails a step keeps its directory (with `FAILED` in `PREVIEW.txt`): a new attempt needs a new NAME.
+Each staged directory also has `manifest.json`: `source_tree.head` is the full commit hash;
+`artifacts.bb-probe` and `artifacts.libbbgpu.dylib` each give the absolute staged `path` and
+`sha256`. `qualification.test_gate` is `PASS` only after the full keep-going gate passes; it is
+`NOT_RUN` for a build-only preview or an interrupted gate, and `FAILED` or `SKIPPED` otherwise.

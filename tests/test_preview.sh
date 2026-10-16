@@ -58,6 +58,22 @@ f=$dir/stage/$head-P1/PREVIEW.txt
     grep -q '^test: not run (--build-only)' "$f" && grep -q "^commit $head" "$f" ||
     fail "--build-only ($status): $(cat "$dir/out")"
 echo "PASS --build-only: staged, hashed, signatures and smoke checked, PREVIEW.txt"
+python3 - "$dir/stage/$head-P1/manifest.json" "$(git -C "$tree" rev-parse HEAD)" <<'PY' || fail 'preview manifest provenance'
+import hashlib
+import json
+import pathlib
+import sys
+
+manifest = json.loads(pathlib.Path(sys.argv[1]).read_text())
+assert manifest['source_tree']['head'] == sys.argv[2]
+assert manifest['qualification']['test_gate'] == 'NOT_RUN'
+for name in ('bb-probe', 'libbbgpu.dylib'):
+    artifact = manifest['artifacts'][name]
+    path = pathlib.Path(artifact['path'])
+    assert path.is_absolute() and path.is_file()
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == artifact['sha256']
+PY
+echo 'PASS manifest identifies staged, hashed binaries and unrun gate'
 set +e; run --stage "$dir/stage" --build-only P1; status=$?; set -e
 (( status == 2 )) && grep -q 'exists (a preview is never overwritten)' "$dir/out" || fail "overwrite ($status)"
 echo "PASS a second preview of the same name and commit is refused (exit 2)"
@@ -68,6 +84,10 @@ set +e; FAKE_SMOKE_PAUSED=1 run --stage "$dir/stage" --build-only P1b; status=$?
 echo "PASS a smoke job paused by a perf run: heavy's PAUSED line after the probe's output, still PASS"
 set +e; FAKE_TEST=pass run --stage "$dir/stage" P2; status=$?; set -e
 (( status == 0 )) && grep -q '^test: PASS (build.sh --test-keep-going exit 0' "$dir/stage/$head-P2/PREVIEW.txt" || fail "pass ($status): $(cat "$dir/out")"
+python3 - "$dir/stage/$head-P2/manifest.json" <<'PY' || fail 'passed gate missing from manifest'
+import json, sys
+assert json.load(open(sys.argv[1]))['qualification']['test_gate'] == 'PASS'
+PY
 echo "PASS the gate passes: test: PASS, exit 0"
 
 # A perf run paused the gate's build.sh job: its failure gets one --test-one rerun.
