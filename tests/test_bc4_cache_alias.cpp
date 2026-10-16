@@ -15,6 +15,7 @@
 #include "common/elf_info.h"
 #include "test_alarm.h"
 #include "video_core/amdgpu/liverpool.h"
+#include "video_core/cache_storage.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
@@ -322,6 +323,10 @@ int main(int argc, char** argv) {
         runtime.SetImageAccessHook(nullptr, nullptr);
         scheduler.SetSubmitCallback({});
         rasterizer.reset();
+        // All cache producers are gone; stop the persistent IO worker while its
+        // synchronization globals are still alive, before normal static teardown.
+        Storage::DataBase::Instance().Close();
+        Expect("cache storage worker explicitly closed", !Storage::DataBase::Instance().IsOpened());
         test_alarm(0);
     };
     on_a([&] { select(bc); read_image(cache.GetImage(image_id), Seed(0)); });
