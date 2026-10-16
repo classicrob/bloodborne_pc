@@ -1102,17 +1102,24 @@ def disk_group_running(group):
 
 
 def owned_descendants(group):
-    owned = {}
-    for pid in descendants(group):
+    owned, unknown = {}, False
+    try:
+        pids = descendants(group)
+    except OSError as error:
+        print(f'heavy: disk stop cannot enumerate descendants of {group}: {error}',
+              file=sys.stderr, flush=True)
+        return {}, True
+    for pid in pids:
         try:
             start = process_start(pid)
         except OSError as error:
             print(f'heavy: disk stop cannot identify descendant {pid}: {error}',
                   file=sys.stderr, flush=True)
+            unknown = True
             continue
         if start is not None:
             owned[pid] = start
-    return owned
+    return owned, unknown
 
 
 def signal_owned(owned, signum):
@@ -1130,8 +1137,11 @@ def signal_owned(owned, signum):
 def owned_running(owned):
     if not owned:
         return False
-    result = subprocess.run(['ps', '-o', 'pid=,stat=', '-p', ','.join(map(str, owned))],
-                            capture_output=True, text=True)
+    try:
+        result = subprocess.run(['ps', '-o', 'pid=,stat=', '-p', ','.join(map(str, owned))],
+                                capture_output=True, text=True)
+    except OSError:
+        return None
     if result.returncode not in (0, 1):
         return None
     for line in result.stdout.splitlines():
@@ -1149,7 +1159,7 @@ def owned_running(owned):
 
 def stop_for_disk(child, label):
     group = child.pid
-    owned = owned_descendants(group)
+    owned, unknown_owned = owned_descendants(group)
     try:
         os.killpg(group, signal.SIGTERM)
     except ProcessLookupError:
@@ -1161,7 +1171,7 @@ def stop_for_disk(child, label):
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline:
         running = disk_group_running(group)
-        detached_running = owned_running(owned)
+        detached_running = None if unknown_owned else owned_running(owned)
         if running is False and detached_running is False:
             break
         time.sleep(0.2)
@@ -1177,7 +1187,7 @@ def stop_for_disk(child, label):
         signal_owned(owned, signal.SIGKILL)
     for _ in range(25):
         running = disk_group_running(group)
-        detached_running = owned_running(owned)
+        detached_running = None if unknown_owned else owned_running(owned)
         if running is False and detached_running is False:
             break
         time.sleep(0.2)
@@ -1185,7 +1195,7 @@ def stop_for_disk(child, label):
         print(f'heavy: {label}: disk stop could not verify owned processes of group {group} drained',
               file=sys.stderr, flush=True)
         record({'event': 'disk-group-undrained', 'label': label, 'group': group,
-                'detached_pids': list(owned)})
+                'detached_pids': list(owned), 'unknown_descendant_identity': unknown_owned})
     try:
         child.wait(timeout=5)
     except subprocess.TimeoutExpired:
