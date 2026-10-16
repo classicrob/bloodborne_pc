@@ -180,9 +180,9 @@ inline bool HasBc4FloatAliasConflict(
         for (u32 other_index = 0; other_index < images.size(); ++other_index) {
             if (other_index == i) continue;
             const auto& other = images[other_index];
-            if ((written || other.type != Cache::BindingType::Texture ||
-                 other.info.pixel_format == vk::Format::eBc4UnormBlock) &&
-                VideoCore::Bc4Alias::RangesOverlap(address, size,
+            // The cache admits exactly a parent/companion pair, not a third image
+            // representation. Reject even read/read selected aliases before either binds.
+            if (VideoCore::Bc4Alias::RangesOverlap(address, size,
                     other.info.guest_address, other.info.guest_size)) return true;
         }
         for (const auto* stage : stages) {

@@ -445,6 +445,11 @@ static void Bc4FloatPreflightControls(bool skip_preflight) {
     images.push_back(bc);
     Expect("Float and uncached selected BC parent reject even read-only", conflict());
     images[1].info.pixel_format = vk::Format::eR32Uint;
+    Expect("Float and read-only third image representation reject before binds", conflict());
+    images[1] = images[0];
+    Expect("Duplicate selected Float image rejected conservatively", conflict());
+    images[1] = bc;
+    images[1].info.pixel_format = vk::Format::eR32Uint;
     images[1].type = Cache::BindingType::Storage;
     Expect("Float and overlapping other image writer reject", conflict());
     images[1].info.guest_address = 0x200000;
