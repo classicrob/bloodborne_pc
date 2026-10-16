@@ -25,6 +25,7 @@
 #include "video_core/texture_cache/host_compatibility.h"
 #include "video_core/texture_cache/texture_cache.h"
 #ifdef __APPLE__
+#include <sys/mman.h>
 #include "bbport_bind_context.h"
 #include "video_core/renderer_vulkan/vk_scene_resolution.h"
 #include "video_core/texture_cache/bc4_alias.h"
@@ -310,7 +311,7 @@ RuntimeMemoryAliasSnapshot FloatMapping(VAddr address, u64 size) {
     ASSERT_MSG(runtime_memory_inventory(&inventory) == 0 && !inventory.shared_backing_views &&
                    runtime_memory_alias_snapshot(address, nullptr, 0, &mapping) == 1 &&
                    inventory.generation == mapping.generation && !(mapping.generation & 1) &&
-                   address < mapping.end && size <= mapping.end - address && (mapping.prot & 1),
+                   address < mapping.end && size <= mapping.end - address && (mapping.prot & PROT_READ),
                "BC4 Float tail requires unique committed parent backing");
     return mapping;
 }
@@ -425,6 +426,8 @@ void TextureCache::ValidateFloatParent(const Bc4FloatParentRecord& record) {
 }
 void TextureCache::ValidateFloatRelation(const Bc4FloatRelation& relation) {
     ValidateFloatParent(relation.parent);
+    ASSERT_MSG(slot_images[relation.parent.parent_id].bc4_float_parent,
+               "BC4 Float parent lost linked ownership");
     ASSERT_MSG(slot_images.is_allocated(relation.companion_id), "BC4 Float companion retired");
     const auto& child = slot_images[relation.companion_id];
     ASSERT_MSG(True(child.flags & ImageFlagBits::Registered) && child.bc4_float_companion &&
@@ -1515,13 +1518,20 @@ ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc, Vi
         UpdateImage(image_id);
     }
     if (memo && !BbToggle::Disabled(BbToggle::TextureViewMemo)) {
-        if (memo->image_id == image_id && memo->backing == image.backing && memo->view_id) {
+        if (memo->image_id == image_id && memo->backing == image.backing && memo->view_id
+#ifdef __APPLE__
+            && (!(image.bc4_float_parent || image.bc4_float_companion) || memo->image_uid == image.image_uid)
+#endif
+        ) {
             return slot_image_views[memo->view_id];
         }
         ImageView& view = image.FindView(desc.view_info);
         const auto& ids = image.backing->image_view_ids;
         const u32 last = image.backing->last_view;
         memo->image_id = image_id;
+#ifdef __APPLE__
+        memo->image_uid = image.image_uid;
+#endif
         memo->backing = image.backing;
         memo->view_id = last < ids.size() && &slot_image_views[ids[last]] == &view ? ids[last]
                                                                                     : ids.back();

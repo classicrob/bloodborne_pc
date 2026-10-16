@@ -223,6 +223,9 @@ public:
         ImageId image_id{};
         const void* backing = nullptr;
         ImageViewId view_id{};
+#ifdef __APPLE__
+        u64 image_uid{};
+#endif
     };
 
     /// Retrieves an image view with the properties of the specified image id.
