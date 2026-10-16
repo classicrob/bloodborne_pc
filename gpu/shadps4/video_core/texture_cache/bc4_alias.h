@@ -8,6 +8,11 @@
 
 namespace VideoCore::Bc4Alias {
 
+constexpr bool RangesOverlap(VAddr a, u64 a_size, VAddr b, u64 b_size) {
+    if (!a_size || !b_size) return false;
+    return a <= b ? b - a < a_size : a - b < b_size;
+}
+
 constexpr bool AuthorityCompatible(bool gpu_modified, bool backing_dirty) {
     return !gpu_modified || !backing_dirty;
 }

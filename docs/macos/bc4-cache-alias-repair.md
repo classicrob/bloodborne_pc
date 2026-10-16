@@ -11,6 +11,10 @@ no metadata or other registered overlap, and no committed guest physical aliases
 Tile13 requires complete 8x8 microtiles of blocks. Partial views, chains, other
 formats/layouts and simultaneous differently represented bindings stop before
 conversion. The conservative whole-VM alias check can reject unrelated aliases.
+Raw GPU buffer writes overlapping any already converted image are rejected at
+the central written-buffer acquisition, including interior partial writes and
+GPU fill/copy HLE destinations. This candidate does not merge simultaneous raw
+buffer and image authority. Ordinary image invalidation policy is unchanged.
 Existing renderer/VM exclusion protects the current mapping through command work;
 a conversion-time inventory is not a lifetime pin by itself.
 
@@ -31,6 +35,14 @@ Stage-B/VM mutation protocol keeps the selected active image alive outside the
 texture lock; image UID/authority is checked again before publication. No pending
 converted image means no submission or wait. This is a conservative correctness
 path, with no speedup claim.
+
+The unlocked image reference also relies on presenter ordering: CPU flips enter
+through Liverpool SendCommand, whose command processing drains the draw pipe;
+EOP flips run in the same ordered Stage-B task stream (or drained Stage A).
+Presenter-thread DrawLastFrame uses PrepareLastFrame, which does not insert images.
+The stream-wrap Flush callback flushes barriers and pending arena binds, rather
+than calling OnSubmit/GC or PrepareFrame. Deferred deletions concern unregistered
+slots, not this active registry member. New callers must preserve these exclusions.
 
 The guarantee is publication before command recording completion and later ordered
 labels/fences/flip; it does not promise visibility to unsynchronized CPU reads

@@ -173,6 +173,7 @@ public:
 #ifdef __APPLE__
     /// Publish converted image writes before the recording command returns. Keeps images alive.
     void MaterializeBc4AliasesAfterCommand();
+    void RejectBc4AliasBufferWrite(VAddr address, u64 size);
     /// Called with renderer work drained, before acquiring the guest VMA writer lock.
     void PrepareBc4AliasesForMemoryMutation();
 #endif

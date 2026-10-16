@@ -263,6 +263,18 @@ void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
 }
 
 #ifdef __APPLE__
+void TextureCache::RejectBc4AliasBufferWrite(VAddr address, u64 size) {
+    std::scoped_lock lock{mutex};
+    for (const auto id : bc4_alias_images) {
+        const auto& image = slot_images[id];
+        ASSERT_MSG(!Bc4Alias::RangesOverlap(address, size, image.info.guest_address,
+                                           image.info.guest_size),
+                   "Raw GPU buffer write overlaps converted BC4 image: buffer={:#x}+{}, "
+                   "image={:#x}+{}; mixed buffer/image authority is unsupported",
+                   address, size, image.info.guest_address, image.info.guest_size);
+    }
+}
+
 void TextureCache::MaterializeBc4AliasesAfterCommand() {
     std::vector<std::pair<ImageId, u64>> pending;
     {

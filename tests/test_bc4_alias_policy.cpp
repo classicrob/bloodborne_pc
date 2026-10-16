@@ -5,6 +5,15 @@
 using namespace VideoCore;
 
 void RunBc4AliasPolicy() {
+    assert(Bc4Alias::RangesOverlap(0x100000, 2048, 0x100008, 8));
+    assert(Bc4Alias::RangesOverlap(0x100008, 8, 0x100000, 2048));
+    assert(Bc4Alias::RangesOverlap(0x0ffff8, 16, 0x100000, 2048));
+    assert(!Bc4Alias::RangesOverlap(0x100800, 8, 0x100000, 2048));
+    assert(!Bc4Alias::RangesOverlap(0x0ffff8, 8, 0x100000, 2048));
+    assert(!Bc4Alias::RangesOverlap(0x100000, 0, 0x100000, 2048));
+    assert(!Bc4Alias::RangesOverlap(0x100000, 2048, 0x100000, 0));
+    assert(Bc4Alias::RangesOverlap(UINT64_MAX - 15, 16, UINT64_MAX - 7, 8));
+    assert(!Bc4Alias::RangesOverlap(UINT64_MAX - 15, 16, 0, 8));
     assert(Bc4Alias::AuthorityCompatible(false, false));
     assert(Bc4Alias::AuthorityCompatible(false, true));
     assert(Bc4Alias::AuthorityCompatible(true, false));

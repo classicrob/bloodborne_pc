@@ -350,6 +350,9 @@ void PrintBufferStats() {
 std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 size,
                                                         bool is_written, bool is_texel_buffer,
                                                         std::source_location caller) {
+#ifdef __APPLE__
+    if (is_written) texture_cache.RejectBc4AliasBufferWrite(device_addr, size);
+#endif
     const bool stats = BufferStatsEnabled();
     if (stats) {
         PrintBufferStats();
