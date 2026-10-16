@@ -218,7 +218,20 @@ std::shared_ptr<Textures> TemporalScaler::Register(Images images) {
         impl->Validate(textures->depth, tw, th, impl->scaler.depthTextureFormat,
                        impl->scaler.depthTextureUsage);
         impl->Validate(textures->motion, tw, th, MTLPixelFormatRG16Float, impl->scaler.motionTextureUsage);
-        impl->Validate(textures->reactive, tw, th, MTLPixelFormatR8Unorm, impl->scaler.reactiveTextureUsage);
+#if __MAC_OS_X_VERSION_MAX_ALLOWED >= 270000
+        MTLTextureUsage reactive_usage;
+        if (@available(macOS 27.0, *)) {
+            reactive_usage = impl->scaler.reactiveMaskTextureUsage;
+        } else {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+            reactive_usage = impl->scaler.reactiveTextureUsage;
+#pragma clang diagnostic pop
+        }
+#else
+        const auto reactive_usage = impl->scaler.reactiveTextureUsage;
+#endif
+        impl->Validate(textures->reactive, tw, th, MTLPixelFormatR8Unorm, reactive_usage);
         impl->Validate(textures->output, config.output_width, config.output_height,
                        impl->output_format, impl->scaler.outputTextureUsage);
         Require(textures->output.storageMode == MTLStorageModePrivate,
