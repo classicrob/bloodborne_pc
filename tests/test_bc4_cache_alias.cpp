@@ -11,6 +11,8 @@
 #include <signal.h>
 #include <unistd.h>
 #include <sirit/sirit.h>
+#include "../gpu/bbgpu.h"
+#include "common/elf_info.h"
 #include "test_alarm.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -49,6 +51,22 @@ void runtime_thread_run_host(void (*)(void*), void*) { std::abort(); }
 void runtime_restart() { std::abort(); }
 int32_t* runtime_errno() { std::abort(); }
 }
+
+// Keep this friend-class definition identical to gpu/shim/bbgpu.cpp. Only the
+// normal metadata initialization is needed; bbgpu_init also creates a presenter.
+namespace Core {
+class Emulator {
+public:
+    static void FillElfInfo(const BbGpuConfig& config) {
+        auto& info = Common::ElfInfo::Instance();
+        info.initialized = true;
+        info.game_serial = config.serial ? config.serial : "UNKNOWN";
+        info.title = config.title ? config.title : "";
+        info.sdk_ver = config.sdk_version;
+        info.psf_attributes.raw = config.psf_attributes;
+    }
+};
+} // namespace Core
 
 namespace {
 constexpr unsigned Grid = 16, Bytes = Grid * Grid * 8, Page = 16384, Offset = 256;
@@ -166,6 +184,14 @@ int main(int argc, char** argv) {
     std::setvbuf(stdout, nullptr, _IOLBF, 0);
     std::printf("BC4 actual cache/VM fixture mode=%s\n", mode);
     setenv("BB_UPSCALER", "none", 1);
+    const BbGpuConfig config{.title = "BC4 cache/VM fixture", .serial = "BC4_CACHE_FIXTURE"};
+    Core::Emulator::FillElfInfo(config);
+    if (Common::ElfInfo::Instance().GameSerial() != config.serial ||
+        Common::ElfInfo::Instance().Title() != config.title) {
+        std::fputs("SETUP FAIL: fixture game metadata mismatch\n", stderr);
+        return 2;
+    }
+    std::printf("fixture metadata initialized: serial=%s\n", config.serial);
     runtime_memory_reserve();
     struct sigaction action{};
     action.sa_sigaction = Fault;
