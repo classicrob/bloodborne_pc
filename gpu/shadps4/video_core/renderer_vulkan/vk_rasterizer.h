@@ -64,6 +64,64 @@ private:
     u64 producer_end = 0;
 };
 
+// Share the binding path's prepared-sharp selection; callers pass null when disabled.
+inline const PreparedStage* MatchingPreparedStage(const Shader::Info& stage,
+                                                   const PreparedDraw* prepared) {
+    if (!prepared) return nullptr;
+    for (u32 i = 0; i < prepared->num_stages; ++i) {
+        const auto& candidate = prepared->stages[i];
+        if (candidate.info == &stage && candidate.num_images == stage.images.size() &&
+            candidate.num_samplers == stage.samplers.size() &&
+            candidate.num_buffers == stage.buffers.size()) return &candidate;
+    }
+    return nullptr;
+}
+
+// Preflight the whole command before any stage binds or refreshes either representation.
+// Even a first conversion has no coherent image/raw-buffer authority when either may write.
+inline bool HasBc4BufferAliasConflict(std::span<const Shader::Info* const> stages,
+                                      const PreparedDraw* prepared = nullptr,
+                                      bool has_unsnapshotted_stream_out = false) {
+    for (const auto* image_stage : stages) {
+        if (!image_stage) continue;
+        const auto* image_prepared = MatchingPreparedStage(*image_stage, prepared);
+        for (u32 i = 0; i < image_stage->images.size(); ++i) {
+            const auto& image = image_stage->images[i];
+            const auto sharp = image_prepared ? image_prepared->image_sharps[i]
+                                               : image.GetSharp(*image_stage);
+            const bool integer = sharp.GetDataFmt() == AmdGpu::DataFormat::Format32_32 &&
+                                 sharp.GetNumberFmt() == AmdGpu::NumberFormat::Uint;
+            const bool bc4 = sharp.GetDataFmt() == AmdGpu::DataFormat::FormatBc4 &&
+                             sharp.GetNumberFmt() == AmdGpu::NumberFormat::Unorm;
+            if (!sharp.Address() || (!integer && !bc4) ||
+                (sharp.GetTileMode() != AmdGpu::TileMode::DisplayLinearAligned &&
+                 sharp.GetTileMode() != AmdGpu::TileMode::Thin1DThin)) continue;
+            const VideoCore::ImageInfo info{sharp, image};
+            if (VideoCore::Bc4Alias::RejectStoredLayout(info)) continue;
+            // SO has mutable flattened data outside the packet snapshots. Do not use it to
+            // approve a BC4 command whose later raw-buffer bindings could differ.
+            if (has_unsnapshotted_stream_out) return true;
+            for (const auto* buffer_stage : stages) {
+                if (!buffer_stage) continue;
+                const auto* buffer_prepared = MatchingPreparedStage(*buffer_stage, prepared);
+                for (u32 b = 0; b < buffer_stage->buffers.size(); ++b) {
+                    const auto& buffer = buffer_stage->buffers[b];
+                    if (buffer.IsSpecial() ||
+                        (!buffer.is_written && !image.is_written && !image.is_atomic)) continue;
+                    const auto vsharp = buffer_prepared ? buffer_prepared->buffer_sharps[b]
+                                                       : buffer.GetSharp(*buffer_stage);
+                    const u64 bytes = vsharp.stride ? u64(vsharp.num_records) * vsharp.stride
+                                                   : u64(vsharp.num_records);
+                    if (vsharp.base_address && VideoCore::Bc4Alias::RangesOverlap(
+                            info.guest_address, info.guest_size, vsharp.base_address, bytes))
+                        return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
 // Use the same selected stage data as the packet, including appended ES/GS stages.
 // A first conversion happens on B, so consulting the current texture registry is too late.
 template <class Note>
@@ -737,6 +795,7 @@ private:
 #ifdef __APPLE__
     Bc4ImageWriteOrder bc4_image_write_order;
     void SyncBc4ImageWritesBeforeSelection();
+    void PreflightBc4BufferAliases(const Pipeline* pipeline, const PreparedDraw* prepared = nullptr);
 #endif
     VAddr pending_min = ~VAddr{0}, pending_max = 0; ///< bounds of pending_writes
     u32 pending_checks = 0;

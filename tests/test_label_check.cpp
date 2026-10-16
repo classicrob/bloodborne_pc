@@ -283,9 +283,112 @@ static void Bc4ImageOrderControls(bool precommit, bool skip_drain) {
     Expect("BC4 noninteger format is not admitted", ranges.empty());
 }
 
+static void Bc4BufferAliasControls(bool skip_preflight) {
+    AmdGpu::Image image{};
+    image.base_address = 0x100000 >> 8;
+    image.data_format = u64(AmdGpu::DataFormat::Format32_32);
+    image.num_format = u64(AmdGpu::NumberFormat::Uint);
+    image.type = u64(AmdGpu::ImageType::Color2D);
+    image.width = image.height = image.pitch = 15;
+    image.tiling_index = u64(AmdGpu::TileMode::Thin1DThin);
+    Shader::Info image_stage, buffer_stage;
+    Shader::ImageResource image_resource{};
+    std::memcpy(image_resource.sharp_fetch.immediates.data(), &image, sizeof(image));
+    image_stage.images.push_back(image_resource);
+    AmdGpu::Buffer buffer{};
+    buffer.base_address = 0x100008;
+    buffer.num_records = 8;
+    Shader::BufferResource buffer_resource{};
+    buffer_resource.is_written = true;
+    buffer_stage.buffers.push_back(buffer_resource);
+    const auto set_buffer = [&] {
+        std::memcpy(buffer_stage.buffers[0].sharp_fetch.immediates.data(), &buffer, sizeof(buffer));
+    };
+    set_buffer();
+    std::array<const Shader::Info*, 6> stages{};
+    stages.front() = &buffer_stage;
+    stages.back() = &image_stage; // cross-stage alias, including appended ES/GS
+    const auto conflict = [&](const Vulkan::PreparedDraw* prepared = nullptr, bool so = false) {
+        return !skip_preflight && Vulkan::HasBc4BufferAliasConflict(stages, prepared, so);
+    };
+    Expect("BC4 sampled integer + interior raw write rejects before refresh", conflict());
+    image_stage.images[0].is_written = true;
+    Expect("BC4 disjoint writes inside one image range reject before full writeback", conflict());
+    buffer_stage.buffers[0].is_written = false;
+    Expect("BC4 storage image + read-only raw alias rejects", conflict());
+    image_stage.images[0].is_written = false;
+    image_stage.images[0].is_atomic = true;
+    Expect("BC4 atomic image + read-only raw alias rejects", conflict());
+    image_stage.images[0].is_atomic = false;
+    Expect("BC4 read-only image and buffer overlap allowed", !conflict());
+    buffer_stage.buffers[0].is_written = true;
+    buffer.base_address = 0x100800;
+    set_buffer();
+    Expect("BC4 exact end adjacent buffer allowed", !conflict());
+    buffer.base_address = 0xffff8;
+    set_buffer();
+    Expect("BC4 exact start adjacent buffer allowed", !conflict());
+    buffer.num_records = 16;
+    set_buffer();
+    Expect("BC4 prefix overlap rejects", conflict());
+    buffer.num_records = 0;
+    set_buffer();
+    Expect("BC4 empty raw buffer allowed", !conflict());
+    buffer.base_address = 0x100008;
+    buffer.num_records = 8;
+    set_buffer();
+    buffer_stage.buffers[0].buffer_type = Shader::BufferType::GdsBuffer;
+    Expect("BC4 non-guest special buffer ignored", !conflict());
+    buffer_stage.buffers[0].buffer_type = Shader::BufferType::Guest;
+
+    image.data_format = u64(AmdGpu::DataFormat::FormatBc4);
+    image.num_format = u64(AmdGpu::NumberFormat::Unorm);
+    image.width = image.height = image.pitch = 63;
+    std::memcpy(image_stage.images[0].sharp_fetch.immediates.data(), &image, sizeof(image));
+    Expect("BC4 sampled compressed image + raw write rejects", conflict());
+    Expect("BC4 candidate plus unsnapshotted SO rejects", conflict(nullptr, true));
+    image.width = 62;
+    std::memcpy(image_stage.images[0].sharp_fetch.immediates.data(), &image, sizeof(image));
+    Expect("BC4 unsupported padded layout is outside conversion policy", !conflict());
+    Expect("BC4 no admitted candidate leaves SO unchanged", !conflict(nullptr, true));
+    image.width = 63;
+
+    // Effective prepared descriptors win over stale immediate sharps, exactly as at bind.
+    Vulkan::PreparedDraw prepared;
+    prepared.num_stages = 2;
+    prepared.stages[0] = {.info = &image_stage, .image_sharps = &image, .num_images = 1};
+    prepared.stages[1] = {.info = &buffer_stage, .buffer_sharps = &buffer, .num_buffers = 1};
+    Expect("BC4 actual prepared image range is checked", conflict(&prepared));
+    buffer.base_address = 0x200008;
+    Expect("BC4 actual prepared nonoverlap is allowed", !conflict(&prepared));
+    image.base_address = 0x200000 >> 8;
+    Expect("BC4 actual prepared buffer range is checked", conflict(&prepared));
+    Shader::Info other;
+    prepared.stages[0].info = &other;
+    Expect("BC4 wrong Info prepared image ignored", !conflict(&prepared));
+    prepared.stages[0].info = &image_stage;
+    prepared.stages[0].num_samplers = 1;
+    Expect("BC4 mismatched prepared resource counts ignored", !conflict(&prepared));
+
+    // Without prepared sharps, use selected flat data rather than the immediate descriptor.
+    image_stage.images[0].sharp_fetch.load_mask = 0xff;
+    for (unsigned i = 0; i < 8; ++i) image_stage.images[0].sharp_fetch.offsets[i] = i;
+    image_stage.flattened_ud_buf.resize(8);
+    std::memcpy(image_stage.flattened_ud_buf.data(), &image, sizeof(image));
+    set_buffer();
+    Expect("BC4 selected flattened image range rejects overlap", conflict());
+    image_stage.flattened_ud_buf.clear();
+}
+
 int main(int argc, char** argv) {
     if (argc == 3 && !std::strcmp(argv[1], "--hot-thread-child")) {
         return HotThreadChild(argv[2]);
+    }
+    if (argc == 2 && std::string_view(argv[1]).starts_with("--bc4-buffer-alias")) {
+        Bc4BufferAliasControls(!std::strcmp(argv[1], "--bc4-buffer-alias-skip-preflight"));
+        std::printf("BC4 buffer alias: %s (%u failures); descriptor policy only\n",
+                    failures ? "FAIL" : "PASS", failures);
+        return failures ? 1 : 0;
     }
     if (argc == 2 && std::string_view(argv[1]).starts_with("--bc4-image-order")) {
         Bc4ImageOrderControls(!std::strcmp(argv[1], "--bc4-image-order-precommit"),
@@ -295,6 +398,7 @@ int main(int argc, char** argv) {
         return failures ? 1 : 0;
     }
     Bc4ImageOrderControls(false, false);
+    Bc4BufferAliasControls(false);
     using namespace BbLabelCheck;
     alignas(16) static std::uint64_t block[6] = {0, 0x1111, 0x2222, 0x3333, 0x4444, 0x5555};
     std::uint64_t* label = &block[0];

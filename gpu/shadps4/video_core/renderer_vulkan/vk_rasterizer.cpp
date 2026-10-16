@@ -1137,6 +1137,7 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
                             bool is_indexed, u32 index_offset) {
 #ifdef __APPLE__
     SCOPE_EXIT { texture_cache.MaterializeBc4AliasesAfterCommand(); };
+    PreflightBc4BufferAliases(pipeline, used_prepared);
 #endif
     BB_SPLIT_MARK_ON(stage_b, BDrawSetup);
     NoteRecordContext("draw", pipeline);
@@ -1512,6 +1513,7 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
                                     const IndirectDraw& indirect) {
 #ifdef __APPLE__
     SCOPE_EXIT { texture_cache.MaterializeBc4AliasesAfterCommand(); };
+    PreflightBc4BufferAliases(pipeline);
 #endif
     NoteRecordContext("indirect draw", pipeline);
 #ifdef __APPLE__
@@ -1719,6 +1721,7 @@ void Rasterizer::DispatchDirect() {
 void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
 #ifdef __APPLE__
     SCOPE_EXIT { texture_cache.MaterializeBc4AliasesAfterCommand(); };
+    PreflightBc4BufferAliases(pipeline);
 #endif
     NoteRecordContext("dispatch", pipeline);
     FrameCapture::Poll();
@@ -1805,6 +1808,7 @@ void Rasterizer::DispatchIndirectRecord(const ComputePipeline* pipeline, VAddr a
                                         u32 size) {
 #ifdef __APPLE__
     SCOPE_EXIT { texture_cache.MaterializeBc4AliasesAfterCommand(); };
+    PreflightBc4BufferAliases(pipeline);
 #endif
     NoteRecordContext("indirect dispatch", pipeline);
 #ifdef __APPLE__
@@ -1882,7 +1886,33 @@ void Rasterizer::OnSubmit() {
     runtime.TickFrame();
 }
 
+#ifdef __APPLE__
+void Rasterizer::PreflightBc4BufferAliases(const Pipeline* pipeline, const PreparedDraw* prepared) {
+    if (!pipeline) return;
+    boost::container::static_vector<const Shader::Info*, Shader::MaxStageTypes> stages;
+    bool has_stream_out = false;
+    for (const auto* stage : pipeline->GetStages()) {
+        if (stage) stages.push_back(stage);
+    }
+    if (!pipeline->IsCompute()) {
+        if (const auto* gs = static_cast<const GraphicsPipeline*>(pipeline)->GsEmulation()) {
+            ASSERT(stages.size() + 2 <= stages.capacity());
+            stages.push_back(&gs->es->GetStage(Shader::SwStage::Compute));
+            stages.push_back(&gs->gs->GetStage(Shader::SwStage::Compute));
+            has_stream_out = gs->so != nullptr;
+        }
+    }
+    ASSERT_MSG(!HasBc4BufferAliasConflict({stages.data(), stages.size()},
+                   BbToggle::Disabled(BbToggle::PreparedResources) ? nullptr : prepared, has_stream_out),
+               "macOS BC4 alias: same-command image/raw-buffer write overlap or unsnapshotted stream-out");
+}
+#endif
+
 const PreparedStage* Rasterizer::FindPreparedStage(const Shader::Info& stage) const {
+#ifdef __APPLE__
+    return MatchingPreparedStage(stage,
+        BbToggle::Disabled(BbToggle::PreparedResources) ? nullptr : bind_prepared);
+#else
     // Sharps a draw-preparation worker read from the same flattened user data.
     if (!bind_prepared || BbToggle::Disabled(BbToggle::PreparedResources)) {
         return nullptr;
@@ -1897,6 +1927,7 @@ const PreparedStage* Rasterizer::FindPreparedStage(const Shader::Info& stage) co
         }
     }
     return nullptr;
+#endif
 }
 
 bool Rasterizer::BindHelperWanted() {
