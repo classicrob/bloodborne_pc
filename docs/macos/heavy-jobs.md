@@ -4,6 +4,17 @@ Eight agents share one M4 Max. Unlimited parallel builds kept the load at 40 to 
 GPU build took 8 to 11 minutes and no timing meant anything. `tools/macos/heavy.sh` limits heavy
 work machine-wide.
 
+Every new heavy job also checks free disk space on its working volume before it starts. It needs
+35 GB free after a 5 GB default buffer, its own expected peak growth, and the budgets of jobs already
+holding slots. Defaults are 5 GB for build/playtest, 2 GB for sweep, and 1 GB for quick; set
+`BB_HEAVY_DISK_BUDGET_GB` to a larger whole number when the expected peak is larger. For a
+lead-approved bounded job, `BB_HEAVY_DISK_BUFFER_GB` can reduce the buffer to at least 1 GB.
+Nested jobs cannot request more than the outer job reserved. These are
+decimal GB (1,000,000,000 bytes). The job is refused with exit 75 when the budget cannot fit.
+While a job runs, heavy.sh checks free space every second and stops its own command if it falls
+below the floor plus its buffer. An exec-in-place game has a watcher for its exact PID and start time. The guard
+cannot protect against an external process consuming more than the buffer between checks.
+
 ```sh
 tools/macos/heavy.sh [--pool build|playtest|quick|sweep] [--priority] [--gpu shared|exclusive] LABEL -- COMMAND [ARG...]
 tools/macos/heavy.sh status
