@@ -715,7 +715,7 @@ void Rasterizer::PostDraw(const Pipeline* pipeline, const PreparedDraw* used_pre
     std::vector<std::pair<VAddr, u64>> image_writes;
     ForEachBc4ImageWrite({stages.data(), stages.size()}, [&](VAddr address, u64 bytes) {
         image_writes.emplace_back(address, bytes);
-    });
+    }, BbToggle::Disabled(BbToggle::PreparedResources) ? nullptr : used_prepared);
 #endif
     // Constants: copied here into the ring, the recording thread only binds them.
     thread_local std::array<boost::container::static_vector<RingBinding, Shader::NUM_BUFFERS>,
@@ -1137,7 +1137,8 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
                             bool is_indexed, u32 index_offset) {
 #ifdef __APPLE__
     SCOPE_EXIT { texture_cache.MaterializeBc4AliasesAfterCommand(); };
-    PreflightBc4BufferAliases(pipeline, used_prepared);
+    const auto bc4_float_preflight = PreflightBc4BufferAliases(pipeline, used_prepared);
+    const auto bc4_float_scope = texture_cache.UseBc4FloatPreflight(bc4_float_preflight);
 #endif
     BB_SPLIT_MARK_ON(stage_b, BDrawSetup);
     NoteRecordContext("draw", pipeline);
@@ -1513,7 +1514,8 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
                                     const IndirectDraw& indirect) {
 #ifdef __APPLE__
     SCOPE_EXIT { texture_cache.MaterializeBc4AliasesAfterCommand(); };
-    PreflightBc4BufferAliases(pipeline);
+    const auto bc4_float_preflight = PreflightBc4BufferAliases(pipeline);
+    const auto bc4_float_scope = texture_cache.UseBc4FloatPreflight(bc4_float_preflight);
 #endif
     NoteRecordContext("indirect draw", pipeline);
 #ifdef __APPLE__
@@ -1721,7 +1723,8 @@ void Rasterizer::DispatchDirect() {
 void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
 #ifdef __APPLE__
     SCOPE_EXIT { texture_cache.MaterializeBc4AliasesAfterCommand(); };
-    PreflightBc4BufferAliases(pipeline);
+    const auto bc4_float_preflight = PreflightBc4BufferAliases(pipeline);
+    const auto bc4_float_scope = texture_cache.UseBc4FloatPreflight(bc4_float_preflight);
 #endif
     NoteRecordContext("dispatch", pipeline);
     FrameCapture::Poll();
@@ -1808,7 +1811,8 @@ void Rasterizer::DispatchIndirectRecord(const ComputePipeline* pipeline, VAddr a
                                         u32 size) {
 #ifdef __APPLE__
     SCOPE_EXIT { texture_cache.MaterializeBc4AliasesAfterCommand(); };
-    PreflightBc4BufferAliases(pipeline);
+    const auto bc4_float_preflight = PreflightBc4BufferAliases(pipeline);
+    const auto bc4_float_scope = texture_cache.UseBc4FloatPreflight(bc4_float_preflight);
 #endif
     NoteRecordContext("indirect dispatch", pipeline);
 #ifdef __APPLE__
@@ -1887,8 +1891,9 @@ void Rasterizer::OnSubmit() {
 }
 
 #ifdef __APPLE__
-void Rasterizer::PreflightBc4BufferAliases(const Pipeline* pipeline, const PreparedDraw* prepared) {
-    if (!pipeline) return;
+VideoCore::TextureCache::Bc4FloatPreflight Rasterizer::PreflightBc4BufferAliases(
+    const Pipeline* pipeline, const PreparedDraw* prepared) {
+    if (!pipeline) return {};
     boost::container::static_vector<const Shader::Info*, Shader::MaxStageTypes> stages;
     bool has_stream_out = false;
     for (const auto* stage : pipeline->GetStages()) {
@@ -1902,9 +1907,16 @@ void Rasterizer::PreflightBc4BufferAliases(const Pipeline* pipeline, const Prepa
             has_stream_out = gs->so != nullptr;
         }
     }
-    ASSERT_MSG(!HasBc4BufferAliasConflict({stages.data(), stages.size()},
-                   BbToggle::Disabled(BbToggle::PreparedResources) ? nullptr : prepared, has_stream_out),
+    const auto* selected = BbToggle::Disabled(BbToggle::PreparedResources) ? nullptr : prepared;
+    ASSERT_MSG(!HasBc4BufferAliasConflict({stages.data(), stages.size()}, selected, has_stream_out),
                "macOS BC4 alias: same-command image/raw-buffer write overlap or unsnapshotted stream-out");
+    const auto images = SelectedBc4FloatImages({stages.data(), stages.size()}, selected);
+    if (images.empty()) return {};
+    const auto snapshot = texture_cache.InspectBc4FloatParents(images);
+    ASSERT_MSG(!HasBc4FloatAliasConflict(images, snapshot, {stages.data(), stages.size()},
+                                        selected, has_stream_out),
+               "macOS BC4 Float alias: same-command parent/image/raw overlap or unsnapshotted stream-out");
+    return snapshot;
 }
 #endif
 

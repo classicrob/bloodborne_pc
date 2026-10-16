@@ -380,7 +380,118 @@ static void Bc4BufferAliasControls(bool skip_preflight) {
     image_stage.flattened_ud_buf.clear();
 }
 
+static void Bc4FloatPreflightControls(bool skip_preflight) {
+    using Cache = VideoCore::TextureCache;
+    AmdGpu::Image sharp{};
+    sharp.base_address = 0x105c00 >> 8;
+    sharp.data_format = u64(AmdGpu::DataFormat::Format32_32);
+    sharp.num_format = u64(AmdGpu::NumberFormat::Float);
+    sharp.type = u64(AmdGpu::ImageType::Color2D);
+    sharp.pitch = 7;
+    sharp.tiling_index = u64(AmdGpu::TileMode::Thin1DThin);
+    Shader::Info image_stage, raw_stage;
+    Shader::ImageResource resource{};
+    resource.is_written = true;
+    std::memcpy(resource.sharp_fetch.immediates.data(), &sharp, sizeof(sharp));
+    image_stage.images.push_back(resource);
+    AmdGpu::Buffer buffer{};
+    buffer.base_address = 0x100008; // another mip, outside the selected Float allocation
+    buffer.num_records = 8;
+    Shader::BufferResource raw{};
+    raw.is_written = true;
+    raw_stage.buffers.push_back(raw);
+    const auto set_buffer = [&] {
+        std::memcpy(raw_stage.buffers[0].sharp_fetch.immediates.data(), &buffer, sizeof(buffer));
+    };
+    set_buffer();
+    std::array<const Shader::Info*, 6> stages{};
+    stages.front() = &raw_stage;
+    stages.back() = &image_stage;
+    auto images = Vulkan::SelectedBc4FloatImages(stages);
+    Expect("Float selected appended GS descriptor admitted", images.size() == 1);
+    if (images.size() != 1) return;
+    Expect("Float prospective range is allocated 512B, not visible 8B",
+           VideoCore::Bc4Alias::IsFloatTailCandidate(images[0].info) &&
+           images[0].info.guest_size == 512);
+    Cache::Bc4FloatPreflight snapshot;
+    Cache::Bc4FloatParentRecord parent;
+    parent.selected_index = 0;
+    parent.request = images[0];
+    parent.parent_id = VideoCore::ImageId{1};
+    parent.parent_address = 0x100000;
+    parent.parent_size = 0x6000;
+    snapshot.parents.push_back(parent);
+    const auto conflict = [&](bool so = false, const Vulkan::PreparedDraw* prepared = nullptr) {
+        return !skip_preflight && Vulkan::HasBc4FloatAliasConflict(images, snapshot, stages,
+                                                                  prepared, so);
+    };
+    Expect("Float hidden parent sibling raw writer rejects before first bind", conflict());
+    raw_stage.buffers[0].is_written = false;
+    Expect("Float writer rejects read-only raw reference into hidden parent", conflict());
+    images[0].type = Cache::BindingType::Texture;
+    Expect("Float and raw read-only references allowed", !conflict());
+    raw_stage.buffers[0].is_written = true;
+    Expect("Read-only Float still rejects hidden parent raw writer", conflict());
+    buffer.base_address = 0x106000;
+    set_buffer();
+    Expect("Float full parent exact-end raw nonoverlap allowed", !conflict());
+    Expect("Float candidate with unsnapshotted SO rejects", conflict(true));
+    snapshot.parents.clear();
+    Cache::ImageDesc bc;
+    bc.info = images[0].info;
+    bc.info.guest_address = 0x100000;
+    bc.info.guest_size = 0x6000;
+    bc.info.pixel_format = vk::Format::eBc4UnormBlock;
+    images.push_back(bc);
+    Expect("Float and uncached selected BC parent reject even read-only", conflict());
+    images[1].info.pixel_format = vk::Format::eR32Uint;
+    images[1].type = Cache::BindingType::Storage;
+    Expect("Float and overlapping other image writer reject", conflict());
+    images[1].info.guest_address = 0x200000;
+    Expect("Float and nonoverlapping image writer allowed", !conflict());
+    images.resize(1);
+    images[0].type = Cache::BindingType::Storage;
+    buffer.base_address = 0x105c08;
+    set_buffer();
+    Expect("Parentless Float still protects its complete tail from raw reads", conflict());
+    buffer.base_address = 0x105e00;
+    set_buffer();
+    Expect("Parentless Float exact-tail boundary allowed", !conflict());
+
+    Vulkan::PreparedDraw prepared;
+    prepared.num_stages = 1;
+    prepared.stages[0] = {.info = &image_stage, .image_sharps = &sharp, .num_images = 1};
+    sharp.base_address = 0x205c00 >> 8;
+    const auto selected = Vulkan::SelectedBc4FloatImages(stages, &prepared);
+    Expect("Float inventory uses actual matching prepared sharp",
+           selected.size() == 1 && selected[0].info.guest_address == 0x205c00);
+    std::vector<std::pair<VAddr, u64>> ranges;
+    Vulkan::ForEachBc4ImageWrite(stages, [&](VAddr a, u64 n) { ranges.emplace_back(a, n); },
+                               &prepared);
+    Expect("Float producer admission matches prepared snapshot and full tail",
+           ranges == std::vector<std::pair<VAddr, u64>>{{0x205c00, 512}});
+    image_stage.images[0].is_written = false;
+    ranges.clear();
+    Vulkan::ForEachBc4ImageWrite(stages, [&](VAddr a, u64 n) { ranges.emplace_back(a, n); });
+    Expect("Read-only Float does not admit producer", ranges.empty());
+    image_stage.images[0].is_atomic = true;
+    ranges.clear();
+    Vulkan::ForEachBc4ImageWrite(stages, [&](VAddr a, u64 n) { ranges.emplace_back(a, n); });
+    Expect("Atomic Float is conservatively ordered before loud cache refusal", ranges.size() == 1);
+    auto atomic_images = Vulkan::SelectedBc4FloatImages(stages);
+    Expect("Atomic Float preflight is never treated read-only",
+           atomic_images.size() == 1 && atomic_images[0].type == Cache::BindingType::Storage);
+    sharp.width = 1;
+    Expect("Unsupported Float shape has empty inventory/no cache inspection",
+           Vulkan::SelectedBc4FloatImages(stages, &prepared).empty());
+}
+
 int main(int argc, char** argv) {
+    if (argc == 2 && (!std::strcmp(argv[1], "--bc4-float-preflight") ||
+                      !std::strcmp(argv[1], "--bc4-float-skip-preflight"))) {
+        Bc4FloatPreflightControls(!std::strcmp(argv[1], "--bc4-float-skip-preflight"));
+        return failures ? 1 : 0;
+    }
     if (argc == 3 && !std::strcmp(argv[1], "--hot-thread-child")) {
         return HotThreadChild(argv[2]);
     }
@@ -397,6 +508,7 @@ int main(int argc, char** argv) {
                     failures ? "FAIL" : "PASS", failures);
         return failures ? 1 : 0;
     }
+    Bc4FloatPreflightControls(false);
     Bc4ImageOrderControls(false, false);
     Bc4BufferAliasControls(false);
     using namespace BbLabelCheck;

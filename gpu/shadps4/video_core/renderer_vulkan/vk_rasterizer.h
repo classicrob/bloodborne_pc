@@ -122,21 +122,106 @@ inline bool HasBc4BufferAliasConflict(std::span<const Shader::Info* const> stage
     return false;
 }
 
+// Build the complete effective image inventory only for commands with a prospective Float
+// tail. The index passed to the cache is an index in this vector, not a shader binding.
+inline std::vector<VideoCore::TextureCache::ImageDesc> SelectedBc4FloatImages(
+    std::span<const Shader::Info* const> stages, const PreparedDraw* prepared = nullptr) {
+    using Cache = VideoCore::TextureCache;
+    bool candidate = false;
+    for (const auto* stage : stages) {
+        if (!stage) continue;
+        const auto* selected = MatchingPreparedStage(*stage, prepared);
+        for (u32 i = 0; i < stage->images.size(); ++i) {
+            const auto& resource = stage->images[i];
+            const auto sharp = selected ? selected->image_sharps[i] : resource.GetSharp(*stage);
+            if (sharp.Address() && sharp.GetDataFmt() == AmdGpu::DataFormat::Format32_32 &&
+                sharp.GetNumberFmt() == AmdGpu::NumberFormat::Float &&
+                VideoCore::Bc4Alias::IsFloatTailCandidate(VideoCore::ImageInfo{sharp, resource}))
+                candidate = true;
+        }
+    }
+    if (!candidate) return {};
+    std::vector<Cache::ImageDesc> images;
+    for (const auto* stage : stages) {
+        if (!stage) continue;
+        const auto* selected = MatchingPreparedStage(*stage, prepared);
+        for (u32 i = 0; i < stage->images.size(); ++i) {
+            const auto& resource = stage->images[i];
+            const auto sharp = selected ? selected->image_sharps[i] : resource.GetSharp(*stage);
+            if (!sharp.Address() || sharp.GetDataFmt() == AmdGpu::DataFormat::FormatInvalid) continue;
+            auto& image = images.emplace_back(sharp, resource);
+            if (resource.is_atomic) image.type = Cache::BindingType::Storage;
+        }
+    }
+    return images;
+}
+
+// A hidden cached parent broadens the conflict range to every sibling mip. Even before
+// that parent is cached, a selected overlapping BC image cannot coexist with the Float view.
+inline bool HasBc4FloatAliasConflict(
+    std::span<const VideoCore::TextureCache::ImageDesc> images,
+    const VideoCore::TextureCache::Bc4FloatPreflight& preflight,
+    std::span<const Shader::Info* const> stages, const PreparedDraw* prepared = nullptr,
+    bool has_unsnapshotted_stream_out = false) {
+    using Cache = VideoCore::TextureCache;
+    for (u32 i = 0; i < images.size(); ++i) {
+        const auto& image = images[i];
+        if (!VideoCore::Bc4Alias::IsFloatTailCandidate(image.info)) continue;
+        if (has_unsnapshotted_stream_out) return true;
+        VAddr address = image.info.guest_address;
+        u64 size = image.info.guest_size;
+        for (const auto& parent : preflight.parents) {
+            if (parent.selected_index == i && parent.parent_id) {
+                address = parent.parent_address;
+                size = parent.parent_size;
+            }
+        }
+        const bool written = image.type != Cache::BindingType::Texture;
+        for (u32 other_index = 0; other_index < images.size(); ++other_index) {
+            if (other_index == i) continue;
+            const auto& other = images[other_index];
+            if ((written || other.type != Cache::BindingType::Texture ||
+                 other.info.pixel_format == vk::Format::eBc4UnormBlock) &&
+                VideoCore::Bc4Alias::RangesOverlap(address, size,
+                    other.info.guest_address, other.info.guest_size)) return true;
+        }
+        for (const auto* stage : stages) {
+            if (!stage) continue;
+            const auto* selected = MatchingPreparedStage(*stage, prepared);
+            for (u32 b = 0; b < stage->buffers.size(); ++b) {
+                const auto& buffer = stage->buffers[b];
+                if (buffer.IsSpecial() || (!written && !buffer.is_written)) continue;
+                const auto sharp = selected ? selected->buffer_sharps[b] : buffer.GetSharp(*stage);
+                const u64 bytes = sharp.stride ? u64(sharp.num_records) * sharp.stride
+                                               : u64(sharp.num_records);
+                if (sharp.base_address && VideoCore::Bc4Alias::RangesOverlap(
+                        address, size, sharp.base_address, bytes)) return true;
+            }
+        }
+    }
+    return false;
+}
+
 // Use the same selected stage data as the packet, including appended ES/GS stages.
 // A first conversion happens on B, so consulting the current texture registry is too late.
 template <class Note>
-void ForEachBc4ImageWrite(std::span<const Shader::Info* const> stages, Note&& note) {
+void ForEachBc4ImageWrite(std::span<const Shader::Info* const> stages, Note&& note,
+                         const PreparedDraw* prepared = nullptr) {
     for (const auto* stage : stages) {
         if (!stage) continue;
-        for (const auto& resource : stage->images) {
+        const auto* selected = MatchingPreparedStage(*stage, prepared);
+        for (u32 i = 0; i < stage->images.size(); ++i) {
+            const auto& resource = stage->images[i];
             if (!resource.is_written && !resource.is_atomic) continue;
-            const auto sharp = resource.GetSharp(*stage);
+            const auto sharp = selected ? selected->image_sharps[i] : resource.GetSharp(*stage);
             if (!sharp.Address() || sharp.GetDataFmt() != AmdGpu::DataFormat::Format32_32 ||
-                sharp.GetNumberFmt() != AmdGpu::NumberFormat::Uint ||
+                (sharp.GetNumberFmt() != AmdGpu::NumberFormat::Uint &&
+                 sharp.GetNumberFmt() != AmdGpu::NumberFormat::Float) ||
                 (sharp.GetTileMode() != AmdGpu::TileMode::DisplayLinearAligned &&
                  sharp.GetTileMode() != AmdGpu::TileMode::Thin1DThin)) continue;
             const VideoCore::ImageInfo info{sharp, resource};
-            if (!VideoCore::Bc4Alias::RejectStoredLayout(info)) {
+            if (!VideoCore::Bc4Alias::RejectStoredLayout(info) ||
+                VideoCore::Bc4Alias::IsFloatTailCandidate(info)) {
                 note(info.guest_address, info.guest_size);
             }
         }
@@ -795,7 +880,8 @@ private:
 #ifdef __APPLE__
     Bc4ImageWriteOrder bc4_image_write_order;
     void SyncBc4ImageWritesBeforeSelection();
-    void PreflightBc4BufferAliases(const Pipeline* pipeline, const PreparedDraw* prepared = nullptr);
+    [[nodiscard]] VideoCore::TextureCache::Bc4FloatPreflight PreflightBc4BufferAliases(
+        const Pipeline* pipeline, const PreparedDraw* prepared = nullptr);
 #endif
     VAddr pending_min = ~VAddr{0}, pending_max = 0; ///< bounds of pending_writes
     u32 pending_checks = 0;
