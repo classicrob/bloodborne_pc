@@ -127,6 +127,7 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, const char* title) : width{width_}
 #ifdef __APPLE__
     if (background) {
         SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_FOCUSABLE_BOOLEAN, false);
+        mouse.Disable(); // scripted runs on a Mac someone is using: never take their mouse
     }
 #endif
     const char* fullscreen = std::getenv("BB_FULLSCREEN");
@@ -228,7 +229,7 @@ WindowSDL::~WindowSDL() {
 MouseCapture::Change MouseCapture::OnEvent(const SDL_Event& event, bool shift, bool blocked) {
     std::scoped_lock lock{mutex};
     if (!captured) {
-        return !blocked && event.type == SDL_EVENT_MOUSE_BUTTON_DOWN &&
+        return !disabled && !blocked && event.type == SDL_EVENT_MOUSE_BUTTON_DOWN &&
                        event.button.button == SDL_BUTTON_LEFT
                    ? Change::Capture
                    : Change::None;
@@ -274,6 +275,14 @@ MouseCapture::Change MouseCapture::OnEvent(const SDL_Event& event, bool shift, b
 void MouseCapture::SetCaptured(bool value) {
     std::scoped_lock lock{mutex};
     captured = value;
+    dx = dy = 0;
+    held = pressed = 0;
+}
+
+void MouseCapture::Disable() {
+    std::scoped_lock lock{mutex};
+    disabled = true;
+    captured = false;
     dx = dy = 0;
     held = pressed = 0;
 }

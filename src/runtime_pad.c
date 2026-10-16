@@ -148,7 +148,7 @@ static float magnitude(float x, float y) {
     for (int i=0;i<4 && m>0;++i) m=(m+sq/m)/2;
     return m;
 }
-static void mouse_camera(float dx, float dy, uint64_t now) {
+static void mouse_camera(int captured, float dx, float dy, uint64_t now) {
     if (!mouse_cam.sensitivity) {
         const char *e=getenv("BB_MOUSE_SENSITIVITY");
         char *end=NULL;
@@ -159,6 +159,10 @@ static void mouse_camera(float dx, float dy, uint64_t now) {
         }
         mouse_cam.sensitivity=v;
         mouse_cam.since=now;
+    }
+    if (!captured) { /* released: no motion carried over, no last deflection kept */
+        mouse_cam.dx=mouse_cam.dy=0; mouse_cam.x=mouse_cam.y=128; mouse_cam.since=now;
+        return;
     }
     mouse_cam.dx+=dx; mouse_cam.dy+=dy;
     if (now-mouse_cam.since<MOUSE_WINDOW_US) return; /* keep the last deflection */
@@ -178,13 +182,14 @@ static void mouse_camera(float dx, float dy, uint64_t now) {
  * stick or a moving mouse replaces the stick. Shift at a click's press picks the strong
  * attack / transform for the whole hold. Nothing is held by this layer itself: released keys
  * (SDL releases all on focus loss) and a released mouse (bbgpu_mouse_take) are neutral. */
-static void keyboard_mouse(PadData *d, const bool *k, float dx, float dy, uint32_t mouse, uint64_t now) {
+static void keyboard_mouse(PadData *d, const bool *k, int captured, float dx, float dy, uint32_t mouse, uint64_t now) {
+    uint32_t added=0; /* only these press L2/R2 fully: a gamepad's partial trigger stays as it is */
     static const struct { uint32_t bit, ps; } clicks[]={
         {BBGPU_MOUSE_LEFT,BTN_R1}, {BBGPU_MOUSE_LEFT_SHIFT,BTN_R2}, {BBGPU_MOUSE_RIGHT,BTN_L2},
         {BBGPU_MOUSE_RIGHT_SHIFT,BTN_L1}, {BBGPU_MOUSE_MIDDLE,BTN_R3},
     };
-    for (size_t i=0;i<sizeof(clicks)/sizeof(*clicks);++i) if (mouse & clicks[i].bit) d->buttons|=clicks[i].ps;
-    mouse_camera(dx,dy,now);
+    for (size_t i=0;i<sizeof(clicks)/sizeof(*clicks);++i) if (mouse & clicks[i].bit) added|=clicks[i].ps;
+    mouse_camera(captured,dx,dy,now);
     if (mouse_cam.x!=128 || mouse_cam.y!=128) { d->right_x=mouse_cam.x; d->right_y=mouse_cam.y; }
     if (k) {
         static const struct { SDL_Scancode key; uint32_t ps; } keys[]={
@@ -194,7 +199,7 @@ static void keyboard_mouse(PadData *d, const bool *k, float dx, float dy, uint32
             {SDL_SCANCODE_UP,BTN_UP}, {SDL_SCANCODE_DOWN,BTN_DOWN}, {SDL_SCANCODE_LEFT,BTN_LEFT},
             {SDL_SCANCODE_RIGHT,BTN_RIGHT},
         };
-        for (size_t i=0;i<sizeof(keys)/sizeof(*keys);++i) if (k[keys[i].key]) d->buttons|=keys[i].ps;
+        for (size_t i=0;i<sizeof(keys)/sizeof(*keys);++i) if (k[keys[i].key]) added|=keys[i].ps;
         if (k[SDL_SCANCODE_TAB]) touch_click(d,0);
         if (k[SDL_SCANCODE_BACKSPACE]) touch_click(d,1);
         const int walk=k[SDL_SCANCODE_LALT] || k[SDL_SCANCODE_RALT];
@@ -205,8 +210,9 @@ static void keyboard_mouse(PadData *d, const bool *k, float dx, float dy, uint32
         const int ry=(k[SDL_SCANCODE_K] ? 127 : 0)-(k[SDL_SCANCODE_I] ? 128 : 0);
         if (rx || ry) { d->right_x=(uint8_t)(128+rx); d->right_y=(uint8_t)(128+ry); }
     }
-    if (d->buttons & BTN_L2) d->l2=255;
-    if (d->buttons & BTN_R2) d->r2=255;
+    d->buttons|=added;
+    if (added & BTN_L2) d->l2=255;
+    if (added & BTN_R2) d->r2=255;
 }
 static void sample_host(PadData *d) {
     memset(d,0,sizeof(*d));
@@ -253,8 +259,8 @@ static void sample_host(PadData *d) {
     }
     float dx=0, dy=0;
     uint32_t mouse=0;
-    bbgpu_mouse_take(&dx,&dy,&mouse);
-    keyboard_mouse(d,k,dx,dy,mouse,d->timestamp);
+    const int captured=bbgpu_mouse_take(&dx,&dy,&mouse);
+    keyboard_mouse(d,k,captured,dx,dy,mouse,d->timestamp);
 }
 
 /* BB_PAD_FILE=<file>: scripted input for automated runs. The file holds whitespace-separated

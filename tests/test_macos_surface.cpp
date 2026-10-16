@@ -84,7 +84,14 @@ static void mouse_capture() {
             assert(!mouse.Captured() && !take() && dx == 0 && dy == 0 && buttons == 0);
         }
     }
-    std::puts("PASS: mouse capture, Shift-latched clicks, short clicks, release on Cmd/focus/hide/menu");
+    // A background (scripted) window never captures, whatever is clicked.
+    mouse.SetCaptured(true);
+    mouse.Disable();
+    assert(!mouse.Captured() && !take() && buttons == 0);
+    assert(mouse.OnEvent(event(SDL_EVENT_MOUSE_BUTTON_DOWN, SDL_BUTTON_LEFT), false, false) == C::None);
+    assert(!take() && buttons == 0);
+    std::puts("PASS: mouse capture, Shift-latched clicks, short clicks, release on Cmd/focus/hide/menu, "
+              "never in background windows");
 }
 
 static Frontend::WindowSDL* window;

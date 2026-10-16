@@ -21,7 +21,7 @@ that captures the mouse doesn't count as an attack.
 | Transform weapon | Shift + right click | L1 | skill |
 | Interact / confirm | E (or Enter) | Cross | event action |
 | Blood vial (heal) | R | Triangle | use item |
-| Use quick item | F | Square | jump (not in Bloodborne) |
+| Use quick item | F | Square | jump (no dedicated button in Bloodborne) |
 | Lock on / reset camera | Q or middle click | R3 | same |
 | L3 | X | L3 | crouch (L3 on pad) |
 | D-pad: switch quick item | Down arrow | down | switch item |
@@ -37,13 +37,14 @@ Free camera debug chord: hold E and press X. Port settings menu: Insert (unchang
 **Deliberate differences from Elden Ring:**
 - R drinks a Blood Vial, and F uses the selected quick item. Elden Ring has one use-item key
   because its flask is a regular item; Bloodborne has separate heal and item buttons.
-  Bloodborne has no jump, so F is free.
+  Bloodborne has no dedicated jump button (its jumps come from attacks and sprinting), so F
+  is free.
 - Right click fires the gun (Bloodborne's parry) where Elden Ring guards. Shift + right click
   transforms the weapon, in the place of Elden Ring's skill.
 - Menus go back with Space (Circle), not Q, because the port can't tell menus from gameplay
   and Q is lock-on.
 - The mouse drives a stick, so very fast flicks turn at the game's top camera speed. Set
-  `BB_MOUSE_SENSITIVITY` (default `1`, range 0 to 100) to change the speed; other values stop
+  `BB_MOUSE_SENSITIVITY` (default `1`; above 0, at most 100) to change the speed; other values stop
   the game. The game's camera speed and axis-invert options apply as with a gamepad.
 - Shift is read when a mouse button goes down. Holding a strong attack keeps it strong after
   you let go of Shift.

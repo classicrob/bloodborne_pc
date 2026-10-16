@@ -21,7 +21,7 @@ struct WindowSystemInfo {
 };
 
 /// The mouse for keyboard-and-mouse play. A left click in the window captures it (relative mode;
-/// that click is not passed on); Cmd, focus loss, the settings menu or the text dialog release it.
+/// that click is not passed on; never in a BB_WINDOW_BACKGROUND window); Cmd, focus loss, the settings menu or the text dialog release it.
 /// The pad (runtime_pad.c, through bbgpu_mouse_take) takes the motion and buttons.
 class MouseCapture {
 public:
@@ -33,13 +33,15 @@ public:
     Change OnEvent(const SDL_Event& event, bool shift, bool blocked);
     void SetCaptured(bool value);
     bool Captured() const;
+    /// Never captures again (a background window: scripted input only).
+    void Disable();
     /// Motion (points) and buttons since the previous take: a button pressed and released in
     /// between is reported once. False, with nothing, while released.
     bool Take(float& dx, float& dy, u32& buttons);
 
 private:
     mutable std::mutex mutex;
-    bool captured{};
+    bool captured{}, disabled{};
     float dx{}, dy{};
     u32 held{}, pressed{};
 };

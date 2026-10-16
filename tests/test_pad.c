@@ -23,10 +23,11 @@ int32_t *runtime_errno(void) { static _Thread_local int32_t value; return &value
 int bbgpu_overlay_captures_input(void) { return capture; }
 static float mouse_dx, mouse_dy;
 static uint32_t mouse_buttons;
+static int mouse_captured=1;
 int bbgpu_mouse_take(float *dx, float *dy, uint32_t *buttons) {
     *dx=mouse_dx; *dy=mouse_dy; *buttons=mouse_buttons;
     mouse_dx=mouse_dy=0;
-    return 1;
+    return mouse_captured;
 }
 uintptr_t runtime_lookup(const RuntimeExport *table, size_t count, const char *name) {
     (void)table; (void)count; (void)name;
@@ -47,7 +48,7 @@ static void keyboard_mouse_mapping(void) {
     mouse_cam.sensitivity=0;
     setenv("BB_MOUSE_SENSITIVITY","1",1);
     PadData d=neutral();
-    keyboard_mouse(&d,k,0,0,0,t);
+    keyboard_mouse(&d,k,1,0,0,0,t);
     assert(d.buttons==0 && d.left_x==128 && d.left_y==128 && d.right_x==128 && d.right_y==128 && !d.l2 && !d.r2);
     static const struct { SDL_Scancode key; uint32_t ps; } keys[]={
         {SDL_SCANCODE_SPACE,BTN_CIRCLE}, {SDL_SCANCODE_E,BTN_CROSS}, {SDL_SCANCODE_RETURN,BTN_CROSS},
@@ -57,13 +58,13 @@ static void keyboard_mouse_mapping(void) {
     };
     for (size_t i=0;i<sizeof(keys)/sizeof(*keys);++i) {
         k[keys[i].key]=true; d=neutral();
-        keyboard_mouse(&d,k,0,0,0,t);
+        keyboard_mouse(&d,k,1,0,0,0,t);
         assert(d.buttons==keys[i].ps && d.left_x==128 && d.right_x==128);
         k[keys[i].key]=false;
     }
-    k[SDL_SCANCODE_TAB]=true; d=neutral(); keyboard_mouse(&d,k,0,0,0,t);
+    k[SDL_SCANCODE_TAB]=true; d=neutral(); keyboard_mouse(&d,k,1,0,0,0,t);
     assert(d.buttons==BTN_TOUCHPAD && d.touch_count==1 && d.touches[0].x==480);
-    k[SDL_SCANCODE_TAB]=false; k[SDL_SCANCODE_BACKSPACE]=true; d=neutral(); keyboard_mouse(&d,k,0,0,0,t);
+    k[SDL_SCANCODE_TAB]=false; k[SDL_SCANCODE_BACKSPACE]=true; d=neutral(); keyboard_mouse(&d,k,1,0,0,0,t);
     assert(d.buttons==BTN_TOUCHPAD && d.touches[0].x==1440);
     k[SDL_SCANCODE_BACKSPACE]=false;
     /* Clicks: Shift at the press is reported by the window as a separate bit. */
@@ -72,47 +73,65 @@ static void keyboard_mouse_mapping(void) {
         {BBGPU_MOUSE_RIGHT_SHIFT,BTN_L1}, {BBGPU_MOUSE_MIDDLE,BTN_R3},
     };
     for (size_t i=0;i<sizeof(clicks)/sizeof(*clicks);++i) {
-        d=neutral(); keyboard_mouse(&d,k,0,0,clicks[i].bit,t);
+        d=neutral(); keyboard_mouse(&d,k,1,0,0,clicks[i].bit,t);
         assert(d.buttons==clicks[i].ps);
         assert(d.l2==(clicks[i].ps==BTN_L2 ? 255 : 0) && d.r2==(clicks[i].ps==BTN_R2 ? 255 : 0));
     }
     /* WASD full deflection; Alt walks at 40%; IJKL turns the camera. */
-    k[SDL_SCANCODE_W]=k[SDL_SCANCODE_D]=true; d=neutral(); keyboard_mouse(&d,k,0,0,0,t);
+    k[SDL_SCANCODE_W]=k[SDL_SCANCODE_D]=true; d=neutral(); keyboard_mouse(&d,k,1,0,0,0,t);
     assert(d.left_x==255 && d.left_y==0 && d.right_x==128);
-    k[SDL_SCANCODE_LALT]=true; d=neutral(); keyboard_mouse(&d,k,0,0,0,t);
+    k[SDL_SCANCODE_LALT]=true; d=neutral(); keyboard_mouse(&d,k,1,0,0,0,t);
     assert(d.left_x==128+50 && d.left_y==128-51);
     k[SDL_SCANCODE_W]=k[SDL_SCANCODE_D]=k[SDL_SCANCODE_LALT]=false;
-    k[SDL_SCANCODE_J]=k[SDL_SCANCODE_K]=true; d=neutral(); keyboard_mouse(&d,k,0,0,0,t);
+    k[SDL_SCANCODE_J]=k[SDL_SCANCODE_K]=true; d=neutral(); keyboard_mouse(&d,k,1,0,0,0,t);
     assert(d.right_x==0 && d.right_y==255 && d.left_x==128);
     k[SDL_SCANCODE_J]=k[SDL_SCANCODE_K]=false;
     /* With a gamepad: idle keys keep its sticks and buttons; a pressed key adds or replaces. */
     d=neutral(); d.left_x=40; d.right_y=200; d.buttons=BTN_CROSS;
-    keyboard_mouse(&d,k,0,0,0,t);
+    keyboard_mouse(&d,k,1,0,0,0,t);
     assert(d.left_x==40 && d.right_y==200 && d.buttons==BTN_CROSS);
-    k[SDL_SCANCODE_A]=true; keyboard_mouse(&d,k,0,0,BBGPU_MOUSE_LEFT,t);
+    k[SDL_SCANCODE_A]=true; keyboard_mouse(&d,k,1,0,0,BBGPU_MOUSE_LEFT,t);
     assert(d.left_x==0 && d.left_y==128 && d.right_y==200 && d.buttons==(BTN_CROSS|BTN_R1));
     k[SDL_SCANCODE_A]=false;
+    /* A gamepad's partial trigger keeps its analog value with idle keys and mouse; a right
+     * click presses L2 fully. */
+    d=neutral(); d.l2=90; d.r2=40; d.buttons=BTN_L2|BTN_R2;
+    keyboard_mouse(&d,k,1,0,0,0,t);
+    assert(d.l2==90 && d.r2==40 && d.buttons==(BTN_L2|BTN_R2));
+    keyboard_mouse(&d,k,1,0,0,BBGPU_MOUSE_RIGHT,t);
+    assert(d.l2==255 && d.r2==40);
     /* Mouse camera: 800 points/s is full deflection; slow motion still clears the dead zone;
      * reads closer than 8 ms keep the last deflection; a still mouse is neutral. */
-    t+=10000; d=neutral(); keyboard_mouse(&d,k,8,0,0,t);
+    t+=10000; d=neutral(); keyboard_mouse(&d,k,1,8,0,0,t);
     assert(d.right_x==255 && d.right_y==128);
-    t+=2000; d=neutral(); keyboard_mouse(&d,k,0,0,0,t);
+    t+=2000; d=neutral(); keyboard_mouse(&d,k,1,0,0,0,t);
     assert(d.right_x==255);
-    t+=8000; d=neutral(); keyboard_mouse(&d,k,0,0,0,t);
+    t+=8000; d=neutral(); keyboard_mouse(&d,k,1,0,0,0,t);
     assert(d.right_x==128 && d.right_y==128);
-    t+=10000; d=neutral(); keyboard_mouse(&d,k,1,0,0,t); /* 100 points/s */
+    t+=10000; d=neutral(); keyboard_mouse(&d,k,1,1,0,0,t); /* 100 points/s */
     assert(d.right_x==128+33 && d.right_y==128);
-    t+=10000; d=neutral(); keyboard_mouse(&d,k,0,-80,0,t); /* past full: clamped */
+    t+=10000; d=neutral(); keyboard_mouse(&d,k,1,0,-80,0,t); /* past full: clamped */
     assert(d.right_x==128 && d.right_y==1);
-    t+=10000; d=neutral(); keyboard_mouse(&d,k,6,8,0,t); /* 1000 points/s diagonally: radial */
+    t+=10000; d=neutral(); keyboard_mouse(&d,k,1,6,8,0,t); /* 1000 points/s diagonally: radial */
     assert(d.right_x==128+76 && d.right_y==128+102);
+    /* A release (Cmd, focus loss, menu) drops the last deflection at once, within the 8 ms
+     * window, and leaves a gamepad's or IJKL's right stick alone. */
+    t+=10000; d=neutral(); keyboard_mouse(&d,k,1,8,0,0,t);
+    assert(d.right_x==255);
+    t+=1000; d=neutral(); d.right_x=60; keyboard_mouse(&d,k,0,0,0,0,t);
+    assert(d.right_x==60 && d.right_y==128);
+    k[SDL_SCANCODE_I]=true; t+=1000; d=neutral(); keyboard_mouse(&d,k,0,0,0,0,t);
+    assert(d.right_x==128 && d.right_y==0);
+    k[SDL_SCANCODE_I]=false;
+    t+=1000; d=neutral(); keyboard_mouse(&d,k,1,0,0,0,t);
+    assert(d.right_x==128 && d.right_y==128);
     /* A pause longer than 100 ms is not read as slow motion. */
-    t+=1000000; d=neutral(); keyboard_mouse(&d,k,80,0,0,t);
+    t+=1000000; d=neutral(); keyboard_mouse(&d,k,1,80,0,0,t);
     assert(d.right_x==255);
     /* BB_MOUSE_SENSITIVITY=2 doubles the turn speed; a malformed value stops. */
     mouse_cam.sensitivity=0; setenv("BB_MOUSE_SENSITIVITY","2",1);
-    t+=10000; keyboard_mouse(&d,k,0,0,0,t);
-    t+=10000; d=neutral(); keyboard_mouse(&d,k,4,0,0,t);
+    t+=10000; keyboard_mouse(&d,k,1,0,0,0,t);
+    t+=10000; d=neutral(); keyboard_mouse(&d,k,1,4,0,0,t);
     assert(d.right_x==255);
     const char *bad[]={"0","-1","fast","nan","101"};
     for (size_t i=0;i<sizeof(bad)/sizeof(*bad);++i) {
@@ -122,15 +141,15 @@ static void keyboard_mouse_mapping(void) {
         if (!child) {
             if (!freopen("/dev/null","w",stderr)) _exit(2);
             mouse_cam.sensitivity=0; setenv("BB_MOUSE_SENSITIVITY",bad[i],1);
-            keyboard_mouse(&d,k,0,0,0,t);
+            keyboard_mouse(&d,k,1,0,0,0,t);
             _exit(0);
         }
         int status=0;
         assert(waitpid(child,&status,0)==child && WIFEXITED(status) && WEXITSTATUS(status)==1);
     }
     unsetenv("BB_MOUSE_SENSITIVITY"); mouse_cam.sensitivity=0;
-    keyboard_mouse(&d,k,0,0,0,t);
-    t+=10000; d=neutral(); keyboard_mouse(&d,k,0,0,0,t);
+    keyboard_mouse(&d,k,1,0,0,0,t);
+    t+=10000; d=neutral(); keyboard_mouse(&d,k,1,0,0,0,t);
     assert(d.buttons==0 && d.right_x==128 && d.left_x==128);
     puts("PASS: Elden Ring keyboard/mouse mapping, Shift clicks, walk, gamepad merge, mouse camera, sensitivity");
 }
@@ -165,6 +184,12 @@ int main(void) {
     inject(path,"");
     assert(pad_read_state(1,&data)==0 && data.buttons==0 && data.touch_count==0);
     keyboard_mouse_mapping();
+    /* Through sampling: a released mouse is neutral at the very next read. */
+    mouse_dx=1000;
+    assert(pad_read_state(1,&data)==0 && data.right_x==255);
+    mouse_captured=0; mouse_dx=1000;
+    assert(pad_read_state(1,&data)==0 && data.right_x==128 && data.right_y==128);
+    mouse_captured=1;
     /* Route input and the mouse add up; a released mouse leaves nothing held; the settings menu
      * hides clicks still held when it closes until they are released. */
     inject(path,"cross");
