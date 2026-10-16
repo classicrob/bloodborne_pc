@@ -25,6 +25,9 @@ extern "C" {
 #include "../src/runtime.h"
 #include "../src/runtime_memory.h"
 int bbgpu_handle_fault(void*, void*);
+void runtime_memory_set_gpu_hooks(void (*)(uintptr_t, uint64_t),
+                                 void (*)(uintptr_t, uint64_t),
+                                 void (*)(uintptr_t, uint64_t));
 // Only non-memory host services are stubbed. The target links runtime_memory.c itself.
 uintptr_t runtime_lookup(const RuntimeExport* table, size_t n, const char* name) {
     for (size_t i = 0; i < n; ++i)
