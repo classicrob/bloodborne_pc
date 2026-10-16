@@ -17,6 +17,7 @@
 # Exit: 0 when everything passed (or built, staged and smoked with --build-only), 1 on a failed
 # step or test, 3 when tests were skipped, 2 on bad usage.
 set -uo pipefail
+original_args=("$@")
 usage() { echo 'usage: tools/macos/preview.sh --stage DIR [--build-only] [--priority] [--skip SUBSTRING] NAME' >&2; exit 2; }
 stage='' build_only='' priority=0 skip='' name=''
 while (($#)); do
@@ -32,6 +33,12 @@ done
 [[ -n $stage && -n $name && $name =~ ^[A-Za-z0-9._-]+$ ]] || usage
 [[ -f build.sh && -x tools/macos/heavy.sh ]] || { echo 'preview: run from a tree root (build.sh, tools/macos/heavy.sh)' >&2; exit 2; }
 [[ -d $stage ]] || { echo "preview: stage directory $stage does not exist" >&2; exit 2; }
+if [[ -z ${BB_HEAVY_HELD:-} ]]; then
+    heavy_priority=()
+    (( priority )) && heavy_priority=(--priority)
+    exec tools/macos/heavy.sh "${heavy_priority[@]}" "preview $name in $(basename "$PWD")" -- \
+        bash tools/macos/preview.sh "${original_args[@]}"
+fi
 say() { echo "preview: $name: $*"; echo "$*" >> "$facts"; }
 die() { echo "preview: $name: FAILED: $*" >&2; [[ -n ${facts:-} && -e $facts ]] && echo "FAILED: $*" >> "$facts"; exit 1; }
 
@@ -39,6 +46,19 @@ if [[ -n $(git diff HEAD --ignore-submodules=dirty --stat) ]]; then
     echo "preview: $name: refused: tracked files differ from HEAD (a preview is a commit)" >&2; exit 2
 fi
 git submodule update -q
+source_root() {
+    git rev-parse HEAD
+    git rev-parse 'HEAD^{tree}'
+    git diff HEAD --ignore-submodules=dirty --binary | shasum -a 256
+}
+source_fsr() {
+    if [[ -d gpu/third_party/fsr-vulkan ]]; then
+        git -C gpu/third_party/fsr-vulkan rev-parse HEAD
+        git -C gpu/third_party/fsr-vulkan diff HEAD --binary | shasum -a 256
+    fi
+}
+root_stamp=$(source_root) || die 'cannot pin source tree'
+full_head=$(git rev-parse HEAD)
 head=$(git rev-parse --short HEAD)
 dest=$stage/$head-$name
 [[ ! -e $dest ]] || { echo "preview: $name: refused: $dest exists (a preview is never overwritten)" >&2; exit 2; }
@@ -52,6 +72,12 @@ export BB_DEPS_PREFIX=${BB_DEPS_PREFIX:-$HOME/bbport-deps/x86_64}
 started=$(date +%s)
 BB_HEAVY_PRIORITY=$priority bash build.sh > "out/preview-$name-build.log" 2>&1 ||
     die "build (log: out/preview-$name-build.log): $(tail -3 "out/preview-$name-build.log" | tr '\n' ' ')"
+[[ $(source_root) == "$root_stamp" ]] || die 'source tree changed during build'
+fsr_stamp=$(source_fsr) || die 'cannot pin FSR source state'
+verify_source() {
+    [[ $(source_root) == "$root_stamp" && $(source_fsr) == "$fsr_stamp" ]] ||
+        die 'source tree or FSR submodule changed after build'
+}
 say "built in $(( $(date +%s) - started )) s"
 while read -r line; do say "$line"; done < <(grep -E '^GPU library: ccache|host imports verified' "out/preview-$name-build.log")
 
@@ -72,9 +98,10 @@ VK_DRIVER_FILES=$BB_DEPS_PREFIX/share/vulkan/icd.d/MoltenVK_icd.json \
 smoke_status=$?
 smoke=$(grep -v '^heavy: ' "out/preview-$name-smoke.log" | tail -1)
 [[ $smoke_status == 0 && $smoke == *PASS* ]] || die "smoke (exit $smoke_status): $(tail -3 "out/preview-$name-smoke.log" | tr '\n' ' ')"
+verify_source
 say "smoke: $smoke"
 write_manifest() {
-    python3 - "$dest" "$(git rev-parse HEAD)" "$1" <<'PY'
+    python3 - "$dest" "$full_head" "$1" "$fsr_stamp" "$root_stamp" <<'PY'
 import hashlib
 import json
 import pathlib
@@ -85,17 +112,23 @@ artifacts = {}
 for name, relative in (('bb-probe', 'bb-probe'), ('libbbgpu.dylib', 'gpu/libbbgpu.dylib')):
     path = stage / relative
     artifacts[name] = {'path': str(path), 'sha256': hashlib.sha256(path.read_bytes()).hexdigest()}
-manifest = {'source_tree': {'head': sys.argv[2]}, 'artifacts': artifacts,
+fsr = sys.argv[4].splitlines()
+root = sys.argv[5].splitlines()
+manifest = {'source_tree': {'head': sys.argv[2], 'tree': root[1],
+                            'tracked_diff_sha256': root[2].split()[0]}, 'artifacts': artifacts,
             'qualification': {'test_gate': sys.argv[3]}}
+if fsr:
+    manifest['submodules'] = {'fsr-vulkan': {'head': fsr[0], 'diff_sha256': fsr[1].split()[0]}}
 (stage / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
 PY
 }
-write_manifest NOT_RUN
+write_manifest NOT_RUN || die 'cannot write preview manifest'
 if [[ -n $build_only ]]; then say "test: not run (--build-only)"; exit 0; fi
 
 started=$(date +%s)
 BB_HEAVY_PRIORITY=$priority BB_TEST_SKIP=$skip bash build.sh --test-keep-going > "out/preview-$name-test.log" 2>&1
 status=$?
+verify_source
 summary=$(grep '^test-keep-going: [0-9]' "out/preview-$name-test.log" | tail -1)
 case $status in
 0) verdict=PASS ;;
@@ -103,7 +136,8 @@ case $status in
 *) verdict=FAILED ;;
 esac
 say "test: $verdict (build.sh --test-keep-going exit $status, $(( $(date +%s) - started )) s): ${summary:-no summary: a build or non-test step failed, see out/preview-$name-test.log}"
-case $status in 0) write_manifest PASS ;; 3) write_manifest SKIPPED ;; *) write_manifest FAILED ;; esac
+case $status in 0) write_manifest PASS ;; 3) write_manifest SKIPPED ;; *) write_manifest FAILED ;; esac ||
+    die 'cannot update preview manifest'
 while read -r line; do say "test ${line#  }"; done < <(grep -E '^  (FAILED|skipped): ' "out/preview-$name-test.log")
 # Paused or demoted (E-core QoS) by a perf run while it ran? heavy.sh's history has the build.sh
 # job's quiet-pause / quiet-ecore events; either can make a time limit in a test fire.

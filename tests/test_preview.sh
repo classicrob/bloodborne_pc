@@ -11,6 +11,7 @@ dir=$(mktemp -d); trap 'rm -rf "$dir"' EXIT
 fail() { echo "preview test FAILED: $*" >&2; exit 1; }
 unset ${!BB_HEAVY_@}
 export BB_HEAVY_DIR=$dir/locks BB_HEAVY_SHARED_TREE=1 BB_HEAVY_IDLE_SECONDS=0
+export BB_HEAVY_HELD='build0:preview fixture'
 mkdir -p "$BB_HEAVY_DIR" "$dir/stage"
 tree=$dir/trees/t && mkdir -p "$tree/tools/macos" "$tree/out/gpu"
 cp tools/macos/heavy.py tools/macos/preview.sh "$tree/tools/macos/"
@@ -29,6 +30,7 @@ cat > "$tree/build.sh" <<FAKE
 #!/usr/bin/env bash
 case \${1:-} in
 '') cp "$dir/bb-probe" out/bb-probe; cp "$dir/libbbgpu.dylib" out/gpu/libbbgpu.dylib
+    if [[ -n \${FAKE_MUTATE_SOURCE:-} ]]; then echo changed >> tools/macos/preview.sh; fi
     echo 'GPU library: ccache=off'; echo 'Darwin GPU host imports verified: bb-probe (27 symbols)' ;;
 --test-keep-going)
     case \$FAKE_TEST in
@@ -66,6 +68,8 @@ import sys
 
 manifest = json.loads(pathlib.Path(sys.argv[1]).read_text())
 assert manifest['source_tree']['head'] == sys.argv[2]
+assert len(manifest['source_tree']['tree']) == 40
+assert len(manifest['source_tree']['tracked_diff_sha256']) == 64
 assert manifest['qualification']['test_gate'] == 'NOT_RUN'
 for name in ('bb-probe', 'libbbgpu.dylib'):
     artifact = manifest['artifacts'][name]
@@ -74,6 +78,11 @@ for name in ('bb-probe', 'libbbgpu.dylib'):
     assert hashlib.sha256(path.read_bytes()).hexdigest() == artifact['sha256']
 PY
 echo 'PASS manifest identifies staged, hashed binaries and unrun gate'
+set +e; FAKE_MUTATE_SOURCE=1 run --stage "$dir/stage" --build-only P1c; status=$?; set -e
+(( status == 1 )) && grep -q 'source tree changed during build' "$dir/out" ||
+    fail "a source edit during build ($status): $(cat "$dir/out")"
+git -C "$tree" checkout -q tools/macos/preview.sh
+echo 'PASS a source edit during build is refused before staging'
 set +e; run --stage "$dir/stage" --build-only P1; status=$?; set -e
 (( status == 2 )) && grep -q 'exists (a preview is never overwritten)' "$dir/out" || fail "overwrite ($status)"
 echo "PASS a second preview of the same name and commit is refused (exit 2)"
