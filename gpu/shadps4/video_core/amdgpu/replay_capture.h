@@ -13,6 +13,7 @@
 
 namespace AmdGpu {
 class CmdSnapshot;
+struct Liverpool;
 }
 namespace Vulkan {
 class Rasterizer;
@@ -21,6 +22,8 @@ class Rasterizer;
 /// Capture for offline replay (docs/macos/capture-replay.md), Apple-only diagnostic, off unless
 /// BB_REPLAY_CAPTURE is set. v1 feasibility gate, inventory stage:
 ///   BB_REPLAY_CAPTURE=inventory:<frames>   arm at the <frames>th retired frame end (1..100000)
+///   BB_REPLAY_CAPTURE=perf:<frames>        the same, then write a perf replay capture (v0:
+///                                          image rejections do not block it; anything else does)
 ///   BB_REPLAY_HOLD_MS=<ms>                 hold bound, 1..60000 (default 3000)
 ///   BB_REPLAY_TRIGGER=<file>               count <frames> from the poll that finds and removes
 ///                                          this file (every 30 retired frame ends, so up to 30
@@ -63,6 +66,7 @@ struct Held {
     u32 asc_tasks;            ///< tasks queued on asynchronous-compute queues at sampling
     u64 asc_seen;             ///< AscSubmitted() before the queues were sampled
     u32 host_commands;        ///< host commands run during the hold
+    const AmdGpu::Liverpool* liverpool; ///< for the perf capture's parse state
 };
 
 /// GPU command thread, when the hold ends. Prints the inventory and releases the hold.

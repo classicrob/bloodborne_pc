@@ -45,6 +45,7 @@
 #include "bbport_pass_trace.h"
 #include <vulkan/vulkan_format_traits.hpp>
 #include "bbport_bind_context.h"
+#include "bbport_replay_gpu_probe.h"
 #include <optional>
 #include <vk_mem_alloc.h>
 
@@ -1311,6 +1312,7 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     MarkPass(pipeline, state);
     scheduler.BeginRendering(state);
 #ifdef __APPLE__
+    BbReplayGpuProbe::NoteDraw();
     if (BbPassTrace::Enabled()) {
         BbPassTrace::NoteDraw();
     }
@@ -1579,6 +1581,7 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
     MarkPass(pipeline, state);
     scheduler.BeginRendering(state);
 #ifdef __APPLE__
+    BbReplayGpuProbe::NoteDraw();
     if (BbPassTrace::Enabled()) {
         BbPassTrace::NoteDraw();
     }
@@ -4313,6 +4316,9 @@ void Rasterizer::UpdateViewportScissorState() const {
         capture_viewport = viewports[0];
         capture_scissor = scissors[0];
     }
+#ifdef __APPLE__
+    BbReplayGpuProbe::ApplyScissors(scissors);
+#endif
     auto& dynamic_state = scheduler.GetDynamicState();
     dynamic_state.SetViewports(viewports);
     dynamic_state.SetScissors(scissors);

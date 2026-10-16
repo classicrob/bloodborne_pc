@@ -9,6 +9,7 @@
  * Guest addresses are placed below 1 TiB (PS4 user range): GPU descriptors
  * encode 40-bit addresses, so host-default 0x7f... addresses would not fit. */
 #define _GNU_SOURCE
+#include <sys/stat.h>
 #include "runtime.h"
 #include "runtime_memory.h"
 #include <stdio.h>
@@ -959,13 +960,82 @@ typedef struct GuestAllocation {
     size_t size;
     struct GuestAllocation *next;
     int free;
+    uint64_t ordinal;     /* allocation sequence number, for the perf replay's object identity */
+    const void *caller;   /* the allocating code */
 } GuestAllocation;
+static uint64_t guest_alloc_ordinal;
 #define GUEST_ALIGNMENT ((size_t)64)
 #define GUEST_HEADER ((sizeof(GuestAllocation)+GUEST_ALIGNMENT-1)&~(GUEST_ALIGNMENT-1))
 #define GUEST_CHUNK ((size_t)1024*1024)
 static pthread_mutex_t guest_heap_lock=PTHREAD_MUTEX_INITIALIZER;
 static GuestAllocation *guest_heap;
+typedef struct {
+    RuntimeReplayObject object;
+    GuestAllocation *owner;
+} ReplayNamedObject;
+static ReplayNamedObject replay_named_objects[32];
+
+int runtime_replay_name_object(void *pointer, uint64_t size, const char *name) {
+    const char *capture=getenv("BB_REPLAY_CAPTURE"), *replay=getenv("BB_REPLAY_RUN");
+    if ((!capture || !*capture) && (!replay || !*replay)) return 0;
+    const uintptr_t start=(uintptr_t)pointer;
+    if (!pointer || !size || size>UINTPTR_MAX-start || !name || !*name || strnlen(name,64)>=64)
+        return -1;
+    pthread_mutex_lock(&guest_heap_lock);
+    GuestAllocation *owner=NULL;
+    for (GuestAllocation *at=guest_heap; at; at=at->next) {
+        const uintptr_t base=(uintptr_t)at+GUEST_HEADER;
+        if (!at->free && start>=base && size<=at->size && start-base<=at->size-size) {
+            owner=at; break;
+        }
+    }
+    ReplayNamedObject *slot=NULL;
+    int conflict=0;
+    for (size_t i=0;i<sizeof(replay_named_objects)/sizeof(replay_named_objects[0]);++i) {
+        ReplayNamedObject *at=&replay_named_objects[i];
+        if (!at->owner) { if (!slot) slot=at; continue; }
+        if (!strcmp(at->object.name,name) ||
+            (start<at->object.start+at->object.size && at->object.start<start+size)) conflict=1;
+    }
+    const int ok=owner && slot && !conflict;
+    if (ok) {
+        slot->owner=owner;
+        slot->object.start=start; slot->object.size=size;
+        memcpy(slot->object.name,name,strlen(name)+1);
+    }
+    pthread_mutex_unlock(&guest_heap_lock);
+    return ok ? 0 : -1;
+}
+int runtime_replay_named(const char *name, RuntimeReplayObject *out) {
+    if (!name || !*name || strnlen(name,64)>=64 || !out) return -1;
+    pthread_mutex_lock(&guest_heap_lock);
+    for (size_t i=0;i<sizeof(replay_named_objects)/sizeof(replay_named_objects[0]);++i) {
+        const ReplayNamedObject *at=&replay_named_objects[i];
+        if (at->owner && !strcmp(at->object.name,name)) {
+            *out=at->object; pthread_mutex_unlock(&guest_heap_lock); return 0;
+        }
+    }
+    pthread_mutex_unlock(&guest_heap_lock);
+    return -1;
+}
+int runtime_replay_object(uintptr_t address, RuntimeReplayObject *out) {
+    if (!out) return -1;
+    pthread_mutex_lock(&guest_heap_lock);
+    for (size_t i=0;i<sizeof(replay_named_objects)/sizeof(replay_named_objects[0]);++i) {
+        const ReplayNamedObject *at=&replay_named_objects[i];
+        if (at->owner && address>=at->object.start && address-at->object.start<at->object.size) {
+            *out=at->object; pthread_mutex_unlock(&guest_heap_lock); return 0;
+        }
+    }
+    pthread_mutex_unlock(&guest_heap_lock);
+    return -1;
+}
+
+static void *guest_malloc_from(size_t size, const void *caller);
 __attribute__((noinline)) void *runtime_guest_malloc(size_t size) {
+    return guest_malloc_from(size,__builtin_return_address(0));
+}
+static void *guest_malloc_from(size_t size, const void *caller) {
     if (!size) size=1;
     if (size>SIZE_MAX-GUEST_HEADER-GUEST_ALIGNMENT-PAGE) return NULL;
     size=(size+GUEST_ALIGNMENT-1)&~(GUEST_ALIGNMENT-1);
@@ -987,22 +1057,51 @@ __attribute__((noinline)) void *runtime_guest_malloc(size_t size) {
         block->next=rest; block->size=size;
     }
     block->free=0;
-    low_trace("alloc","host-object",(unsigned char *)block+GUEST_HEADER,block->size,0,__builtin_return_address(0));
+    block->ordinal=++guest_alloc_ordinal;
+    block->caller=caller;
+    low_trace("alloc","host-object",(unsigned char *)block+GUEST_HEADER,block->size,0,(void *)caller);
     pthread_mutex_unlock(&guest_heap_lock);
     return (unsigned char *)block+GUEST_HEADER;
 }
-void *runtime_guest_calloc(size_t count, size_t size) {
+__attribute__((noinline)) void *runtime_guest_calloc(size_t count, size_t size) {
     if (size && count>SIZE_MAX/size) return NULL;
     size_t bytes=count*size;
-    void *result=runtime_guest_malloc(bytes);
+    void *result=guest_malloc_from(bytes,__builtin_return_address(0));
     if (result) memset(result,0,bytes);
     return result;
+}
+static void code_location(const void *address, char *module, size_t module_size, uint64_t *offset) {
+    Dl_info info={0};
+    *offset=0;
+    snprintf(module,module_size,"unknown");
+    if (address && dladdr(address,&info) && info.dli_fname) {
+        const char *slash=strrchr(info.dli_fname,'/');
+        snprintf(module,module_size,"%s",slash ? slash+1 : info.dli_fname);
+        *offset=(uint64_t)((uintptr_t)address-(uintptr_t)info.dli_fbase);
+    }
+}
+int runtime_guest_object(uintptr_t address, RuntimeGuestObject *out) {
+    if (!out) return -1;
+    pthread_mutex_lock(&guest_heap_lock);
+    for (const GuestAllocation *at=guest_heap; at; at=at->next) {
+        const uintptr_t start=(uintptr_t)at+GUEST_HEADER;
+        if (at->free || address<start || address-start>=at->size) continue;
+        out->start=start; out->size=at->size; out->ordinal=at->ordinal;
+        code_location(at->caller,out->module,sizeof(out->module),&out->offset);
+        pthread_mutex_unlock(&guest_heap_lock);
+        return 0;
+    }
+    pthread_mutex_unlock(&guest_heap_lock);
+    return -1;
 }
 __attribute__((noinline)) void runtime_guest_free(void *pointer) {
     if (!pointer) return;
     GuestAllocation *block=(GuestAllocation *)((unsigned char *)pointer-GUEST_HEADER);
     pthread_mutex_lock(&guest_heap_lock);
     low_trace("free","host-object",pointer,block->size,0,__builtin_return_address(0));
+    for (size_t i=0;i<sizeof(replay_named_objects)/sizeof(replay_named_objects[0]);++i) {
+        if (replay_named_objects[i].owner==block) replay_named_objects[i]=(ReplayNamedObject){0};
+    }
     block->free=1;
     for (GuestAllocation *at=guest_heap; at && at->next;) {
         GuestAllocation *next=at->next;
@@ -1213,6 +1312,63 @@ int runtime_memory_write_backing(uintptr_t address, const void *data, uint64_t s
     read_unlock();
     return ok;
 }
+#ifdef __APPLE__
+int runtime_replay_apply_resets(const RuntimeReplayReset *resets, size_t count,
+                                char *why, size_t why_size) {
+    if ((!resets && count) || !why || !why_size) return -1;
+    *why=0;
+    pthread_mutex_lock(&guest_heap_lock);
+    write_lock();
+    for (size_t i=0;i<count;++i) {
+        const RuntimeReplayReset *r=&resets[i];
+        if (!r->bytes || !r->size || r->size>UINTPTR_MAX-r->address || r->host>1) {
+            snprintf(why,why_size,"reset %zu has invalid address, size or host flag",i);
+            goto fail;
+        }
+        if (!r->host) {
+            if (!covered(r->address,r->address+r->size,0)) {
+                snprintf(why,why_size,"guest reset %zu at %#" PRIxPTR " is not fully mapped",i,r->address);
+                goto fail;
+            }
+            continue;
+        }
+        const RuntimeReplayObject *want=&r->object;
+        if (!want->name[0] || !memchr(want->name,0,sizeof(want->name)) || !want->size ||
+            want->size>UINTPTR_MAX-want->start || r->offset>want->size ||
+            r->size>want->size-r->offset || r->address!=want->start+r->offset) {
+            snprintf(why,why_size,"host reset %zu has invalid named range or offset",i);
+            goto fail;
+        }
+        int found=0;
+        for (size_t j=0;j<sizeof(replay_named_objects)/sizeof(replay_named_objects[0]);++j) {
+            const ReplayNamedObject *live=&replay_named_objects[j];
+            if (!live->owner || strcmp(live->object.name,want->name)) continue;
+            found=live->object.start==want->start && live->object.size==want->size;
+            break;
+        }
+        if (!found) {
+            snprintf(why,why_size,"host reset %zu: named object '%s' missing or moved/resized",i,
+                     want->name);
+            goto fail;
+        }
+    }
+    for (size_t i=0;i<count;++i) {
+        const RuntimeReplayReset *r=&resets[i];
+        if (r->host) memcpy((void *)r->address,r->bytes,r->size);
+        else if (!runtime_memory_write_backing(r->address,r->bytes,r->size)) {
+            snprintf(why,why_size,"guest reset %zu changed after locked preflight",i);
+            goto fail;
+        }
+    }
+    write_unlock();
+    pthread_mutex_unlock(&guest_heap_lock);
+    return 0;
+fail:
+    write_unlock();
+    pthread_mutex_unlock(&guest_heap_lock);
+    return -1;
+}
+#endif
 /* Per-thread cache of recently found regions for the GPU's per-draw queries:
  * entries hold for as long as the table generation they were read at. */
 typedef struct { uint64_t generation; uintptr_t start, end; int kind; } CachedRegion;
@@ -1347,7 +1503,224 @@ int runtime_memory_inventory(RuntimeMemoryInventory *out) {
     free(spans);
     return 0;
 }
+int runtime_memory_layout(RuntimeMemoryView *views, size_t view_capacity, size_t *view_count,
+                          RuntimeMemoryBlock *out_blocks, size_t block_capacity, size_t *block_count,
+                          uint64_t *generation) {
+    if (!view_count || !block_count || !generation || (!views && view_capacity) ||
+        (!out_blocks && block_capacity)) return -1;
+    size_t nv=0, nb=0;
+    read_lock();
+    *generation=__atomic_load_n(&table_generation,__ATOMIC_ACQUIRE);
+    for (size_t i=0;i<vma_count;++i) {
+        const Vma *v=&vmas[i];
+        if (v->kind==KIND_RESERVED) continue;
+        if (nv<view_capacity)
+            views[nv]=(RuntimeMemoryView){v->start,v->end,v->phys,v->kind==KIND_FLEXIBLE,v->prot,v->type,0};
+        ++nv;
+    }
+    /* blocks[] (the allocator table) is unordered: insertion-sort the copied prefix by offset. */
+    for (int i=0;i<LIMIT;++i) {
+        if (!blocks[i].used) continue;
+        if (nb<block_capacity) {
+            size_t at=nb;
+            while (at && out_blocks[at-1].start>blocks[i].start) { out_blocks[at]=out_blocks[at-1]; --at; }
+            out_blocks[at]=(RuntimeMemoryBlock){blocks[i].start,blocks[i].size,blocks[i].type,0};
+        }
+        ++nb;
+    }
+    read_unlock();
+    *view_count=nv;
+    *block_count=nb;
+    return 0;
+}
+/* Perf replay files (gpu/shadps4/video_core/amdgpu/replay_format.h, mirrored here in C). */
+typedef struct { char magic[8]; uint32_t version, reserved; uint64_t records; } ReplayHeader;
+typedef struct { uint64_t start, size; int32_t type; uint32_t reserved; } ReplayBlock;
+typedef struct { uint64_t start, end, phys; uint32_t flexible; int32_t prot, type; uint32_t reserved; } ReplayView;
+typedef struct { uint64_t phys, bytes; } ReplayRun;
+_Static_assert(sizeof(ReplayHeader)==24 && sizeof(ReplayBlock)==24 && sizeof(ReplayView)==40 &&
+               sizeof(ReplayRun)==16, "perf replay record layout");
+static FILE *replay_open(const char *dir, const char *name, const char magic[8], ReplayHeader *h,
+                         char *why, size_t why_size) {
+    char path[4096];
+    snprintf(path,sizeof(path),"%s/%s",dir,name);
+    FILE *f=fopen(path,"rb");
+    if (!f) { snprintf(why,why_size,"cannot open %s",path); return NULL; }
+    if (fread(h,sizeof(*h),1,f)!=1 || memcmp(h->magic,magic,8) || h->version!=2 || h->reserved) {
+        snprintf(why,why_size,"%s: not a version 2 perf replay file",path); fclose(f); return NULL;
+    }
+    return f;
+}
+static uint64_t replay_file_size(FILE *f) {
+    struct stat st;
+    return fstat(fileno(f),&st) ? 0 : (uint64_t)st.st_size;
+}
+/* Every record checked before anything is allocated or mapped (Sol-2): blocks page-aligned,
+ * nonempty, inside the direct pool, sorted and disjoint, memory type 0..10; views page-aligned,
+ * nonempty, sorted and disjoint, inside the guest user range [USER_MIN, USER_MAX) and over no
+ * guest mapping or reservation the process already has there (the host-level arena reservation
+ * covers [USER_MIN, USER_MAX)), direct views backed by one
+ * captured block, flexible views inside the flexible span; the file sizes exactly the records. */
+static int replay_preflight(const ReplayBlock *blocks_in, uint64_t nb, const ReplayView *views,
+                            uint64_t nv, char *why, size_t why_size) {
+    for (uint64_t i=0;i<nb;++i) {
+        const ReplayBlock *b=&blocks_in[i];
+        if (!b->size || b->start%PAGE || b->size%PAGE || b->start>POOL_SIZE || b->size>POOL_SIZE-b->start ||
+            b->type<0 || b->type>10 || (i && b->start<blocks_in[i-1].start+blocks_in[i-1].size)) {
+            snprintf(why,why_size,"views.bin: direct block %" PRIu64 " [%#" PRIx64 ", +%#" PRIx64 ") type %d is "
+                     "misaligned, outside the pool, unsorted or overlapping",i,b->start,b->size,b->type);
+            return -1;
+        }
+    }
+    for (uint64_t i=0;i<nv;++i) {
+        const ReplayView *v=&views[i];
+        const uint64_t len=v->end-v->start;
+        if (v->end<=v->start || v->start%PAGE || v->end%PAGE || v->start<USER_MIN || v->end>USER_MAX ||
+            v->flexible>1 || (i && v->start<views[i-1].end)) {
+            snprintf(why,why_size,"views.bin: view %" PRIu64 " [%#" PRIx64 ", %#" PRIx64 ") is empty, misaligned, "
+                     "outside the guest user range, of unknown kind, unsorted or overlapping",i,v->start,v->end);
+            return -1;
+        }
+        if (v->flexible) {
+            if (v->phys<POOL_SIZE || v->phys-POOL_SIZE>FLEX_SPAN || len>FLEX_SPAN-(v->phys-POOL_SIZE)) {
+                snprintf(why,why_size,"views.bin: flexible view %#" PRIx64 " backing %#" PRIx64 " (+%#" PRIx64 ") is "
+                         "outside the flexible span",v->start,v->phys,len);
+                return -1;
+            }
+        } else {
+            int backed=0;
+            for (uint64_t k=0;k<nb && !backed;++k)
+                backed=v->phys>=blocks_in[k].start && v->phys-blocks_in[k].start<=blocks_in[k].size &&
+                       len<=blocks_in[k].size-(v->phys-blocks_in[k].start);
+            if (!backed) {
+                snprintf(why,why_size,"views.bin: direct view %#" PRIx64 " backing %#" PRIx64 " (+%#" PRIx64 ") lies "
+                         "in no captured block",v->start,v->phys,len);
+                return -1;
+            }
+        }
+    }
+    read_lock();
+    for (uint64_t i=0;i<nv;++i)
+        if (overlaps(views[i].start,views[i].end,0)) {
+            read_unlock();
+            snprintf(why,why_size,"views.bin: view [%#" PRIx64 ", %#" PRIx64 ") overlaps a guest mapping or "
+                     "reservation this process already has",views[i].start,views[i].end);
+            return -1;
+        }
+    read_unlock();
+    return 0;
+}
+int runtime_memory_replay_map(const char *dir, char *why, size_t why_size) {
+    ReplayHeader h;
+    FILE *f=replay_open(dir,"views.bin","BBRPVIEW",&h,why,why_size);
+    if (!f) return -1;
+    uint64_t counts[2];
+    const uint64_t file_bytes=replay_file_size(f);
+    if (fread(counts,sizeof(counts),1,f)!=1 || counts[0]>LIMIT || counts[1]>(1u<<20) ||
+        counts[0]+counts[1]!=h.records ||
+        file_bytes!=sizeof(ReplayHeader)+sizeof(counts)+counts[0]*sizeof(ReplayBlock)+counts[1]*sizeof(ReplayView)) {
+        snprintf(why,why_size,"views.bin: counts %" PRIu64 " blocks, %" PRIu64 " views do not match the header or "
+                 "the file size (%" PRIu64 " bytes)",counts[0],counts[1],file_bytes);
+        fclose(f); return -1;
+    }
+    ReplayBlock *in_blocks=calloc(counts[0] ? counts[0] : 1,sizeof(*in_blocks));
+    ReplayView *views=calloc(counts[1] ? counts[1] : 1,sizeof(*views));
+    if (!in_blocks || !views || (counts[0] && fread(in_blocks,sizeof(*in_blocks),counts[0],f)!=counts[0]) ||
+        (counts[1] && fread(views,sizeof(*views),counts[1],f)!=counts[1])) {
+        snprintf(why,why_size,"views.bin: truncated"); free(in_blocks); free(views); fclose(f); return -1;
+    }
+    fclose(f);
+    if (replay_preflight(in_blocks,counts[0],views,counts[1],why,why_size)) {
+        free(in_blocks); free(views); return -1;
+    }
+    for (uint64_t i=0;i<counts[0];++i) {
+        const ReplayBlock b=in_blocks[i]; int64_t phys=-1;
+        int32_t r=direct_allocate((int64_t)b.start,(int64_t)(b.start+b.size),b.size,PAGE,b.type,&phys);
+        if (r || (uint64_t)phys!=b.start) {
+            snprintf(why,why_size,"direct block [%#" PRIx64 ", +%#" PRIx64 ") not recreated at its offset (%#x, got %#" PRIx64 ")",
+                     b.start,b.size,(unsigned)r,(uint64_t)phys);
+            free(in_blocks); free(views); return -1;
+        }
+    }
+    free(in_blocks);
+    for (uint64_t i=0;i<counts[1];++i) {
+        const ReplayView *v=&views[i];
+        void *va=(void *)(uintptr_t)v->start;
+        int32_t r=v->flexible ? map_flexible(&va,v->end-v->start,v->prot,MAP_FIXED_FLAG)
+                              : direct_map(&va,v->end-v->start,v->prot,MAP_FIXED_FLAG,(int64_t)v->phys,PAGE);
+        if (r || (uintptr_t)va!=v->start) {
+            snprintf(why,why_size,"view [%#" PRIx64 ", %#" PRIx64 ") (%s) not mapped at its address (%#x)",
+                     v->start,v->end,v->flexible ? "flexible" : "direct",(unsigned)r);
+            free(views); return -1;
+        }
+    }
+    /* Backing runs reach guest memory through every captured view over them. */
+    f=replay_open(dir,"backing.bin","BBRPBACK",&h,why,why_size);
+    if (!f) { free(views); return -1; }
+    const uint64_t piece=UINT64_C(64)<<20;
+    unsigned char *buffer=malloc(piece);
+    uint64_t unreached=0, left=replay_file_size(f);
+    left=left>=sizeof(ReplayHeader) ? left-sizeof(ReplayHeader) : 0;
+    if (h.records>left/sizeof(ReplayRun)) {
+        snprintf(why,why_size,"backing.bin: run count exceeds file bytes"); goto fail;
+    }
+    for (uint64_t i=0;i<h.records && buffer;++i) {
+        ReplayRun run;
+        if (fread(&run,sizeof(run),1,f)!=1) { snprintf(why,why_size,"backing.bin: truncated"); goto fail; }
+        if (left<sizeof(run) || run.bytes>left-sizeof(run) || run.phys>POOL_SIZE+FLEX_SPAN ||
+            run.bytes>POOL_SIZE+FLEX_SPAN-run.phys) {
+            snprintf(why,why_size,"backing.bin: run %" PRIu64 " (%#" PRIx64 ", +%#" PRIx64 ") is past the file or the "
+                     "backing",i,run.phys,run.bytes);
+            goto fail;
+        }
+        left-=sizeof(run)+run.bytes;
+        for (uint64_t done=0;done<run.bytes;) {
+            const uint64_t n=run.bytes-done<piece ? run.bytes-done : piece;
+            if (fread(buffer,1,n,f)!=n) { snprintf(why,why_size,"backing.bin: truncated"); goto fail; }
+            const uint64_t lo=run.phys+done, hi=lo+n;
+            int reached=0;
+            for (uint64_t k=0;k<counts[1];++k) {
+                const ReplayView *v=&views[k];
+                const uint64_t vlo=v->phys, vhi=v->phys+(v->end-v->start);
+                const uint64_t a=lo>vlo ? lo : vlo, b=hi<vhi ? hi : vhi;
+                if (a>=b) continue;
+                if (!runtime_memory_write_backing(v->start+(a-vlo),buffer+(a-lo),b-a)) {
+                    snprintf(why,why_size,"view %#" PRIx64 ": backing write failed",v->start); goto fail;
+                }
+                reached=1;
+            }
+            if (!reached) unreached+=n;
+            done+=n;
+        }
+    }
+    if (!buffer) { snprintf(why,why_size,"out of memory"); goto fail; }
+    if (left || fgetc(f)!=EOF || ferror(f)) {
+        snprintf(why,why_size,"backing.bin: trailing bytes or read error"); goto fail;
+    }
+    free(buffer); free(views); fclose(f);
+    printf("Perf replay: %" PRIu64 " direct blocks and %" PRIu64 " views mapped; %" PRIu64 " MiB of backing under no view skipped\n",
+           counts[0],counts[1],unreached>>20);
+    return 0;
+fail:
+    free(buffer); free(views); fclose(f);
+    return -1;
+}
+const void *runtime_memory_backing(uint64_t *direct_bytes, uint64_t *total_bytes) {
+    if (direct_bytes) *direct_bytes=POOL_SIZE;
+    if (total_bytes) *total_bytes=POOL_SIZE+FLEX_SPAN;
+    return backing_base;
+}
 #endif
+static uintptr_t guest_image_start;
+static uint64_t guest_image_size;
+void runtime_set_guest_image(uintptr_t start, uint64_t size) {
+    guest_image_start=start; guest_image_size=size;
+}
+int runtime_guest_image(uintptr_t *start, uint64_t *size) {
+    if (!start || !size || !guest_image_start) return -1;
+    *start=guest_image_start; *size=guest_image_size;
+    return 0;
+}
 /* GPU page tracking: restrict host access, never beyond the guest's own protection. */
 void runtime_memory_gpu_protect(uintptr_t address, uint64_t size, int read, int write) {
     read_lock();

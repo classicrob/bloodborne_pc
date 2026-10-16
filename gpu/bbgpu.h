@@ -23,6 +23,9 @@ void bbgpu_apply_task_role(void);
 #endif
 /* Creates window, Vulkan device, presenter and GPU command processor. */
 int bbgpu_init(const BbGpuConfig *config);
+/* Perf replay v0 (BB_REPLAY_RUN): replays the capture in `dir` `iterations` times after the
+ * launcher mapped its memory (runtime_memory_replay_map); 0 when every iteration ran. */
+int bbgpu_replay_run(const char *dir, unsigned iterations);
 /* Function for an imported NID ("NID#lib#mod"), or 0 when the GPU library does not provide it. */
 uintptr_t bbgpu_resolve(const char *scoped_nid);
 /* Called first by the loader's SIGSEGV handler: 1 when a GPU page-tracking fault was handled. */

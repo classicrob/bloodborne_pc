@@ -17,6 +17,7 @@
 #include "bbport_toggles.h"
 #ifdef __APPLE__
 #include "bb_mac_compat.h"
+#include "../../../../../src/runtime_memory.h"
 #include "../../../../../src/runtime_hle_trace.h"
 #endif
 #include "video_core/renderer_vulkan/vk_frame_capture.h"
@@ -76,6 +77,10 @@ constexpr u32 PixelFormatBpp(PixelFormat pixel_format) {
 
 VideoOutDriver::VideoOutDriver(u32 width, u32 height) {
 #ifdef __APPLE__
+    ASSERT_MSG(runtime_replay_name_object(main_port.buffer_labels.data(),
+                                         sizeof(main_port.buffer_labels),
+                                         "VideoOut main_port.buffer_labels") == 0,
+               "perf replay: cannot register VideoOut main_port.buffer_labels");
     // Read first, before any thread starts: a malformed BB_FLIP_AT_GPU_RETIRE stops here, not at
     // the first flip.
     flip_run_mode = BbFlip::ParseRunMode(std::getenv("BB_FLIP_AT_GPU_RETIRE"));

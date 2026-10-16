@@ -75,6 +75,72 @@ typedef struct {
  * fault handlers. Low/untracked host allocations outside the VMA table are not counted.
  * Returns 0, or -1 for a NULL output or failed allocation. */
 int runtime_memory_inventory(RuntimeMemoryInventory *out);
+typedef struct {
+    uint64_t start, end;   /* guest VA */
+    uint64_t phys;         /* backing offset (runtime_memory_backing) */
+    int32_t flexible;      /* 0 direct, 1 flexible */
+    int32_t prot, type, reserved;
+} RuntimeMemoryView;
+typedef struct { uint64_t start, size; int32_t type, reserved; } RuntimeMemoryBlock;
+/* Capture-replay layout (diagnostic): the committed views in VA order and the direct
+ * allocations in offset order, from one read of the VMA table (`generation` as in
+ * RuntimeMemoryInventory). Writes up to each capacity and sets the total counts; a count above
+ * its capacity means call again with more room. Returns 0, or -1 for a NULL count/generation or
+ * a NULL array with a nonzero capacity. Not for fault handlers. */
+int runtime_memory_layout(RuntimeMemoryView *views, size_t view_capacity, size_t *view_count,
+                          RuntimeMemoryBlock *blocks, size_t block_capacity, size_t *block_count,
+                          uint64_t *generation);
+/* The host view of the backing pool (direct memory in [0, *direct_bytes), flexible memory after
+ * it, *total_bytes in all), or NULL before the pool exists. Reads through it bypass guest and
+ * GPU page protection: capture only. */
+const void *runtime_memory_backing(uint64_t *direct_bytes, uint64_t *total_bytes);
+/* The guest executable image as loaded (a host allocation outside the VMA table): 0 and its
+ * range, or -1 before the launcher set it (runtime_set_guest_image). */
+int runtime_guest_image(uintptr_t *start, uint64_t *size);
+/* A live guest-heap object (runtime_guest_malloc/calloc) and its identity: payload range,
+ * allocation ordinal (sequence number since start) and the code address that allocated it
+ * (module file name + offset). The perf replay restores a host-memory reset range only into the
+ * object with the same identity. 0 when `address` is inside a live object's payload, else -1. */
+typedef struct {
+    uintptr_t start;
+    uint64_t size, ordinal;
+    char module[64];
+    uint64_t offset;
+} RuntimeGuestObject;
+int runtime_guest_object(uintptr_t address, RuntimeGuestObject *out);
+/* Semantic host ranges for cross-build replay. Registration is inactive unless capture or
+ * replay was requested. Names are copied (1..63 bytes), ranges must lie in one live guest-heap
+ * allocation, and duplicate names or overlapping ranges fail (-1). Freeing that allocation
+ * removes its names before the memory can be reused. Lookups alone do not pin lifetime;
+ * runtime_replay_apply_resets holds the owner lock across validation and writes. */
+typedef struct {
+    uintptr_t start;
+    uint64_t size;
+    char name[64];
+} RuntimeReplayObject;
+int runtime_replay_name_object(void *pointer, uint64_t size, const char *name);
+int runtime_replay_named(const char *name, RuntimeReplayObject *out);
+int runtime_replay_object(uintptr_t address, RuntimeReplayObject *out);
+typedef struct {
+    uintptr_t address;
+    uint64_t size;
+    const void *bytes;
+    uint32_t host;
+    RuntimeReplayObject object;
+    uint64_t offset;
+} RuntimeReplayReset;
+/* Validate every reset target, then write all under the guest-map and named-object lifetime
+ * locks. A bad final record cannot alter an earlier guest or host range. */
+int runtime_replay_apply_resets(const RuntimeReplayReset *resets, size_t count,
+                                char *why, size_t why_size);
+void runtime_set_guest_image(uintptr_t start, uint64_t size);
+/* Writes through the backing view, bypassing guest/GPU page protection: 1, or 0 when part of
+ * the range has no backing. */
+int runtime_memory_write_backing(uintptr_t address, const void *data, uint64_t size);
+/* Perf replay v0 (BB_REPLAY_RUN, after the GPU library is initialised): recreates the captured
+ * direct allocations at their offsets, maps every captured view at its VA and fills it from
+ * backing.bin. 0, or -1 with a reason in `why`. */
+int runtime_memory_replay_map(const char *dir, char *why, size_t why_size);
 #endif
 #ifdef __cplusplus
 }

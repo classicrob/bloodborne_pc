@@ -201,6 +201,96 @@ native game render target before host upscaling, clearly label that output bound
 and retain the game's real rendering commands. Reproducing the presented frame needs
 host temporal-state capture or a warm-up prefix as well.
 
+### Perf replay v0 (approved 2026-10-11, implemented)
+
+Purpose: a fast loop for the stage A/B CPU cost (R0: the frame is bound by it). It replays
+one held frame's submissions through the real Liverpool and renderer N times in a process
+without a guest. **Pixel output is not qualified**, and the report says so. The inventory
+run's image rejections don't block it: the texture cache's images are captured
+(`images.bin`, `image_metadata.bin`) and restored, and the replay's first step checks that
+capture -> restore -> capture again is exact. Iteration 1 creates the
+texture- and buffer-cache state that live frames inherit, and is reported as warm-up.
+Steady state means iterations 2..N agree within noise, on times and on the "images
+registered" / "image uploads" counters.
+
+Capture (`BB_REPLAY_CAPTURE=perf:<frames>`, trigger as for inventory), at the end of the hold,
+after the inventory, into `out/replay/<id>/` (`BB_REPLAY_DIR` overrides the base). The capture refuses to start unless at least 40 decimal GB
+(35 GB hard floor plus 5 GB safety margin) would stay free after its estimated size; keep one capture at a time.
+- `manifest.json`: version, frame, settings, the sizes and checksums of every file, and
+  "perf replay: pixel output not qualified".
+- `views.bin`: every committed direct/flexible view (VA range, kind, protection, memory
+  type, backing offset).
+- `backing.bin`: the union of their backing intervals, read from the backing pool (no
+  guest-VA reads, which the GPU page tracking would intercept). About 4.9 GiB in the clinic.
+- `image.bin`: the eboot image range. It is a host allocation outside the VMA table, and
+  SDK shaders and constants can live in it.
+- `liverpool.bin`: `Regs`, the CE counters and the 48 KiB constants heap, per-queue
+  `cs_state`, `indirect_args_addr`.
+- `submissions.bin`: the held frame, in order. Per submission: DCB/CCB guest spans, every
+  copied region (guest address, dwords, constant flag) with its submit-time words, and the
+  frame end.
+- `resets.bin`: the (address, length) ranges the frame's command processor writes or waits
+  on, with their bytes at the cut. These are EOP/EOS/RELEASE_MEM/WRITE_DATA/COPY_DATA/
+  ATOMIC_MEM destinations, DMA_DATA destinations, WAIT_REG_MEM/COND_EXEC addresses, and
+  indirect argument buffers. A WAIT_REG_MEM whose address no packet in the frame writes and
+  that is not satisfied at the cut makes the capture loud: the frame would wait on the guest.
+
+Replay (`BB_REPLAY_RUN=<dir>`, bb-probe):
+1. Reserve the guest range as usual, map every view at its VA with the same backing layout
+   (direct blocks at their original offsets), and fill the backing and the eboot image range.
+2. Initialise the GPU library. Then, per iteration on the GPU thread, with the GPU idle:
+   restore the reset ranges, `liverpool.bin` and the command words; submit the frame's
+   submissions and its frame end; wait for GpuIdle.
+3. Report per iteration: wall time, stage A/B counters (the "Parse split" fields), images
+   registered, image uploads, prepared draws used, the staging pool's contents, and where
+   the CPU time ran (process faults, context switches, footprint, host paging; P-core share,
+   CPU time by QoS class, effective clock, task role).
+
+Replay settings: `BB_REPLAY_ITERATIONS` (1..10000), `BB_REPLAY_GPU_WAIT=1` (also wait for each
+iteration's GPU work and report submit -> GPU done), `BB_SPLIT_WINDOW` (the replay sets 1: a
+"Parse split" block per iteration), and with `BB_PERF=1` the GPU busy time of each iteration
+(per-submission timestamps). State the power mode (`pmset -g custom`) with any timing.
+
+A/B runs use two existing pinned build manifests; they never create worktrees or build/copy/delete
+inputs. See [replay qualification](replay-qualification.md) for exact usage, legacy identity
+migration, source-gate requirements, controls and limits. `replay-ab.sh --help` lists options.
+
+Capture tools (`tools/macos/`, read a capture directory; no replay run): `pm4find.py` (the
+WRITE_DATA packets covering an address, with context, and the view holding it), `pm4dump.py`
+(the packets around a guest address), `frameseg.py` (per captured command buffer: draws,
+dispatches, writes, waits), `drainseg.py` (one command buffer split at its self-polling
+WAIT_REG_MEMs).
+
+What the replay checks before it writes anything (Sol-2's review):
+- The capture directory is complete: not `*.incomplete`, `manifest.json` at manifest_version 2,
+  and every file at the size the manifest records. A capture writes into its own exclusively
+  created `frame-<time>-<pid>.incomplete` and renames it when done; it never removes another
+  capture's directory.
+- The view table, before any allocation or mapping: blocks page-aligned, inside the pool,
+  sorted and disjoint; views page-aligned, inside the guest user range, sorted, disjoint, over
+  no existing mapping, direct ones backed by one captured block; file sizes exactly the records.
+- Every iteration starts with the GPU quiesced (work complete, deferred writes run), untimed.
+  It is a repeated workload, not a restored-frame replay: only the command processor's reset
+  ranges, the command words and the Liverpool state are restored; shader-written buffers and
+  images and the renderer's caches carry over between iterations.
+- `resets.bin` alone uses format version 3: a host reset names a registered live semantic
+  range, its base/size, and reset offset. Every host name and guest mapping is preflighted before
+  reset writes; the base must match because packets embed it. Legacy v2 resets fail loudly and
+  require an explicit metadata-only identity assertion. Other capture files retain version 2.
+- The capture's reset walk (`replay_reset_walk.h`) passes only decoded writers and packets that
+  write no memory; truncated packets and wrapping ranges are blockers; a wait counts as
+  satisfied by the frame only after an unconditional drawing-engine write (not one inside a
+  COND_EXEC window, not a constant-engine write).
+- The image round trip refuses duplicate keys on either side and checks both counts.
+
+Not handled in v0, and stated rather than solved:
+- guest CPU/HLE writers (none run);
+- flips (a flip submission is replayed without presenting);
+- low/untracked memory outside the views and the eboot image (an access faults loudly),
+  except reset ranges in host objects of the low arena, which are restored in place when the
+  replay process has them writable (it makes the same allocations in the same order);
+- asynchronous compute (a frame with any is refused).
+
 ## Dependencies without a guest CPU
 
 Replay is an input driver, not a replacement PS4 CPU emulator. It submits the recorded

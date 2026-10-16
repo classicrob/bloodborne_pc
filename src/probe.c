@@ -1,5 +1,6 @@
 /* Minimal x86-64 native loader experiment. Not a PS4 emulator or game port. */
 #define _GNU_SOURCE
+#include <sys/stat.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -45,6 +46,13 @@ static LinkedModule modules[16];
 static uint64_t module_count;
 static int entered_game;
 static int gpu_enabled;
+#ifdef __APPLE__
+int runtime_memory_replay_map(const char *dir, char *why, size_t why_size); /* runtime_memory.h */
+#endif
+void runtime_set_guest_image(uintptr_t start, uint64_t size); /* runtime_memory.h */
+#ifdef __APPLE__
+static int run_replay(const char *dir, unsigned char *image_base, uint64_t image_size);
+#endif
 int vulkan_smoke(void);
 
 static __attribute__((noreturn)) void fail(const char *message) {
@@ -663,6 +671,7 @@ static int probe_main(int argc, char **argv) {
         }
     }
     image = allocate(round_host_page(size));
+    runtime_set_guest_image((uintptr_t)image,size);
     if (fread(image, 1, size, f) != size || fgetc(f) != EOF) fail("incorrect memory image size");
     fclose(f);
     if (!cpu_only) {
@@ -678,6 +687,15 @@ static int probe_main(int argc, char **argv) {
         gpu_enabled=1; /* page tracking starts while the rasterizer registers guest memory */
         if (bbgpu_init(&gpu)) fail("GPU initialization failed");
         printf("GPU: window and Vulkan presenter ready; SDK 0x%08x, %u HLE symbols\n",(unsigned)sdk,bbgpu_symbol_count());
+#ifdef __APPLE__
+        const char *replay_dir=getenv("BB_REPLAY_RUN");
+        if (replay_dir && *replay_dir) {
+            const int status=run_replay(replay_dir,image,size);
+            fflush(stdout);
+            fflush(stderr);
+            _exit(status);
+        }
+#endif
     }
     unsigned char *traps = allocate(round_host_page((import_count + 1) * 32));
     unsigned char *data_traps = allocate((import_count + 1) * page_size);
@@ -789,6 +807,125 @@ static int probe_worker(void *argument) {
     return probe_main(args->argc,args->argv);
 }
 #endif
+#ifdef __APPLE__
+/* Perf replay v0 (BB_REPLAY_RUN=<capture dir>, BB_REPLAY_ITERATIONS=N, default 10): instead of
+ * running the guest, map the captured memory, restore the eboot image bytes and replay the
+ * captured frame (docs/macos/capture-replay.md). The image must load at its captured address. */
+/* A complete capture: not a *.incomplete directory, a manifest_version 2 manifest.json, and every
+ * file the manifest lists at its recorded size (replay_format.h CaptureFiles, mirrored here). */
+static int replay_capture_complete(const char *dir, char *why, size_t why_size) {
+    static const char *const files[]={"views.bin","backing.bin","image.bin","liverpool.bin",
+                                      "submissions.bin","resets.bin","images.bin","image_metadata.bin"};
+    size_t n=strlen(dir);
+    while (n>1 && dir[n-1]=='/') --n;
+    if (n>=11 && !memcmp(dir+n-11,".incomplete",11)) {
+        snprintf(why,why_size,"%s is an unfinished capture (*.incomplete)",dir); return -1;
+    }
+    char path[4096], text[8192];
+    snprintf(path,sizeof(path),"%s/manifest.json",dir);
+    FILE *f=fopen(path,"rb");
+    if (!f) { snprintf(why,why_size,"%s: no manifest.json (not a complete capture)",dir); return -1; }
+    const size_t got=fread(text,1,sizeof(text)-1,f);
+    const int whole=feof(f);
+    fclose(f);
+    text[got]=0;
+    if (!whole) { snprintf(why,why_size,"%s is larger than %zu bytes",path,sizeof(text)-1); return -1; }
+    if (!strstr(text,"\"manifest_version\": 2,")) {
+        snprintf(why,why_size,"%s: not manifest_version 2 (a capture from an older build: take a new one)",path);
+        return -1;
+    }
+    for (size_t i=0;i<sizeof(files)/sizeof(files[0]);++i) {
+        char key[64];
+        snprintf(key,sizeof(key),"\"%s\": ",files[i]);
+        const char *at=strstr(text,key);
+        char *end=NULL;
+        const unsigned long long want=at ? strtoull(at+strlen(key),&end,10) : 0;
+        if (!at || !end || end==at+strlen(key)) {
+            snprintf(why,why_size,"%s does not list %s",path,files[i]); return -1;
+        }
+        struct stat st;
+        snprintf(path,sizeof(path),"%s/%s",dir,files[i]);
+        if (stat(path,&st) || !S_ISREG(st.st_mode) || (unsigned long long)st.st_size!=want) {
+            snprintf(why,why_size,"%s: %s, the manifest records %llu bytes",path,
+                     stat(path,&st) ? "missing" : "a different size",want);
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static int run_replay(const char *dir, unsigned char *image_base, uint64_t image_size) {
+    char why[1024];
+    if (replay_capture_complete(dir,why,sizeof(why))) {
+        fprintf(stderr,"STOP: perf replay: %s\n",why);
+        return 2;
+    }
+    if (runtime_memory_replay_map(dir,why,sizeof(why))) {
+        fprintf(stderr,"STOP: perf replay: %s\n",why);
+        return 2;
+    }
+    char path[4096];
+    snprintf(path,sizeof(path),"%s/image.bin",dir);
+    FILE *f=fopen(path,"rb");
+    struct { char magic[8]; uint32_t version, reserved; uint64_t records; } h;
+    uint64_t range[2];
+    if (!f || fread(&h,sizeof(h),1,f)!=1 || memcmp(h.magic,"BBRPEBOT",8) || h.version!=2 ||
+        h.reserved || fread(range,sizeof(range),1,f)!=1) {
+        fprintf(stderr,"STOP: perf replay: %s is not a version 2 image file\n",path);
+        if (f) fclose(f);
+        return 2;
+    }
+    if (range[0]!=(uintptr_t)image_base || range[1]!=image_size) {
+        fprintf(stderr,"STOP: perf replay: the eboot image is at %p (%" PRIu64 " bytes) here and at %#" PRIx64
+                " (%" PRIu64 " bytes) in the capture; the replay needs the same address and eboot\n",
+                (void *)image_base,image_size,range[0],range[1]);
+        fclose(f);
+        return 2;
+    }
+    struct stat image_stat;
+    uint64_t left=0;
+    if (fstat(fileno(f),&image_stat) || image_stat.st_size<(off_t)(sizeof(h)+sizeof(range)) ||
+        h.records>((uint64_t)image_stat.st_size-sizeof(h)-sizeof(range))/sizeof(range)) {
+        fprintf(stderr,"STOP: perf replay: %s: invalid run count or file size\n",path);
+        fclose(f);
+        return 2;
+    }
+    left=(uint64_t)image_stat.st_size-sizeof(h)-sizeof(range);
+    /* Runs of the pages that were readable at capture (protected regions are left as loaded). */
+    for (uint64_t i=0;i<h.records;++i) {
+        uint64_t run[2];
+        if (left<sizeof(run) || fread(run,sizeof(run),1,f)!=1 ||
+            run[0]>image_size || run[1]>image_size-run[0] || run[1]>left-sizeof(run) ||
+            fread(image_base+run[0],1,run[1],f)!=run[1]) {
+            fprintf(stderr,"STOP: perf replay: %s: bad or truncated run %" PRIu64 "\n",path,i);
+            fclose(f);
+            return 2;
+        }
+        left-=sizeof(run)+run[1];
+    }
+    if (left || fgetc(f)!=EOF || ferror(f)) {
+        fprintf(stderr,"STOP: perf replay: %s: trailing bytes or read error\n",path);
+        fclose(f);
+        return 2;
+    }
+    fclose(f);
+    unsigned iterations=10;
+    const char *env=getenv("BB_REPLAY_ITERATIONS");
+    if (env) {
+        char *end=NULL;
+        errno=0;
+        unsigned long n=strtoul(env,&end,10);
+        if (!*env || *end || errno || env[0]=='-' || env[0]=='+' || n<1 || n>10000) {
+            fprintf(stderr,"STOP: BB_REPLAY_ITERATIONS=%s: decimal digits, 1..10000\n",env);
+            return 2;
+        }
+        iterations=(unsigned)n;
+    }
+    fflush(stdout);
+    return bbgpu_replay_run(dir,iterations);
+}
+#endif
+
 int main(int argc, char **argv) {
 #ifdef __APPLE__
     if (argc==2 && !strcmp(argv[1],"--verify-macos-host")) {

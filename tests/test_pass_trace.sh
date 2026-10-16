@@ -10,6 +10,36 @@ mkdir -p "$out"
     tests/test_pass_trace.cpp -o "$out/driver"
 codesign --force --sign - "$out/driver" 2>/dev/null
 
+# Probe policy controls share this standalone driver; they need no Vulkan device. An env
+# claiming replay is insufficient without the internal driver authorization.
+BB_REPLAY_GPU_PROBE=off "$out/driver" probe-inactive > "$out/probe-off.out"
+for mode in scissor-1px discard-load-store; do
+    BB_REPLAY_GPU_WAIT=1 BB_WORK_RETIRED=1 BB_REPLAY_GPU_PROBE=$mode "$out/driver" probe-active > "$out/probe-$mode.out" 2> "$out/probe-$mode.err"
+    grep -q 'replay GPU probe controls: PASS' "$out/probe-$mode.out"
+    grep -q 'INVALID_FOR_CORRECTNESS_QUALITY=1' "$out/probe-$mode.err"
+    if { BB_REPLAY_RUN=claimed BB_REPLAY_GPU_PROBE=$mode "$out/driver" probe-inactive > /dev/null 2> "$out/probe-bad.err"; } 2>/dev/null; then
+        echo "FAIL: GPU probe accepted environment-only replay"; exit 1
+    fi
+    grep -q 'requires the validated replay measurement loop' "$out/probe-bad.err"
+done
+for wait in '' 0; do
+    if { BB_REPLAY_GPU_WAIT=$wait BB_REPLAY_GPU_PROBE=scissor-1px "$out/driver" probe-active > /dev/null 2> "$out/probe-bad.err"; } 2>/dev/null; then
+        echo "FAIL: GPU probe accepted missing completion wait"; exit 1
+    fi
+    grep -q 'requires BB_REPLAY_GPU_WAIT=1' "$out/probe-bad.err"
+done
+for retired in 0 0ignored; do
+    if { BB_REPLAY_GPU_WAIT=1 BB_WORK_RETIRED=$retired BB_REPLAY_GPU_PROBE=discard-load-store "$out/driver" probe-active > /dev/null 2> "$out/probe-bad.err"; } 2>/dev/null; then
+        echo "FAIL: GPU probe accepted recording-retirement bypass"; exit 1
+    fi
+    grep -q 'bypasses recording retirement' "$out/probe-bad.err"
+done
+if { BB_REPLAY_GPU_PROBE=invalid "$out/driver" probe-active > /dev/null 2> "$out/probe-bad.err"; } 2>/dev/null; then
+    echo "FAIL: invalid GPU probe accepted"; exit 1
+fi
+grep -q 'expected off, scissor-1px or discard-load-store' "$out/probe-bad.err"
+unset BB_REPLAY_GPU_PROBE
+
 # Malformed settings stop (and write nothing).
 for bad in 0 x 3+0 3+65 1+ +2; do
     if { BB_PASS_TRACE=$bad BB_PASS_TRACE_OUT="$out/bad.jsonl" "$out/driver" >/dev/null 2>"$out/bad.err"; } 2>/dev/null; then

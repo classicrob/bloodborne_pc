@@ -10,6 +10,15 @@ uintptr_t runtime_lookup(const RuntimeExport *table,size_t count,const char *nam
     return 0;
 }
 static RuntimeMemoryInventory base;
+static void *replay_allocator_growth(void *unused) {
+    (void)unused;
+    for (size_t i=0;i<16;++i) {
+        void *object=runtime_guest_malloc(2*1024*1024+i*PAGE);
+        assert(object);
+        runtime_guest_free(object);
+    }
+    return NULL;
+}
 static RuntimeMemoryInventory take(void) {
     RuntimeMemoryInventory m;
     assert(!runtime_memory_inventory(&m));
@@ -61,6 +70,51 @@ int main(void) {
     assert(!map_flexible(&flex,3*PAGE,3,0));
     assert(!reserve_range(&reserved,5*PAGE,0,PAGE));
     expect("flexible and reservation",4,1,1,8,3,7,4);
+    /* Layout: every committed view with its backing offset, the direct block, and bytes written
+     * through a guest view visible through the backing pool at that offset. */
+    {
+        RuntimeMemoryView views[64]; RuntimeMemoryBlock blks[64];
+        size_t nv=0, nb=0; uint64_t generation=0, direct=0, total=0;
+        assert(runtime_memory_layout(NULL,1,&nv,blks,64,&nb,&generation)==-1);
+        assert(!runtime_memory_layout(views,64,&nv,blks,64,&nb,&generation));
+        assert(generation==take().generation);
+        size_t small=0, small_blocks=0; uint64_t g2=0;
+        assert(!runtime_memory_layout(views,1,&small,blks,0,&small_blocks,&g2) && small==nv && small_blocks==nb);
+        const unsigned char *backing=runtime_memory_backing(&direct,&total);
+        assert(backing && direct==POOL_SIZE && total>direct);
+        int found_a=0, found_flex=0, found_block=0;
+        ((unsigned char *)a)[5]=0xA5; ((unsigned char *)flex)[PAGE+7]=0x5A;
+        for (size_t i=0;i<nv;++i) {
+            assert(i==0 || views[i-1].end<=views[i].start);
+            if (views[i].start==(uintptr_t)a) {
+                found_a=1;
+                assert(!views[i].flexible && views[i].phys==(uint64_t)physical && views[i].end==(uintptr_t)a+2*PAGE);
+                assert(backing[views[i].phys+5]==0xA5);
+            }
+            if (views[i].start==(uintptr_t)flex) {
+                found_flex=1;
+                assert(views[i].flexible && views[i].phys>=direct && views[i].end==(uintptr_t)flex+3*PAGE);
+                assert(backing[views[i].phys+PAGE+7]==0x5A);
+            }
+        }
+        for (size_t i=0;i<nb;++i) {
+            assert(i==0 || blks[i-1].start<blks[i].start);
+            found_block|=blks[i].start==(uint64_t)physical && blks[i].size==4*PAGE;
+        }
+        assert(found_a && found_flex && found_block);
+        /* The capture keeps backing pages by VM disposition: a page written only through a guest
+         * view must show as present through the backing view; a never-touched one must not. */
+        int disp[2]={-1,-1};
+        mach_vm_size_t one=1;
+        assert(mach_vm_page_range_query(mach_task_self(),(mach_vm_address_t)(backing+physical),vm_page_size,
+                                        (mach_vm_address_t)&disp[0],&one)==KERN_SUCCESS && one==1);
+        one=1;
+        assert(mach_vm_page_range_query(mach_task_self(),(mach_vm_address_t)(backing+physical+3*PAGE),vm_page_size,
+                                        (mach_vm_address_t)&disp[1],&one)==KERN_SUCCESS && one==1);
+        printf("  backing dispositions: written page %#x, untouched page %#x\n",disp[0],disp[1]);
+        assert(disp[0]!=0 && disp[1]==0);
+        printf("  layout: %zu views, %zu direct blocks; backing reads match guest writes\n",nv,nb);
+    }
     /* Unmapping the duplicate leaves A shared with the partial alias only. */
     assert(!direct_unmap(dup,2*PAGE));
     expect("duplicate unmapped",3,1,1,6,3,7,3);
@@ -79,4 +133,149 @@ int main(void) {
     expect("all views unmapped",0,0,1,0,0,0,0);
     assert(!direct_release(physical,4*PAGE));
     puts("PASS: inventory counts views, backing union and shared views through aliases and unmaps");
+
+    /* Guest-heap object identity (perf replay host resets): interior lookups name the object,
+     * ordinals follow allocation order, a freed object and a non-object address have none. */
+    {
+        unsigned char *x=runtime_guest_malloc(64), *y=runtime_guest_malloc(100);
+        RuntimeGuestObject ox, oy, none;
+        assert(x && y);
+        assert(!runtime_guest_object((uintptr_t)x+10,&ox) && ox.start==(uintptr_t)x && ox.size>=64);
+        assert(!runtime_guest_object((uintptr_t)y,&oy) && oy.start==(uintptr_t)y && oy.ordinal==ox.ordinal+1);
+        assert(strcmp(ox.module,"unknown") && ox.offset);
+        assert(runtime_guest_object((uintptr_t)y+oy.size,&none)==-1 || none.start!=(uintptr_t)y);
+        runtime_guest_free(x);
+        assert(runtime_guest_object((uintptr_t)x+10,&none)==-1);
+        assert(runtime_guest_object((uintptr_t)&none,&none)==-1); /* a stack address */
+        runtime_guest_free(y);
+        printf("  guest object identity: ordinal %llu, allocated at %s+%#llx\n",
+               (unsigned long long)ox.ordinal,ox.module,(unsigned long long)ox.offset);
+    }
+    /* Names authenticate semantic subranges, expire at owner free, and never alias by accident. */
+    {
+        unsigned char *owner=runtime_guest_malloc(128);
+        RuntimeReplayObject object;
+        unsetenv("BB_REPLAY_CAPTURE"); unsetenv("BB_REPLAY_RUN");
+        assert(!runtime_replay_name_object(NULL,0,NULL));
+        assert(runtime_replay_object((uintptr_t)owner,&object)==-1);
+        setenv("BB_REPLAY_RUN","test",1);
+        char name[]="test semantic range";
+        assert(!runtime_replay_name_object(owner+8,32,name));
+        name[0]='X';
+        assert(!runtime_replay_named("test semantic range",&object));
+        assert(object.start==(uintptr_t)owner+8 && object.size==32);
+        assert(!runtime_replay_object((uintptr_t)owner+39,&object));
+        assert(runtime_replay_object((uintptr_t)owner+40,&object)==-1);
+        assert(runtime_replay_named("unknown",&object)==-1);
+        assert(runtime_replay_name_object(owner+64,16,"test semantic range")==-1);
+        assert(runtime_replay_name_object(owner+16,16,"overlap")==-1);
+        assert(runtime_replay_name_object(owner+120,16,"straddle")==-1);
+        assert(runtime_replay_name_object(owner,0,"zero")==-1);
+        assert(runtime_replay_name_object((void *)(UINTPTR_MAX-2),8,"wrap")==-1);
+        char long_name[65]; memset(long_name,'x',64); long_name[64]=0;
+        assert(runtime_replay_name_object(owner+64,16,long_name)==-1);
+        assert(!runtime_replay_name_object(owner+64,16,"second"));
+        runtime_guest_free(owner);
+        assert(runtime_replay_named("test semantic range",&object)==-1);
+        assert(runtime_replay_named("second",&object)==-1);
+        unsigned char *reused=runtime_guest_malloc(128);
+        assert(reused==owner);
+        assert(runtime_replay_object((uintptr_t)reused+8,&object)==-1);
+        assert(!runtime_replay_name_object(reused+8,32,"test semantic range"));
+        runtime_guest_free(reused);
+        unsetenv("BB_REPLAY_RUN");
+        puts("PASS: semantic host names are owned, unambiguous, bounded and expire on free/reuse");
+    }
+    /* The exact production reset application preflights every target under the map and owner
+     * locks before writing the first byte. A bad last host identity cannot change an earlier
+     * host or guest sentinel. */
+    {
+        unsigned char *owner=runtime_guest_malloc(128);
+        void *guest=NULL;
+        RuntimeReplayObject first={0}, last={0};
+        char why[256];
+        unsigned char a=0xa1,b=0xb2,c=0xc3;
+        assert(owner && !map_flexible(&guest,PAGE,3,0));
+        memset(owner,0,128); memset(guest,0,PAGE);
+        setenv("BB_REPLAY_RUN","test",1);
+        assert(!runtime_replay_name_object(owner+8,8,"first"));
+        assert(!runtime_replay_name_object(owner+32,8,"last"));
+        assert(!runtime_replay_named("first",&first));
+        assert(!runtime_replay_named("last",&last));
+        RuntimeReplayReset rows[2]={
+            {.address=(uintptr_t)owner+8,.size=1,.bytes=&a,.host=1,.object=first,.offset=0},
+            {.address=(uintptr_t)owner+32,.size=1,.bytes=&b,.host=1,.object=last,.offset=0}
+        };
+        rows[1].object.size++;
+        assert(runtime_replay_apply_resets(rows,2,why,sizeof(why))==-1);
+        assert(owner[8]==0 && owner[32]==0);
+        rows[1].object=last;
+        rows[1].object.name[0]='X';
+        assert(runtime_replay_apply_resets(rows,2,why,sizeof(why))==-1);
+        assert(owner[8]==0 && owner[32]==0);
+        rows[1].object=last;
+        rows[0]=(RuntimeReplayReset){.address=(uintptr_t)guest,.size=1,.bytes=&c};
+        rows[1].offset=1;
+        assert(runtime_replay_apply_resets(rows,2,why,sizeof(why))==-1);
+        assert(((unsigned char *)guest)[0]==0 && owner[32]==0);
+        rows[1].offset=0;
+        assert(!runtime_replay_apply_resets(rows,2,why,sizeof(why)));
+        assert(((unsigned char *)guest)[0]==c && owner[32]==b);
+        rows[0]=(RuntimeReplayReset){.address=(uintptr_t)owner+8,.size=1,
+                                     .bytes=&a,.host=1,.object=first,.offset=0};
+        assert(!runtime_replay_apply_resets(rows,2,why,sizeof(why)));
+        assert(owner[8]==a && owner[32]==b);
+        owner[8]=0;
+        rows[1]=(RuntimeReplayReset){.address=(uintptr_t)&why,.size=1,.bytes=&b};
+        assert(runtime_replay_apply_resets(rows,2,why,sizeof(why))==-1);
+        assert(owner[8]==0);
+        runtime_guest_free(owner);
+        assert(runtime_replay_apply_resets(rows,2,why,sizeof(why))==-1);
+        assert(!release_flexible(guest,PAGE));
+        unsetenv("BB_REPLAY_RUN");
+        puts("PASS: production reset batch rejects invalid last identities before any write");
+    }
+    {
+        void *guest=NULL;
+        pthread_t allocator;
+        unsigned char value=0x6b;
+        char why[256];
+        assert(!map_flexible(&guest,PAGE,3,0));
+        RuntimeReplayReset row={.address=(uintptr_t)guest,.size=1,.bytes=&value};
+        assert(!pthread_create(&allocator,NULL,replay_allocator_growth,NULL));
+        for (unsigned i=0;i<1000;++i)
+            assert(!runtime_replay_apply_resets(&row,1,why,sizeof(why)));
+        assert(!pthread_join(allocator,NULL));
+        assert(((unsigned char *)guest)[0]==value);
+        assert(!release_flexible(guest,PAGE));
+        puts("PASS: production reset batch and growing guest allocator complete concurrently");
+    }
+    /* Replay map preflight: a malformed view table fails before anything is mapped. */
+    {
+        char why[512];
+        const uint64_t at=USER_MIN+UINT64_C(0x100000000);
+        ReplayBlock blk[2]={{0,4*PAGE,0,0},{8*PAGE,4*PAGE,0,0}};
+        ReplayView ok[2]={{at,at+2*PAGE,0,0,3,0,0},{at+4*PAGE,at+6*PAGE,8*PAGE,0,3,0,0}};
+        if (replay_preflight(blk,2,ok,2,why,sizeof(why))) { printf("  valid table refused: %s\n",why); assert(0); }
+        ReplayView v[2];
+        memcpy(v,ok,sizeof(v)); v[1].start=at+PAGE;                      /* overlap */
+        assert(replay_preflight(blk,2,v,2,why,sizeof(why))==-1);
+        memcpy(v,ok,sizeof(v)); v[0].start=LOW_MIN; v[0].end=LOW_MIN+PAGE; /* host low arena */
+        assert(replay_preflight(blk,2,v,2,why,sizeof(why))==-1);
+        memcpy(v,ok,sizeof(v)); v[0].end=at+PAGE+1;                       /* misaligned */
+        assert(replay_preflight(blk,2,v,2,why,sizeof(why))==-1);
+        memcpy(v,ok,sizeof(v)); v[1].phys=5*PAGE;                         /* backed by no block */
+        assert(replay_preflight(blk,2,v,2,why,sizeof(why))==-1);
+        memcpy(v,ok,sizeof(v)); v[0].flexible=2;                          /* unknown kind */
+        assert(replay_preflight(blk,2,v,2,why,sizeof(why))==-1);
+        ReplayBlock bad[2]={{0,4*PAGE,0,0},{2*PAGE,4*PAGE,0,0}};          /* overlapping blocks */
+        assert(replay_preflight(bad,2,ok,2,why,sizeof(why))==-1);
+        void *live=NULL;                                                  /* over a live mapping */
+        assert(!map_flexible(&live,PAGE,3,0));
+        ReplayView over={(uint64_t)(uintptr_t)live,(uint64_t)(uintptr_t)live+PAGE,POOL_SIZE,1,3,0,0};
+        assert(replay_preflight(blk,2,&over,1,why,sizeof(why))==-1);
+        printf("  replay preflight: last refusal: %s\n",why);
+        assert(!release_flexible(live,PAGE));
+        puts("PASS: guest object identity and replay map preflight controls");
+    }
 }

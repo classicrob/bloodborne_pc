@@ -23,6 +23,7 @@
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "bbport_parse_split.h"
 #include "bbport_pass_trace.h"
+#include "bbport_replay_gpu_probe.h"
 #include "bbport_hot_thread_qos.h"
 #include "bbport_threads.h"
 
@@ -123,7 +124,7 @@ void Scheduler::BeginRendering(const RenderState& new_state) {
     }
 
     const auto& db = render_state.depth_stencil_attachment;
-    const vk::RenderingAttachmentInfo depth_attachment = {
+    vk::RenderingAttachmentInfo depth_attachment = {
         .imageView = db.image_view,
         .imageLayout = db.image_layout,
         .loadOp = db.depth_clear ? vk::AttachmentLoadOp::eClear : vk::AttachmentLoadOp::eLoad,
@@ -132,7 +133,7 @@ void Scheduler::BeginRendering(const RenderState& new_state) {
             vk::ClearValue{.depthStencil = vk::ClearDepthStencilValue{.depth = std::bit_cast<float>(
                                                                           db.clear_value[0])}},
     };
-    const vk::RenderingAttachmentInfo stencil_attachment = {
+    vk::RenderingAttachmentInfo stencil_attachment = {
         .imageView = db.image_view,
         .imageLayout = db.image_layout,
         .loadOp = db.stencil_clear ? vk::AttachmentLoadOp::eClear : vk::AttachmentLoadOp::eLoad,
@@ -140,6 +141,22 @@ void Scheduler::BeginRendering(const RenderState& new_state) {
         .clearValue = vk::ClearValue{.depthStencil =
                                          vk::ClearDepthStencilValue{.stencil = db.clear_value[1]}},
     };
+
+#ifdef __APPLE__
+    if (BbReplayGpuProbe::CheckedMode() == BbReplayGpuProbe::Mode::DiscardLoadStore) {
+        // Destructive replay hypothesis probe. Preserve explicit clears, but discard LOAD
+        // and every bound aspect's STORE. Later readers can observe undefined contents.
+        const auto discard = [](vk::RenderingAttachmentInfo& attachment) {
+            BbReplayGpuProbe::DiscardAttachment(attachment, vk::AttachmentLoadOp::eLoad,
+                                                vk::AttachmentLoadOp::eDontCare,
+                                                vk::AttachmentStoreOp::eDontCare);
+        };
+        for (u32 i = 0; i < render_state.num_color_attachments; ++i) discard(color_attachments[i]);
+        if (db.has_depth) discard(depth_attachment);
+        if (db.has_stencil) discard(stencil_attachment);
+        BbReplayGpuProbe::NoteDiscardedPass();
+    }
+#endif
 
     const vk::RenderingInfo rendering_info = {
         .renderArea =

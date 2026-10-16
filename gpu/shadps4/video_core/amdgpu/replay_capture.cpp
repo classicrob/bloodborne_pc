@@ -66,6 +66,7 @@ void CountRegion(Pm4Census& census, std::span<const u32> words) {
 #include <vector>
 #include <fmt/format.h>
 #include "video_core/amdgpu/cmd_snapshot.h"
+#include "video_core/amdgpu/replay_perf_capture.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/texture_cache/capture_records.h"
 #include "video_core/texture_cache/texture_cache.h"
@@ -79,7 +80,10 @@ using Detail::Pm4Census;
 
 enum class State { Off, Waiting, Holding, Released, Done };
 
+enum class Mode { Inventory, Perf };
+
 struct Config {
+    Mode mode = Mode::Inventory;
     u64 arm_frames = 0;
     std::chrono::milliseconds hold_bound{3000};
     const char* trigger = nullptr; ///< BB_REPLAY_TRIGGER: frames count from its removal
@@ -97,9 +101,14 @@ const Config& Settings() {
             return c;
         }
         const std::string_view text{value};
-        constexpr std::string_view prefix = "inventory:";
-        if (!text.starts_with(prefix)) {
-            std::fprintf(stderr, "*** BB_REPLAY_CAPTURE=%s: only inventory:<frames> is implemented; "
+        std::string_view prefix;
+        if (text.starts_with("inventory:")) {
+            prefix = "inventory:";
+        } else if (text.starts_with("perf:")) {
+            prefix = "perf:";
+            c.mode = Mode::Perf;
+        } else {
+            std::fprintf(stderr, "*** BB_REPLAY_CAPTURE=%s: inventory:<frames> or perf:<frames>; "
                                  "capture disabled ***\n", value);
             return c;
         }
@@ -125,9 +134,10 @@ const Config& Settings() {
             c.trigger = trigger;
         }
         c.valid = true;
-        std::fprintf(stderr, "\n*** BB_REPLAY_CAPTURE: inventory at retired frame end %llu %s%s, hold "
+        std::fprintf(stderr, "\n*** BB_REPLAY_CAPTURE: %s at retired frame end %llu %s%s, hold "
                              "bound %lld ms (diagnostic: holds the GPU command thread for one frame) "
                              "***\n\n",
+                     c.mode == Mode::Perf ? "inventory + perf replay capture" : "inventory",
                      static_cast<unsigned long long>(c.arm_frames),
                      c.trigger ? "after creating " : "from launch", c.trigger ? c.trigger : "",
                      static_cast<long long>(c.hold_bound.count()));
@@ -348,14 +358,19 @@ void HoldEnded(Vulkan::Rasterizer* rasterizer, const Held& held) {
             ++it->second;
         }
     }
+    // Image authority: blocks inventory qualification, not a perf capture (its images are
+    // captured and restored).
+    std::vector<std::string> image_rejected;
     for (const auto& [why, count] : reasons) {
-        rejected.push_back(fmt::format("{} GPU-modified images not eligible for writeback ({})",
-                                       count, why));
+        image_rejected.push_back(fmt::format("{} GPU-modified images not eligible for writeback ({})",
+                                             count, why));
     }
 
     // Report.
-    fmt::print("Replay capture inventory (frame end {}, inventory only, nothing written):\n",
-               frames_seen);
+    fmt::print("Replay capture inventory (frame end {}, {}):\n", frames_seen,
+               Settings().mode == Mode::Perf
+                   ? "perf capture follows unless blocked; image rejections do not block it"
+                   : "inventory only, nothing written");
     fmt::print("  G1 cut: {} after {:.1f} ms hold; {} graphics submissions held ({:.1f} KiB copied at "
                "submit, {} graphics tasks queued); renderer quiescent: {}; host commands during "
                "hold: {}\n",
@@ -408,6 +423,8 @@ void HoldEnded(Vulkan::Rasterizer* rasterizer, const Held& held) {
                    image.aspects, image.samples, image.mips, image.layers,
                    image.reject ? fmt::format(" REJECT ({})", image.reject) : std::string{});
     }
+    const std::vector<std::string> perf_blockers = rejected;
+    rejected.insert(rejected.end(), image_rejected.begin(), image_rejected.end());
     if (rejected.empty()) {
         fmt::print("  VERDICT: no inventoried blocker found; capture NOT yet qualified. Unproven here: "
                    "guest CPU and HLE writers are not rendezvoused at the cut; low/untracked host "
@@ -418,6 +435,33 @@ void HoldEnded(Vulkan::Rasterizer* rasterizer, const Held& held) {
         fmt::print("  VERDICT: cut REJECTED:\n");
         for (const auto& why : rejected) {
             fmt::print("    - {}\n", why);
+        }
+    }
+    if (Settings().mode == Mode::Perf) {
+        // Perf replay v0 (pixel output not qualified): written unless the cut itself is unusable.
+        if (!perf_blockers.empty()) {
+            fmt::print("  PERF CAPTURE NOT WRITTEN: the cut has blockers other than image "
+                       "authority (listed above)\n");
+        } else if (!held.liverpool) {
+            fmt::print("  PERF CAPTURE NOT WRITTEN: no Liverpool state\n");
+        } else {
+            const auto t0 = std::chrono::steady_clock::now();
+            std::string why;
+            const std::string dir = Perf::Write(*held.liverpool, held.gfx, why);
+            const double ms = std::chrono::duration<double, std::milli>(
+                                  std::chrono::steady_clock::now() - t0).count();
+            if (dir.empty()) {
+                fmt::print("  PERF CAPTURE NOT WRITTEN ({:.0f} ms): {}\n", ms, why);
+            } else {
+                fmt::print("  PERF CAPTURE written to {} in {:.0f} ms (perf replay: pixel output "
+                           "not qualified{})\n",
+                           dir, ms,
+                           image_rejected.empty()
+                               ? ""
+                               : "; the image-authority rejects above do not apply: the "
+                                 "texture cache's images are captured and the replay restores "
+                                 "them");
+            }
         }
     }
     std::fflush(stdout);

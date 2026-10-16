@@ -462,7 +462,8 @@ void Liverpool::Process(std::stop_token stoken) {
                      .gfx_tasks = gfx_tasks,
                      .asc_tasks = asc_tasks,
                      .asc_seen = asc_seen,
-                     .host_commands = replay_hold_commands});
+                     .host_commands = replay_hold_commands,
+                     .liverpool = this});
                 replay_hold = false;
             }
             continue; // the held submissions (and the frame end, if it came) run next

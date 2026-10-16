@@ -17,6 +17,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <mach/mach.h>
 #include <pthread.h>
@@ -650,8 +651,33 @@ inline std::string RingLine(double frames) {
 }
 } // namespace detail
 
-/// On stage A at each frame end: every 600, prints the split per frame and starts a new window.
-/// `draws`: the running draw count (for draws per frame).
+/// Frame ends per window: BB_SPLIT_WINDOW (1..100000, default 600; the perf replay uses 1 for a
+/// line per iteration). A malformed value stops.
+inline std::uint64_t WindowFrames() {
+    static const std::uint64_t frames = [] {
+        const char* env = std::getenv("BB_SPLIT_WINDOW");
+        if (!env || !*env) {
+            return std::uint64_t{600};
+        }
+        std::uint64_t value = 0;
+        for (const char* c = env; *c; ++c) {
+            if (*c < '0' || *c > '9' || value > 100000) {
+                value = 0;
+                break;
+            }
+            value = value * 10 + std::uint64_t(*c - '0');
+        }
+        if (value < 1 || value > 100000) {
+            std::fprintf(stderr, "STOP: BB_SPLIT_WINDOW=%s: decimal digits, 1..100000\n", env);
+            std::abort();
+        }
+        return value;
+    }();
+    return frames;
+}
+
+/// On stage A at each frame end: every WindowFrames() (600), prints the split per frame and
+/// starts a new window. `draws`: the running draw count (for draws per frame).
 inline void NoteFrameEnd(std::uint64_t draws) {
     using namespace detail;
     const std::uint64_t now_cycles = __rdtsc();
@@ -677,7 +703,7 @@ inline void NoteFrameEnd(std::uint64_t draws) {
         window_frames = 0;
         return;
     }
-    if (++window_frames < 600) {
+    if (++window_frames < WindowFrames()) {
         return;
     }
     Flush(); // stage A: its open interval belongs to this window
@@ -718,7 +744,7 @@ inline void NoteFrameEnd(std::uint64_t draws) {
     const std::string b_cpu = OnCpu(stage_b, previous_cpu_b, frames);
     const std::string r_cpu = OnCpu(recorder, previous_cpu_r, frames);
     // Printed like the Stall lines: Info-level logging is filtered in perf runs.
-    std::printf("Parse split, last 600 frame ends: %.2f ms per frame, %.0f draws per frame "
+    std::printf("Parse split, last %llu frame ends: %.2f ms per frame, %.0f draws per frame "
                 "(stage A draw bucket %.2f us wall per draw); ms per frame by thread (accounted / wall)\n"
                 "  stage A (GPU command thread, %.0f%%, %s per frame): %s\n"
                 "    deferred-signal waits during: %s\n"
@@ -726,6 +752,7 @@ inline void NoteFrameEnd(std::uint64_t draws) {
                 "  stage B (draw recording thread, %.0f%%, %s per frame): %s\n"
                 "  Vulkan recording thread (%.0f%%, %s per frame): %s\n"
                 "%s\n%s\n",
+                static_cast<unsigned long long>(window_frames),
                 frame_ms, double(window_draw_count) / frames, a_us_per_draw,
                 100.0 * a_cycles * ms_per_cycle / wall_ms, a_cpu.c_str(), a_line.c_str(),
                 a_deferred.c_str(), a_drain.c_str(), 100.0 * b_cycles * ms_per_cycle / wall_ms,

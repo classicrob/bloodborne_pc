@@ -4,7 +4,16 @@
 #include <array>
 #include <cstdint>
 #include <cstdio>
+#include <cassert>
 #include "bbport_pass_trace.h"
+#include "bbport_replay_gpu_probe.h"
+
+namespace {
+bool replay_active = false;
+}
+namespace BbReplay {
+bool MeasurementActive() { return replay_active; }
+}
 
 namespace {
 struct FakeView {
@@ -68,7 +77,42 @@ void NoteViews(bool color, bool depth) {
 }
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc > 1) {
+        replay_active = !std::strcmp(argv[1], "probe-active");
+        struct Rect { struct { unsigned width, height; } extent; };
+        std::array<Rect, 3> rectangles{{{{1920, 1080}}, {{0, 1080}}, {{1, 1}}}};
+        const auto before = BbReplayGpuProbe::ReadCounters();
+        BbReplayGpuProbe::ApplyScissors(rectangles);
+        BbReplayGpuProbe::NoteDraw();
+        struct Attachment { unsigned imageView; int loadOp, storeOp; };
+        Attachment loaded{1, 0, 0}, cleared{1, 1, 0}, absent{0, 0, 0};
+        BbReplayGpuProbe::DiscardAttachment(loaded, 0, 2, 1);
+        BbReplayGpuProbe::DiscardAttachment(cleared, 0, 2, 1);
+        BbReplayGpuProbe::DiscardAttachment(absent, 0, 2, 1);
+        const auto mode = BbReplayGpuProbe::Requested();
+        const auto after = BbReplayGpuProbe::ReadCounters();
+        assert(rectangles[1].extent.width == 0 && rectangles[1].extent.height == 1080);
+        assert(rectangles[2].extent.width == 1 && rectangles[2].extent.height == 1);
+        assert(absent.loadOp == 0 && absent.storeOp == 0);
+        assert(cleared.loadOp == 1);
+        if (mode == BbReplayGpuProbe::Mode::Scissor1px) {
+            assert(rectangles[0].extent.width == 1 && rectangles[0].extent.height == 1);
+            assert(after.scissors == 1 && after.aspects == 0 && after.draws == 1);
+            assert(loaded.loadOp == 0 && loaded.storeOp == 0 && cleared.storeOp == 0);
+        } else if (mode == BbReplayGpuProbe::Mode::DiscardLoadStore) {
+            assert(rectangles[0].extent.width == 1920 && rectangles[0].extent.height == 1080);
+            assert(loaded.loadOp == 2 && loaded.storeOp == 1 && cleared.storeOp == 1);
+            assert(after.scissors == 0 && after.aspects == 2 && after.loads == 1 && after.draws == 1);
+        } else {
+            assert(rectangles[0].extent.width == 1920 && rectangles[0].extent.height == 1080);
+            assert(loaded.loadOp == 0 && loaded.storeOp == 0 && cleared.storeOp == 0);
+            assert(after.scissors == 0 && after.aspects == 0 && after.draws == 0);
+        }
+        BbReplayGpuProbe::ReportDelta(1, before);
+        std::printf("replay GPU probe controls: PASS\n");
+        return 0;
+    }
     if (!BbPassTrace::Enabled()) {
         std::fprintf(stderr, "FAIL: BB_PASS_TRACE is not set\n");
         return 1;

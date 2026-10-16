@@ -145,10 +145,12 @@ justify it.
 
 ## Output
 
-One block every 600 frame ends, printed from stage A:
+One block every 600 frame ends (`BB_SPLIT_WINDOW=<n>`, 1..100000, changes the window, for this
+block and the render pass census; the perf replay uses 1, a block per replayed iteration), printed
+from stage A:
 
 ```
-Parse split, last 600 frame ends: <ms> ms per frame, <n> draws per frame (stage A draw bucket <us> us wall per draw); ms per frame by thread (accounted / wall)
+Parse split, last <n> frame ends: <ms> ms per frame, <n> draws per frame (stage A draw bucket <us> us wall per draw); ms per frame by thread (accounted / wall)
   stage A (GPU command thread, <accounted %>, on CPU <ms> per frame): <bucket ms, ...>; in scopes: <kind ms, ...>
     deferred-signal waits during: <stage A bucket ms, ...>
     stage B drains at other packets during: <stage A bucket ms, ...>
