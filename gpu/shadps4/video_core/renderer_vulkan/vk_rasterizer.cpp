@@ -2011,6 +2011,11 @@ bool Rasterizer::TexturesBindableOnHelper(const Shader::Info& stage,
             image_id = depth_image_id;
             image = &texture_cache.GetImage(image_id);
         }
+#ifdef __APPLE__
+        // Linked refresh can record transfers and wait even after an earlier clean check.
+        // Keep it on the record owner; a CPU fault may dirty either member at any time.
+        if (image->bc4_float_parent || image->bc4_float_companion) return false;
+#endif
         if (image->binding.needs_rebind || !texture_cache.IsUpToDate(image_id) ||
             scene_targets->Tracks(image->image_uid) ||
             (upscaler->Enabled() && upscaler->RedirectsSampled(image_id))) {
