@@ -409,14 +409,19 @@ endif()
 if (APPLE)
     add_executable(bc4-cache-alias-test EXCLUDE_FROM_ALL
         ../tests/test_bc4_cache_alias.cpp ../src/runtime_memory.c)
-    target_include_directories(bc4-cache-alias-test PRIVATE shim shadps4
-        third_party/gcn/include third_party/sirit/include
-        third_party/sirit/externals/SPIRV-Headers/include)
-    target_compile_options(bc4-cache-alias-test PRIVATE -UNDEBUG -fPIC)
-    target_link_libraries(bc4-cache-alias-test PRIVATE bbgpu Vulkan::Vulkan)
-    add_custom_command(TARGET bc4-cache-alias-test POST_BUILD
-        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../packaging/macos/check-exports.py
-            $<TARGET_FILE:bbgpu> $<TARGET_FILE:bc4-cache-alias-test> VERBATIM)
+    add_executable(bc4-float-cache-alias-test EXCLUDE_FROM_ALL
+        ../tests/test_bc4_cache_alias.cpp ../src/runtime_memory.c)
+    target_compile_definitions(bc4-float-cache-alias-test PRIVATE BC4_CACHE_FLOAT_TAIL_PROBE)
+    foreach(bc4_cache_target bc4-cache-alias-test bc4-float-cache-alias-test)
+        target_include_directories(${bc4_cache_target} PRIVATE shim shadps4
+            third_party/gcn/include third_party/sirit/include
+            third_party/sirit/externals/SPIRV-Headers/include)
+        target_compile_options(${bc4_cache_target} PRIVATE -UNDEBUG -fPIC)
+        target_link_libraries(${bc4_cache_target} PRIVATE bbgpu Vulkan::Vulkan)
+        add_custom_command(TARGET ${bc4_cache_target} POST_BUILD
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../packaging/macos/check-exports.py
+                $<TARGET_FILE:bbgpu> $<TARGET_FILE:${bc4_cache_target}> VERBATIM)
+    endforeach()
 endif()
 
 if (APPLE)
