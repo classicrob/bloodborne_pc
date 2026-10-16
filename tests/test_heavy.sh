@@ -79,6 +79,19 @@ except SystemExit as error:
 else:
     raise AssertionError('unreadable held slot was admitted')
 os.close(fd)
+fd = os.open(os.path.join(os.environ['BB_HEAVY_DIR'], 'quick2'), os.O_RDWR | os.O_CREAT, 0o644)
+fcntl.flock(fd, fcntl.LOCK_EX)
+os.write(fd, json.dumps({'pool': 'quick', 'disk_budget': 10 * h['GB']}).encode())
+os.environ['BB_HEAVY_QUICK_SLOTS'] = '2'
+g['disk_free'] = lambda: h['DISK_FLOOR'] + 15 * h['GB']
+try:
+    g['disk_preflight']('extra configured slot', 'build', 'build0', 5 * h['GB'], 5 * h['GB'])
+except SystemExit as error:
+    assert error.code == 75
+else:
+    raise AssertionError('held slot outside caller count was ignored')
+del os.environ['BB_HEAVY_QUICK_SLOTS']
+os.close(fd)
 g['disk_free'] = lambda: h['DISK_FLOOR'] + 5 * h['GB'] - 1
 assert g['disk_low']('disk boundary', 5 * h['GB'])
 g['disk_free'] = lambda: h['DISK_FLOOR'] + 5 * h['GB']
@@ -114,6 +127,36 @@ while True: time.sleep(1)
     try:
         g['stop_for_disk'](job, 'disk stubborn descendant')
         assert g['disk_group_running'](job.pid) is False, 'disk stop left a descendant running'
+    finally:
+        if g['process_start'](descendant) == descendant_start:
+            os.kill(descendant, 9)
+        try:
+            job.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            os.kill(job.pid, 9)
+            job.wait()
+with tempfile.TemporaryDirectory() as temp:
+    child_pid_file = os.path.join(temp, 'detached.pid')
+    code = '''import os, signal, sys, time
+if os.fork() == 0:
+    os.setsid()
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    open(sys.argv[1], 'w').write(str(os.getpid()))
+while True: time.sleep(1)
+'''
+    job = subprocess.Popen([sys.executable, '-c', code, child_pid_file], start_new_session=True)
+    for _ in range(100):
+        if os.path.exists(child_pid_file):
+            break
+        time.sleep(0.02)
+    else:
+        raise AssertionError('detached descendant did not start')
+    descendant = int(open(child_pid_file).read())
+    descendant_start = g['process_start'](descendant)
+    try:
+        g['stop_for_disk'](job, 'disk detached descendant')
+        assert g['disk_group_running'](job.pid) is False, 'disk stop left original group running'
+        assert g['owned_running']({descendant: descendant_start}) is False, 'disk stop left detached child running'
     finally:
         if g['process_start'](descendant) == descendant_start:
             os.kill(descendant, 9)
