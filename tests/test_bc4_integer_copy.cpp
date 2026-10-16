@@ -1,3 +1,6 @@
+#if defined(BC4_FLOAT_MIP7_BUFFER_PROBE) && !defined(BC4_FLOAT_MIP7_PROBE)
+#error "BC4_FLOAT_MIP7_BUFFER_PROBE requires BC4_FLOAT_MIP7_PROBE"
+#endif
 #if defined(BC4_FLOAT_MIP7_PROBE)
 // Direct compressed-tail/float capability and a selective CPU publication model only.
 #include <algorithm>
@@ -60,6 +63,34 @@ bool HostCanaries(const unsigned char* data) {
     }
     return true;
 }
+#ifdef BC4_FLOAT_MIP7_BUFFER_PROBE
+constexpr unsigned BridgeOffset = Guard, BridgeBytes = 2 * Guard + 8;
+static_assert(BridgeOffset >= 8 && BridgeOffset % 8 == 0);
+bool BridgeCanaries(const unsigned char* data) {
+    for (unsigned i = 0; i < BridgeBytes; ++i) {
+        if (i >= BridgeOffset && i < BridgeOffset + 8) continue;
+        if (data[i] != 0xa5) return false;
+    }
+    return true;
+}
+bool BridgeOracleControls() {
+    std::array<unsigned char, BridgeBytes> bytes;
+    bytes.fill(0xa5);
+    for (const auto& expected : {Initial, Written}) {
+        const std::array<Word, 2> poison{~expected[0], ~expected[1]};
+        std::memcpy(bytes.data() + BridgeOffset, poison.data(), 8);
+        if (!std::memcmp(bytes.data() + BridgeOffset, expected.data(), 8) ||
+            !BridgeCanaries(bytes.data())) return false;
+    }
+    for (unsigned i = 0; i < BridgeBytes; ++i) {
+        if (i >= BridgeOffset && i < BridgeOffset + 8) continue;
+        bytes[i] ^= 1;
+        if (BridgeCanaries(bytes.data())) return false;
+        bytes[i] ^= 1;
+    }
+    return true;
+}
+#endif
 bool OracleControls() {
     if (MipBytes(TargetMip) != 8 || Width(TargetMip) != 2 || Height(TargetMip) != 1)
         return false;
@@ -82,6 +113,9 @@ bool OracleControls() {
         for (auto& word : unread) word = ~word;
         if (!std::memcmp(unread.data(), expected.data(), MipBytes(mip))) return false;
     }
+#ifdef BC4_FLOAT_MIP7_BUFFER_PROBE
+    if (!BridgeOracleControls()) return false;
+#endif
     return Initial != Poison && Initial != Written && Poison != Written;
 }
 } // namespace
@@ -89,7 +123,11 @@ bool OracleControls() {
 #ifdef BC4_COPY_ORACLE_ONLY
 int main() {
     const bool ok = OracleControls();
+#ifdef BC4_FLOAT_MIP7_BUFFER_PROBE
+    std::printf("bc4-float-mip7-buffer CPU oracle: %s (no Vulkan execution)\n", ok ? "PASS" : "FAIL");
+#else
     std::printf("bc4-float-mip7 CPU oracle: %s (no Vulkan execution)\n", ok ? "PASS" : "FAIL");
+#endif
     return ok ? 0 : 1;
 }
 #else
@@ -169,12 +207,24 @@ std::vector<u32> FloatStoreShader() {
 
 int main(int argc, char** argv) {
     const char* mode = argc == 2 ? argv[1] : "none";
+#ifdef BC4_FLOAT_MIP7_BUFFER_PROBE
+    const std::array allowed{"none", "--skip-forward", "--skip-store", "--skip-reverse",
+                             "--skip-publication", "--overpublish", "--skip-sibling-readback",
+                             "--skip-forward-upload", "--skip-reverse-upload"};
+#else
     const std::array allowed{"none", "--skip-forward", "--skip-store", "--skip-reverse",
                              "--skip-publication", "--overpublish", "--skip-sibling-readback"};
+#endif
     if (argc > 2 || std::none_of(allowed.begin(), allowed.end(),
                                 [&](const char* s) { return !std::strcmp(s, mode); })) {
+#ifdef BC4_FLOAT_MIP7_BUFFER_PROBE
+        std::fputs("usage: bc4-float-mip7-buffer-test [--skip-forward|--skip-forward-upload|"
+                   "--skip-store|--skip-reverse|--skip-reverse-upload|--skip-publication|"
+                   "--overpublish|--skip-sibling-readback]\n", stderr);
+#else
         std::fputs("usage: bc4-float-mip7-test [--skip-forward|--skip-store|--skip-reverse|"
                    "--skip-publication|--overpublish|--skip-sibling-readback]\n", stderr);
+#endif
         return 2;
     }
     const auto is = [&](const char* s) { return !std::strcmp(s, mode); };
@@ -192,8 +242,13 @@ int main(int argc, char** argv) {
     const auto properties = instance.GetPhysicalDevice().getProperties(d);
     std::printf("device=%s vendor=%#x driver=%#x mutation=%s\n", properties.deviceName.data(),
                 properties.vendorID, properties.driverVersion, mode);
+#ifdef BC4_FLOAT_MIP7_BUFFER_PROBE
+    std::puts("Explicit image-buffer-image capability; guarded8-byte bridge, no direct copy or fallback; "
+              "finite Rg32f constants; no live shader conversion, arbitrary-NaN, TextureCache or VM proof");
+#else
     std::puts("Direct vkCmdCopyImage capability; finite Rg32f constants; no Runtime::CopyImage, "
               "live shader conversion, arbitrary-NaN, TextureCache or VM proof");
+#endif
     const auto transfer_flags = vk::FormatFeatureFlagBits2::eTransferSrc |
                                 vk::FormatFeatureFlagBits2::eTransferDst;
     if (!instance.IsFormatSupported(vk::Format::eBc4UnormBlock, transfer_flags) ||
@@ -243,6 +298,22 @@ int main(int argc, char** argv) {
         std::fputs("STOP: host allocation failed; no fallback\n", stderr);
         scheduler.Close(); return 2;
     }
+#ifdef BC4_FLOAT_MIP7_BUFFER_PROBE
+    VkBuffer bridge{};
+    VmaAllocation bridge_allocation{};
+    VmaAllocationInfo bridge_mapped{};
+    auto bridge_info = bi;
+    bridge_info.size = BridgeBytes;
+    if (vmaCreateBuffer(instance.GetAllocator(), &bridge_info, &ac, &bridge,
+                        &bridge_allocation, &bridge_mapped) != VK_SUCCESS) {
+        std::fputs("STOP: dedicated bridge allocation failed; no fallback\n", stderr);
+        vmaDestroyBuffer(instance.GetAllocator(), host, allocation);
+        scheduler.Close(); return 2;
+    }
+    auto* bridge_data = static_cast<unsigned char*>(bridge_mapped.pMappedData);
+    std::memset(bridge_data, 0xa5, BridgeBytes);
+    unsigned forward_upload_calls = 0, reverse_upload_calls = 0;
+#endif
     auto* data = static_cast<unsigned char*>(mapped.pMappedData);
     std::memset(data, 0xa5, HostBytes);
     for (unsigned mip = 0; mip < Levels; ++mip) {
@@ -263,15 +334,28 @@ int main(int argc, char** argv) {
         });
         scheduler.Finish();
         vmaInvalidateAllocation(instance.GetAllocator(), allocation, 0, VK_WHOLE_SIZE);
+#ifdef BC4_FLOAT_MIP7_BUFFER_PROBE
+        vmaInvalidateAllocation(instance.GetAllocator(), bridge_allocation, 0, VK_WHOLE_SIZE);
+#endif
     };
     const auto shutdown = [&] {
         scheduler.Finish();
         scheduler.Close();
+#ifdef BC4_FLOAT_MIP7_BUFFER_PROBE
+        vmaDestroyBuffer(instance.GetAllocator(), bridge, bridge_allocation);
+#endif
         vmaDestroyBuffer(instance.GetAllocator(), host, allocation);
         test_alarm(0);
+#ifdef BC4_FLOAT_MIP7_BUFFER_PROBE
+        std::printf("buffer-copy calls forward-source=%u forward-upload=%u reverse-source=%u "
+                    "reverse-upload=%u typed-store=%u; direct-copy=0; no fallback\n",
+                    forward_calls, forward_upload_calls, reverse_calls, reverse_upload_calls, store_calls);
+        std::printf("bc4-float-mip7-buffer-test: %s (%u failures)\n", failures ? "FAIL" : "PASS", failures);
+#else
         std::printf("direct-copy calls forward=%u reverse=%u typed-store=%u; no fallback\n",
                     forward_calls, reverse_calls, store_calls);
         std::printf("bc4-float-mip7-test: %s (%u failures)\n", failures ? "FAIL" : "PASS", failures);
+#endif
         return failures ? 1 : 0;
     };
     const auto transfer = [&](VideoCore::Image& image, unsigned mip, unsigned slot, bool upload) {
@@ -303,6 +387,9 @@ int main(int argc, char** argv) {
     };
     const auto flush_host = [&] {
         vmaFlushAllocation(instance.GetAllocator(), allocation, 0, VK_WHOLE_SIZE);
+#ifdef BC4_FLOAT_MIP7_BUFFER_PROBE
+        vmaFlushAllocation(instance.GetAllocator(), bridge_allocation, 0, VK_WHOLE_SIZE);
+#endif
     };
     const auto read_parent = [&](bool skip_sibling = false) {
         for (unsigned mip = 0; mip < Levels; ++mip) {
@@ -318,6 +405,57 @@ int main(int argc, char** argv) {
         }
         return true;
     };
+#ifdef BC4_FLOAT_MIP7_BUFFER_PROBE
+    const auto poison_bridge = [&](const std::array<Word, 2>& expected) {
+        const std::array<Word, 2> poison{~expected[0], ~expected[1]};
+        std::memcpy(bridge_data + BridgeOffset, poison.data(), 8);
+    };
+    const auto buffer_copy = [&](bool forward) {
+        const bool skip_source = is(forward ? "--skip-forward" : "--skip-reverse");
+        const bool skip_upload = is(forward ? "--skip-forward-upload" : "--skip-reverse-upload");
+        if (skip_source || skip_upload)
+            std::printf("MUTATION %s after clean %s; omit %s leg only\n", mode + 2,
+                        forward ? "setup" : "store", skip_source ? "source" : "destination");
+        auto& src = forward ? parent : companion;
+        auto& dst = forward ? companion : parent;
+        runtime.Transit(&src, vk::ImageLayout::eTransferSrcOptimal,
+                        vk::PipelineStageFlagBits2::eCopy, vk::AccessFlagBits2::eTransferRead);
+        runtime.Transit(&dst, vk::ImageLayout::eTransferDstOptimal,
+                        vk::PipelineStageFlagBits2::eCopy, vk::AccessFlagBits2::eTransferWrite);
+        runtime.FlushBarriers();
+        const vk::BufferImageCopy source{
+            .bufferOffset = BridgeOffset, .bufferRowLength = 0, .bufferImageHeight = 0,
+            .imageSubresource = {vk::ImageAspectFlagBits::eColor, forward ? TargetMip : 0, 0, 1},
+            .imageOffset = {0, 0, 0}, .imageExtent = {forward ? 2u : 1u, 1, 1}};
+        const vk::BufferImageCopy destination{
+            .bufferOffset = BridgeOffset, .bufferRowLength = 0, .bufferImageHeight = 0,
+            .imageSubresource = {vk::ImageAspectFlagBits::eColor, forward ? 0 : TargetMip, 0, 1},
+            .imageOffset = {0, 0, 0}, .imageExtent = {forward ? 1u : 2u, 1, 1}};
+        scheduler.Record([&, src_image = src.GetImage(), dst_image = dst.GetImage(), source,
+                          destination, skip_source, skip_upload](vk::CommandBuffer cmd) {
+            if (!skip_source)
+                cmd.copyImageToBuffer(src_image, vk::ImageLayout::eTransferSrcOptimal, bridge, source, d);
+            const vk::BufferMemoryBarrier2 barrier{
+                .srcStageMask = vk::PipelineStageFlagBits2::eCopy,
+                .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+                .dstStageMask = vk::PipelineStageFlagBits2::eCopy,
+                .dstAccessMask = vk::AccessFlagBits2::eTransferRead,
+                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .buffer = bridge, .offset = BridgeOffset, .size = 8};
+            cmd.pipelineBarrier2({.bufferMemoryBarrierCount = 1, .pBufferMemoryBarriers = &barrier}, d);
+            if (!skip_upload)
+                cmd.copyBufferToImage(bridge, dst_image, vk::ImageLayout::eTransferDstOptimal, destination, d);
+        });
+        if (forward) {
+            forward_calls += !skip_source;
+            forward_upload_calls += !skip_upload;
+        } else {
+            reverse_calls += !skip_source;
+            reverse_upload_calls += !skip_upload;
+        }
+    };
+#else
     const auto direct_copy = [&](bool forward) {
         auto& src = forward ? parent : companion;
         auto& dst = forward ? companion : parent;
@@ -336,6 +474,7 @@ int main(int argc, char** argv) {
         });
         if (forward) ++forward_calls; else ++reverse_calls;
     };
+#endif
     poison_parent(false); poison_float(Poison); flush_host();
     for (unsigned mip = 0; mip < Levels; ++mip) transfer(parent, mip, mip, true);
     transfer(companion, 0, FloatUpload, true);
@@ -344,12 +483,29 @@ int main(int argc, char** argv) {
     Expect("clean setup: typed destination equals differing finite poison",
            !std::memcmp(data + Offset(FloatRead), Poison.data(), 8));
     Expect("clean setup: all readback boundaries intact", HostCanaries(data));
+#ifdef BC4_FLOAT_MIP7_BUFFER_PROBE
+    Expect("clean setup: dedicated bridge canaries intact", BridgeCanaries(bridge_data));
+#endif
     if (failures) { std::puts("SETUP FAIL before mutation"); return shutdown(); }
 
+#ifdef BC4_FLOAT_MIP7_BUFFER_PROBE
+    poison_parent(false); poison_float(Initial); poison_bridge(Initial); flush_host();
+    buffer_copy(true);
+#else
     poison_parent(false); poison_float(Initial); flush_host();
     if (is("--skip-forward")) std::puts("MUTATION skip-forward after clean setup");
     else direct_copy(true);
+#endif
     transfer(companion, 0, FloatRead, false); read_parent(); finish();
+#ifdef BC4_FLOAT_MIP7_BUFFER_PROBE
+    Expect("FORWARD BRIDGE oracle: source leg produced exact8 bytes",
+           !std::memcmp(bridge_data + BridgeOffset, Initial.data(), 8));
+    Expect("forward bridge canaries intact", BridgeCanaries(bridge_data));
+    Expect("forward recorded leg counts match selected arm",
+           forward_calls == unsigned(!is("--skip-forward")) &&
+           forward_upload_calls == unsigned(!is("--skip-forward-upload")) &&
+           reverse_calls == 0 && reverse_upload_calls == 0 && store_calls == 0);
+#endif
     Expect("FORWARD oracle: exact8 bytes from compressed mip7", !std::memcmp(data + Offset(FloatRead), Initial.data(), 8));
     Expect("forward leaves all source parent mips unchanged", parent_matches(false));
     Expect("forward preserves host canaries", HostCanaries(data));
@@ -390,13 +546,32 @@ int main(int argc, char** argv) {
     transfer(companion, 0, FloatRead, false); finish();
     Expect("STORE oracle: finite typedfloat output exact8 bytes", !std::memcmp(data + Offset(FloatRead), Written.data(), 8));
     Expect("storage readback preserves host canaries", HostCanaries(data));
+#ifdef BC4_FLOAT_MIP7_BUFFER_PROBE
+    Expect("storage leaves bridge bytes and canaries unchanged",
+           !std::memcmp(bridge_data + BridgeOffset, Initial.data(), 8) && BridgeCanaries(bridge_data));
+    Expect("storage recorded call count matches selected arm", store_calls == unsigned(!is("--skip-store")));
+#endif
     if (failures) return shutdown();
+#ifdef BC4_FLOAT_MIP7_BUFFER_PROBE
+    poison_parent(true); poison_bridge(Written); flush_host();
+    buffer_copy(false);
+#else
     poison_parent(true); flush_host();
     if (is("--skip-reverse")) std::puts("MUTATION skip-reverse after clean store");
     else direct_copy(false);
+#endif
     if (is("--skip-sibling-readback"))
         std::puts("MUTATION skip-sibling-readback after clean store; mip0 remains poisoned");
     read_parent(is("--skip-sibling-readback")); finish();
+#ifdef BC4_FLOAT_MIP7_BUFFER_PROBE
+    Expect("REVERSE BRIDGE oracle: source leg produced exact8 bytes",
+           !std::memcmp(bridge_data + BridgeOffset, Written.data(), 8));
+    Expect("reverse bridge canaries intact", BridgeCanaries(bridge_data));
+    Expect("reverse recorded leg counts match selected arm",
+           forward_calls == 1 && forward_upload_calls == 1 && store_calls == 1 &&
+           reverse_calls == unsigned(!is("--skip-reverse")) &&
+           reverse_upload_calls == unsigned(!is("--skip-reverse-upload")));
+#endif
     Expect("REVERSE oracle: selected block equals typed store bytes",
            !std::memcmp(data + Offset(Levels + TargetMip), Written.data(), 8));
     bool siblings_match = true;
