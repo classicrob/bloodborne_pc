@@ -11,7 +11,8 @@
 /// on any mismatch or short read.
 namespace ReplayFormat {
 
-constexpr u32 Version = 2; ///< 2: host resets carry a HostObjectRecord
+constexpr u32 Version = 2; ///< unchanged layouts for every file except resets.bin
+constexpr u32 ResetsVersion = 3; ///< named host objects; legacy allocator identity is refused
 
 struct FileHeader {
     char magic[8];  ///< one of the *Magic values, not NUL-terminated
@@ -116,14 +117,14 @@ struct ResetRecord {
     u32 opcode; ///< the PM4 opcode that named it (first one, after merging)
     u32 host;   ///< 1: outside the guest views (host memory, e.g. an HLE object in the low arena)
 };
-/// After a host reset's bytes: the guest-heap object it lies in (runtime_guest_object), which the
-/// replay must find with the same identity before it writes the bytes.
+/// After each host reset's bytes: an explicitly registered semantic range. The reset address
+/// must equal start + offset and its whole payload must lie in the range. Base address still
+/// has to match across builds because the command packets embed it.
 struct HostObjectRecord {
-    u64 start, size, ordinal; ///< payload start and size, allocation sequence number
-    u64 offset;               ///< the allocating code: offset in `module`
-    char module[64];          ///< its file name, NUL-terminated
+    u64 start, size, offset;
+    char name[64]; ///< owned name, nonempty and NUL-terminated
 };
-static_assert(sizeof(HostObjectRecord) == 96);
+static_assert(sizeof(HostObjectRecord) == 88);
 
 /// images.bin: per GPU-modified image (Rasterizer::CaptureImages), an ImageHeader, its state
 /// blob, then `aspects` x (AspectRecord + texels).

@@ -969,6 +969,68 @@ static uint64_t guest_alloc_ordinal;
 #define GUEST_CHUNK ((size_t)1024*1024)
 static pthread_mutex_t guest_heap_lock=PTHREAD_MUTEX_INITIALIZER;
 static GuestAllocation *guest_heap;
+typedef struct {
+    RuntimeReplayObject object;
+    GuestAllocation *owner;
+} ReplayNamedObject;
+static ReplayNamedObject replay_named_objects[32];
+
+int runtime_replay_name_object(void *pointer, uint64_t size, const char *name) {
+    const char *capture=getenv("BB_REPLAY_CAPTURE"), *replay=getenv("BB_REPLAY_RUN");
+    if ((!capture || !*capture) && (!replay || !*replay)) return 0;
+    const uintptr_t start=(uintptr_t)pointer;
+    if (!pointer || !size || size>UINTPTR_MAX-start || !name || !*name || strnlen(name,64)>=64)
+        return -1;
+    pthread_mutex_lock(&guest_heap_lock);
+    GuestAllocation *owner=NULL;
+    for (GuestAllocation *at=guest_heap; at; at=at->next) {
+        const uintptr_t base=(uintptr_t)at+GUEST_HEADER;
+        if (!at->free && start>=base && size<=at->size && start-base<=at->size-size) {
+            owner=at; break;
+        }
+    }
+    ReplayNamedObject *slot=NULL;
+    int conflict=0;
+    for (size_t i=0;i<sizeof(replay_named_objects)/sizeof(replay_named_objects[0]);++i) {
+        ReplayNamedObject *at=&replay_named_objects[i];
+        if (!at->owner) { if (!slot) slot=at; continue; }
+        if (!strcmp(at->object.name,name) ||
+            (start<at->object.start+at->object.size && at->object.start<start+size)) conflict=1;
+    }
+    const int ok=owner && slot && !conflict;
+    if (ok) {
+        slot->owner=owner;
+        slot->object.start=start; slot->object.size=size;
+        memcpy(slot->object.name,name,strlen(name)+1);
+    }
+    pthread_mutex_unlock(&guest_heap_lock);
+    return ok ? 0 : -1;
+}
+int runtime_replay_named(const char *name, RuntimeReplayObject *out) {
+    if (!name || !*name || strnlen(name,64)>=64 || !out) return -1;
+    pthread_mutex_lock(&guest_heap_lock);
+    for (size_t i=0;i<sizeof(replay_named_objects)/sizeof(replay_named_objects[0]);++i) {
+        const ReplayNamedObject *at=&replay_named_objects[i];
+        if (at->owner && !strcmp(at->object.name,name)) {
+            *out=at->object; pthread_mutex_unlock(&guest_heap_lock); return 0;
+        }
+    }
+    pthread_mutex_unlock(&guest_heap_lock);
+    return -1;
+}
+int runtime_replay_object(uintptr_t address, RuntimeReplayObject *out) {
+    if (!out) return -1;
+    pthread_mutex_lock(&guest_heap_lock);
+    for (size_t i=0;i<sizeof(replay_named_objects)/sizeof(replay_named_objects[0]);++i) {
+        const ReplayNamedObject *at=&replay_named_objects[i];
+        if (at->owner && address>=at->object.start && address-at->object.start<at->object.size) {
+            *out=at->object; pthread_mutex_unlock(&guest_heap_lock); return 0;
+        }
+    }
+    pthread_mutex_unlock(&guest_heap_lock);
+    return -1;
+}
+
 static void *guest_malloc_from(size_t size, const void *caller);
 __attribute__((noinline)) void *runtime_guest_malloc(size_t size) {
     return guest_malloc_from(size,__builtin_return_address(0));
@@ -1037,6 +1099,9 @@ __attribute__((noinline)) void runtime_guest_free(void *pointer) {
     GuestAllocation *block=(GuestAllocation *)((unsigned char *)pointer-GUEST_HEADER);
     pthread_mutex_lock(&guest_heap_lock);
     low_trace("free","host-object",pointer,block->size,0,__builtin_return_address(0));
+    for (size_t i=0;i<sizeof(replay_named_objects)/sizeof(replay_named_objects[0]);++i) {
+        if (replay_named_objects[i].owner==block) replay_named_objects[i]=(ReplayNamedObject){0};
+    }
     block->free=1;
     for (GuestAllocation *at=guest_heap; at && at->next;) {
         GuestAllocation *next=at->next;

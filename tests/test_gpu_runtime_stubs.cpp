@@ -27,6 +27,14 @@ int runtime_memory_layout(RuntimeMemoryView*, size_t, size_t*, RuntimeMemoryBloc
 const void* runtime_memory_backing(uint64_t*, uint64_t*) { std::abort(); }
 int runtime_guest_image(uintptr_t*, uint64_t*) { std::abort(); }
 int runtime_guest_object(uintptr_t, RuntimeGuestObject*) { std::abort(); }
+int runtime_replay_name_object(void*, uint64_t, const char*) {
+    const char* capture = std::getenv("BB_REPLAY_CAPTURE");
+    const char* replay = std::getenv("BB_REPLAY_RUN");
+    if ((!capture || !*capture) && (!replay || !*replay)) return 0;
+    std::abort();
+}
+int runtime_replay_named(const char*, RuntimeReplayObject*) { std::abort(); }
+int runtime_replay_object(uintptr_t, RuntimeReplayObject*) { std::abort(); }
 void runtime_hle_trace_dump(void) { std::abort(); }
 void runtime_hle_trace_frame(void) {}
 void runtime_cpu_profile_thread(const char*) {}

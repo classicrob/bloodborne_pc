@@ -238,6 +238,26 @@ int main() {
         Check(first && !second && m.size() == 1 && m.at(1) == 10,
               "image round trip: a duplicate key is refused, not dropped");
     }
+    {
+        ReplayFormat::HostObjectRecord object{0x1000, 0x80, 0x20, "semantic range"};
+        Check(BbReplay::HostMatches(object, 0x1020, 8, 0x1000, 0x80),
+              "host reset: named range accepts exact address/size/offset");
+        Check(!BbReplay::HostMatches(object, 0x1020, 8, 0x2000, 0x80),
+              "host reset: same name moved across builds rejects");
+        Check(!BbReplay::HostMatches(object, 0x1020, 8, 0x1000, 0x81),
+              "host reset: changed range size rejects");
+        Check(!BbReplay::HostSpanValid(object, 0x1024, 8),
+              "host reset: embedded target must match registered base plus offset");
+        Check(!BbReplay::HostSpanValid(object, 0x1020, 0x61),
+              "host reset: whole payload must fit");
+        object.start=UINT64_MAX-0x10;
+        Check(!BbReplay::HostSpanValid(object, UINT64_MAX-1, 8),
+              "host reset: wrapping registered range rejects");
+        object={0x1000, 0x80, 0x20, ""};
+        Check(!BbReplay::HostSpanValid(object, 0x1020, 8), "host reset: empty name rejects");
+        std::memset(object.name, 'x', sizeof(object.name));
+        Check(!BbReplay::HostSpanValid(object, 0x1020, 8), "host reset: unterminated name rejects");
+    }
     std::fprintf(stderr, "%s: %u failures\n", failures ? "FAIL" : "PASS", failures);
     return failures ? 1 : 0;
 }

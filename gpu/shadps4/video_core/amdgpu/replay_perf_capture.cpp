@@ -39,12 +39,13 @@ using AmdGpu::CmdSnapshot;
 using AmdGpu::Liverpool;
 using AmdGpu::ReplayStateAccess;
 
-constexpr u64 MinFreeAfter = u64{40} << 30; // the orchestrator's disk floor (40 GB)
+constexpr u64 MinFreeAfter = u64{55} << 30; // 50 GiB hard floor plus 5 GiB buffer
 
 /// One capture file: a FileHeader (record count patched at Close) and its records.
 class File {
 public:
-    bool Open(const std::filesystem::path& path, const char (&magic)[8], std::string& why) {
+    bool Open(const std::filesystem::path& path, const char (&magic)[8], std::string& why,
+              u32 version = Version) {
         file = std::fopen(path.c_str(), "wb");
         if (!file) {
             why = fmt::format("cannot create {}: {}", path.string(), std::strerror(errno));
@@ -53,7 +54,7 @@ public:
         name = path.string();
         FileHeader header{};
         std::memcpy(header.magic, magic, 8);
-        header.version = Version;
+        header.version = file_version = version;
         std::memcpy(this->magic, magic, 8);
         return Write(&header, sizeof(header), why);
     }
@@ -76,7 +77,7 @@ public:
     bool Close(std::string& why) {
         FileHeader header{};
         std::memcpy(header.magic, magic, 8);
-        header.version = Version;
+        header.version = file_version;
         header.records = records;
         const bool ok = std::fseek(file, 0, SEEK_SET) == 0 &&
                         std::fwrite(&header, sizeof(header), 1, file) == 1 &&
@@ -100,6 +101,7 @@ private:
     std::FILE* file = nullptr;
     std::string name;
     char magic[8]{};
+    u32 file_version = Version;
 };
 
 /// Reads host memory without faulting: false if any byte is unreadable.
@@ -475,7 +477,7 @@ bool WriteResets(const std::filesystem::path& dir, const Memory& m, ResetWalk& w
         }
     }
     File f;
-    if (!f.Open(dir / "resets.bin", ResetsMagic, why)) {
+    if (!f.Open(dir / "resets.bin", ResetsMagic, why, ResetsVersion)) {
         return false;
     }
     std::vector<u8> value;
@@ -496,22 +498,18 @@ bool WriteResets(const std::filesystem::path& dir, const Memory& m, ResetWalk& w
         host_count += host;
         HostObjectRecord object{};
         if (host) {
-            // Host memory is restored only into an identified object: a live guest-heap object
-            // (runtime_guest_malloc) holding the whole range.
-            RuntimeGuestObject o{};
-            if (runtime_guest_object(r.address, &o) != 0 || r.bytes > o.size ||
-                r.address - o.start > o.size - r.bytes) {
-                why = fmt::format("reset range [{:#x}, +{:#x}) (packet {:#04x}) is host memory outside "
-                                  "any live guest-heap object: the replay could not identify it",
+            RuntimeReplayObject o{};
+            if (runtime_replay_object(r.address, &o) != 0 || r.bytes > o.size ||
+                r.address < o.start || r.address - o.start > o.size - r.bytes) {
+                why = fmt::format("reset range [{:#x}, +{:#x}) (packet {:#04x}) is host memory "
+                                  "outside an explicitly named live range",
                                   r.address, r.bytes, r.opcode);
                 return false;
             }
             object.start = o.start;
             object.size = o.size;
-            object.ordinal = o.ordinal;
-            object.offset = o.offset;
-            std::memcpy(object.module, o.module, sizeof(object.module));
-            object.module[sizeof(object.module) - 1] = 0;
+            object.offset = r.address - o.start;
+            std::memcpy(object.name, o.name, sizeof(object.name));
         }
         if (!f.Put(ResetRecord{r.address, u32(r.bytes), r.kind, r.opcode, u32(host)}, why) ||
             !f.Write(value.data(), value.size(), why) || (host && !f.Put(object, why))) {
@@ -579,7 +577,7 @@ std::string Write(const Liverpool& liverpool, std::span<const std::shared_ptr<Cm
     const u64 free_bytes = u64(fs.f_bavail) * fs.f_frsize;
     if (free_bytes < estimate || free_bytes - estimate < MinFreeAfter) {
         why = fmt::format("{:.1f} GiB free, the capture needs up to {:.1f} GiB and must leave {} GiB: "
-                          "delete an older capture under {}",
+                          "capture refused; preserve unique evidence and coordinate disk space under {}",
                           free_bytes / 1073741824.0, estimate / 1073741824.0, MinFreeAfter >> 30,
                           base.string());
         return {};

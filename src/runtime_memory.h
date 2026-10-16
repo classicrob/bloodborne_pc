@@ -108,6 +108,19 @@ typedef struct {
     uint64_t offset;
 } RuntimeGuestObject;
 int runtime_guest_object(uintptr_t address, RuntimeGuestObject *out);
+/* Semantic host ranges for cross-build replay. Registration is inactive unless capture or
+ * replay was requested. Names are copied (1..63 bytes), ranges must lie in one live guest-heap
+ * allocation, and duplicate names or overlapping ranges fail (-1). Freeing that allocation
+ * removes its names before the memory can be reused. Registration/lookup do not pin lifetime:
+ * replay uses them only at quiescent startup, with no guest/HLE writers. */
+typedef struct {
+    uintptr_t start;
+    uint64_t size;
+    char name[64];
+} RuntimeReplayObject;
+int runtime_replay_name_object(void *pointer, uint64_t size, const char *name);
+int runtime_replay_named(const char *name, RuntimeReplayObject *out);
+int runtime_replay_object(uintptr_t address, RuntimeReplayObject *out);
 void runtime_set_guest_image(uintptr_t start, uint64_t size);
 /* Writes through the backing view, bypassing guest/GPU page protection: 1, or 0 when part of
  * the range has no backing. */

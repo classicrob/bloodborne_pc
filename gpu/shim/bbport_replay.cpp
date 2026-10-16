@@ -50,7 +50,8 @@ using namespace ReplayFormat;
 /// A capture file: header checked, records read in order, any short read is an error.
 class Reader {
 public:
-    bool Open(const std::filesystem::path& path, const char (&magic)[8], std::string& why) {
+    bool Open(const std::filesystem::path& path, const char (&magic)[8], std::string& why,
+              u32 version = Version) {
         file = std::fopen(path.c_str(), "rb");
         name = path.string();
         if (!file) {
@@ -61,8 +62,8 @@ public:
         if (!Read(&header, sizeof(header), why)) {
             return false;
         }
-        if (std::memcmp(header.magic, magic, 8) || header.version != Version) {
-            why = fmt::format("{}: not a version {} capture file", name, Version);
+        if (std::memcmp(header.magic, magic, 8) || header.version != version || header.reserved) {
+            why = fmt::format("{}: expected version {} capture file (legacy host resets need explicit migration)", name, version);
             return false;
         }
         records = header.records;
@@ -71,6 +72,13 @@ public:
     bool Read(void* out, size_t size, std::string& why) {
         if (size && std::fread(out, 1, size, file) != size) {
             why = fmt::format("{}: truncated", name);
+            return false;
+        }
+        return true;
+    }
+    bool End(std::string& why) {
+        if (std::fgetc(file) != EOF || std::ferror(file)) {
+            why = fmt::format("{}: trailing bytes or read error", name);
             return false;
         }
         return true;
@@ -265,22 +273,39 @@ private:
 
     bool LoadResets(const std::filesystem::path& dir, std::string& why) {
         Reader r;
-        if (!r.Open(dir / "resets.bin", ResetsMagic, why)) {
+        if (!r.Open(dir / "resets.bin", ResetsMagic, why, ResetsVersion)) {
             return false;
         }
+        if (r.records > 1000000) {
+            why = "resets.bin: more than 1000000 ranges";
+            return false;
+        }
+        u64 previous_end = 0;
         for (u64 i = 0; i < r.records; ++i) {
             ResetRecord rr{};
             if (!r.Get(rr, why)) {
                 return false;
             }
+            if (rr.host > 1 || !rr.bytes || rr.bytes > (256u << 20) ||
+                rr.address > UINT64_MAX - rr.bytes || rr.kind < ResetKind::Written ||
+                rr.kind > ResetKind::Indirect || rr.address < previous_end) {
+                why = "resets.bin: invalid host flag, kind, size or wrapping span";
+                return false;
+            }
+            previous_end = rr.address + rr.bytes;
             Reset reset{rr.address, std::vector<u8>(rr.bytes), rr.host != 0};
             if (!r.Read(reset.bytes.data(), reset.bytes.size(), why) ||
                 (reset.host && !r.Get(reset.object, why))) {
                 return false;
             }
+            if (reset.host && !BbReplay::HostSpanValid(reset.object, reset.address,
+                                                       reset.bytes.size())) {
+                why = "resets.bin: invalid named host range or reset offset";
+                return false;
+            }
             resets.push_back(std::move(reset));
         }
-        return true;
+        return r.End(why);
     }
 };
 
@@ -430,30 +455,37 @@ struct ProcessCounters {
 /// Restores everything the frame starts from: the reset ranges, the command words and the
 /// Liverpool parse state. The GPU command thread is idle (waiting for a submission).
 bool Restore(AmdGpu::Liverpool& lp, Capture& c, std::string& why) {
+    // Validate every host identity before writing even the first guest or host reset.
+    for (const auto& reset : c.resets) {
+        if (!reset.host) {
+            for (u64 at = reset.address, end = at + reset.bytes.size(); at < end;) {
+                uintptr_t lo = 0, hi = 0;
+                int mapped = 0;
+                if (!runtime_memory_region(at, &lo, &hi, &mapped) || !mapped || hi <= at) {
+                    why = fmt::format("reset range {:#x} (+{}) is not fully mapped",
+                                      reset.address, reset.bytes.size());
+                    return false;
+                }
+                at = std::min<u64>(hi, end);
+            }
+            continue;
+        }
+        const auto& want = reset.object;
+        RuntimeReplayObject live{};
+        const bool found = runtime_replay_named(want.name, &live) == 0;
+        if (!found || !BbReplay::HostMatches(want, reset.address, reset.bytes.size(),
+                                            live.start, live.size)) {
+            why = fmt::format("host reset range {:#x} (+{}): named object '{}' expected "
+                              "[{:#x}, +{:#x}) offset {:#x}; here {}",
+                              reset.address, reset.bytes.size(), want.name, want.start, want.size,
+                              want.offset, found ? fmt::format("[{:#x}, +{:#x})", live.start,
+                                                              live.size)
+                                                 : std::string{"name not registered"});
+            return false;
+        }
+    }
     for (const auto& reset : c.resets) {
         if (reset.host) {
-            // Host memory (an HLE object the frame's packets write): restored only into the live
-            // guest-heap object with the captured identity (same payload range, allocation
-            // ordinal and allocating code), never by address alone.
-            const HostObjectRecord& want = reset.object;
-            RuntimeGuestObject o{};
-            const bool found = runtime_guest_object(reset.address, &o) == 0;
-            const bool same = found && o.start == want.start && o.size == want.size &&
-                              o.ordinal == want.ordinal && o.offset == want.offset &&
-                              std::strncmp(o.module, want.module, sizeof(o.module)) == 0 &&
-                              reset.bytes.size() <= o.size &&
-                              reset.address - o.start <= o.size - reset.bytes.size();
-            if (!same) {
-                why = fmt::format(
-                    "host reset range {:#x} (+{}): the capture's object is guest-heap #{} [{:#x}, "
-                    "+{:#x}) allocated at {}+{:#x}; here {}",
-                    reset.address, reset.bytes.size(), want.ordinal, want.start, want.size,
-                    want.module, want.offset,
-                    found ? fmt::format("#{} [{:#x}, +{:#x}) at {}+{:#x}", o.ordinal, o.start,
-                                        o.size, o.module, o.offset)
-                          : std::string{"no live guest-heap object holds it"});
-                return false;
-            }
             std::memcpy(reinterpret_cast<void*>(reset.address), reset.bytes.data(),
                         reset.bytes.size());
             continue;

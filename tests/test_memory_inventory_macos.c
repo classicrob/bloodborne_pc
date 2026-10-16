@@ -142,6 +142,41 @@ int main(void) {
         printf("  guest object identity: ordinal %llu, allocated at %s+%#llx\n",
                (unsigned long long)ox.ordinal,ox.module,(unsigned long long)ox.offset);
     }
+    /* Names authenticate semantic subranges, expire at owner free, and never alias by accident. */
+    {
+        unsigned char *owner=runtime_guest_malloc(128);
+        RuntimeReplayObject object;
+        unsetenv("BB_REPLAY_CAPTURE"); unsetenv("BB_REPLAY_RUN");
+        assert(!runtime_replay_name_object(NULL,0,NULL));
+        assert(runtime_replay_object((uintptr_t)owner,&object)==-1);
+        setenv("BB_REPLAY_RUN","test",1);
+        char name[]="test semantic range";
+        assert(!runtime_replay_name_object(owner+8,32,name));
+        name[0]='X';
+        assert(!runtime_replay_named("test semantic range",&object));
+        assert(object.start==(uintptr_t)owner+8 && object.size==32);
+        assert(!runtime_replay_object((uintptr_t)owner+39,&object));
+        assert(runtime_replay_object((uintptr_t)owner+40,&object)==-1);
+        assert(runtime_replay_named("unknown",&object)==-1);
+        assert(runtime_replay_name_object(owner+64,16,"test semantic range")==-1);
+        assert(runtime_replay_name_object(owner+16,16,"overlap")==-1);
+        assert(runtime_replay_name_object(owner+120,16,"straddle")==-1);
+        assert(runtime_replay_name_object(owner,0,"zero")==-1);
+        assert(runtime_replay_name_object((void *)(UINTPTR_MAX-2),8,"wrap")==-1);
+        char long_name[65]; memset(long_name,'x',64); long_name[64]=0;
+        assert(runtime_replay_name_object(owner+64,16,long_name)==-1);
+        assert(!runtime_replay_name_object(owner+64,16,"second"));
+        runtime_guest_free(owner);
+        assert(runtime_replay_named("test semantic range",&object)==-1);
+        assert(runtime_replay_named("second",&object)==-1);
+        unsigned char *reused=runtime_guest_malloc(128);
+        assert(reused==owner);
+        assert(runtime_replay_object((uintptr_t)reused+8,&object)==-1);
+        assert(!runtime_replay_name_object(reused+8,32,"test semantic range"));
+        runtime_guest_free(reused);
+        unsetenv("BB_REPLAY_RUN");
+        puts("PASS: semantic host names are owned, unambiguous, bounded and expire on free/reuse");
+    }
     /* Replay map preflight: a malformed view table fails before anything is mapped. */
     {
         char why[512];
