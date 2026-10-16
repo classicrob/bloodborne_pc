@@ -39,6 +39,57 @@ void RunBc4AliasPolicy() {
     assert(!Bc4Alias::RejectLayout(ui, bc));
     assert(!Bc4Alias::RejectStoredLayout(bc));
     assert(!Bc4Alias::RejectStoredLayout(ui));
+    assert(Bc4Alias::NeedsAliasPreflight(bc, ui, false));
+    assert(Bc4Alias::NeedsAliasPreflight(ui, bc, false));
+    assert(!Bc4Alias::NeedsAliasPreflight(bc, bc, false));
+    assert(Bc4Alias::NeedsAliasPreflight(bc, bc, true));
+    {
+        // The observed sampled mip chain and an interior, unconverted float image.
+        auto sampled = bc;
+        sampled.guest_address = 0x70e2470700;
+        sampled.guest_size = 0xab400;
+        sampled.size = {1024, 1024, 1};
+        sampled.pitch = 1024;
+        sampled.resources.levels = 11;
+        sampled.props.is_tiled = sampled.props.is_pow2 = true;
+        sampled.tile_mode = AmdGpu::TileMode::Thin1DThin;
+        sampled.array_mode = AmdGpu::ArrayMode::Array1DTiledThin1;
+        auto interior = ui;
+        interior.pixel_format = vk::Format::eR32G32Sfloat;
+        interior.guest_address = 0x70e24c8800;
+        interior.guest_size = 0x200;
+        interior.size = {1, 1, 1};
+        interior.pitch = 8;
+        interior.props.is_tiled = true;
+        interior.tile_mode = sampled.tile_mode;
+        interior.array_mode = sampled.array_mode;
+        assert(Bc4Alias::RangesOverlap(sampled.guest_address, sampled.guest_size,
+                                      interior.guest_address, interior.guest_size));
+        assert(!Bc4Alias::NeedsAliasPreflight(sampled, interior, false));
+        assert(!Bc4Alias::NeedsAliasPreflight(interior, sampled, false));
+        assert(Bc4Alias::NeedsAliasPreflight(sampled, interior, true));
+        assert(Bc4Alias::NeedsAliasPreflight(interior, sampled, true));
+        assert(Bc4Alias::NeedsAliasPreflight(interior, interior, true));
+        // Classification changes no admission rule: this is never a supported conversion.
+        assert(Bc4Alias::RejectLayout(sampled, interior));
+        assert(Bc4Alias::RejectLayout(interior, sampled));
+        auto same_base = interior;
+        same_base.guest_address = sampled.guest_address;
+        assert(Bc4Alias::NeedsAliasPreflight(sampled, same_base, false));
+        assert(Bc4Alias::NeedsAliasPreflight(same_base, sampled, false));
+        auto wrong_base_uint = interior;
+        wrong_base_uint.pixel_format = vk::Format::eR32G32Uint;
+        assert(Bc4Alias::NeedsAliasPreflight(sampled, wrong_base_uint, false));
+        assert(Bc4Alias::NeedsAliasPreflight(wrong_base_uint, sampled, false));
+        assert(Bc4Alias::RejectLayout(sampled, wrong_base_uint));
+        assert(Bc4Alias::RejectLayout(wrong_base_uint, sampled));
+        auto wrong_shape_uint = wrong_base_uint;
+        wrong_shape_uint.guest_address = sampled.guest_address;
+        assert(Bc4Alias::NeedsAliasPreflight(sampled, wrong_shape_uint, false));
+        assert(Bc4Alias::NeedsAliasPreflight(wrong_shape_uint, sampled, false));
+        assert(Bc4Alias::RejectLayout(sampled, wrong_shape_uint));
+        assert(Bc4Alias::RejectLayout(wrong_shape_uint, sampled));
+    }
     for (bool tiled : {false, true}) {
         auto a = bc, b = ui;
         if (tiled) {
@@ -59,6 +110,7 @@ void RunBc4AliasPolicy() {
         reject([](auto& i) { ++i.guest_size; });
         reject([](auto& i) { i.resources.levels = 2; });
         reject([](auto& i) { i.resources.layers = 2; });
+        reject([](auto& i) { i.type = AmdGpu::ImageType::Color3D; });
         reject([](auto& i) { i.num_samples = 2; });
         reject([](auto& i) { i.mips_layout[0].offset = 8; });
         reject([](auto& i) { ++i.mips_layout[0].size; });

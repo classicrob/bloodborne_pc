@@ -26,6 +26,17 @@ inline bool CrossesBc4(const ImageInfo& a, const ImageInfo& b) {
            (b.pixel_format == vk::Format::eBc4UnormBlock && !a.props.is_block);
 }
 
+inline bool NeedsAliasPreflight(const ImageInfo& request, const ImageInfo& cached,
+                                bool cached_converted) {
+    // Converted ownership must never escape through ordinary overlap resolution. For ordinary
+    // images, an interior noninteger view is not the same-base integer block-grid alias route.
+    return cached_converted ||
+           (CrossesBc4(request, cached) &&
+            (request.guest_address == cached.guest_address ||
+             request.pixel_format == vk::Format::eR32G32Uint ||
+             cached.pixel_format == vk::Format::eR32G32Uint));
+}
+
 // A deliberately complete, unpadded block grid. No min-mip/min-layer copy or assumption that
 // a storage shader overwrites all blocks is sufficient to admit a different guest layout.
 inline const char* RejectLayout(const ImageInfo& a, const ImageInfo& b) {

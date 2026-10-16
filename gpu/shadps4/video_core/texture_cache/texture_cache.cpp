@@ -853,6 +853,9 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     // before registration, refresh or retirement; a view of BC4 can never become storage.
     for (const auto old_id : image_ids) {
         auto& old = slot_images[old_id];
+        if (!Bc4Alias::NeedsAliasPreflight(info, old.info, old.bc4_integer_alias)) {
+            continue;
+        }
         if (!Bc4Alias::CrossesBc4(info, old.info)) {
             if (old.bc4_integer_alias) CheckBc4AliasUse(old, desc);
             continue;

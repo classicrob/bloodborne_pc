@@ -14,15 +14,19 @@
 #include <signal.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <array>
+#include <bit>
 #include <chrono>
 #include <cstdio>
 #include <string>
+#include <string_view>
 #include "common/slot_vector.h"
 #include "shader_recompiler/resource.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/texture_cache/blit_helper.h" // Runtime destroys its BlitHelper
+#include "video_core/texture_cache/bc4_alias.h"
 #include "video_core/texture_cache/host_compatibility.h"
 #include "video_core/texture_cache/image.h"
 #include "video_core/texture_cache/image_view.h"
@@ -124,8 +128,41 @@ AmdGpu::Image Sharp(VAddr address, AmdGpu::DataFormat data, AmdGpu::NumberFormat
 }
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
     RunBc4AliasPolicy();
+    {
+        // Exact effective sampled T# from the 0f5a replay rejection, and its cached layout.
+        const std::array<u32, 8> words{0x70e24707, 0x02600000, 0x00ffc3ff, 0x96da0204,
+                                       0x007fe000, 0, 0, 0};
+        const auto sharp = std::bit_cast<AmdGpu::Image>(words);
+        Shader::ImageResource sampled{};
+        const VideoCore::ImageInfo mip_chain{sharp, sampled};
+        auto float_sharp = Sharp(0x70e24c8800, AmdGpu::DataFormat::Format32_32,
+                                  AmdGpu::NumberFormat::Float, 1, 1);
+        float_sharp.pitch = 7;
+        float_sharp.tiling_index = u32(AmdGpu::TileMode::Thin1DThin);
+        const VideoCore::ImageInfo interior{float_sharp, sampled};
+        Expect("observed BC4 T# constructs the complete 11-mip guest layout",
+               mip_chain.pixel_format == vk::Format::eBc4UnormBlock &&
+                   mip_chain.guest_address == 0x70e2470700 && mip_chain.guest_size == 0xab400 &&
+                   mip_chain.resources.levels == 11 && mip_chain.mips_layout[0].size == 0x80000);
+        Expect("observed interior float layout is one padded 1x1 microtile",
+               interior.pixel_format == vk::Format::eR32G32Sfloat &&
+                   interior.guest_address == 0x70e24c8800 && interior.guest_size == 0x200 &&
+                   interior.size == VideoCore::Extent3D{1, 1, 1} && interior.pitch == 8);
+        Expect("format compatibility alone does not reject the observed overlap",
+               interior.IsCompatible(mip_chain));
+        Expect("production MipOf rejects the interior address/geometry as a subresource",
+               interior.MipOf(mip_chain) == -1);
+        Expect("unconverted observed pair takes ordinary overlap resolution",
+               !VideoCore::Bc4Alias::NeedsAliasPreflight(mip_chain, interior, false));
+        Expect("converted observed pair still requires alias preflight",
+               VideoCore::Bc4Alias::NeedsAliasPreflight(mip_chain, interior, true));
+    }
+    if (argc == 2 && std::string_view{argv[1]} == "--cpu-overlap-only") {
+        std::printf("CPU overlap %s: %u failure(s)\n", failures ? "FAIL" : "PASS", failures);
+        return failures ? 1 : 0;
+    }
     // The fixture's own bound (before any Vulkan): a child that closes stderr and stays alive is
     // killed at the deadline, not waited for.
     const ChildResult silent = RunChild(
