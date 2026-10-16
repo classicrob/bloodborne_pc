@@ -310,6 +310,33 @@ def pin_artifacts(record):
     return pinned / 'bb-probe'
 
 
+def verify_preview_manifest(path, artifacts, required=False):
+    if path is None:
+        if required:
+            die('--native-1080p requires --preview-manifest with an executed PASS gate')
+        return None
+    try:
+        path = Path(path).resolve(strict=True)
+        data = path.read_bytes()
+        value = json.loads(data)
+        if value.get('qualification', {}).get('test_gate') != 'PASS':
+            raise ValueError('qualification.test_gate must be PASS')
+        source = value.get('source_tree', {})
+        if not re.fullmatch(r'[0-9a-f]{40}', source.get('head', '')):
+            raise ValueError('full source_tree.head SHA required')
+        for name in ('bb-probe', 'libbbgpu.dylib'):
+            item = value['artifacts'][name]
+            declared = Path(item['path'])
+            actual = artifacts[name]
+            if (not declared.is_absolute() or declared.resolve(strict=True) != Path(actual['path']).resolve(strict=True)
+                    or item['sha256'] != actual['sha256']):
+                raise ValueError(f'{name} stage path/hash does not match the verified --probe pair')
+        return {'path': str(path), 'sha256': hashlib.sha256(data).hexdigest(),
+                'source_tree': source, 'test_gate': 'PASS', 'submodules': value.get('submodules', {})}
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as e:
+        die(f'preview manifest preflight failed: {e}')
+
+
 def translated_games():
     out = subprocess.run(['pgrep', '-x', 'bb-probe'], capture_output=True, text=True).stdout.split()
     return [int(p) for p in out]
@@ -317,6 +344,8 @@ def translated_games():
 
 def launch(args):
     settings, window_size, expected_pixels = launch_display(args)
+    if args.native_1080p and args.preview_manifest is None:
+        die('--native-1080p requires --preview-manifest with an executed PASS gate')
     if args.perf_phases and not args.perf:
         die('--perf-phases requires --perf')
     dyld = sorted(k for k in os.environ if k.startswith('DYLD_'))
@@ -348,6 +377,10 @@ def launch(args):
     if not (deps / 'share/vulkan/icd.d/MoltenVK_icd.json').is_file():
         die(f'no MoltenVK ICD under {deps} (set BB_DEPS_PREFIX)')
     artifacts = verify_artifacts(Path(args.probe))
+    preview = verify_preview_manifest(args.preview_manifest, artifacts, required=args.native_1080p)
+    if preview:
+        artifacts['source_tree_observed'] = artifacts['source_tree']
+        artifacts['source_tree'] = preview['source_tree']
     probe = pin_artifacts(artifacts)
 
     stamp = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
@@ -426,6 +459,7 @@ def launch(args):
         (run / 'captures').mkdir()
         env.update(BB_CAPTURE_TRIGGER=str(run / 'capture.trigger'), BB_CAPTURE_DIR=str(run / 'captures'))
     record = {'run': run.name, 'started': now(), 'output': args.output, 'settings': settings,
+              'preview': preview,
               'artifacts': artifacts, 'pinned_probe': str(probe), 'repo_head': subprocess.run(
                   ['git', '-C', str(ROOT), 'rev-parse', 'HEAD'], capture_output=True, text=True).stdout.strip(),
               'env': {k: v for k, v in env.items() if k.startswith(('BB_', 'DYLD_'))}, 'env_removed': removed,
@@ -958,6 +992,8 @@ def main():
     for command in ('launch', 'route'):
         p = sub.add_parser(command)
         p.add_argument('--probe', required=True, help='signed production bb-probe (gpu/libbbgpu.dylib beside it)')
+        p.add_argument('--preview-manifest', type=Path,
+                       help='PASS shared-preview manifest matching --probe (required with --native-1080p)')
         p.add_argument('--output', choices=sorted(SETTINGS), default='1080p')
         p.add_argument('--window-size', type=dimensions, metavar='WIDTHxHEIGHT',
                        help='window size in points (default 960x540; render size is separate)')

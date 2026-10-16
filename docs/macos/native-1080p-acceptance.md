@@ -16,6 +16,7 @@ their enabled defaults. Added SSR, cheats and tweaks retain disabled defaults.
 Disabling a default effect or reducing internal resolution is not an accepted arm.
 
 `play_route.py route --native-1080p --probe <signed-preview>/bb-probe
+--preview-manifest <signed-preview>/manifest.json
 --fixture <scene> --until world --keep` selects this configuration, requests a
 1920x1080-point background window and requires its logged pixel size to be
 1920x1080. The default tool mode remains 960x540. On a display where points and
@@ -24,6 +25,12 @@ not a reason to accept a different output size. The option refuses ini,
 unreviewed diagnostic and nonzero initial optimization-mask overrides. It uses
 an empty external patch directory/selection and records generated patches.bin
 and configuration hashes before releasing the launch lock.
+Native mode requires the shared preview manifest's executed `test_gate=PASS`,
+full source SHA and exact stage paths/hashes for the verified probe/library pair
+before pinning any artifacts. Its byte hash and source metadata are retained in
+the route manifest; staged artifacts need not reside in a git checkout. Signing
+alone cannot qualify a preview. A non-PASS preview may still be used in generic
+diagnostic mode without making a native acceptance claim.
 
 `live_resolution=0` at 1080p still uses the host live-target path: the startup
 patch generator returns no scaled size for the game's native output. Expected
