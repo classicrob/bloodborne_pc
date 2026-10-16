@@ -51,6 +51,7 @@ bool MeasurementActive() { return measurement_active.load(std::memory_order_acqu
 #include <xxhash.h>
 #include "../../src/runtime_memory.h"
 #include "bbport_replay_compare.h"
+#include "bbport_replay_gpu_probe.h"
 
 extern std::unique_ptr<AmdGpu::Liverpool> liverpool;
 
@@ -399,7 +400,7 @@ private:
                 return false;
             }
             previous_end = rr.address + rr.bytes;
-            if (!r.CanRead(rr.bytes + (rr.host ? sizeof(RuntimeReplayObject) : 0), why)) {
+            if (!r.CanRead(rr.bytes + (rr.host ? sizeof(HostObjectRecord) : 0), why)) {
                 return false;
             }
             Reset reset{rr.address, std::vector<u8>(rr.bytes), rr.host != 0};
@@ -981,6 +982,7 @@ extern "C" int bbgpu_replay_run(const char* dir, unsigned iterations) {
             return 3;
         }
         MeasurementScope measurement_scope;
+        const auto probe_before = BbReplayGpuProbe::ReadCounters();
         const auto t0 = std::chrono::steady_clock::now();
         for (const auto& sub : capture.submissions) {
             const u32* dcb[1] = {sub.dcb};
@@ -1115,6 +1117,7 @@ extern "C" int bbgpu_replay_run(const char* dir, unsigned iterations) {
                        "{:.2f} ms\n",
                        it, collected_submissions, collected_ms);
         }
+        BbReplayGpuProbe::ReportDelta(it, probe_before);
         std::fflush(stdout);
     }
     if (iterations >= 3) {
