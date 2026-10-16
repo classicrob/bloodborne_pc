@@ -287,6 +287,17 @@ int main(int argc, char** argv) {
         }
         scheduler.Finish(); // also holds the descriptor view through GPU completion
     };
+    const auto shutdown = [&] {
+        runtime_memory_set_gpu_lifetime_hooks(nullptr, nullptr, nullptr);
+        runtime_memory_set_gpu_hooks(nullptr, nullptr, nullptr);
+        liverpool.reset();
+        scheduler.Finish();
+        scheduler.Close();
+        runtime.SetImageAccessHook(nullptr, nullptr);
+        scheduler.SetSubmitCallback({});
+        rasterizer.reset();
+        test_alarm(0);
+    };
     on_a([&] { select(bc); read_image(cache.GetImage(image_id), Seed(0)); });
     const auto faults_before = write_faults;
     std::memcpy(guest + Offset, Tiled(Seed(1)).data(), Bytes);
@@ -313,6 +324,15 @@ int main(int argc, char** argv) {
     }
     Expect("command completion publishes exact tiled bytes", Matches(guest + Offset, Tiled(Seed(1, true))));
     Expect("publication preserves full guest page canaries", Canaries(guest));
+    if (is("--skip-store") || is("--skip-materialize")) {
+        // End this one deliberate bypass after its oracle; do not enter a second mutation
+        // with a failed first oracle and misclassify that as a setup failure.
+        assert(!release(physical, Page));
+        shutdown();
+        std::printf("bc4-cache-alias bypass: %s (%u failures)\n",
+                    failures ? "FAIL as expected" : "UNEXPECTED PASS", failures);
+        return failures ? 1 : 0;
+    }
     on_a([&] {
         if (is("--raw-interior") || is("--raw-full")) {
             RequireNegativeSetup();
@@ -372,15 +392,7 @@ int main(int argc, char** argv) {
     assert(runtime_memory_alias_snapshot(address, nullptr, 0, &before) == 1);
     Expect("same-VA same-size physical reuse has a new mapping generation", before.generation > after.generation);
     assert(!release(replacement, Page));
-    runtime_memory_set_gpu_lifetime_hooks(nullptr, nullptr, nullptr);
-    runtime_memory_set_gpu_hooks(nullptr, nullptr, nullptr);
-    liverpool.reset();
-    scheduler.Finish();
-    scheduler.Close();
-    runtime.SetImageAccessHook(nullptr, nullptr);
-    scheduler.SetSubmitCallback({});
-    rasterizer.reset();
-    test_alarm(0);
+    shutdown();
     std::printf("bc4-cache-alias-test: %s (%u failures); completed cache/VM operations only\n",
                 failures ? "FAIL" : "PASS", failures);
     return failures ? 1 : 0;
