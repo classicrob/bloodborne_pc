@@ -651,6 +651,17 @@ void Rasterizer::CollectRingBindings(const Shader::Info& stage, const PreparedDr
     }
 }
 
+#ifdef __APPLE__
+void Rasterizer::SyncBc4ImageWritesBeforeSelection() {
+    if (!OnStageA()) return;
+    // SRT/fetch/tessellation reads and prepared-data revalidation precede ring copying.
+    // Draining the rare eligible producer also waits for its command-exit writeback.
+    bc4_image_write_order.BeforeRead(draw_pipe.get(), [&] {
+        DrainDrawPipe(DrawPipe::ReasonCommands);
+    });
+}
+#endif
+
 void Rasterizer::PostDraw(const Pipeline* pipeline, const PreparedDraw* used_prepared,
                           bool is_indexed, u32 index_offset, const AmdGpu::ComputeProgram* cs,
                           const IndirectDraw* indirect) {
@@ -700,6 +711,12 @@ void Rasterizer::PostDraw(const Pipeline* pipeline, const PreparedDraw* used_pre
         }
 #endif
     }
+#ifdef __APPLE__
+    std::vector<std::pair<VAddr, u64>> image_writes;
+    ForEachBc4ImageWrite({stages.data(), stages.size()}, [&](VAddr address, u64 bytes) {
+        image_writes.emplace_back(address, bytes);
+    });
+#endif
     // Constants: copied here into the ring, the recording thread only binds them.
     thread_local std::array<boost::container::static_vector<RingBinding, Shader::NUM_BUFFERS>,
                             Shader::MaxStageTypes>
@@ -796,6 +813,15 @@ void Rasterizer::PostDraw(const Pipeline* pipeline, const PreparedDraw* used_pre
     }
     dirty.Clear();
     draw_pipe->Commit(static_cast<u32>(out - start));
+#ifdef __APPLE__
+    if (!image_writes.empty()) {
+        // Head before Commit names the previous packet and can already be consumed.
+        bc4_image_write_order.NoteCommitted(*draw_pipe);
+        for (const auto [address, bytes] : image_writes) {
+            NotePendingGpuWrite(address, bytes);
+        }
+    }
+#endif
     PrintPipeStats();
 }
 
@@ -1054,6 +1080,9 @@ bool Rasterizer::FilterDrawPasses() const {
 
 void Rasterizer::Draw(bool is_indexed, u32 index_offset, const PreparedDraw* prepared) {
     RENDERER_TRACE;
+#ifdef __APPLE__
+    SyncBc4ImageWritesBeforeSelection();
+#endif
     BbStats::draws.fetch_add(1, std::memory_order_relaxed);
 
     // bbport: with the draw pipeline this thread only selects the pipeline and hands the draw
@@ -1448,6 +1477,9 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
                               u32 max_count, VAddr count_address, u16 vertex_sgpr_offset,
                               u16 instance_sgpr_offset) {
     RENDERER_TRACE;
+#ifdef __APPLE__
+    SyncBc4ImageWritesBeforeSelection();
+#endif
     // bbport: like direct draws, handed to the recording thread after the pipeline selection
     // (else the GPU thread waited here for a whole frame of queued draws).
     const bool pipelined = UseDrawPipe() && FilterDrawPasses() &&
@@ -1664,6 +1696,9 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
 
 void Rasterizer::DispatchDirect() {
     RENDERER_TRACE;
+#ifdef __APPLE__
+    SyncBc4ImageWritesBeforeSelection();
+#endif
     BbStats::dispatches.fetch_add(1, std::memory_order_relaxed);
     // bbport: like draws, handed to the draw recording thread after the pipeline selection.
     const bool pipelined = UseDrawPipe() && !BbToggle::Disabled(BbToggle::PipelinedDispatch);
@@ -1746,6 +1781,9 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
 
 void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     RENDERER_TRACE;
+#ifdef __APPLE__
+    SyncBc4ImageWritesBeforeSelection();
+#endif
     // bbport: handed to the recording thread like direct dispatches.
     const bool pipelined = UseDrawPipe() && !BbToggle::Disabled(BbToggle::PipelinedIndirectDraws);
     if (!pipelined) {
@@ -5233,6 +5271,7 @@ Rasterizer::~Rasterizer() {
         draw_pipe->Drain(); // while draw_pipe still points to it (its packets may consult it)
     }
     draw_pipe.reset();
+    bc4_image_write_order = {};
     read_checker.reset();
 #endif
 }

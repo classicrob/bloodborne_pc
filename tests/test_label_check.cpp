@@ -32,6 +32,7 @@
 #include "bbport_thread_report.h"
 #include "bbport_write_order.h"
 #include "video_core/renderer_vulkan/vk_draw_pipe.h"
+#include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "bbport_compute_sh.h"
 #include "bbport_frame_marks.h"
 #include "bbport_hot_thread_qos.h"
@@ -188,10 +189,112 @@ int HotThreadChild(const std::string& mode) {
 }
 } // namespace
 
+static void Bc4ImageOrderControls(bool precommit, bool skip_drain) {
+    struct Fixture {
+        std::atomic<bool> release{false};
+        std::atomic<u32> backing{0x11111111};
+    } fixture;
+    const auto handler = [](void* context, const u8*, u32) {
+        auto& f = *static_cast<Fixture*>(context);
+        while (!f.release.load(std::memory_order_acquire)) std::this_thread::yield();
+        // Represents the command-exit synchronous materialization, before consumption.
+        f.backing.store(0x22222222, std::memory_order_release);
+    };
+    Vulkan::DrawPipe pipe(handler, &fixture);
+    Vulkan::Bc4ImageWriteOrder order;
+    unsigned drains = 0;
+    const auto drain = [&] {
+        ++drains;
+        fixture.release.store(true, std::memory_order_release);
+        pipe.Drain();
+    };
+    order.BeforeRead(&pipe, drain);
+    Expect("BC4 no candidate: no selection drain", drains == 0);
+    *pipe.Begin(1) = 0;
+    if (precommit) order.NoteCommitted(pipe);
+    pipe.Commit(1);
+    if (!precommit) order.NoteCommitted(pipe);
+    const u32 prepared_snapshot = fixture.backing.load();
+    Expect("BC4 held producer: old snapshot exists before selection", prepared_snapshot == 0x11111111);
+    if (!skip_drain) order.BeforeRead(&pipe, drain);
+    const u32 fresh_snapshot = fixture.backing.load();
+    Expect("BC4 selection waits for producer writeback", drains == 1 && fresh_snapshot == 0x22222222);
+    Expect("BC4 stale prepared bytes differ from fresh selection", fresh_snapshot != prepared_snapshot);
+    // Release even for mutations so teardown cannot hide the expected failure with a hang.
+    fixture.release.store(true, std::memory_order_release);
+    pipe.Drain();
+    order.NoteCommitted(pipe);
+    const unsigned prior = drains;
+    order.BeforeRead(&pipe, drain);
+    Expect("BC4 consumed producer: no second selection drain", drains == prior);
+    order.NoteCommitted(pipe);
+    order.BeforeRead(nullptr, drain);
+    order.BeforeRead(&pipe, drain);
+    Expect("BC4 absent pipe clears cursor without drain", drains == prior);
+
+    AmdGpu::Image sharp{};
+    sharp.base_address = 0x100000 >> 8;
+    sharp.data_format = u64(AmdGpu::DataFormat::Format32_32);
+    sharp.num_format = u64(AmdGpu::NumberFormat::Uint);
+    sharp.type = u64(AmdGpu::ImageType::Color2D);
+    sharp.width = sharp.height = sharp.pitch = 15;
+    sharp.tiling_index = u64(AmdGpu::TileMode::Thin1DThin);
+    Shader::Info stage;
+    Shader::ImageResource resource{};
+    resource.is_written = true;
+    std::memcpy(resource.sharp_fetch.immediates.data(), &sharp, sizeof(sharp));
+    stage.images.push_back(resource);
+    std::array<const Shader::Info*, 6> stages{};
+    stages.back() = &stage; // appended emulated GS stage, not just a graphics pipeline stage
+    std::vector<std::pair<VAddr, u64>> ranges;
+    const auto collect = [&] {
+        ranges.clear();
+        Vulkan::ForEachBc4ImageWrite(stages, [&](VAddr address, u64 size) {
+            ranges.emplace_back(address, size);
+        });
+    };
+    collect();
+    Expect("BC4 appended GS image write covers complete bytes",
+           ranges == std::vector<std::pair<VAddr, u64>>{{0x100000, 2048}});
+    stage.images[0].is_written = false;
+    collect();
+    Expect("BC4 sampled image does not admit a write", ranges.empty());
+    stage.images[0].is_atomic = true;
+    collect();
+    Expect("BC4 atomic image is a potential write", ranges.size() == 1);
+    stage.images[0].is_atomic = false;
+    stage.images[0].is_written = true;
+    stage.images[0].sharp_fetch.load_mask = 0xff;
+    for (unsigned i = 0; i < 8; ++i) stage.images[0].sharp_fetch.offsets[i] = i;
+    stage.flattened_ud_buf.resize(8);
+    sharp.base_address = 0x200000 >> 8;
+    std::memcpy(stage.flattened_ud_buf.data(), &sharp, sizeof(sharp));
+    collect();
+    Expect("BC4 range follows selected flattened data, not stale immediates",
+           ranges == std::vector<std::pair<VAddr, u64>>{{0x200000, 2048}});
+    sharp.width = 14;
+    std::memcpy(stage.flattened_ud_buf.data(), &sharp, sizeof(sharp));
+    collect();
+    Expect("BC4 padded/incomplete layout is not admitted", ranges.empty());
+    sharp.width = 15;
+    sharp.num_format = u64(AmdGpu::NumberFormat::Float);
+    std::memcpy(stage.flattened_ud_buf.data(), &sharp, sizeof(sharp));
+    collect();
+    Expect("BC4 noninteger format is not admitted", ranges.empty());
+}
+
 int main(int argc, char** argv) {
     if (argc == 3 && !std::strcmp(argv[1], "--hot-thread-child")) {
         return HotThreadChild(argv[2]);
     }
+    if (argc == 2 && std::string_view(argv[1]).starts_with("--bc4-image-order")) {
+        Bc4ImageOrderControls(!std::strcmp(argv[1], "--bc4-image-order-precommit"),
+                             !std::strcmp(argv[1], "--bc4-image-order-skip-drain"));
+        std::printf("BC4 image order: %s (%u failures); CPU ordering only\n",
+                    failures ? "FAIL" : "PASS", failures);
+        return failures ? 1 : 0;
+    }
+    Bc4ImageOrderControls(false, false);
     using namespace BbLabelCheck;
     alignas(16) static std::uint64_t block[6] = {0, 0x1111, 0x2222, 0x3333, 0x4444, 0x5555};
     std::uint64_t* label = &block[0];

@@ -25,6 +25,9 @@
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/texture_cache/texture_cache.h"
+#ifdef __APPLE__
+#include "video_core/texture_cache/bc4_alias.h"
+#endif
 
 namespace AmdGpu {
 enum class SourceSelect : u32;
@@ -40,6 +43,48 @@ namespace Vulkan {
 class GraphicsPipeline;
 class Runtime;
 class NullResources;
+
+#ifdef __APPLE__
+// Stage A owns this cursor. Stage B publishes consumption only after the command's
+// synchronous converted-image writeback, including on early-return paths.
+class Bc4ImageWriteOrder {
+public:
+    void NoteCommitted(const DrawPipe& pipe) { producer_end = pipe.Head(); }
+
+    template <class Drain>
+    void BeforeRead(const DrawPipe* pipe, Drain&& drain) {
+        if (pipe && producer_end && !pipe->Reached(producer_end)) {
+            drain();
+            ASSERT(pipe->Reached(producer_end));
+        }
+        producer_end = 0;
+    }
+
+private:
+    u64 producer_end = 0;
+};
+
+// Use the same selected stage data as the packet, including appended ES/GS stages.
+// A first conversion happens on B, so consulting the current texture registry is too late.
+template <class Note>
+void ForEachBc4ImageWrite(std::span<const Shader::Info* const> stages, Note&& note) {
+    for (const auto* stage : stages) {
+        if (!stage) continue;
+        for (const auto& resource : stage->images) {
+            if (!resource.is_written && !resource.is_atomic) continue;
+            const auto sharp = resource.GetSharp(*stage);
+            if (!sharp.Address() || sharp.GetDataFmt() != AmdGpu::DataFormat::Format32_32 ||
+                sharp.GetNumberFmt() != AmdGpu::NumberFormat::Uint ||
+                (sharp.GetTileMode() != AmdGpu::TileMode::DisplayLinearAligned &&
+                 sharp.GetTileMode() != AmdGpu::TileMode::Thin1DThin)) continue;
+            const VideoCore::ImageInfo info{sharp, resource};
+            if (!VideoCore::Bc4Alias::RejectStoredLayout(info)) {
+                note(info.guest_address, info.guest_size);
+            }
+        }
+    }
+}
+#endif
 
 class Rasterizer {
 public:
@@ -689,6 +734,10 @@ private:
         u64 position;
     };
     std::vector<PendingWrite> pending_writes;
+#ifdef __APPLE__
+    Bc4ImageWriteOrder bc4_image_write_order;
+    void SyncBc4ImageWritesBeforeSelection();
+#endif
     VAddr pending_min = ~VAddr{0}, pending_max = 0; ///< bounds of pending_writes
     u32 pending_checks = 0;
     u64 proxy_samples = 0; ///< texture bindings that read a scene proxy (statistics)
