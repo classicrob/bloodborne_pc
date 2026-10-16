@@ -517,6 +517,7 @@ if [[ ${1:-} == --test || ${1:-} == --test-dry || ${1:-} == --test-one || ${1:-}
         t bash tests/test_heavy.sh
         t bash tests/test_build_test_one.sh
         t bash tests/test_build_keep_going.sh
+        t bash tests/test_preview.sh
         t sh tests/test_sync_diagnostics_macos.sh
         t sh tests/test_cond_wake_check_macos.sh
         t python3 tests/test_restart_macos.py
