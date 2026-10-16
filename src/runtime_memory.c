@@ -1317,8 +1317,8 @@ int runtime_replay_apply_resets(const RuntimeReplayReset *resets, size_t count,
                                 char *why, size_t why_size) {
     if ((!resets && count) || !why || !why_size) return -1;
     *why=0;
-    write_lock();
     pthread_mutex_lock(&guest_heap_lock);
+    write_lock();
     for (size_t i=0;i<count;++i) {
         const RuntimeReplayReset *r=&resets[i];
         if (!r->bytes || !r->size || r->size>UINTPTR_MAX-r->address || r->host>1) {
@@ -1360,12 +1360,12 @@ int runtime_replay_apply_resets(const RuntimeReplayReset *resets, size_t count,
             goto fail;
         }
     }
-    pthread_mutex_unlock(&guest_heap_lock);
     write_unlock();
+    pthread_mutex_unlock(&guest_heap_lock);
     return 0;
 fail:
-    pthread_mutex_unlock(&guest_heap_lock);
     write_unlock();
+    pthread_mutex_unlock(&guest_heap_lock);
     return -1;
 }
 #endif

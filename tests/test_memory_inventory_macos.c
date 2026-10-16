@@ -10,6 +10,15 @@ uintptr_t runtime_lookup(const RuntimeExport *table,size_t count,const char *nam
     return 0;
 }
 static RuntimeMemoryInventory base;
+static void *replay_allocator_growth(void *unused) {
+    (void)unused;
+    for (size_t i=0;i<16;++i) {
+        void *object=runtime_guest_malloc(2*1024*1024+i*PAGE);
+        assert(object);
+        runtime_guest_free(object);
+    }
+    return NULL;
+}
 static RuntimeMemoryInventory take(void) {
     RuntimeMemoryInventory m;
     assert(!runtime_memory_inventory(&m));
@@ -216,11 +225,30 @@ int main(void) {
                                      .bytes=&a,.host=1,.object=first,.offset=0};
         assert(!runtime_replay_apply_resets(rows,2,why,sizeof(why)));
         assert(owner[8]==a && owner[32]==b);
+        owner[8]=0;
+        rows[1]=(RuntimeReplayReset){.address=(uintptr_t)&why,.size=1,.bytes=&b};
+        assert(runtime_replay_apply_resets(rows,2,why,sizeof(why))==-1);
+        assert(owner[8]==0);
         runtime_guest_free(owner);
         assert(runtime_replay_apply_resets(rows,2,why,sizeof(why))==-1);
         assert(!release_flexible(guest,PAGE));
         unsetenv("BB_REPLAY_RUN");
         puts("PASS: production reset batch rejects invalid last identities before any write");
+    }
+    {
+        void *guest=NULL;
+        pthread_t allocator;
+        unsigned char value=0x6b;
+        char why[256];
+        assert(!map_flexible(&guest,PAGE,3,0));
+        RuntimeReplayReset row={.address=(uintptr_t)guest,.size=1,.bytes=&value};
+        assert(!pthread_create(&allocator,NULL,replay_allocator_growth,NULL));
+        for (unsigned i=0;i<1000;++i)
+            assert(!runtime_replay_apply_resets(&row,1,why,sizeof(why)));
+        assert(!pthread_join(allocator,NULL));
+        assert(((unsigned char *)guest)[0]==value);
+        assert(!release_flexible(guest,PAGE));
+        puts("PASS: production reset batch and growing guest allocator complete concurrently");
     }
     /* Replay map preflight: a malformed view table fails before anything is mapped. */
     {

@@ -116,8 +116,11 @@ def transform(data, plan):
 def migrate(source, output, plan):
     source = source.resolve(strict=True)
     parent = output.parent.resolve(strict=True)
-    output = (parent / output.name).resolve(strict=False)
-    if source.name.endswith('.incomplete') or source == output or source in output.parents or output.exists():
+    if not parent.is_dir():
+        raise ValueError('output parent must be a directory')
+    output = parent / output.name
+    if source.name.endswith('.incomplete') or source == output or source in output.parents or \
+            output.is_symlink() or output.exists():
         raise ValueError('source must be complete; output must be new and different')
     if shutil.disk_usage(parent).free < 40 * 1000 ** 3 + LIMIT:
         raise ValueError('migration budget: require 40 GB free plus 64 MiB metadata budget')

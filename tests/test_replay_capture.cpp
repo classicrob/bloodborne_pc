@@ -162,6 +162,12 @@ void ReaderControls() {
     std::memcpy(altered.data() + sizeof(FileHeader) + 8, &too_large, sizeof(too_large));
     Check(!accepts("resets.bin", altered), "production reader: oversized reset refused before allocation");
     altered = resets;
+    altered.resize(sizeof(FileHeader) + sizeof(ResetRecord));
+    Check(!accepts("resets.bin", altered), "production reader: reset payload refused before allocation");
+    altered = resets;
+    altered.resize(resets.size() - sizeof(HostObjectRecord));
+    Check(!accepts("resets.bin", altered), "production reader: missing host identity refused before allocation");
+    altered = resets;
     const u64 overlapping = 0x1002;
     const size_t host_record = sizeof(FileHeader) + sizeof(ResetRecord) + sizeof(value);
     std::memcpy(altered.data() + host_record, &overlapping, sizeof(overlapping));
@@ -205,6 +211,20 @@ void ReaderControls() {
           "production reader: duplicate singleton rejected");
     Check(!accepts("liverpool.bin", liverpool(true, true, false, true)),
           "production reader: trailing Liverpool byte rejected");
+    const auto submissions = [&](s32 ccb_index, u32 size_dw) {
+        std::vector<u8> bytes;
+        Append(bytes, FileHeader{{'B','B','R','P','S','U','B','S'}, Version, 0, 1});
+        Append(bytes, SubmissionRecord{1, 1, 0, ccb_index, 0});
+        Append(bytes, RegionRecord{0x1000, size_dw, 0, 1, 0});
+        if (size_dw == 1) Append(bytes, value);
+        return bytes;
+    };
+    Check(!accepts("submissions.bin", submissions(-2, 1)),
+          "production reader: invalid negative CCB index rejected");
+    Check(!accepts("submissions.bin", submissions(0, 1)),
+          "production reader: DCB and CCB cannot share an index");
+    Check(!accepts("submissions.bin", submissions(-1, UINT32_MAX)),
+          "production reader: wrapped command byte count rejected");
     std::filesystem::remove_all(dir);
 }
 

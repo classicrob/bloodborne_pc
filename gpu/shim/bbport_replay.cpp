@@ -171,6 +171,9 @@ struct Capture {
     bool CheckLiverpool(const std::filesystem::path& dir, std::string& why) {
         return LoadLiverpool(dir, why);
     }
+    bool CheckSubmissions(const std::filesystem::path& dir, std::string& why) {
+        return LoadSubmissions(dir, why);
+    }
 
 private:
     bool LoadLiverpool(const std::filesystem::path& dir, std::string& why) {
@@ -293,7 +296,9 @@ private:
             }
             if (s.reserved || !s.regions || s.regions > r.Remaining() / sizeof(RegionRecord) ||
                 s.dcb_region < 0 || u32(s.dcb_region) >= s.regions ||
-                (s.ccb_region >= 0 && u32(s.ccb_region) >= s.regions)) {
+                s.ccb_region < -1 ||
+                (s.ccb_region >= 0 && (u32(s.ccb_region) >= s.regions ||
+                                       s.ccb_region == s.dcb_region))) {
                 why = fmt::format("submissions.bin: submission {} has invalid region count or indices", i);
                 return false;
             }
@@ -305,6 +310,7 @@ private:
                 }
                 const u64 bytes = u64(rr.size_dw) * sizeof(u32);
                 if (rr.reserved || rr.constant > 1 || rr.copied != 1 || !rr.size_dw ||
+                    bytes > UINT32_MAX ||
                     rr.guest > UINT64_MAX - bytes || !r.CanRead(bytes, why)) {
                     if (why.empty()) {
                         why = fmt::format("submission {} region {:#x} has invalid size or flags", i,
@@ -393,6 +399,9 @@ private:
                 return false;
             }
             previous_end = rr.address + rr.bytes;
+            if (!r.CanRead(rr.bytes + (rr.host ? sizeof(RuntimeReplayObject) : 0), why)) {
+                return false;
+            }
             Reset reset{rr.address, std::vector<u8>(rr.bytes), rr.host != 0};
             if (!r.Read(reset.bytes.data(), reset.bytes.size(), why) ||
                 (reset.host && !r.Get(reset.object, why))) {
@@ -878,6 +887,7 @@ extern "C" int bbgpu_replay_check_file(const char* dir, const char* file, char* 
     bool okay = false;
     if (!std::strcmp(file, "resets.bin")) okay = capture.CheckResets(dir, why);
     else if (!std::strcmp(file, "liverpool.bin")) okay = capture.CheckLiverpool(dir, why);
+    else if (!std::strcmp(file, "submissions.bin")) okay = capture.CheckSubmissions(dir, why);
     else why = "unsupported replay file";
     std::snprintf(reason, reason_size, "%s", why.c_str());
     return okay ? 0 : -1;

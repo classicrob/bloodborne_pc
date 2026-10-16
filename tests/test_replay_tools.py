@@ -81,6 +81,17 @@ class ReplayTools(unittest.TestCase):
         self.assertEqual(sorted(p.name for p in source.iterdir()), ['unique-evidence'])
         self.assertTrue(alias.is_symlink())
 
+    def test_migration_rejects_dangling_final_symlink(self):
+        source = self.root / 'protected'; source.mkdir()
+        target = self.root / 'other-project' / 'redirected'
+        target.parent.mkdir()
+        output = self.root / 'overlay'; output.symlink_to(target, target_is_directory=True)
+        with mock.patch.object(identity.shutil, 'disk_usage', side_effect=AssertionError('guard must run first')), \
+                self.assertRaisesRegex(ValueError, 'source|output'):
+            identity.migrate(source, output, {})
+        self.assertTrue(output.is_symlink())
+        self.assertFalse(target.exists())
+
     def log(self, stop=False, duplicate=False, missing=False, busy=True, draws=(1487, 1487, 1487),
             done=True, name='run-1-A.log', collection=False):
         lines = ['Perf replay: 3 images restored; capture -> restore -> capture again is exact']
