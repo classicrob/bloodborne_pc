@@ -16,7 +16,11 @@
 #include "../gpu/bbgpu.h"
 #include "common/elf_info.h"
 #ifdef BC4_CACHE_FLOAT_TAIL_PROBE
+#include <atomic>
+#include <thread>
+#include "bbport_toggles.h"
 #include "core/emulator_settings.h"
+#include "gcn_buffer_conformance/gcn_asm.h"
 #endif
 #include "test_alarm.h"
 #include "video_core/amdgpu/liverpool.h"
@@ -188,6 +192,223 @@ std::vector<u32> StoreShader() {
 } // namespace
 
 #ifdef BC4_CACHE_FLOAT_TAIL_PROBE
+// Add with the fixture includes: <atomic>, <thread>, "gcn_buffer_conformance/gcn_asm.h".
+// The owning fixture calls Run before its direct mutation sequence, after registering a
+// clean BC parent. BB_DRAW_PIPE=1 and BB_VK_RECORD_THREAD=1 must precede construction.
+namespace Vulkan {
+class Bc4FloatQueuedFixture {
+public:
+    static bool Ready(Rasterizer& r) {
+        return r.OnStageA() && r.UseDrawPipe() &&
+               !BbToggle::Disabled(BbToggle::PipelinedDispatch) && r.constant_ring &&
+               !BbToggle::Disabled(BbToggle::ConstantRing);
+    }
+    static void Observe(Rasterizer& r, std::atomic<bool>* entered) {
+        r.bc4_image_write_order.fixture_drain_entered = entered;
+    }
+    static void Cursor(Rasterizer& r, u64 value) {
+        r.bc4_image_write_order.producer_end = value;
+    }
+    struct RingEvidence {
+        u64 shader_hash;
+        VAddr address;
+        std::array<u32, 2> expected;
+        u32 matches = 0;
+        bool exact_bytes = false;
+    };
+    static void ObserveRing(Rasterizer& r, RingEvidence* evidence) {
+        r.fixture_ring_context = evidence;
+        r.fixture_ring_observer = evidence ? +[](void* context, const Shader::Info& info,
+                std::span<const Rasterizer::RingBinding> bindings, ConstantRing* ring) {
+            auto& result = *static_cast<RingEvidence*>(context);
+            if (info.pgm_hash != result.shader_hash) return;
+            for (const auto& binding : bindings) {
+                if (binding.address != result.address) continue;
+                ++result.matches;
+                result.exact_bytes = ring && binding.size == 8 &&
+                    binding.index < info.buffers.size() &&
+                    !info.buffers[binding.index].IsSpecial() &&
+                    !info.buffers[binding.index].is_written &&
+                    binding.offset <= ConstantRing::Capacity - 8 &&
+                    !std::memcmp(ring->Data(binding.offset), result.expected.data(), 8);
+            }
+        } : nullptr;
+    }
+};
+} // namespace Vulkan
+
+namespace FloatQueued {
+constexpr std::array<u32, 2> Stored{0x3f000000, 0x40400000}; // 0.5, 3.0
+
+static AmdGpu::ComputeProgram Program(void* destination, GcnAsm::Code code, u64 hash,
+                                     const AmdGpu::UserData& user_data) {
+    const u32 length = code.words.size() * sizeof(u32);
+    while (code.words.size() % 2) code.words.push_back(0);
+    const u32 metadata = code.words.size();
+    assert(metadata >= 2 && metadata * sizeof(u32) + sizeof(AmdGpu::BinaryInfo) <= 1024);
+    code.words[1] = metadata / 2 - 1;
+    AmdGpu::BinaryInfo info{};
+    info.signature = AmdGpu::BinaryInfo::signature_ref;
+    info.length = length;
+    info.shader_hash = hash;
+    std::memcpy(destination, code.words.data(), metadata * sizeof(u32));
+    std::memcpy(static_cast<u8*>(destination) + metadata * sizeof(u32), &info, sizeof(info));
+    AmdGpu::ComputeProgram result{};
+    assert(!(uintptr_t(destination) % 256));
+    result.address = uintptr_t(destination) >> 8;
+    result.dispatch_initiator = 1;
+    result.dim_x = result.dim_y = result.dim_z = 1;
+    result.num_thread_x.full = result.num_thread_y.full = result.num_thread_z.full = 1;
+    result.settings.num_vgprs = 4;
+    result.settings.num_sgprs = 4;
+    result.settings.num_user_regs = 16;
+    result.user_data = user_data;
+    assert(AmdGpu::GetParams(result).hash == hash);
+    return result;
+}
+
+// Returns 0 only with actual queued publication and the expected consumer data. The two
+// cursor mutations must return 1 at the data/selection oracles, not at a setup or crash gate.
+static int Run(Vulkan::Scheduler& scheduler, AmdGpu::Liverpool& liverpool,
+               Vulkan::Rasterizer& rasterizer, void* mapped, size_t mapped_size,
+               const AmdGpu::Image& child_sharp, const char* mode) {
+    const bool ring = !std::strcmp(mode, "--float-queued-ring");
+    const bool skip = !std::strcmp(mode, "--float-queued-skip-drain");
+    const bool precommit = !std::strcmp(mode, "--float-queued-precommit");
+    if (!ring && !skip && !precommit && std::strcmp(mode, "--float-queued-srt")) return 2;
+    if (mapped_size < 32768) return 2;
+    auto* guest = static_cast<u8*>(mapped);
+    const VAddr parent = uintptr_t(guest) + 256;
+    const VAddr tail = parent + 0x5c00;
+    if (child_sharp.Address() != tail) return 2;
+    Shader::ImageResource image_resource{};
+    image_resource.is_written = true;
+    if (!VideoCore::Bc4Alias::IsFloatTailCandidate({child_sharp, image_resource})) return 2;
+    std::array<u32, 2> before{};
+    std::memcpy(before.data(), reinterpret_cast<const void*>(tail), sizeof(before));
+    if (before == Stored) return 2;
+    std::array<u8, 0x6000> parent_before{};
+    std::memcpy(parent_before.data(), reinterpret_cast<const void*>(parent), parent_before.size());
+    auto* output = reinterpret_cast<u32*>(guest + 0x7c00);
+    output[0] = output[1] = 0xa5a5a5a5;
+    auto output_sharp = AmdGpu::Buffer::Placeholder(8);
+    output_sharp.base_address = uintptr_t(output);
+    auto input_sharp = AmdGpu::Buffer::Placeholder(8);
+    input_sharp.base_address = tail;
+    GcnAsm::Code writer;
+    writer.SMovLiteral(GcnAsm::VCC_HI, 0);
+    writer.VMovLiteral(0, 0); writer.VMovLiteral(1, 0);
+    writer.VMovLiteral(4, Stored[0]); writer.VMovLiteral(5, Stored[1]);
+    writer.words.push_back(0xf0000000u | (8u << 18) | (3u << 8)); // image_store xy
+    writer.words.push_back(4u << 8); // vaddr0, vdata4, s[0:7]
+    writer.SWaitcntAll(); writer.SEndpgm();
+    AmdGpu::UserData writer_ud{};
+    std::memcpy(writer_ud.data(), &child_sharp, sizeof(child_sharp));
+    const auto writer_program = Program(guest + 0x7000, writer, 0xbc4f710001, writer_ud);
+    GcnAsm::Code reader;
+    reader.SMovLiteral(GcnAsm::VCC_HI, 0);
+    if (ring) {
+        reader.SBufferLoad(2, 12, 4, true, 0);
+    } else {
+        reader.SLoadDword(12, 2, 0);
+        reader.SLoadDword(13, 2, 1);
+    }
+    reader.SWaitcntAll();
+    reader.VMov(4, 12); reader.VMov(5, 13);
+    reader.Mubuf(GcnAsm::BUFFER_STORE_DWORDX2, {.vdata = 4, .srsrc = 8});
+    reader.SEndpgm();
+    AmdGpu::UserData reader_ud{};
+    reader_ud[2] = u32(tail); reader_ud[3] = u32(tail >> 32);
+    std::memcpy(reader_ud.data() + 4, &input_sharp, sizeof(input_sharp));
+    std::memcpy(reader_ud.data() + 8, &output_sharp, sizeof(output_sharp));
+    const auto reader_program = Program(guest + 0x7400, reader,
+                                       ring ? 0xbc4f710003 : 0xbc4f710002, reader_ud);
+    struct Gate {
+        std::atomic<bool> entered{false}, release{false}, drain{false}, reader_returned{false};
+        std::atomic<bool> timed_out{false};
+    } gate;
+    bool ready = false, producer_queued = false, reader_queued = false;
+    Vulkan::Bc4FloatQueuedFixture::RingEvidence ring_evidence{0xbc4f710003, tail, Stored};
+    bool old_cursor_consumed = false, held_before_reader = false;
+    std::jthread releaser([&] {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+        while (!gate.entered.load(std::memory_order_acquire) ||
+               !(gate.drain.load(std::memory_order_acquire) ||
+                 gate.reader_returned.load(std::memory_order_acquire))) {
+            if (std::chrono::steady_clock::now() >= deadline) {
+                gate.timed_out.store(true, std::memory_order_release);
+                break;
+            }
+            std::this_thread::yield();
+        }
+        gate.release.store(true, std::memory_order_release);
+    });
+    // No SendCommand boundary or drain between the two public dispatches.
+    liverpool.SendCommand<true>([&] {
+        ready = Vulkan::Bc4FloatQueuedFixture::Ready(rasterizer) && scheduler.IsRecordingDeferred();
+        if (!ready) {
+            gate.entered.store(true, std::memory_order_release);
+            gate.reader_returned.store(true, std::memory_order_release);
+            return;
+        }
+        const u64 old_cursor = rasterizer.DrawPipeHead();
+        old_cursor_consumed = rasterizer.DrawPipeReached(old_cursor);
+        Vulkan::Bc4FloatQueuedFixture::Observe(rasterizer, &gate.drain);
+        if (ring) Vulkan::Bc4FloatQueuedFixture::ObserveRing(rasterizer, &ring_evidence);
+        scheduler.Record([&gate](vk::CommandBuffer) {
+            gate.entered.store(true, std::memory_order_release);
+            while (!gate.release.load(std::memory_order_acquire)) std::this_thread::yield();
+        });
+        scheduler.KickRecording();
+        liverpool.GetCsRegs() = writer_program;
+        rasterizer.DispatchDirect();
+        const u64 producer = rasterizer.DrawPipeHead();
+        producer_queued = producer > old_cursor;
+        held_before_reader = !rasterizer.DrawPipeReached(producer);
+        if (skip) Vulkan::Bc4FloatQueuedFixture::Cursor(rasterizer, 0);
+        if (precommit) Vulkan::Bc4FloatQueuedFixture::Cursor(rasterizer, old_cursor);
+        liverpool.GetCsRegs() = reader_program;
+        rasterizer.DispatchDirect();
+        reader_queued = rasterizer.DrawPipeHead() > producer;
+        gate.reader_returned.store(true, std::memory_order_release);
+        Vulkan::Bc4FloatQueuedFixture::Observe(rasterizer, nullptr);
+        Vulkan::Bc4FloatQueuedFixture::ObserveRing(rasterizer, nullptr);
+        rasterizer.DrainDrawPipe();
+        scheduler.Finish();
+    });
+    releaser.join();
+    if (!ready || !old_cursor_consumed || !producer_queued || !held_before_reader ||
+        !reader_queued || gate.timed_out.load()) {
+        std::fprintf(stderr, "SETUP FAIL: queued Float pipeline/gate/dispatch coverage\n");
+        return 2;
+    }
+    unsigned failures = 0;
+    const auto check = [&](const char* label, bool passed) {
+        std::printf("queued Float %s: %s\n", label, passed ? "ok" : "FAIL");
+        failures += !passed;
+    };
+    check("actual queued writer and consumer executed", producer_queued && reader_queued);
+    check("selection observed pending producer drain", gate.drain.load());
+    check("command-exit published visible8B", !std::memcmp(reinterpret_cast<void*>(tail), Stored.data(), 8));
+    check("actual selected consumer sees published8B", !std::memcmp(output, Stored.data(), 8));
+    if (skip || precommit)
+        check("mutation selected old SRT bytes", !std::memcmp(output, before.data(), 8));
+    if (ring) check("actual reader packet readonly V# RingBinding carries published8B",
+                    ring_evidence.matches == 1 && ring_evidence.exact_bytes);
+    std::memcpy(parent_before.data() + 0x5c00, Stored.data(), 8);
+    check("all siblings and tail padding preserved",
+          !std::memcmp(reinterpret_cast<void*>(parent), parent_before.data(), parent_before.size()));
+    // A mutation is qualified only by the two intended failures with all publication,
+    // old-data and sibling oracles intact. Other failures are not its expected exit.
+    if ((skip || precommit) &&
+        (failures != 2 || gate.drain.load() || std::memcmp(output, before.data(), 8) ||
+         std::memcmp(reinterpret_cast<void*>(tail), Stored.data(), 8) ||
+         std::memcmp(reinterpret_cast<void*>(parent), parent_before.data(), parent_before.size())))
+        return 2;
+    return failures ? 1 : 0;
+}
+} // namespace FloatQueued
+
 namespace FloatCache {
 constexpr unsigned Levels = 9, TargetMip = 7, GuestSize = 0x6000, Tail = 0x5c00;
 constexpr unsigned MapSize = 0x8000, Prefix = 256, ReadGuard = 32;
@@ -253,7 +474,7 @@ bool OracleControls() {
     }
     return true;
 }
-Cache::ImageDesc Desc(uintptr_t base, bool parent) {
+AmdGpu::Image Sharp(uintptr_t base, bool parent) {
     auto sharp = AmdGpu::Image::Null(false);
     sharp.base_address = (base + (parent ? 0 : Tail)) >> 8;
     sharp.data_format = u64(parent ? AmdGpu::DataFormat::FormatBc4 : AmdGpu::DataFormat::Format32_32);
@@ -264,10 +485,13 @@ Cache::ImageDesc Desc(uintptr_t base, bool parent) {
     sharp.last_level = parent ? 8 : 0;
     sharp.tiling_index = 13;
     sharp.dst_sel_x = 4; sharp.dst_sel_y = 5; sharp.dst_sel_z = 0; sharp.dst_sel_w = 1;
+    return sharp;
+}
+Cache::ImageDesc Desc(uintptr_t base, bool parent) {
     Shader::ImageResource resource{};
     resource.is_written = !parent;
     resource.is_array = true;
-    return {sharp, resource};
+    return {Sharp(base, parent), resource};
 }
 std::vector<u32> StoreShader() {
     Sirit::Module m(0x00010500);
@@ -465,6 +689,22 @@ int Run(Vulkan::Instance& instance, Vulkan::Scheduler& scheduler, Vulkan::Runtim
     };
     on_a([&] { select_parent(); read_parent(0, false); });
     if (failures) { std::puts("SETUP FAIL before Float mutations"); return complete(); }
+    const bool queued = is("--float-queued-srt") || is("--float-queued-ring") ||
+                        is("--float-queued-skip-drain") || is("--float-queued-precommit");
+    if (queued) {
+        const bool mutation = is("--float-queued-skip-drain") || is("--float-queued-precommit");
+        std::printf("QUEUED Float selected control=%s after clean parent setup\n", mode);
+        const int result = FloatQueued::Run(scheduler, liverpool, rasterizer, mapped, MapSize,
+                                            Sharp(base, false), mode);
+        assert(!release(physical, MapSize));
+        shutdown();
+        const bool qualified = !failures && result == (mutation ? 1 : 0);
+        std::printf("bc4-float-cache-queued: %s mode=%s helper_result=%d cleanup_failures=%u\n",
+                    qualified ? (mutation ? "EXPECTED_MUTATION_FAILURE" : "PASS") : "FAIL",
+                    mode, result, failures);
+        if (!qualified) return 2;
+        return mutation ? 1 : 0;
+    }
     const auto seed1 = Seed(1);
     const auto faults = write_faults;
     std::memcpy(guest, seed1.data(), MapSize);
@@ -599,7 +839,14 @@ int main(int argc, char** argv) {
 #ifdef BC4_CACHE_FLOAT_TAIL_PROBE
     if (argc > 2 || (!is("ordinary") && !is("--skip-store") && !is("--skip-materialize") &&
                     !is("--mixed-authority") && !is("--raw-tail") && !is("--raw-sibling") &&
-                    !is("--raw-full") && !is("--parent-gpu-authority") && !is("--other-image-write"))) return 2;
+                    !is("--raw-full") && !is("--parent-gpu-authority") && !is("--other-image-write") &&
+                    !is("--float-queued-srt") && !is("--float-queued-ring") &&
+                    !is("--float-queued-skip-drain") && !is("--float-queued-precommit"))) return 2;
+    if (is("--float-queued-srt") || is("--float-queued-ring") ||
+        is("--float-queued-skip-drain") || is("--float-queued-precommit")) {
+        setenv("BB_DRAW_PIPE", "1", 1);
+        setenv("BB_VK_RECORD_THREAD", "1", 1);
+    }
     setenv("BB_READBACK_LINEAR", "1", 1);
     constexpr unsigned AllocationBytes = FloatCache::MapSize;
 #else
