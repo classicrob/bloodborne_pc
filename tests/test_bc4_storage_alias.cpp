@@ -28,6 +28,8 @@
 #include "video_core/texture_cache/image_view.h"
 #include "video_core/texture_cache/texture_cache.h"
 
+void RunBc4AliasPolicy();
+
 namespace {
 unsigned failures = 0;
 void Expect(const std::string& what, bool ok) {
@@ -123,6 +125,7 @@ AmdGpu::Image Sharp(VAddr address, AmdGpu::DataFormat data, AmdGpu::NumberFormat
 } // namespace
 
 int main() {
+    RunBc4AliasPolicy();
     // The fixture's own bound (before any Vulkan): a child that closes stderr and stays alive is
     // killed at the deadline, not waited for.
     const ChildResult silent = RunChild(

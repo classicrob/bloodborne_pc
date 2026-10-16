@@ -170,6 +170,13 @@ public:
     /// Schedules a copy of pending images for download back to CPU memory.
     void ProcessDownloadImages();
 
+#ifdef __APPLE__
+    /// Publish converted image writes before the recording command returns. Keeps images alive.
+    void MaterializeBc4AliasesAfterCommand();
+    /// Called with renderer work drained, before acquiring the guest VMA writer lock.
+    void PrepareBc4AliasesForMemoryMutation();
+#endif
+
     /// Retrieves the image handle of the image with the provided attributes.
     [[nodiscard]] ImageId FindImage(ImageDesc& desc, bool exact_fmt = false);
 
@@ -452,6 +459,10 @@ private:
     Common::SlotVector<ImageView> slot_image_views;
     tsl::robin_map<u64, Sampler> samplers;
     std::unordered_set<ImageId> download_images;
+#ifdef __APPLE__
+    // Registered converted images only; protected by mutex, independent of binding resets.
+    std::unordered_set<ImageId> bc4_alias_images;
+#endif
     u64 total_used_memory = 0;
     u64 gc_evictions = 0, gc_downloads = 0; ///< bbport: pressure report
     std::chrono::steady_clock::time_point gc_report_time{};

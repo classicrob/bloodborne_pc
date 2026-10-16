@@ -164,6 +164,7 @@ public:
     u64 depth_uid{};
     u64 image_uid{};
 #ifdef __APPLE__
+    bool bc4_integer_alias = false;
     /// bbport (BB_PERF refresh census): what last made the image dirty, and a detail (the CPU
     /// write address, or the hash of the shader whose storage write invalidated it).
     u8 dirty_source = 0;

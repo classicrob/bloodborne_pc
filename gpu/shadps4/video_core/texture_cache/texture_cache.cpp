@@ -25,6 +25,8 @@
 #include "video_core/texture_cache/texture_cache.h"
 #ifdef __APPLE__
 #include "video_core/renderer_vulkan/vk_scene_resolution.h"
+#include "video_core/texture_cache/bc4_alias.h"
+#include "../../../../src/runtime_memory.h"
 #endif
 #include "video_core/texture_cache/tile_manager.h"
 #include "bbport_parse_split.h"
@@ -39,6 +41,27 @@ namespace {
 enum DirtySource : u8 { DirtyInitial, DirtyCpuWrite, DirtyCpuMaybe, DirtyGpuStorage, DirtyGpuCopy };
 constexpr const char* DirtySourceNames[] = {"initial/other", "CPU write", "CPU write near",
                                             "GPU storage write", "GPU copy/DMA"};
+
+void CheckBc4AliasUse(const Image& image, const TextureCache::ImageDesc& desc) {
+    const auto& info = desc.info;
+    const char* reject = Bc4Alias::RejectStoredLayout(info);
+    ASSERT_MSG(!reject && info.pixel_format == image.info.pixel_format &&
+                   info.guest_address == image.info.guest_address &&
+                   info.guest_size == image.info.guest_size && info.size == image.info.size &&
+                   info.tile_mode == image.info.tile_mode &&
+                   info.array_mode == image.info.array_mode &&
+                   info.props.is_pow2 == image.info.props.is_pow2,
+               "Converted BC4 image reused with a different byte layout: {}",
+               reject ? reject : "incompatible cached representation");
+    ASSERT_MSG((desc.type == TextureCache::BindingType::Texture ||
+                desc.type == TextureCache::BindingType::Storage) &&
+                   (desc.type != TextureCache::BindingType::Storage ||
+                    info.pixel_format == vk::Format::eR32G32Uint) &&
+                   Bc4Alias::CompleteSubresource(desc.view_info.range.base.level,
+                       desc.view_info.range.base.layer, desc.view_info.range.extent.levels,
+                       desc.view_info.range.extent.layers),
+               "Converted BC4 image requires a complete sampled/storage subresource");
+}
 
 struct RefreshCensus {
     struct Entry {
@@ -198,6 +221,10 @@ void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
     if (False(image.flags & ImageFlagBits::GpuModified)) {
         return;
     }
+#ifdef __APPLE__
+    ASSERT_MSG(!image.bc4_integer_alias,
+               "Converted BC4 authority must be published at the command boundary");
+#endif
     const u32 download_size = image.info.pitch * image.info.size.height * image.info.size.depth *
                               image.info.resources.layers * (image.info.num_bits / 8);
     ASSERT(download_size <= image.info.guest_size);
@@ -234,6 +261,104 @@ void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
             });
     }
 }
+
+#ifdef __APPLE__
+void TextureCache::MaterializeBc4AliasesAfterCommand() {
+    std::vector<std::pair<ImageId, u64>> pending;
+    {
+        std::scoped_lock lock{mutex};
+        // Validate the entire set before issuing transfers or publishing any bytes.
+        for (const auto id : bc4_alias_images) {
+            const auto& image = slot_images[id];
+            const char* reject = Bc4Alias::RejectStoredLayout(image.info);
+            ASSERT_MSG(!reject, "BC4 materialization layout: {}", reject ? reject : "");
+            ASSERT_MSG(Bc4Alias::AuthorityCompatible(True(image.flags & ImageFlagBits::GpuModified),
+                                                  True(image.flags & ImageFlagBits::Dirty)),
+                       "BC4 materialization has conflicting image/backing authority");
+            if (True(image.flags & ImageFlagBits::GpuModified))
+                pending.emplace_back(id, image.image_uid);
+        }
+    }
+    if (pending.empty()) return;
+    static thread_local bool materializing = false;
+    ASSERT_MSG(!materializing, "Recursive BC4 materialization");
+    materializing = true;
+    SCOPE_EXIT { materializing = false; };
+    runtime.BeforeImageAccess();
+    for (const auto [id, uid] : pending) {
+        Vulkan::StagingBufferRef download;
+        VAddr address{};
+        u64 bytes{};
+        {
+            std::scoped_lock lock{mutex};
+            ASSERT_MSG(slot_images.is_allocated(id) && slot_images[id].image_uid == uid &&
+                           bc4_alias_images.contains(id), "BC4 image retired before readback");
+            auto& image = slot_images[id];
+            ASSERT_MSG(image.SafeToDownload(), "BC4 authority changed before readback");
+            address = image.info.guest_address;
+            bytes = image.info.guest_size;
+            // A deferred allocation cannot be reused while Finish runs pending operations.
+            download = runtime.GetStagingPool().Request(bytes, MemoryType::HostCached,
+                                                       instance.StorageMinAlignment(), true);
+            vk::BufferImageCopy region{
+                .bufferRowLength = image.info.pitch,
+                .bufferImageHeight = image.info.size.height,
+                .imageSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+                .imageExtent = {image.info.size.width, image.info.size.height, 1}};
+            // TileImage normalizes compressed pitch/height into blocks and uses the actual
+            // guest layout; a raw image download would corrupt tile13 backing bytes.
+            tile_manager.TileImage(image, std::span{&region, 1}, download.buffer, download.offset);
+            runtime.FlushBarriers();
+            scheduler.Record([](vk::CommandBuffer cmd) {
+                const vk::MemoryBarrier2 barrier{
+                    .srcStageMask = vk::PipelineStageFlagBits2::eCopy |
+                                    vk::PipelineStageFlagBits2::eComputeShader,
+                    .srcAccessMask = vk::AccessFlagBits2::eTransferWrite |
+                                     vk::AccessFlagBits2::eShaderWrite,
+                    .dstStageMask = vk::PipelineStageFlagBits2::eHost,
+                    .dstAccessMask = vk::AccessFlagBits2::eHostRead};
+                cmd.pipelineBarrier2({.memoryBarrierCount = 1, .pMemoryBarriers = &barrier});
+            });
+        }
+        // Neither the texture mutex nor a VMA read/write lock may span this wait.
+        scheduler.Finish();
+        download.Invalidate();
+        {
+            std::scoped_lock lock{mutex};
+            ASSERT_MSG(slot_images.is_allocated(id) && slot_images[id].image_uid == uid &&
+                           bc4_alias_images.contains(id), "BC4 image retired during readback");
+            auto& image = slot_images[id];
+            ASSERT_MSG(image.SafeToDownload(), "BC4 backing changed during readback");
+            ASSERT_MSG(Core::Memory::Instance()->TryWriteBacking(
+                           std::bit_cast<u8*>(address), download.mapped, bytes),
+                       "BC4 readback could not publish complete guest backing");
+            image.flags &= ~ImageFlagBits::GpuModified;
+            image.hash = XXH3_64bits(download.mapped, bytes);
+            std::ranges::fill(image.mip_hashes, 0);
+        }
+        runtime.GetStagingPool().FreeDeferred(download);
+    }
+}
+
+void TextureCache::PrepareBc4AliasesForMemoryMutation() {
+    MaterializeBc4AliasesAfterCommand();
+    {
+        std::scoped_lock lock{mutex};
+        if (bc4_alias_images.empty()) return;
+        // The mutation protocol has drained recording and joined the helper. Materialization
+        // above checked every layout/authority before any writes; CPU-authoritative images
+        // need only eviction. New aliases cannot inherit a cache entry for the old mapping.
+        const std::vector<ImageId> ids(bc4_alias_images.begin(), bc4_alias_images.end());
+        for (const auto id : ids) {
+            ASSERT_MSG(False(slot_images[id].flags & ImageFlagBits::GpuModified),
+                       "BC4 image gained GPU authority during memory mutation");
+            FreeImage(id);
+        }
+    }
+    scheduler.Finish();
+    scheduler.PopPendingOperations();
+}
+#endif
 
 void TextureCache::MarkAsMaybeDirty(ImageId image_id, Image& image) {
     if (image.hash == 0) {
@@ -672,6 +797,9 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
         cached.levels == info.resources.levels && cached.layers == info.resources.layers &&
         !BbToggle::Disabled(BbToggle::FindImageCache)) {
         Image& image = slot_images[cached.image_id];
+#ifdef __APPLE__
+        if (image.bc4_integer_alias) CheckBc4AliasUse(image, desc);
+#endif
         image.tick_accessed_last = scheduler.CurrentTick();
         TouchImage(image);
         if (cached.view_mip > 0) {
@@ -689,26 +817,83 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
 
     ImageId image_id{};
 
-    // Check for a perfect match first
-    for (const auto& cache_id : image_ids) {
-        auto& cache_image = slot_images[cache_id];
-        if (cache_image.info.guest_address != info.guest_address) {
+#ifdef __APPLE__
+    // Cross-format block-grid aliases need distinct Vulkan images. Preflight the whole route
+    // before registration, refresh or retirement; a view of BC4 can never become storage.
+    for (const auto old_id : image_ids) {
+        auto& old = slot_images[old_id];
+        if (!Bc4Alias::CrossesBc4(info, old.info)) {
+            if (old.bc4_integer_alias) CheckBc4AliasUse(old, desc);
             continue;
         }
-        if (cache_image.info.guest_size != info.guest_size) {
-            continue;
+        const char* reject = Bc4Alias::RejectLayout(info, old.info);
+        ASSERT_MSG(!reject, "BC4 integer alias at {:#x} unsupported: {}",
+                   info.guest_address, reject ? reject : "");
+        ASSERT_MSG(image_ids.size() == 1,
+                   "BC4 integer alias has other registered overlapping images");
+        ASSERT_MSG((desc.type == BindingType::Texture || desc.type == BindingType::Storage) &&
+                       (desc.type != BindingType::Storage ||
+                        info.pixel_format == vk::Format::eR32G32Uint) &&
+                       Bc4Alias::CompleteSubresource(desc.view_info.range.base.level,
+                           desc.view_info.range.base.layer, desc.view_info.range.extent.levels,
+                           desc.view_info.range.extent.layers),
+                   "BC4 integer alias requires the complete texture/storage subresource");
+        ASSERT_MSG(!old.binding.is_bound && !old.binding.is_target &&
+                       !old.binding.needs_rebind && !old.scene_proxy,
+                   "BC4 integer alias is already bound in this command or redirected");
+        ASSERT_MSG(Bc4Alias::AuthorityCompatible(True(old.flags & ImageFlagBits::GpuModified),
+                                              True(old.flags & ImageFlagBits::Dirty)),
+                   "BC4 integer alias has conflicting CPU/buffer and image authority");
+
+        RuntimeMemoryInventory inventory{};
+        RuntimeMemoryAliasSnapshot mapping{};
+        ASSERT_MSG(runtime_memory_inventory(&inventory) == 0 && !inventory.shared_backing_views &&
+                       runtime_memory_alias_snapshot(info.guest_address, nullptr, 0, &mapping) == 1 &&
+                       inventory.generation == mapping.generation && !(mapping.generation & 1) &&
+                       info.guest_size <= mapping.end - info.guest_address,
+                   "BC4 integer alias requires a stable committed range without guest backing aliases");
+
+        // The VM lifetime protocol drains renderer work before map/unmap/reuse and invalidates
+        // these images. Track before refreshing so the CPU-dirty source, never a stale backing,
+        // initializes the integer storage image even when the next shader writes only a block.
+        TrackImage(old_id);
+        RefreshImage(old);
+        image_id = slot_images.insert(instance, runtime, slot_image_views, info);
+        RegisterImage(image_id);
+        auto& replacement = slot_images[image_id];
+        replacement.bc4_integer_alias = true;
+        bc4_alias_images.emplace(image_id);
+        auto& source = slot_images[old_id];
+        runtime.CopyImage(&source, &replacement);
+        replacement.usage = source.usage;
+        FreeImage(old_id); // registry generation and deferred image/view retirement
+        TrackImage(image_id);
+        break;
+    }
+#endif
+
+    // Check for a perfect match first unless the separate BC4 backing was just constructed.
+    if (!image_id) {
+        for (const auto& cache_id : image_ids) {
+            auto& cache_image = slot_images[cache_id];
+            if (cache_image.info.guest_address != info.guest_address) {
+                continue;
+            }
+            if (cache_image.info.guest_size != info.guest_size) {
+                continue;
+            }
+            if (cache_image.info.size != info.size) {
+                continue;
+            }
+            if (!IsVulkanFormatCompatible(cache_image.info.pixel_format, info.pixel_format) ||
+                (cache_image.info.type != info.type && info.size != Extent3D{1, 1, 1})) {
+                continue;
+            }
+            if (exact_fmt && info.pixel_format != cache_image.info.pixel_format) {
+                continue;
+            }
+            image_id = cache_id;
         }
-        if (cache_image.info.size != info.size) {
-            continue;
-        }
-        if (!IsVulkanFormatCompatible(cache_image.info.pixel_format, info.pixel_format) ||
-            (cache_image.info.type != info.type && info.size != Extent3D{1, 1, 1})) {
-            continue;
-        }
-        if (exact_fmt && info.pixel_format != cache_image.info.pixel_format) {
-            continue;
-        }
-        image_id = cache_id;
     }
 
     // Try to resolve overlaps (if any)
@@ -811,9 +996,24 @@ ImageId TextureCache::FindImageFromRange(VAddr address, size_t size, bool ensure
 ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc, ViewMemo* memo,
                                      bool refresh) {
     Image& image = slot_images[image_id];
+#ifdef __APPLE__
+    if (image.bc4_integer_alias) {
+        CheckBc4AliasUse(image, desc);
+        if (refresh) {
+            UpdateImage(image_id);
+            refresh = false;
+        }
+        ASSERT_MSG(False(image.flags & ImageFlagBits::Dirty),
+                   "Converted BC4 binding was not refreshed before potential storage writes");
+    }
+#endif
     if (desc.type == BindingType::Storage) {
         image.flags |= ImageFlagBits::GpuModified;
-        if (readback_linear_images && (!image.info.props.is_tiled || image.info.size.width <= 8) &&
+        if (
+#ifdef __APPLE__
+            !image.bc4_integer_alias &&
+#endif
+            readback_linear_images && (!image.info.props.is_tiled || image.info.size.width <= 8) &&
             image.info.guest_address != 0) {
             std::unique_lock lk{download_images_mutex};
             download_images.emplace(image_id);
@@ -840,6 +1040,9 @@ ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc, Vi
 
 ImageView& TextureCache::FindRenderTarget(ImageId image_id, const ImageDesc& desc) {
     Image& image = slot_images[image_id];
+#ifdef __APPLE__
+    ASSERT_MSG(!image.bc4_integer_alias, "Converted BC4 render targets are unsupported");
+#endif
     image.flags |= ImageFlagBits::GpuModified;
     if (readback_linear_images && (!image.info.props.is_tiled || image.info.size.width <= 8)) {
         std::unique_lock lk{download_images_mutex};
@@ -907,6 +1110,10 @@ void TextureCache::RefreshImage(Image& image) {
     if (False(image.flags & ImageFlagBits::Dirty) || image.info.num_samples > 1) {
         return;
     }
+#ifdef __APPLE__
+    ASSERT_MSG(!image.bc4_integer_alias || False(image.flags & ImageFlagBits::GpuModified),
+               "BC4 integer alias refresh cannot merge dirty guest bytes with GPU-written blocks");
+#endif
     BbStats::Timer timer{BbStats::t_refresh};
     BB_SPLIT_SCOPE(KImageRefresh);
 #ifdef __APPLE__
@@ -1049,6 +1256,9 @@ void TextureCache::UnregisterImage(ImageId image_id) {
     ASSERT_MSG(True(image.flags & ImageFlagBits::Registered),
                "Trying to unregister an already unregistered image");
     image.flags &= ~ImageFlagBits::Registered;
+#ifdef __APPLE__
+    bc4_alias_images.erase(image_id);
+#endif
     ++registry_generation;
     lru_cache.Free(image.lru_id);
     total_used_memory -= Common::AlignUp(image.info.guest_size, 1024);
