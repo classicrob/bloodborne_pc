@@ -80,10 +80,13 @@ Neither index replaces or authorizes deletion of originals.
    non-BB_PERF guest-FPS check. This is not an actual-present oracle. Replay
    has not recovered a separate actual-display-present FPS counter; that
    acceptance gap remains explicit. Compare instrumentation overhead.
-5. On the PM4 candidate, run clinic and Central Yharnam with BB_PIPE_VERIFY=1,
-   BB_QUALITY_VERIFY and bounded BB_FLIP_TRACE: zero changed-resource-table
-   lines, ordered label/store/flip/publication generations, correct visuals and
-   actual queued/submitted/not-retired evidence. Live bit-4 changes must execute.
+5. On the PM4 candidate, run clinic and Central Yharnam with BB_PIPE_VERIFY=1
+   and BB_QUALITY_VERIFY: zero changed-resource-table lines, existing ordering/
+   mutation controls and correct visuals. Live bit-4 changes must execute.
+   The lead parked new frame-overlap telemetry; no BB_FLIP_TRACE is in the
+   queued preview. Existing intervals/GPU busy permit a throughput comparison
+   but do not establish coherent queued/submitted/not-retired overlap. Keep
+   that evidence gap explicit; do not hold the first comparison on new tracing.
 6. Only after the runtime gate passes, quiet live ABBAABBA comparisons with
    identical fixtures/cache/quality and matched visually supervised inputs.
    Word2 bit 4 restores the old stage-B wait only; compare a pre-change

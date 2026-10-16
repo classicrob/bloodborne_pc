@@ -518,7 +518,7 @@ def launch_display(args):
             die('--native-1080p requires --output 1080p, --fps 60 and no --ini overrides')
         if args.window_size and args.window_size != (1920, 1080):
             die('--native-1080p requires a 1920x1080 window')
-        allowed = {'BB_PLAYER_POS_FILE', 'BB_PIPE_VERIFY', 'BB_FLIP_TRACE', 'BB_QUALITY_VERIFY',
+        allowed = {'BB_PLAYER_POS_FILE', 'BB_PIPE_VERIFY', 'BB_QUALITY_VERIFY',
                    'BB_FRAMES_AHEAD', 'BB_PERF_FRAMES'}
         if any(item.partition('=')[0] not in allowed for item in args.diag_env):
             die('--native-1080p refuses unreviewed diagnostic overrides')
