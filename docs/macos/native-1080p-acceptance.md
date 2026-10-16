@@ -105,6 +105,8 @@ Report exact guest-interval median/p95/p99, 1% low, >60-Hz-budget, >50-ms and
 >100-ms counts, maximum, duration/sample count, compilation and missing/invalid
 data, plus independent guest FPS and GPU busy per flip. Never pool window
 percentiles or count synthetic/repeated frames as a performance win.
+Missing final-window data cannot qualify an unbounded full run; retained bounded
+segments must cover the specified end and disclose the missing tail.
 
 ## Routes and gameplay gaps
 

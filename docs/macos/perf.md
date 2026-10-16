@@ -30,6 +30,10 @@ cost about 7 MB/hour. An abrupt process exit loses the current partial window;
 the summary explicitly reports whether a final window was present. There are
 no added GPU submissions/queries, but storage/CPU overhead must be checked with
 a matching run without BB_PERF. Keep tracing separate from accepted timing.
+If the final window is missing, the summary describes only retained data;
+it cannot support an unbounded full-run acceptance claim. A bounded segment
+must have retained samples covering its requested end, with abrupt-exit losses
+reported separately.
 
 `python3 tools/macos/frame_summary.py perf.jsonl --start 120 --end 300`
 selects only intervals whose **both endpoints** lie in the stated reporter
