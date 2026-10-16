@@ -396,6 +396,20 @@ if (APPLE)
     endforeach()
 endif()
 
+# Actual guest-memory/cache fixture: optional, separate from primitive copy tests.
+if (APPLE)
+    add_executable(bc4-cache-alias-test EXCLUDE_FROM_ALL
+        ../tests/test_bc4_cache_alias.cpp ../src/runtime_memory.c)
+    target_include_directories(bc4-cache-alias-test PRIVATE shim shadps4
+        third_party/gcn/include third_party/sirit/include
+        third_party/sirit/externals/SPIRV-Headers/include)
+    target_compile_options(bc4-cache-alias-test PRIVATE -UNDEBUG -fPIC)
+    target_link_libraries(bc4-cache-alias-test PRIVATE bbgpu Vulkan::Vulkan)
+    add_custom_command(TARGET bc4-cache-alias-test POST_BUILD
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../packaging/macos/check-exports.py
+            $<TARGET_FILE:bbgpu> $<TARGET_FILE:bc4-cache-alias-test> VERBATIM)
+endif()
+
 if (APPLE)
     get_property(darwin_targets DIRECTORY PROPERTY BUILDSYSTEM_TARGETS)
     foreach(darwin_target IN LISTS darwin_targets)
