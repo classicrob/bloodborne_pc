@@ -53,6 +53,7 @@ static void Env(const char* perf, const char* out, const char* phases) {
         else unsetenv(name);
     }
     unsetenv("BB_GPU_PROFILE");
+    unsetenv("BB_PERF_FRAMES");
     setenv("BB_FRAME_STATS", "1", 1);
 }
 static std::vector<std::string> Lines(const std::string& path) {
@@ -119,6 +120,11 @@ int main() {
     assert(Aborted(InChild([] { Env("1", nullptr, nullptr); (void)BbPerf::Enabled(); })));
     assert(Aborted(InChild([&] { Env("1", existing.c_str(), nullptr); (void)BbPerf::Enabled(); })));
     assert(Aborted(InChild([] { Env(nullptr, nullptr, "1"); (void)BbPerf::Enabled(); })));
+    assert(Aborted(InChild([] {
+        Env(nullptr, nullptr, nullptr);
+        setenv("BB_PERF_FRAMES", "1", 1);
+        (void)BbPerf::Enabled();
+    })));
     assert(Aborted(InChild([&] { Env("1", (dir + "/x.jsonl").c_str(), "yes"); (void)BbPerf::Phases(); })));
     assert(Aborted(InChild([&] {
         Env("1", (dir + "/y.jsonl").c_str(), nullptr);
@@ -146,6 +152,7 @@ int main() {
     assert(lines.size() == 3); // schema, queue, final window
     assert(Has(lines[0], "\"type\":\"schema\"") && Has(lines[0], "\"perturbed\":false"));
     assert(Number(lines[0], "version") == 3);
+    assert(Has(lines[0], "\"frame_samples\":false") && !Has(lines[2], "\"flip_samples\""));
     assert(Has(lines[1], "\"type\":\"queue\"") && Has(lines[1], "\"present\":false"));
     assert(Has(lines[2], "\"final\":true") && Has(lines[2], "\"perturbed\":false"));
     assert(Number(lines[2], "flips") == Frames);
@@ -165,6 +172,32 @@ int main() {
     assert(Number(lines[2].substr(lines[2].find("\"deferred_signal_wait_wall_ms\"")), "mean") == 2);
     assert(Number(lines[2].substr(lines[2].find("\"host_copy_record_wait_wall_ms\"")), "mean") == 3);
     assert(Number(lines[2].substr(lines[2].find("\"copy_worker_wait_wall_ms\"")), "mean") >= 5);
+
+    const std::string raw = dir + "/raw.jsonl";
+    assert(Passed(InChild([&] {
+        Env("1", raw.c_str(), "0");
+        setenv("BB_PERF_FRAMES", "1", 1);
+        Run(Frames);
+    })));
+    lines = Lines(raw);
+    assert(lines.size() == 3 && Has(lines[0], "\"frame_samples\":true"));
+    assert(Number(lines[2], "main_submissions") == Submissions);
+    assert(Number(lines[2], "flip_sequence_end") == Frames);
+    const auto sample_at = lines[2].find("\"flip_samples\":[");
+    assert(sample_at != std::string::npos);
+    const char* sample = lines[2].c_str() + sample_at + std::string("\"flip_samples\":[").size();
+    unsigned long long previous = 0;
+    for (int i = 0; i < Frames - 1; ++i) {
+        unsigned long long end = 0, duration = 0;
+        int consumed = 0;
+        assert(std::sscanf(sample, "[%llu,%llu]%n", &end, &duration, &consumed) == 2);
+        assert(duration > 0 && end >= duration && consumed > 0);
+        if (previous) assert(end - previous == duration);
+        previous = end;
+        sample += consumed;
+        if (i < Frames - 2) assert(*sample++ == ',');
+    }
+    assert(*sample == ']');
 
     // Phases: each phase change submits. Per frame: Scene (mark + flush), Post, Upscaler,
     // back to Post on scope exit, then the explicit flush (nothing new): 4 submissions.
@@ -193,6 +226,7 @@ int main() {
     std::printf("BB_PERF read-after-timeline: %d submissions, %lld deferred reads\n", Tight, deferred);
 
     std::remove(tight.c_str());
+    std::remove(raw.c_str());
     std::remove(existing.c_str());
     std::remove(plain.c_str());
     std::remove(phases.c_str());
