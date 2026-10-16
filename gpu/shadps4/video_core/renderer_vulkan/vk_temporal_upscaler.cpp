@@ -276,8 +276,8 @@ void TemporalUpscaler::OnSceneColor(VideoCore::ImageId color) {
 #ifdef __APPLE__
     if (BbQuality::Enabled()) {
         const auto& image = texture_cache.GetImage(color);
-        quality_scene_revision += quality_scene_uid != image.uid;
-        quality_scene_uid = image.uid;
+        quality_scene_revision += quality_scene_uid != image.image_uid;
+        quality_scene_uid = image.image_uid;
         const auto native = image.info.size;
         const bool proxy = ReducedScene(image);
         const auto raster = proxy ? scene_targets.Size()
