@@ -198,6 +198,33 @@ std::vector<u32> StoreShader() {
 namespace Vulkan {
 class Bc4FloatQueuedFixture {
 public:
+    class GraphicsQueueScope {
+    public:
+        explicit GraphicsQueueScope(AmdGpu::Liverpool& owner)
+            : owner{owner}, saved_qid{owner.curr_qid},
+              saved_program{owner.mapped_queues[AmdGpu::Liverpool::GfxQueueId].cs_state} {
+            assert(std::this_thread::get_id() == owner.GetGpuCommandProcessorThread());
+            assert(saved_qid == -1);
+            assert(owner.mapped_queues[AmdGpu::Liverpool::GfxQueueId].submits.empty());
+            owner.curr_qid = AmdGpu::Liverpool::GfxQueueId;
+            assert(owner.curr_qid >= 0 && u32(owner.curr_qid) < owner.num_mapped_queues &&
+                   u32(owner.curr_qid) < owner.mapped_queues.size());
+            assert(&owner.GetCsRegs() ==
+                   &owner.mapped_queues[AmdGpu::Liverpool::GfxQueueId].cs_state);
+        }
+        GraphicsQueueScope(const GraphicsQueueScope&) = delete;
+        GraphicsQueueScope& operator=(const GraphicsQueueScope&) = delete;
+        ~GraphicsQueueScope() {
+            assert(std::this_thread::get_id() == owner.GetGpuCommandProcessorThread());
+            assert(owner.curr_qid == AmdGpu::Liverpool::GfxQueueId);
+            owner.mapped_queues[AmdGpu::Liverpool::GfxQueueId].cs_state = saved_program;
+            owner.curr_qid = saved_qid;
+        }
+    private:
+        AmdGpu::Liverpool& owner;
+        s32 saved_qid;
+        AmdGpu::ComputeProgram saved_program;
+    };
     static bool Ready(Rasterizer& r) {
         return r.OnStageA() && r.UseDrawPipe() &&
                !BbToggle::Disabled(BbToggle::PipelinedDispatch) && r.constant_ring &&
@@ -356,6 +383,7 @@ static int Run(Vulkan::Scheduler& scheduler, AmdGpu::Liverpool& liverpool,
             gate.reader_returned.store(true, std::memory_order_release);
             return;
         }
+        const Vulkan::Bc4FloatQueuedFixture::GraphicsQueueScope queue_scope{liverpool};
         const u64 old_cursor = rasterizer.DrawPipeHead();
         old_cursor_consumed = rasterizer.DrawPipeReached(old_cursor);
         Vulkan::Bc4FloatQueuedFixture::Observe(rasterizer, &gate.drain);

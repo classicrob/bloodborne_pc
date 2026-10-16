@@ -30,6 +30,7 @@
 
 namespace Vulkan {
 class Rasterizer;
+class Bc4FloatQueuedFixture;
 }
 
 namespace Libraries::VideoOut {
@@ -43,6 +44,7 @@ union PM4Header;
 class ReplayStateAccess;
 
 struct Liverpool {
+    friend class Vulkan::Bc4FloatQueuedFixture;
     friend class ReplayStateAccess; ///< perf replay capture/restore (replay_perf_capture.cpp)
     static constexpr u32 GfxQueueId = 0u;
     static constexpr u32 NumGfxRings = 1u;     // actually 2, but HP is reserved by system software
