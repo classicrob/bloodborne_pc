@@ -2930,25 +2930,30 @@ Rasterizer::ImageDescCacheEntry& Rasterizer::CachedImageDescEntry(const AmdGpu::
 
 #ifdef __APPLE__
 namespace {
-/// A texture binding being resolved (BindTextures' second pass), for stop messages from the
-/// texture cache: described only when a stop prints.
+/// Selected texture binding inputs, described only when a cache lookup stops.
 struct TextureBindingContext {
     const Shader::Info* stage;
-    const PreparedStage* prepared;
+    const AmdGpu::Image* sharp;
+    u32 resource_index;
     u32 binding_index;
-    const boost::container::small_vector<u32, 8>* array_sizes; ///< bindings per image resource
     const VideoCore::TextureCache::ImageDesc* desc;
 };
 
-std::string DescribeTextureBinding(const void* context) {
-    const auto& c = *static_cast<const TextureBindingContext*>(context);
+u32 TextureResourceForBinding(u32 binding_index,
+                             const boost::container::small_vector<u32, 8>& array_sizes) {
     u32 resource = 0;
-    for (u32 first = 0; resource < c.array_sizes->size(); ++resource) {
-        if (c.binding_index < first + (*c.array_sizes)[resource]) {
+    for (u32 first = 0; resource < array_sizes.size(); ++resource) {
+        if (binding_index < first + array_sizes[resource]) {
             break;
         }
-        first += (*c.array_sizes)[resource];
+        first += array_sizes[resource];
     }
+    return resource;
+}
+
+std::string DescribeTextureBinding(const void* context) {
+    const auto& c = *static_cast<const TextureBindingContext*>(context);
+    const u32 resource = c.resource_index;
     const auto& want = *c.desc;
     std::string text = fmt::format(
         "shader {:#x} ({}), binding {}, image resource {}; requested image: format {}, {}x{}x{}, "
@@ -2961,8 +2966,7 @@ std::string DescribeTextureBinding(const void* context) {
         return text + " (no image resource for this binding)";
     }
     const auto& res = c.stage->images[resource];
-    const AmdGpu::Image sharp =
-        c.prepared ? c.prepared->image_sharps[resource] : res.GetSharp(*c.stage);
+    const AmdGpu::Image& sharp = *c.sharp;
     std::array<u32, sizeof(AmdGpu::Image) / 4> words{};
     std::memcpy(words.data(), &sharp, sizeof(words));
     // The effective T# (as bound: after the r128 pitch repair, cube conversion and validity
@@ -3010,6 +3014,9 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
     ++bind_epoch;
     // To emulate storing to explicit mip levels, build a descriptor array with each mip level.
     boost::container::small_vector<u32, 8> image_descriptor_array_sizes;
+#ifdef __APPLE__
+    boost::container::static_vector<AmdGpu::Image, Shader::NUM_IMAGES> failure_sharps;
+#endif
     // TextureSetMemo: what this call resolves, to remember when the set qualifies.
     std::array<TextureSetEntry, TextureSet::MaxImages> resolved{};
     bool set_ok = set_slot != nullptr;
@@ -3023,6 +3030,9 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
         const auto& image_desc = stage.images[image_index];
         const auto tsharp =
             prepared ? prepared->image_sharps[image_index] : image_desc.GetSharp(stage);
+#ifdef __APPLE__
+        failure_sharps.push_back(tsharp);
+#endif
         // bbport: a hash lookup per texture per draw for a diagnostic only.
         static const bool warn_meta = std::getenv("BB_WARN_META_TEXTURE") != nullptr;
         if (warn_meta && texture_cache.IsMeta(tsharp.Address())) {
@@ -3167,6 +3177,11 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
             }
 
             const u64 generation = texture_cache.RegistryGeneration();
+#ifdef __APPLE__
+            const TextureBindingContext failure_context{
+                &stage, &tsharp, image_index, u32(image_bindings.size() - 1), &desc};
+            const BbBindContext::Scope context_scope{&failure_context, &DescribeTextureBinding};
+#endif
             image_id = texture_cache.FindImage(desc);
             if (mip_fallback_mode == Shader::MipStorageFallbackMode::None &&
                 generation == texture_cache.RegistryGeneration() &&
@@ -3224,11 +3239,21 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
             }
             image_infos.emplace_back(VK_NULL_HANDLE, view, vk::ImageLayout::eGeneral);
         } else {
+#ifdef __APPLE__
+            const u32 resource = TextureResourceForBinding(binding_index,
+                                                           image_descriptor_array_sizes);
+            ASSERT(resource < failure_sharps.size());
+#endif
             if (auto& old_image = texture_cache.GetImage(image_id);
                 old_image.binding.needs_rebind) {
                 old_image.binding = {};
                 auto& rebind_desc = image_desc_storage.emplace_back(desc);
                 desc_ptr = &rebind_desc;
+#ifdef __APPLE__
+                const TextureBindingContext failure_context{
+                    &stage, &failure_sharps[resource], resource, binding_index, &rebind_desc};
+                const BbBindContext::Scope context_scope{&failure_context, &DescribeTextureBinding};
+#endif
                 image_id = texture_cache.FindImage(rebind_desc);
                 memo_entry = nullptr;
                 set_ok = false;
@@ -3239,7 +3264,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
 #ifdef __APPLE__
             // A stop while resolving this binding names the shader, the resource and its T#.
             const TextureBindingContext failure_context{
-                &stage, prepared, binding_index, &image_descriptor_array_sizes, &desc};
+                &stage, &failure_sharps[resource], resource, binding_index, &desc};
             const BbBindContext::Scope context_scope{&failure_context, &DescribeTextureBinding};
 #endif
             auto& image = texture_cache.GetImage(image_id);
