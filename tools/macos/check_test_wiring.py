@@ -29,6 +29,9 @@ EXCLUDED = {
     'tests/test_bc4_integer_copy.cpp': 'manual BC4/integer-copy hardware capability probe; '
                                         'the optional target requires ordinary and three mutation '
                                         'device arms before it can become an automatic gate',
+    'tests/test_bc4_cache_alias.cpp': 'manual BC4 cache and VM publication device fixture; '
+                                       'the optional target requires an ordinary arm, two bypass '
+                                       'oracles and three production-stop controls',
     'tests/macos_gs/bench/': 'design measurement of the render-pass split cost (docs/macos/'
                              'geometry-shaders.md): timings, no pass/fail',
     'tests/macos_spike/run.sh': 'the original Rosetta feasibility spike (historical); the TLS and HLE '
