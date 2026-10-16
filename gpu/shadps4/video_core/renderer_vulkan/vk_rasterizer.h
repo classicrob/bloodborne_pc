@@ -54,6 +54,7 @@ public:
     template <class Drain>
     void BeforeRead(const DrawPipe* pipe, Drain&& drain) {
         if (pipe && producer_end && !pipe->Reached(producer_end)) {
+            if (fixture_drain_entered) fixture_drain_entered->store(true, std::memory_order_release);
             drain();
             ASSERT(pipe->Reached(producer_end));
         }
@@ -61,7 +62,10 @@ public:
     }
 
 private:
+    friend class Bc4FloatQueuedFixture;
     u64 producer_end = 0;
+    // Installed only by the real-cache fixture on Stage A; no observer on ordinary commands.
+    std::atomic<bool>* fixture_drain_entered = nullptr;
 };
 
 // Share the binding path's prepared-sharp selection; callers pass null when disabled.
@@ -230,6 +234,9 @@ void ForEachBc4ImageWrite(std::span<const Shader::Info* const> stages, Note&& no
 #endif
 
 class Rasterizer {
+#ifdef __APPLE__
+    friend class Bc4FloatQueuedFixture;
+#endif
 public:
     explicit Rasterizer(const Instance& instance, Scheduler& scheduler, Runtime& runtime,
                         AmdGpu::Liverpool* liverpool);
