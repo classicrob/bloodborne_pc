@@ -10,6 +10,41 @@ extra submissions, no file. `tools/macos/perf_run.sh` drives the tracked product
 | `BB_PERF` | `0`/unset, `1` | Enable. Any other value aborts. |
 | `BB_PERF_OUT` | path | New JSONL file, created exclusively. Required with `BB_PERF=1`. |
 | `BB_PERF_PHASES` | `0`/unset, `1` | One submission per phase (below). Requires `BB_PERF=1`. |
+| `BB_PERF_FRAMES` | `0`/unset, `1` | Retain compact raw guest flip-entry intervals. Requires `BB_PERF=1`. |
+
+## Recomputable guest frame intervals
+
+`BB_PERF_FRAMES=1` adds `frame_samples:true` to the version-3 schema and
+`flip_sequence_end` plus `flip_samples` to every window. Each sample is
+`[end_ns,duration_ns]`, positive integer nanoseconds on the reporter-relative
+steady clock. The hook is the existing `VideoOutDriver::Flip` entry before
+`RunPresenter`: it includes pacing/blocking but is **not actual display
+presentation**, guest frame production time, or GPU work duration. The first
+flip has no predecessor and therefore no interval. No sampling/downsampling
+occurs; every subsequent flip contributes one sample. The parser verifies
+sequence counts and exact interval continuity, failing on missing/invalid data.
+
+Output is batched with the existing five-second windows, capped at 16,384
+samples per window (loud failure, no silent dropping). At 60 FPS the raw pairs
+cost about 7 MB/hour. An abrupt process exit loses the current partial window;
+the summary explicitly reports whether a final window was present. There are
+no added GPU submissions/queries, but storage/CPU overhead must be checked with
+a matching run without BB_PERF. Keep tracing separate from accepted timing.
+If the final window is missing, the summary describes only retained data;
+it cannot support an unbounded full-run acceptance claim. A bounded segment
+must have retained samples covering its requested end, with abrupt-exit losses
+reported separately.
+
+`python3 tools/macos/frame_summary.py perf.jsonl --start 120 --end 300`
+selects only intervals whose **both endpoints** lie in the stated reporter
+clock range. Mark warm/cold and scene boundaries explicitly; do not infer them
+from FPS or discard stalls. Retain the raw file and selected bounds. It computes
+nearest-rank median/p95/p99; FPS is N/sum(interval seconds); 1% low is the
+reciprocal mean of the slowest ceil(0.01*N) intervals. Threshold counts use
+strict >1/60 second (integer `duration_ns*60 > 1e9`), >50 ms and >100 ms.
+Intervals outside the bounds and the first undefined interval are reported
+separately. Perturbed phase data is refused. Existing per-window percentiles
+cannot be pooled into exact run-wide percentiles or 1% lows.
 
 `BB_PERF` together with `BB_GPU_PROFILE` aborts. `BB_GPU_PROFILE=1` alone aborts on macOS
 (see the next section). `BB_FRAME_STATS=1` can run alongside `BB_PERF`: both take

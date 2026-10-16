@@ -77,10 +77,13 @@ struct Reporter {
     std::mutex mutex;
     FILE* file;
     const bool phases = Phases();
+    const bool frames = Flag("BB_PERF_FRAMES");
     Clock::time_point start = Clock::now(), window = start, last_flip{};
     Counters previous{};
     std::map<std::string, std::vector<double>> samples;
     uint64_t flips = 0;
+    uint64_t flip_sequence = 0;
+    std::vector<std::pair<uint64_t, uint64_t>> flip_samples;
     // GPU execution of completed submissions in this window, both streams (same queue).
     std::vector<std::pair<double, double>> intervals; ///< [begin, end] in ms on the GPU clock
     std::array<double, 2> stream_ms{};                ///< main, present: sum of submissions
@@ -92,9 +95,12 @@ struct Reporter {
         file = std::fopen(path, "wx");
         if (!file) Fail("cannot create BB_PERF_OUT (it must not already exist)");
         std::fprintf(file, "{\"type\":\"schema\",\"version\":3,\"window_seconds\":5,\"perturbed\":%s,"
+            "\"frame_samples\":%s,\"frame_sample_clock\":\"steady clock nanoseconds since reporter start\","
+            "\"frame_sample_semantics\":\"[interval end, interval duration] at VideoOutDriver::Flip entry; not display presentation; first flip has no interval\","
             "\"gpu_source\":\"first and last timestamp of each submission (tests/macos_perf/timestamps.sh)\","
             "\"gpu_busy_union\":\"union of submission spans on the GPU clock, both streams\","
             "\"phases\":\"%s\"}\n", phases ? "true" : "false",
+            frames ? "true" : "false",
             phases ? "per-frame phase times from one submission per phase (BB_PERF_PHASES=1)"
                    : "not measured (BB_PERF_PHASES=0)");
         Flush();
@@ -149,9 +155,22 @@ struct Reporter {
                 percentile(.5), percentile(.95), percentile(.99), values.back());
             comma = true;
         }
-        std::fprintf(file, "}}\n");
+        std::fprintf(file, "}");
+        if (frames) {
+            std::fprintf(file, ",\"flip_sequence_end\":%llu,\"flip_samples\":[",
+                         (unsigned long long)flip_sequence);
+            bool first = true;
+            for (const auto& [end_ns, duration_ns] : flip_samples) {
+                std::fprintf(file, "%s[%llu,%llu]", first ? "" : ",",
+                             (unsigned long long)end_ns, (unsigned long long)duration_ns);
+                first = false;
+            }
+            std::fprintf(file, "]");
+        }
+        std::fprintf(file, "}\n");
         Flush();
         samples.clear(); intervals.clear(); stream_ms = {}; stream_submissions = {}; flips = 0;
+        flip_samples.clear();
         deferred_reads = 0;
         window = now;
     }
@@ -163,6 +182,7 @@ bool Enabled() {
     static const bool enabled = [] {
         if (!Flag("BB_PERF")) {
             if (Flag("BB_PERF_PHASES")) Fail("BB_PERF_PHASES=1 requires BB_PERF=1");
+            if (Flag("BB_PERF_FRAMES")) Fail("BB_PERF_FRAMES=1 requires BB_PERF=1");
             return false;
         }
         if (Flag("BB_GPU_PROFILE")) Fail("BB_PERF and BB_GPU_PROFILE cannot run together");
@@ -353,7 +373,15 @@ void Flip() {
     const auto c = ReadCounters();
     std::scoped_lock lock{report.mutex};
     ++report.flips;
+    ++report.flip_sequence;
     if (report.last_flip != Clock::time_point{}) {
+        if (report.frames) {
+            const auto end_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now - report.start).count();
+            const auto duration_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now - report.last_flip).count();
+            if (duration_ns <= 0 || end_ns < duration_ns) Fail("invalid raw guest flip interval");
+            if (report.flip_samples.size() >= 16384) Fail("raw guest flip window exceeds 16384 samples");
+            report.flip_samples.emplace_back(uint64_t(end_ns), uint64_t(duration_ns));
+        }
         report.Add("guest_flip_interval_ms", std::chrono::duration<double, std::milli>(now - report.last_flip).count());
         const auto delta = [](const char* name, uint64_t now, uint64_t previous) {
             if (now < previous) {
