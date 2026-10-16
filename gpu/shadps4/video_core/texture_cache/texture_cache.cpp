@@ -24,6 +24,7 @@
 #include "video_core/texture_cache/host_compatibility.h"
 #include "video_core/texture_cache/texture_cache.h"
 #ifdef __APPLE__
+#include "bbport_bind_context.h"
 #include "video_core/renderer_vulkan/vk_scene_resolution.h"
 #include "video_core/texture_cache/bc4_alias.h"
 #include "../../../../src/runtime_memory.h"
@@ -41,6 +42,19 @@ namespace {
 enum DirtySource : u8 { DirtyInitial, DirtyCpuWrite, DirtyCpuMaybe, DirtyGpuStorage, DirtyGpuCopy };
 constexpr const char* DirtySourceNames[] = {"initial/other", "CPU write", "CPU write near",
                                             "GPU storage write", "GPU copy/DMA"};
+
+std::string DescribeBc4OverlapImage(const ImageInfo& info) {
+    return fmt::format(
+        "address={:#x}+{:#x} format={} type={} extent={}x{}x{} pitch={} "
+        "levels={} layers={} samples={} bits={} block={} tiled={} tile={} array={} "
+        "pow2={} bank={} alt={} depth={} stencil={:#x}+{:#x}",
+        info.guest_address, info.guest_size, vk::to_string(info.pixel_format), u32(info.type),
+        info.size.width, info.size.height, info.size.depth, info.pitch, info.resources.levels,
+        info.resources.layers, info.num_samples, info.num_bits, bool(info.props.is_block),
+        bool(info.props.is_tiled), u32(info.tile_mode), u32(info.array_mode),
+        bool(info.props.is_pow2), info.bank_swizzle, info.alt_tile, bool(info.props.is_depth),
+        info.stencil_addr, info.stencil_size);
+}
 
 void CheckBc4AliasUse(const Image& image, const TextureCache::ImageDesc& desc) {
     const auto& info = desc.info;
@@ -844,8 +858,21 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
             continue;
         }
         const char* reject = Bc4Alias::RejectLayout(info, old.info);
-        ASSERT_MSG(!reject, "BC4 integer alias at {:#x} unsupported: {}",
-                   info.guest_address, reject ? reject : "");
+        ASSERT_MSG(!reject,
+                   "BC4 integer alias at {:#x} unsupported: {}\n"
+                   "Requested: {}\nCached: {}\n"
+                   "View: binding={} format={} type={} storage={} levels={}+{} layers={}+{}\n"
+                   "Cached state: uid={} flags={:#x} converted={} bound={} target={} rebind={} "
+                   "access_tick={} current_tick={} overlapping_images={}\nBinding: {}",
+                   info.guest_address, reject ? reject : "", DescribeBc4OverlapImage(info),
+                   DescribeBc4OverlapImage(old.info), u32(desc.type),
+                   vk::to_string(desc.view_info.format), u32(desc.view_info.type),
+                   desc.view_info.is_storage, desc.view_info.range.base.level,
+                   desc.view_info.range.extent.levels, desc.view_info.range.base.layer,
+                   desc.view_info.range.extent.layers, old.image_uid, u32(old.flags),
+                   old.bc4_integer_alias, bool(old.binding.is_bound), bool(old.binding.is_target),
+                   bool(old.binding.needs_rebind), old.tick_accessed_last, scheduler.CurrentTick(),
+                   image_ids.size(), BbBindContext::Text());
         ASSERT_MSG(image_ids.size() == 1,
                    "BC4 integer alias has other registered overlapping images");
         ASSERT_MSG((desc.type == BindingType::Texture || desc.type == BindingType::Storage) &&
