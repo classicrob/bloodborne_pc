@@ -93,7 +93,10 @@ def disk_buffer():
 
 def disk_reservations(excluding):
     reserved = 0
-    for name in ['build-priority', 'build-idle'] + [slot for pool in POOLS for slot in slot_names(pool)]:
+    names = {'build-priority', 'build-idle'}
+    names.update(name for name in os.listdir(lock_dir())
+                 if re.fullmatch(r'(?:build|playtest|quick|sweep)[0-9]+', name))
+    for name in sorted(names):
         if name == excluding:
             continue
         fd = try_lock(name)
@@ -108,10 +111,11 @@ def disk_reservations(excluding):
     return reserved
 
 
-def disk_preflight(label, pool, slot, budget, buffer):
-    gate = lock_file('disk-admission')
+def disk_preflight(label, pool, slot, budget, buffer, gate_held=False):
+    gate = None if gate_held else lock_file('disk-admission')
     try:
-        fcntl.flock(gate, fcntl.LOCK_EX)
+        if gate is not None:
+            fcntl.flock(gate, fcntl.LOCK_EX)
         free = disk_free()
         other = disk_reservations(slot)
         needed = DISK_FLOOR + buffer + budget + other
@@ -122,7 +126,21 @@ def disk_preflight(label, pool, slot, budget, buffer):
                  f'need {needed} bytes (35 GB floor + {buffer / GB:.0f} GB buffer + '
                  f'{budget / GB:.0f} GB job budget + {other / GB:.0f} GB other reservations)', 75)
     finally:
-        os.close(gate)
+        if gate is not None:
+            os.close(gate)
+
+
+def write_slot_info(fd, info, gate_held=False):
+    gate = None if gate_held else lock_file('disk-admission')
+    try:
+        if gate is not None:
+            fcntl.flock(gate, fcntl.LOCK_EX)
+        os.ftruncate(fd, 0)
+        os.pwrite(fd, json.dumps(info).encode(), 0)
+        os.fsync(fd)
+    finally:
+        if gate is not None:
+            os.close(gate)
 
 
 def disk_low(label, buffer):
@@ -853,16 +871,19 @@ def run(pool, priority, gpu, label, command, pool_given=False, quiet=False, sett
         names = ((['build-priority'] if priority else []) + slot_names(pool) +
                  (['build-idle'] if pool == 'build' and idle[0] else []))
         for name in names:
-            fd = try_lock(name)
-            if fd is None:
-                continue
-            info = {'label': label, 'pid': os.getpid(), 'pool': pool, 'priority': priority,
-                    'since': datetime.datetime.now().isoformat(timespec='seconds'),
-                    'command': command, 'disk_budget': budget, 'disk_buffer': buffer}
-            os.ftruncate(fd, 0)
-            os.pwrite(fd, json.dumps(info).encode(), 0)
-            os.fsync(fd)
-            disk_preflight(label, pool, name, budget, buffer)
+            gate = lock_file('disk-admission')
+            try:
+                fcntl.flock(gate, fcntl.LOCK_EX)
+                fd = try_lock(name)
+                if fd is None:
+                    continue
+                info = {'label': label, 'pid': os.getpid(), 'pool': pool, 'priority': priority,
+                        'since': datetime.datetime.now().isoformat(timespec='seconds'),
+                        'command': command, 'disk_budget': budget, 'disk_buffer': buffer}
+                write_slot_info(fd, info, gate_held=True)
+                disk_preflight(label, pool, name, budget, buffer, gate_held=True)
+            finally:
+                os.close(gate)
             for kind in ('paused', 'ecore'):  # left by an earlier job with this pid (killed before its end)
                 try:
                     os.unlink(pause_file(os.getpid(), kind))
@@ -1080,36 +1101,91 @@ def disk_group_running(group):
     return False
 
 
+def owned_descendants(group):
+    owned = {}
+    for pid in descendants(group):
+        try:
+            start = process_start(pid)
+        except OSError as error:
+            print(f'heavy: disk stop cannot identify descendant {pid}: {error}',
+                  file=sys.stderr, flush=True)
+            continue
+        if start is not None:
+            owned[pid] = start
+    return owned
+
+
+def signal_owned(owned, signum):
+    for pid, start in owned.items():
+        try:
+            if process_start(pid) == start:
+                os.kill(pid, signum)
+        except ProcessLookupError:
+            pass
+        except OSError as error:
+            print(f'heavy: disk stop cannot signal descendant {pid}: {error}',
+                  file=sys.stderr, flush=True)
+
+
+def owned_running(owned):
+    if not owned:
+        return False
+    result = subprocess.run(['ps', '-o', 'pid=,stat=', '-p', ','.join(map(str, owned))],
+                            capture_output=True, text=True)
+    if result.returncode not in (0, 1):
+        return None
+    for line in result.stdout.splitlines():
+        fields = line.split()
+        if len(fields) != 2 or not fields[0].isdigit() or 'Z' in fields[1]:
+            continue
+        pid = int(fields[0])
+        try:
+            if process_start(pid) == owned.get(pid):
+                return True
+        except OSError:
+            return None
+    return False
+
+
 def stop_for_disk(child, label):
     group = child.pid
+    owned = owned_descendants(group)
     try:
         os.killpg(group, signal.SIGTERM)
     except ProcessLookupError:
-        return True
+        pass
+    except PermissionError as error:
+        print(f'heavy: {label}: disk stop could not signal original group {group}: {error}',
+              file=sys.stderr, flush=True)
+    signal_owned(owned, signal.SIGTERM)
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline:
         running = disk_group_running(group)
-        if running is False:
-            break
-        if running is None:
+        detached_running = owned_running(owned)
+        if running is False and detached_running is False:
             break
         time.sleep(0.2)
-    else:
-        running = True
-    if running is not False:
-        try:
-            os.killpg(group, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
+    if running is not False or detached_running is not False:
+        if running is not False:
+            try:
+                os.killpg(group, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            except PermissionError as error:
+                print(f'heavy: {label}: disk stop could not escalate original group {group}: {error}',
+                      file=sys.stderr, flush=True)
+        signal_owned(owned, signal.SIGKILL)
     for _ in range(25):
         running = disk_group_running(group)
-        if running is False:
+        detached_running = owned_running(owned)
+        if running is False and detached_running is False:
             break
         time.sleep(0.2)
-    if running is not False:
-        print(f'heavy: {label}: disk stop could not verify process group {group} drained',
+    if running is not False or detached_running is not False:
+        print(f'heavy: {label}: disk stop could not verify owned processes of group {group} drained',
               file=sys.stderr, flush=True)
-        record({'event': 'disk-group-undrained', 'label': label, 'group': group})
+        record({'event': 'disk-group-undrained', 'label': label, 'group': group,
+                'detached_pids': list(owned)})
     try:
         child.wait(timeout=5)
     except subprocess.TimeoutExpired:
@@ -1132,8 +1208,7 @@ def supervise(label, pool, command, buffer, fd=None, info=None):
         fail(f'cannot run {command[0]}: {error}', 127)
     if fd is not None:  # the slot names the command too, so status can tell an orphan apart
         info = session_info(info, child)
-        os.ftruncate(fd, 0)
-        os.pwrite(fd, json.dumps(info).encode(), 0)
+        write_slot_info(fd, info)
     def forward(signum, _):
         try:
             os.killpg(child.pid, signum)
@@ -1161,8 +1236,7 @@ def supervise_quick(label, command, buffer, fd=None, info=None):
     except OSError as error:
         fail(f'cannot run {command[0]}: {error}', 127)
     if fd is not None:  # the command's process group, for CPU quiet
-        os.ftruncate(fd, 0)
-        os.pwrite(fd, json.dumps(session_info(info, child)).encode(), 0)
+        write_slot_info(fd, session_info(info, child))
     started, warned = time.monotonic(), False
     forward = lambda signum, _: os.killpg(child.pid, signum)
     for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
