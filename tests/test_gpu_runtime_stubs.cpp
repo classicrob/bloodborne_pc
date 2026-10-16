@@ -35,6 +35,7 @@ int runtime_replay_name_object(void*, uint64_t, const char*) {
 }
 int runtime_replay_named(const char*, RuntimeReplayObject*) { std::abort(); }
 int runtime_replay_object(uintptr_t, RuntimeReplayObject*) { std::abort(); }
+int runtime_replay_apply_resets(const RuntimeReplayReset*, size_t, char*, size_t) { std::abort(); }
 void runtime_hle_trace_dump(void) { std::abort(); }
 void runtime_hle_trace_frame(void) {}
 void runtime_cpu_profile_thread(const char*) {}

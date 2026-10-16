@@ -19,6 +19,7 @@ bool MeasurementActive() { return measurement_active.load(std::memory_order_acqu
 #ifdef __APPLE__
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -36,6 +37,7 @@ bool MeasurementActive() { return measurement_active.load(std::memory_order_acqu
 #include <mach/task_policy.h>
 #include <sys/resource.h>
 #include <unistd.h>
+#include <sys/stat.h>
 #include "bbport_toggles.h"
 #include "macos_perf.h"
 #include "core/libraries/gnmdriver/gnmdriver.h"
@@ -67,6 +69,12 @@ public:
             why = fmt::format("cannot open {}", name);
             return false;
         }
+        struct stat info{};
+        if (fstat(fileno(file), &info) || info.st_size < 0) {
+            why = fmt::format("{}: cannot determine file size", name);
+            return false;
+        }
+        remaining = static_cast<u64>(info.st_size);
         FileHeader header{};
         if (!Read(&header, sizeof(header), why)) {
             return false;
@@ -79,14 +87,26 @@ public:
         return true;
     }
     bool Read(void* out, size_t size, std::string& why) {
+        if (!CanRead(size, why)) {
+            return false;
+        }
         if (size && std::fread(out, 1, size, file) != size) {
             why = fmt::format("{}: truncated", name);
             return false;
         }
+        remaining -= size;
         return true;
     }
+    bool CanRead(u64 size, std::string& why) const {
+        if (size > remaining || size > SIZE_MAX) {
+            why = fmt::format("{}: record exceeds remaining file bytes", name);
+            return false;
+        }
+        return true;
+    }
+    u64 Remaining() const { return remaining; }
     bool End(std::string& why) {
-        if (std::fgetc(file) != EOF || std::ferror(file)) {
+        if (remaining || std::fgetc(file) != EOF || std::ferror(file)) {
             why = fmt::format("{}: trailing bytes or read error", name);
             return false;
         }
@@ -106,6 +126,7 @@ public:
 private:
     std::FILE* file = nullptr;
     std::string name;
+    u64 remaining = 0;
 };
 
 struct Submission {
@@ -144,6 +165,12 @@ struct Capture {
     bool Load(const std::filesystem::path& dir, std::string& why) {
         return LoadLiverpool(dir, why) && LoadSubmissions(dir, why) && LoadResets(dir, why);
     }
+    bool CheckResets(const std::filesystem::path& dir, std::string& why) {
+        return LoadResets(dir, why);
+    }
+    bool CheckLiverpool(const std::filesystem::path& dir, std::string& why) {
+        return LoadLiverpool(dir, why);
+    }
 
 private:
     bool LoadLiverpool(const std::filesystem::path& dir, std::string& why) {
@@ -151,10 +178,16 @@ private:
         if (!r.Open(dir / "liverpool.bin", LiverpoolMagic, why)) {
             return false;
         }
-        bool have_regs = false, have_heap = false;
+        bool have_regs = false, have_counters = false, have_heap = false;
+        bool have_indirect = false, have_checksum = false;
+        std::array<bool, AmdGpu::Liverpool::NumTotalQueues> have_queue{};
         for (u64 i = 0; i < r.records; ++i) {
             SectionRecord s{};
             if (!r.Get(s, why)) {
+                return false;
+            }
+            if (s.reserved) {
+                why = "liverpool.bin: nonzero section reserved field";
                 return false;
             }
             const auto expect = [&](u64 size) {
@@ -168,20 +201,25 @@ private:
             };
             switch (s.section) {
             case LiverpoolSection::Regs:
+                if (have_regs) { why = "liverpool.bin: duplicate registers"; return false; }
                 if (!expect(sizeof(*regs)) || !r.Read(regs.get(), sizeof(*regs), why)) {
                     return false;
                 }
                 have_regs = true;
                 break;
             case LiverpoolSection::CeCounters:
+                if (have_counters) { why = "liverpool.bin: duplicate CE counters"; return false; }
                 if (!expect(sizeof(ce_counters)) || !r.Read(ce_counters, sizeof(ce_counters), why)) {
                     return false;
                 }
+                have_counters = true;
                 break;
             case LiverpoolSection::CeHeap:
+                if (have_heap) { why = "liverpool.bin: duplicate CE heap"; return false; }
                 if (!expect(AmdGpu::ReplayStateAccess::CeHeap().size())) {
                     return false;
                 }
+                if (!r.CanRead(s.bytes, why)) return false;
                 ce_heap.resize(s.bytes);
                 if (!r.Read(ce_heap.data(), ce_heap.size(), why)) {
                     return false;
@@ -200,16 +238,24 @@ private:
                     why = fmt::format("liverpool.bin: queue {} out of range", entry.queue);
                     return false;
                 }
+                if (have_queue[entry.queue]) {
+                    why = fmt::format("liverpool.bin: duplicate queue {}", entry.queue);
+                    return false;
+                }
+                have_queue[entry.queue] = true;
                 cs_states.emplace_back(entry.queue, entry.cs);
                 break;
             }
             case LiverpoolSection::IndirectArgs:
+                if (have_indirect) { why = "liverpool.bin: duplicate indirect arguments"; return false; }
                 if (!expect(sizeof(indirect_args)) ||
                     !r.Read(&indirect_args, sizeof(indirect_args), why)) {
                     return false;
                 }
+                have_indirect = true;
                 break;
             case LiverpoolSection::GfxRegChecksum:
+                if (have_checksum) { why = "liverpool.bin: duplicate register checksum"; return false; }
                 if (!expect(sizeof(gfx_reg_checksum)) ||
                     !r.Read(&gfx_reg_checksum, sizeof(gfx_reg_checksum), why)) {
                     return false;
@@ -221,11 +267,12 @@ private:
                 return false;
             }
         }
-        if (!have_regs || !have_heap || !have_checksum) {
-            why = "liverpool.bin lacks the registers, the CE heap or the register checksum";
+        if (!have_regs || !have_counters || !have_heap || !have_indirect || !have_checksum ||
+            !std::ranges::all_of(have_queue, [](bool present) { return present; })) {
+            why = "liverpool.bin lacks a required state section or queue";
             return false;
         }
-        return true;
+        return r.End(why);
     }
 
     bool LoadSubmissions(const std::filesystem::path& dir, std::string& why) {
@@ -233,14 +280,21 @@ private:
         if (!r.Open(dir / "submissions.bin", SubmissionsMagic, why)) {
             return false;
         }
+        if (!r.records || r.records > r.Remaining() / sizeof(SubmissionRecord)) {
+            why = "submissions.bin: invalid submission count";
+            return false;
+        }
+        struct Span { u64 start, end; };
+        std::vector<Span> guest_spans, backing_spans;
         for (u64 i = 0; i < r.records; ++i) {
             SubmissionRecord s{};
             if (!r.Get(s, why)) {
                 return false;
             }
-            if (s.dcb_region < 0 || u32(s.dcb_region) >= s.regions ||
+            if (s.reserved || !s.regions || s.regions > r.Remaining() / sizeof(RegionRecord) ||
+                s.dcb_region < 0 || u32(s.dcb_region) >= s.regions ||
                 (s.ccb_region >= 0 && u32(s.ccb_region) >= s.regions)) {
-                why = fmt::format("submissions.bin: submission {} has invalid region indices", i);
+                why = fmt::format("submissions.bin: submission {} has invalid region count or indices", i);
                 return false;
             }
             Submission sub;
@@ -249,10 +303,51 @@ private:
                 if (!r.Get(rr, why)) {
                     return false;
                 }
-                if (!rr.copied) {
-                    why = fmt::format("submission {} region {:#x} was not copied at capture", i,
-                                      rr.guest);
+                const u64 bytes = u64(rr.size_dw) * sizeof(u32);
+                if (rr.reserved || rr.constant > 1 || rr.copied != 1 || !rr.size_dw ||
+                    rr.guest > UINT64_MAX - bytes || !r.CanRead(bytes, why)) {
+                    if (why.empty()) {
+                        why = fmt::format("submission {} region {:#x} has invalid size or flags", i,
+                                          rr.guest);
+                    }
                     return false;
+                }
+                const Span guest{rr.guest, rr.guest + bytes};
+                for (const Span& earlier : guest_spans) {
+                    if (guest.start < earlier.end && earlier.start < guest.end) {
+                        why = fmt::format("submissions.bin: region {:#x} overlaps an earlier command "
+                                          "region; restoring all command words before submit would "
+                                          "change that submission", rr.guest);
+                        return false;
+                    }
+                }
+                guest_spans.push_back(guest);
+                for (u64 at = guest.start; at < guest.end;) {
+                    uintptr_t lo = 0, hi = 0;
+                    int mapped = 0;
+                    if (!runtime_memory_region(at, &lo, &hi, &mapped)) break;
+                    if (hi <= at) {
+                        why = fmt::format("submissions.bin: cannot inspect region {:#x}", at);
+                        return false;
+                    }
+                    const u64 next = std::min<u64>(hi, guest.end);
+                    if (mapped) {
+                        u64 offset = 0;
+                        if (!runtime_memory_backing_region(at, &lo, &hi, &offset) || hi < next) {
+                            why = fmt::format("submissions.bin: no backing for region {:#x}", at);
+                            return false;
+                        }
+                        const Span backing{offset + (at - lo), offset + (next - lo)};
+                        for (const Span& earlier : backing_spans) {
+                            if (backing.start < earlier.end && earlier.start < backing.end) {
+                                why = fmt::format("submissions.bin: region {:#x} aliases an earlier "
+                                                  "command region in guest backing", rr.guest);
+                                return false;
+                            }
+                        }
+                        backing_spans.push_back(backing);
+                    }
+                    at = next;
                 }
                 Submission::Region region{rr.guest, std::vector<u32>(rr.size_dw)};
                 if (!r.Read(region.words.data(), region.words.size() * 4, why)) {
@@ -273,11 +368,7 @@ private:
             sub.ccb_region = s.ccb_region;
             submissions.push_back(std::move(sub));
         }
-        if (submissions.empty()) {
-            why = "submissions.bin holds no submission";
-            return false;
-        }
-        return true;
+        return r.End(why);
     }
 
     bool LoadResets(const std::filesystem::path& dir, std::string& why) {
@@ -464,46 +555,23 @@ struct ProcessCounters {
 /// Restores everything the frame starts from: the reset ranges, the command words and the
 /// Liverpool parse state. The GPU command thread is idle (waiting for a submission).
 bool Restore(AmdGpu::Liverpool& lp, Capture& c, std::string& why) {
-    // Validate every host identity before writing even the first guest or host reset.
+    std::vector<RuntimeReplayReset> ranges;
+    ranges.reserve(c.resets.size());
     for (const auto& reset : c.resets) {
-        if (!reset.host) {
-            for (u64 at = reset.address, end = at + reset.bytes.size(); at < end;) {
-                uintptr_t lo = 0, hi = 0;
-                int mapped = 0;
-                if (!runtime_memory_region(at, &lo, &hi, &mapped) || !mapped || hi <= at) {
-                    why = fmt::format("reset range {:#x} (+{}) is not fully mapped",
-                                      reset.address, reset.bytes.size());
-                    return false;
-                }
-                at = std::min<u64>(hi, end);
-            }
-            continue;
-        }
-        const auto& want = reset.object;
-        RuntimeReplayObject live{};
-        const bool found = runtime_replay_named(want.name, &live) == 0;
-        if (!found || !BbReplay::HostMatches(want, reset.address, reset.bytes.size(),
-                                            live.start, live.size)) {
-            why = fmt::format("host reset range {:#x} (+{}): named object '{}' expected "
-                              "[{:#x}, +{:#x}) offset {:#x}; here {}",
-                              reset.address, reset.bytes.size(), want.name, want.start, want.size,
-                              want.offset, found ? fmt::format("[{:#x}, +{:#x})", live.start,
-                                                              live.size)
-                                                 : std::string{"name not registered"});
-            return false;
-        }
-    }
-    for (const auto& reset : c.resets) {
+        RuntimeReplayReset range{reset.address, reset.bytes.size(), reset.bytes.data(),
+                                 u32(reset.host), {}, reset.object.offset};
         if (reset.host) {
-            std::memcpy(reinterpret_cast<void*>(reset.address), reset.bytes.data(),
-                        reset.bytes.size());
-            continue;
+            range.object.start = reset.object.start;
+            range.object.size = reset.object.size;
+            std::memcpy(range.object.name, reset.object.name, sizeof(range.object.name));
         }
-        if (!runtime_memory_write_backing(reset.address, reset.bytes.data(), reset.bytes.size())) {
-            why = fmt::format("reset range {:#x} (+{}) is not mapped", reset.address,
-                              reset.bytes.size());
-            return false;
-        }
+        ranges.push_back(range);
+    }
+    char reset_why[512]{};
+    if (runtime_replay_apply_resets(ranges.data(), ranges.size(), reset_why,
+                                    sizeof(reset_why))) {
+        why = reset_why;
+        return false;
     }
     for (auto& sub : c.submissions) {
         for (size_t k = 0; k < sub.regions.size(); ++k) {
@@ -631,14 +699,19 @@ bool RestoreImagesChecked(AmdGpu::Liverpool& lp, const std::filesystem::path& di
             if (why.empty()) why = "image_metadata.bin holds no record";
             return false;
         }
+        if (!meta.CanRead(m.bytes, why)) return false;
         metadata.version = m.version;
         metadata.state.resize(m.bytes);
-        if (!meta.Read(metadata.state.data(), metadata.state.size(), why)) {
+        if (!meta.Read(metadata.state.data(), metadata.state.size(), why) || !meta.End(why)) {
             return false;
         }
     }
     Reader images;
     if (!images.Open(dir / "images.bin", ImagesMagic, why)) {
+        return false;
+    }
+    if (images.records > images.Remaining() / sizeof(ImageHeader)) {
+        why = "images.bin: image count exceeds remaining file bytes";
         return false;
     }
     std::map<ImageKey, ImagePrint> captured, again;
@@ -653,9 +726,14 @@ bool RestoreImagesChecked(AmdGpu::Liverpool& lp, const std::filesystem::path& di
         if (!images.Get(h, read_why)) {
             return false;
         }
+        if (!images.CanRead(h.state_bytes, read_why)) return false;
         image.version = h.version;
         image.state.resize(h.state_bytes);
         if (!images.Read(image.state.data(), image.state.size(), read_why)) {
+            return false;
+        }
+        if (h.aspects > images.Remaining() / sizeof(AspectRecord)) {
+            read_why = "images.bin: aspect count exceeds remaining file bytes";
             return false;
         }
         for (u32 i = 0; i < h.aspects; ++i) {
@@ -663,6 +741,7 @@ bool RestoreImagesChecked(AmdGpu::Liverpool& lp, const std::filesystem::path& di
             if (!images.Get(ar, read_why)) {
                 return false;
             }
+            if (!images.CanRead(ar.bytes, read_why)) return false;
             VideoCore::CapturedAspect a{ar.aspect, ar.mip, ar.layers, ar.width, ar.height, ar.depth,
                                         ar.texel_bytes, std::vector<u8>(ar.bytes)};
             if (!images.Read(a.texels.data(), a.texels.size(), read_why)) {
@@ -716,6 +795,7 @@ bool RestoreImagesChecked(AmdGpu::Liverpool& lp, const std::filesystem::path& di
         why = fmt::format("RestoreImages took {} of {} images", read, images.records);
         return false;
     }
+    if (!images.End(why)) return false;
     if (!capture_why.empty()) {
         why = "recapture: " + capture_why;
         return false;
@@ -790,6 +870,19 @@ bool RestoreImagesChecked(AmdGpu::Liverpool& lp, const std::filesystem::path& di
 
 } // namespace
 
+extern "C" int bbgpu_replay_check_file(const char* dir, const char* file, char* reason,
+                                        size_t reason_size) {
+    if (!dir || !file || !reason || !reason_size) return -1;
+    Capture capture;
+    std::string why;
+    bool okay = false;
+    if (!std::strcmp(file, "resets.bin")) okay = capture.CheckResets(dir, why);
+    else if (!std::strcmp(file, "liverpool.bin")) okay = capture.CheckLiverpool(dir, why);
+    else why = "unsupported replay file";
+    std::snprintf(reason, reason_size, "%s", why.c_str());
+    return okay ? 0 : -1;
+}
+
 /// Replays the capture in `dir` `iterations` times; 0 when every iteration ran, else nonzero
 /// after a STOP line.
 extern "C" int bbgpu_replay_run(const char* dir, unsigned iterations) {
@@ -854,7 +947,7 @@ extern "C" int bbgpu_replay_run(const char* dir, unsigned iterations) {
         });
         return totals;
     };
-    std::vector<double> wall_ms, cpu_ms, done_ms, busy_ms;
+    std::vector<double> wall_ms, cpu_ms, done_ms;
     BbPerf::GpuTotals gpu_last = BbPerf::Totals();
     struct MeasurementScope {
         MeasurementScope() { measurement_active.store(true, std::memory_order_release); }
@@ -918,15 +1011,12 @@ extern "C" int bbgpu_replay_run(const char* dir, unsigned iterations) {
                                                                  t0).count();
             done_ms.push_back(gpu_done);
         }
-        // BB_PERF: GPU execution collected during this iteration's submissions = the previous
-        // iteration's work when it was waited for (BB_REPLAY_GPU_WAIT=1).
+        // Timestamp collection can be deferred after GPU completion. This delta is a collection
+        // window, not the GPU execution time of one replay iteration.
         const BbPerf::GpuTotals gpu_now = BbPerf::Totals();
-        const double prev_busy = gpu_now.main_ms - gpu_last.main_ms;
-        const u64 prev_submissions = gpu_now.main_submissions - gpu_last.main_submissions;
+        const double collected_ms = gpu_now.main_ms - gpu_last.main_ms;
+        const u64 collected_submissions = gpu_now.main_submissions - gpu_last.main_submissions;
         gpu_last = gpu_now;
-        if (BbPerf::Enabled() && gpu_wait && it >= 3) {
-            busy_ms.push_back(prev_busy); // iteration it-1 >= 2
-        }
         const auto prep_after = prep_totals();
         const u64 prep_used = prep_after.first - prep_before.first;
         const u64 prep_all = prep_used + (prep_after.second - prep_before.second);
@@ -1011,9 +1101,9 @@ extern "C" int bbgpu_replay_run(const char* dir, unsigned iterations) {
                        (pa.energy_nj - pb.energy_nj) / 1e6, pa.role, pb.role);
         }
         if (BbPerf::Enabled() && gpu_wait && it >= 2) {
-            fmt::print("  GPU busy of iteration {} (per-submission timestamps, {} submissions): "
+            fmt::print("  GPU timestamp collection window at iteration {} ({} submissions): "
                        "{:.2f} ms\n",
-                       it - 1, prev_submissions, prev_busy);
+                       it, collected_submissions, collected_ms);
         }
         std::fflush(stdout);
     }
@@ -1028,13 +1118,6 @@ extern "C" int bbgpu_replay_run(const char* dir, unsigned iterations) {
                    iterations, median(w), *std::min_element(w.begin(), w.end()),
                    *std::max_element(w.begin(), w.end()), median(c),
                    *std::min_element(c.begin(), c.end()), *std::max_element(c.begin(), c.end()));
-        if (!busy_ms.empty()) {
-            std::vector<double> b = busy_ms;
-            fmt::print("Perf replay steady state, GPU busy per iteration (iterations 2..{}): median "
-                       "{:.2f} ms [{:.2f}, {:.2f}]\n",
-                       iterations - 1, median(b), *std::min_element(b.begin(), b.end()),
-                       *std::max_element(b.begin(), b.end()));
-        }
         if (gpu_wait) {
             std::vector<double> d(done_ms.begin() + 1, done_ms.end());
             fmt::print("Perf replay steady state, GPU waited per iteration: submit-to-GPU-done median "

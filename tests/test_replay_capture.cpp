@@ -6,8 +6,11 @@
 // only a conditional or constant-engine write would satisfy; the image round trip refuses
 // duplicate keys.
 #include <algorithm>
+#include <array>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <limits>
 #include <optional>
 #include <string>
@@ -15,8 +18,13 @@
 #include <vector>
 #include <map>
 #include "bbport_replay_compare.h"
+#include "video_core/amdgpu/liverpool.h"
 #include "video_core/amdgpu/replay_capture.h"
+#include "video_core/amdgpu/replay_format.h"
 #include "video_core/amdgpu/replay_reset_walk.h"
+#include "video_core/amdgpu/replay_state_access.h"
+
+extern "C" int bbgpu_replay_check_file(const char*, const char*, char*, size_t);
 
 using ReplayCapture::Detail::CountRegion;
 using ReplayCapture::Detail::ParseBounded;
@@ -104,9 +112,106 @@ Pm4Census Scan(const std::vector<u32>& words) {
     return census;
 }
 
+template <typename T>
+void Append(std::vector<u8>& bytes, const T& value) {
+    const auto* at = reinterpret_cast<const u8*>(&value);
+    bytes.insert(bytes.end(), at, at + sizeof(value));
+}
+
+void ReaderControls() {
+    char temporary[] = "/tmp/bb-replay-reader-XXXXXX";
+    char* created = mkdtemp(temporary);
+    Check(created != nullptr, "production reader: temporary directory created");
+    if (!created) return;
+    const std::filesystem::path dir{created};
+    const auto write = [&](const char* name, const std::vector<u8>& bytes) {
+        std::ofstream out{dir / name, std::ios::binary | std::ios::trunc};
+        out.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+        return bool(out);
+    };
+    const auto accepts = [&](const char* name, const std::vector<u8>& bytes) {
+        char why[256]{};
+        if (!write(name, bytes)) return false;
+        return bbgpu_replay_check_file(dir.c_str(), name, why, sizeof(why)) == 0;
+    };
+    using namespace ReplayFormat;
+    const FileHeader reset_header{{'B','B','R','P','R','S','E','T'}, ResetsVersion, 0, 2};
+    const ResetRecord guest{0x1000, 4, ResetKind::Written, 0x37, 0};
+    const ResetRecord host{0x1020, 4, ResetKind::Written, 0x37, 1};
+    const HostObjectRecord object{0x1000, 0x80, 0x20, "named host"};
+    const u32 value = 0x12345678;
+    std::vector<u8> resets;
+    Append(resets, reset_header); Append(resets, guest); Append(resets, value);
+    Append(resets, host); Append(resets, value); Append(resets, object);
+    Check(accepts("resets.bin", resets), "production reader: complete named v3 resets accepted");
+    auto altered = resets;
+    const u32 old_version = 2;
+    std::memcpy(altered.data() + 8, &old_version, 4);
+    Check(!accepts("resets.bin", altered), "production reader: legacy v2 resets rejected");
+    altered = resets; altered.pop_back();
+    Check(!accepts("resets.bin", altered), "production reader: truncated last identity rejected");
+    altered = resets; altered.push_back(0);
+    Check(!accepts("resets.bin", altered), "production reader: trailing reset byte rejected");
+    altered = resets;
+    const u64 wrong_offset = 0x21;
+    std::memcpy(altered.data() + altered.size() - sizeof(HostObjectRecord) + 16,
+                &wrong_offset, sizeof(wrong_offset));
+    Check(!accepts("resets.bin", altered), "production reader: wrong last host offset rejected");
+    altered = resets;
+    const u32 too_large = MaxResetBytes + 1;
+    std::memcpy(altered.data() + sizeof(FileHeader) + 8, &too_large, sizeof(too_large));
+    Check(!accepts("resets.bin", altered), "production reader: oversized reset refused before allocation");
+    altered = resets;
+    const u64 overlapping = 0x1002;
+    const size_t host_record = sizeof(FileHeader) + sizeof(ResetRecord) + sizeof(value);
+    std::memcpy(altered.data() + host_record, &overlapping, sizeof(overlapping));
+    Check(!accepts("resets.bin", altered), "production reader: overlapping reset ranges rejected");
+
+    const auto liverpool = [&](bool counters, bool indirect, bool duplicate, bool trailing) {
+        std::vector<u8> bytes;
+        const u64 sections = 3 + u64(counters) + u64(indirect) +
+                             AmdGpu::Liverpool::NumTotalQueues + u64(duplicate);
+        const FileHeader header{{'B','B','R','P','L','P','O','O'}, Version, 0, sections};
+        Append(bytes, header);
+        const auto section = [&](LiverpoolSection kind, const void* data, size_t size) {
+            Append(bytes, SectionRecord{kind, 0, size});
+            const auto* at = reinterpret_cast<const u8*>(data);
+            bytes.insert(bytes.end(), at, at + size);
+        };
+        AmdGpu::Regs regs{};
+        section(LiverpoolSection::Regs, &regs, sizeof(regs));
+        const u32 ce[3]{};
+        if (counters) section(LiverpoolSection::CeCounters, ce, sizeof(ce));
+        const auto heap = AmdGpu::ReplayStateAccess::CeHeap();
+        section(LiverpoolSection::CeHeap, heap.data(), heap.size());
+        const u64 zero = 0;
+        if (indirect) section(LiverpoolSection::IndirectArgs, &zero, sizeof(zero));
+        section(LiverpoolSection::GfxRegChecksum, &zero, sizeof(zero));
+        if (duplicate) section(LiverpoolSection::GfxRegChecksum, &zero, sizeof(zero));
+        for (u32 q = 0; q < AmdGpu::Liverpool::NumTotalQueues; ++q) {
+            struct { u32 queue; AmdGpu::ComputeProgram cs; } entry{q, {}};
+            section(LiverpoolSection::QueueCsState, &entry, sizeof(entry));
+        }
+        if (trailing) bytes.push_back(0);
+        return bytes;
+    };
+    Check(accepts("liverpool.bin", liverpool(true, true, false, false)),
+          "production reader: complete Liverpool state accepted");
+    Check(!accepts("liverpool.bin", liverpool(false, true, false, false)),
+          "production reader: missing CE counters rejected");
+    Check(!accepts("liverpool.bin", liverpool(true, false, false, false)),
+          "production reader: missing indirect args rejected");
+    Check(!accepts("liverpool.bin", liverpool(true, true, true, false)),
+          "production reader: duplicate singleton rejected");
+    Check(!accepts("liverpool.bin", liverpool(true, true, false, true)),
+          "production reader: trailing Liverpool byte rejected");
+    std::filesystem::remove_all(dir);
+}
+
 } // namespace
 
 int main() {
+    ReaderControls();
     constexpr u64 max64 = std::numeric_limits<u64>::max();
     Parse("1", 100000, 1);
     Parse("00012", 100000, 12);
@@ -230,6 +335,24 @@ int main() {
         // A constant-engine write runs concurrently with the DE: it does not certify a DE wait.
         const auto w = Walk(WaitFor(0x1000, 1), {Type3(DumpConstRam, 4), 0, 1, 0x1000, 0});
         Check(Blocked(w, "WAIT_REG_MEM polls 0x1000"), "walk: CE producer does not certify");
+    }
+    {
+        const u32 control = u32(AmdGpu::EventType::PixelPipeStatDump) |
+                            (u32(AmdGpu::EventIndex::ZpassDone) << 8);
+        Check(Blocked(Walk({Type3(0x46, 1), control}), "lacks its two address dwords"),
+              "walk: two-dword PixelPipeStatDump refuses missing address");
+        Check(Blocked(Walk({Type3(0x46, 2), control, 0x1000}),
+                      "lacks its two address dwords"),
+              "walk: three-dword PixelPipeStatDump refuses missing address");
+        Check(Blocked(Walk({Type3(0x46, 3), control, 0x1000, 0}),
+                      "uncaptured Liverpool pixel_counter"),
+              "walk: complete PixelPipeStatDump refuses uncaptured state");
+    }
+    {
+        const auto w = Walk({Type3(CondExec, 3), 0x2000 >> 2, 0, 4,
+                             Type3(0x11, 3), 1, 0x3000, 0});
+        Check(Blocked(w, "conditional or CE SET_BASE"),
+              "walk: conditional indirect base cannot authenticate later draw");
     }
     {
         std::map<int, int> m;

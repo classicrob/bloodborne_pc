@@ -245,7 +245,12 @@ private:
             const auto* ev = As<AmdGpu::PM4CmdEventWrite>(p, op);
             if (ev && ev->event_index.Value() == AmdGpu::EventIndex::ZpassDone &&
                 ev->event_type.Value() == AmdGpu::EventType::PixelPipeStatDump) {
-                Add(ev->Address<u64>(), u64{pairs} * 16, ResetKind::Written, op, certifies);
+                if (p.size() < 4) {
+                    Blocker("EVENT_WRITE PixelPipeStatDump lacks its two address dwords");
+                } else {
+                    Blocker(fmt::format("PixelPipeStatDump writes {} bytes and changes uncaptured "
+                                        "Liverpool pixel_counter", u64{pairs} * 16));
+                }
             }
             return;
         }
@@ -276,6 +281,10 @@ private:
             const auto* base = As<AmdGpu::PM4CmdSetBase>(p, op);
             if (base &&
                 base->base_index.Value() == AmdGpu::PM4CmdSetBase::BaseIndex::DrawIndexIndirPatchTable) {
+                if (conditional || ce) {
+                    Blocker("conditional or CE SET_BASE makes the indirect reset base ambiguous");
+                    return;
+                }
                 indirect_base = base->Address<u64>();
             }
             return;

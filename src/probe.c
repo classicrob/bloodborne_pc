@@ -870,7 +870,7 @@ static int run_replay(const char *dir, unsigned char *image_base, uint64_t image
     struct { char magic[8]; uint32_t version, reserved; uint64_t records; } h;
     uint64_t range[2];
     if (!f || fread(&h,sizeof(h),1,f)!=1 || memcmp(h.magic,"BBRPEBOT",8) || h.version!=2 ||
-        fread(range,sizeof(range),1,f)!=1) {
+        h.reserved || fread(range,sizeof(range),1,f)!=1) {
         fprintf(stderr,"STOP: perf replay: %s is not a version 2 image file\n",path);
         if (f) fclose(f);
         return 2;
@@ -882,15 +882,31 @@ static int run_replay(const char *dir, unsigned char *image_base, uint64_t image
         fclose(f);
         return 2;
     }
+    struct stat image_stat;
+    uint64_t left=0;
+    if (fstat(fileno(f),&image_stat) || image_stat.st_size<(off_t)(sizeof(h)+sizeof(range)) ||
+        h.records>((uint64_t)image_stat.st_size-sizeof(h)-sizeof(range))/sizeof(range)) {
+        fprintf(stderr,"STOP: perf replay: %s: invalid run count or file size\n",path);
+        fclose(f);
+        return 2;
+    }
+    left=(uint64_t)image_stat.st_size-sizeof(h)-sizeof(range);
     /* Runs of the pages that were readable at capture (protected regions are left as loaded). */
     for (uint64_t i=0;i<h.records;++i) {
         uint64_t run[2];
-        if (fread(run,sizeof(run),1,f)!=1 || run[0]>image_size || run[1]>image_size-run[0] ||
+        if (left<sizeof(run) || fread(run,sizeof(run),1,f)!=1 ||
+            run[0]>image_size || run[1]>image_size-run[0] || run[1]>left-sizeof(run) ||
             fread(image_base+run[0],1,run[1],f)!=run[1]) {
             fprintf(stderr,"STOP: perf replay: %s: bad or truncated run %" PRIu64 "\n",path,i);
             fclose(f);
             return 2;
         }
+        left-=sizeof(run)+run[1];
+    }
+    if (left || fgetc(f)!=EOF || ferror(f)) {
+        fprintf(stderr,"STOP: perf replay: %s: trailing bytes or read error\n",path);
+        fclose(f);
+        return 2;
     }
     fclose(f);
     unsigned iterations=10;

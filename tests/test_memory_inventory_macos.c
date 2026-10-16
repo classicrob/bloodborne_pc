@@ -177,6 +177,51 @@ int main(void) {
         unsetenv("BB_REPLAY_RUN");
         puts("PASS: semantic host names are owned, unambiguous, bounded and expire on free/reuse");
     }
+    /* The exact production reset application preflights every target under the map and owner
+     * locks before writing the first byte. A bad last host identity cannot change an earlier
+     * host or guest sentinel. */
+    {
+        unsigned char *owner=runtime_guest_malloc(128);
+        void *guest=NULL;
+        RuntimeReplayObject first={0}, last={0};
+        char why[256];
+        unsigned char a=0xa1,b=0xb2,c=0xc3;
+        assert(owner && !map_flexible(&guest,PAGE,3,0));
+        memset(owner,0,128); memset(guest,0,PAGE);
+        setenv("BB_REPLAY_RUN","test",1);
+        assert(!runtime_replay_name_object(owner+8,8,"first"));
+        assert(!runtime_replay_name_object(owner+32,8,"last"));
+        assert(!runtime_replay_named("first",&first));
+        assert(!runtime_replay_named("last",&last));
+        RuntimeReplayReset rows[2]={
+            {.address=(uintptr_t)owner+8,.size=1,.bytes=&a,.host=1,.object=first,.offset=0},
+            {.address=(uintptr_t)owner+32,.size=1,.bytes=&b,.host=1,.object=last,.offset=0}
+        };
+        rows[1].object.size++;
+        assert(runtime_replay_apply_resets(rows,2,why,sizeof(why))==-1);
+        assert(owner[8]==0 && owner[32]==0);
+        rows[1].object=last;
+        rows[1].object.name[0]='X';
+        assert(runtime_replay_apply_resets(rows,2,why,sizeof(why))==-1);
+        assert(owner[8]==0 && owner[32]==0);
+        rows[1].object=last;
+        rows[0]=(RuntimeReplayReset){.address=(uintptr_t)guest,.size=1,.bytes=&c};
+        rows[1].offset=1;
+        assert(runtime_replay_apply_resets(rows,2,why,sizeof(why))==-1);
+        assert(((unsigned char *)guest)[0]==0 && owner[32]==0);
+        rows[1].offset=0;
+        assert(!runtime_replay_apply_resets(rows,2,why,sizeof(why)));
+        assert(((unsigned char *)guest)[0]==c && owner[32]==b);
+        rows[0]=(RuntimeReplayReset){.address=(uintptr_t)owner+8,.size=1,
+                                     .bytes=&a,.host=1,.object=first,.offset=0};
+        assert(!runtime_replay_apply_resets(rows,2,why,sizeof(why)));
+        assert(owner[8]==a && owner[32]==b);
+        runtime_guest_free(owner);
+        assert(runtime_replay_apply_resets(rows,2,why,sizeof(why))==-1);
+        assert(!release_flexible(guest,PAGE));
+        unsetenv("BB_REPLAY_RUN");
+        puts("PASS: production reset batch rejects invalid last identities before any write");
+    }
     /* Replay map preflight: a malformed view table fails before anything is mapped. */
     {
         char why[512];

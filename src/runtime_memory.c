@@ -1312,6 +1312,63 @@ int runtime_memory_write_backing(uintptr_t address, const void *data, uint64_t s
     read_unlock();
     return ok;
 }
+#ifdef __APPLE__
+int runtime_replay_apply_resets(const RuntimeReplayReset *resets, size_t count,
+                                char *why, size_t why_size) {
+    if ((!resets && count) || !why || !why_size) return -1;
+    *why=0;
+    write_lock();
+    pthread_mutex_lock(&guest_heap_lock);
+    for (size_t i=0;i<count;++i) {
+        const RuntimeReplayReset *r=&resets[i];
+        if (!r->bytes || !r->size || r->size>UINTPTR_MAX-r->address || r->host>1) {
+            snprintf(why,why_size,"reset %zu has invalid address, size or host flag",i);
+            goto fail;
+        }
+        if (!r->host) {
+            if (!covered(r->address,r->address+r->size,0)) {
+                snprintf(why,why_size,"guest reset %zu at %#" PRIxPTR " is not fully mapped",i,r->address);
+                goto fail;
+            }
+            continue;
+        }
+        const RuntimeReplayObject *want=&r->object;
+        if (!want->name[0] || !memchr(want->name,0,sizeof(want->name)) || !want->size ||
+            want->size>UINTPTR_MAX-want->start || r->offset>want->size ||
+            r->size>want->size-r->offset || r->address!=want->start+r->offset) {
+            snprintf(why,why_size,"host reset %zu has invalid named range or offset",i);
+            goto fail;
+        }
+        int found=0;
+        for (size_t j=0;j<sizeof(replay_named_objects)/sizeof(replay_named_objects[0]);++j) {
+            const ReplayNamedObject *live=&replay_named_objects[j];
+            if (!live->owner || strcmp(live->object.name,want->name)) continue;
+            found=live->object.start==want->start && live->object.size==want->size;
+            break;
+        }
+        if (!found) {
+            snprintf(why,why_size,"host reset %zu: named object '%s' missing or moved/resized",i,
+                     want->name);
+            goto fail;
+        }
+    }
+    for (size_t i=0;i<count;++i) {
+        const RuntimeReplayReset *r=&resets[i];
+        if (r->host) memcpy((void *)r->address,r->bytes,r->size);
+        else if (!runtime_memory_write_backing(r->address,r->bytes,r->size)) {
+            snprintf(why,why_size,"guest reset %zu changed after locked preflight",i);
+            goto fail;
+        }
+    }
+    pthread_mutex_unlock(&guest_heap_lock);
+    write_unlock();
+    return 0;
+fail:
+    pthread_mutex_unlock(&guest_heap_lock);
+    write_unlock();
+    return -1;
+}
+#endif
 /* Per-thread cache of recently found regions for the GPU's per-draw queries:
  * entries hold for as long as the table generation they were read at. */
 typedef struct { uint64_t generation; uintptr_t start, end; int kind; } CachedRegion;
@@ -1489,7 +1546,7 @@ static FILE *replay_open(const char *dir, const char *name, const char magic[8],
     snprintf(path,sizeof(path),"%s/%s",dir,name);
     FILE *f=fopen(path,"rb");
     if (!f) { snprintf(why,why_size,"cannot open %s",path); return NULL; }
-    if (fread(h,sizeof(*h),1,f)!=1 || memcmp(h->magic,magic,8) || h->version!=2) {
+    if (fread(h,sizeof(*h),1,f)!=1 || memcmp(h->magic,magic,8) || h->version!=2 || h->reserved) {
         snprintf(why,why_size,"%s: not a version 2 perf replay file",path); fclose(f); return NULL;
     }
     return f;
@@ -1604,6 +1661,9 @@ int runtime_memory_replay_map(const char *dir, char *why, size_t why_size) {
     unsigned char *buffer=malloc(piece);
     uint64_t unreached=0, left=replay_file_size(f);
     left=left>=sizeof(ReplayHeader) ? left-sizeof(ReplayHeader) : 0;
+    if (h.records>left/sizeof(ReplayRun)) {
+        snprintf(why,why_size,"backing.bin: run count exceeds file bytes"); goto fail;
+    }
     for (uint64_t i=0;i<h.records && buffer;++i) {
         ReplayRun run;
         if (fread(&run,sizeof(run),1,f)!=1) { snprintf(why,why_size,"backing.bin: truncated"); goto fail; }
@@ -1634,6 +1694,9 @@ int runtime_memory_replay_map(const char *dir, char *why, size_t why_size) {
         }
     }
     if (!buffer) { snprintf(why,why_size,"out of memory"); goto fail; }
+    if (left || fgetc(f)!=EOF || ferror(f)) {
+        snprintf(why,why_size,"backing.bin: trailing bytes or read error"); goto fail;
+    }
     free(buffer); free(views); fclose(f);
     printf("Perf replay: %" PRIu64 " direct blocks and %" PRIu64 " views mapped; %" PRIu64 " MiB of backing under no view skipped\n",
            counts[0],counts[1],unreached>>20);
