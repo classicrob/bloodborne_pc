@@ -837,13 +837,14 @@ int main(int argc, char** argv) {
     const char* mode = argc == 2 ? argv[1] : "ordinary";
     const auto is = [&](const char* value) { return !std::strcmp(mode, value); };
 #ifdef BC4_CACHE_FLOAT_TAIL_PROBE
+    const bool queued_recording = is("--float-queued-srt") || is("--float-queued-ring") ||
+                                  is("--float-queued-skip-drain") || is("--float-queued-precommit");
     if (argc > 2 || (!is("ordinary") && !is("--skip-store") && !is("--skip-materialize") &&
                     !is("--mixed-authority") && !is("--raw-tail") && !is("--raw-sibling") &&
                     !is("--raw-full") && !is("--parent-gpu-authority") && !is("--other-image-write") &&
                     !is("--float-queued-srt") && !is("--float-queued-ring") &&
                     !is("--float-queued-skip-drain") && !is("--float-queued-precommit"))) return 2;
-    if (is("--float-queued-srt") || is("--float-queued-ring") ||
-        is("--float-queued-skip-drain") || is("--float-queued-precommit")) {
+    if (queued_recording) {
         setenv("BB_DRAW_PIPE", "1", 1);
         setenv("BB_VK_RECORD_THREAD", "1", 1);
     }
@@ -900,7 +901,11 @@ int main(int argc, char** argv) {
 #endif
 
     Vulkan::Instance instance(0, false);
+#ifdef BC4_CACHE_FLOAT_TAIL_PROBE
+    Vulkan::Scheduler scheduler(instance, queued_recording);
+#else
     Vulkan::Scheduler scheduler(instance);
+#endif
     Vulkan::Runtime runtime(instance, scheduler);
     auto liverpool = std::make_unique<AmdGpu::Liverpool>();
     auto rasterizer = std::make_unique<Vulkan::Rasterizer>(instance, scheduler, runtime, liverpool.get());
