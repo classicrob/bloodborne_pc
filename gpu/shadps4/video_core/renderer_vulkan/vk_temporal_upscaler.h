@@ -130,6 +130,18 @@ private:
     BbQuality::Trace<6> quality_scene{"scene", false};
     BbQuality::Trace<6> quality_dispatch{"dispatch"};
     BbQuality::Trace<12> quality_frames{"frames"};
+    BbQuality::Trace<1> quality_missing{"missing_dispatch", false};
+    struct QualityTrigger {
+        const char* outcome = "no_matching_trigger";
+        bool seen = false;
+        u64 scene_uid = 0, scene_revision = 0;
+        // Resource bits: color format, depth width, depth height, storage usage.
+        u32 camera_missing = 0, resource_missing = 0;
+        u32 color_width = 0, color_height = 0, color_format = 0;
+        u32 depth_width = 0, depth_height = 0;
+        bool resource_checked = false, storage = false;
+    } quality_trigger;
+    u64 quality_scene_uid = 0, quality_scene_revision = 0;
     unsigned long long quality_scene_frames = 0, quality_recorded_frames = 0;
     unsigned long long quality_failed_frames = 0, quality_inactive_frames = 0;
     unsigned long long quality_missing_frames = 0;

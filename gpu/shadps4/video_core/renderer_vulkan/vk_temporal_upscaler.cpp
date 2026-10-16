@@ -276,6 +276,8 @@ void TemporalUpscaler::OnSceneColor(VideoCore::ImageId color) {
 #ifdef __APPLE__
     if (BbQuality::Enabled()) {
         const auto& image = texture_cache.GetImage(color);
+        quality_scene_revision += quality_scene_uid != image.uid;
+        quality_scene_uid = image.uid;
         const auto native = image.info.size;
         const bool proxy = ReducedScene(image);
         const auto raster = proxy ? scene_targets.Size()
@@ -345,6 +347,22 @@ bool TemporalUpscaler::OnFrameStart() {
                          render_height, target_width, target_height, unsigned(enabled),
                          unsigned(last_active), unsigned(problem), unsigned(dispatched_last_frame),
                          unsigned(scene), unsigned(scaled_session));
+        }
+        if (scene && !dispatched_last_frame &&
+            quality_missing.Note({quality_frames.Observed()})) {
+            const auto& q = quality_trigger;
+            std::fprintf(stderr, "QUALITY stream=missing_dispatch ended=%llu "
+                         "trigger_seen=%u outcome=%s trigger_scene_uid=%llu final_scene_uid=%llu "
+                         "scene_changed_after_trigger=%u camera_missing_mask=%u "
+                         "resource_checked=%u resource_missing_mask=%u "
+                         "color=%ux%u color_format=%u depth=%ux%u storage=%u\n",
+                         quality_frames.Observed(), unsigned(q.seen), q.outcome,
+                         static_cast<unsigned long long>(q.scene_uid),
+                         static_cast<unsigned long long>(quality_scene_uid),
+                         unsigned(q.seen && q.scene_revision != quality_scene_revision),
+                         q.camera_missing, unsigned(q.resource_checked), q.resource_missing,
+                         q.color_width, q.color_height, q.color_format,
+                         q.depth_width, q.depth_height, unsigned(q.storage));
         }
     }
 #endif
@@ -422,6 +440,12 @@ bool TemporalUpscaler::OnFrameStart() {
     done_this_frame = false;
     ldr_target = {};
     scene_color = {};
+#ifdef __APPLE__
+    if (BbQuality::Enabled()) {
+        quality_trigger = {};
+        quality_scene_uid = quality_scene_revision = 0;
+    }
+#endif
     snapshot_taken = false;
     opaque_valid = false;
     mask_ready = false;
@@ -442,6 +466,16 @@ bool TemporalUpscaler::OnFrameStart() {
 void TemporalUpscaler::OnDispatch(u64 cs_hash) {
 #ifdef __APPLE__
     if (cs_hash == trigger_hash) scheduler.PerfMark(BbPerf::Phase::Post);
+    if (BbQuality::Enabled() && cs_hash == trigger_hash && !quality_trigger.seen) {
+        auto& q = quality_trigger;
+        q.seen = true;
+        q.scene_uid = quality_scene_uid;
+        q.scene_revision = quality_scene_revision;
+        q.camera_missing = camera_motion.QualityReadinessMissing();
+        q.outcome = done_this_frame ? "already_done" : failed ? "already_failed" :
+                    Scaled() ? "scaled_path" : !scene_color ? "no_scene" :
+                    q.camera_missing ? "camera_not_ready" : !Active() ? "inactive" : "run_entered";
+    }
 #endif
     if (cs_hash != trigger_hash || done_this_frame || failed || Scaled()) {
         return;
@@ -452,6 +486,12 @@ void TemporalUpscaler::OnDispatch(u64 cs_hash) {
         return;
     }
     Run();
+#ifdef __APPLE__
+    if (BbQuality::Enabled() && quality_trigger.resource_missing == 0) {
+        quality_trigger.outcome = dispatched_last_frame ? "recorded" :
+                                  failed ? "run_failed" : "run_without_record";
+    }
+#endif
 }
 
 bool TemporalUpscaler::EnsureResources(u32 w, u32 h, u32 ow, u32 oh, bool hdr) {
@@ -1095,6 +1135,22 @@ void TemporalUpscaler::Run() {
     const bool reduced = ReducedScene(color) && scene_targets.EligibleScene(depth);
     const u32 w = reduced ? scene_targets.Size().width : ow;
     const u32 h = reduced ? scene_targets.Size().height : oh;
+#ifdef __APPLE__
+    if (BbQuality::Enabled()) {
+        auto& q = quality_trigger;
+        q.resource_checked = true;
+        q.color_width = ow;
+        q.color_height = oh;
+        q.color_format = u32(color.info.pixel_format);
+        q.depth_width = depth.info.size.width;
+        q.depth_height = depth.info.size.height;
+        q.storage = bool(color.usage_flags & vk::ImageUsageFlagBits::eStorage);
+        q.resource_missing = u32(color.info.pixel_format != vk::Format::eR16G16B16A16Sfloat) |
+                             (u32(q.depth_width != ow) << 1) |
+                             (u32(q.depth_height != oh) << 2) | (u32(!q.storage) << 3);
+        if (q.resource_missing) q.outcome = "resource_rejected";
+    }
+#endif
     if (color.info.pixel_format != vk::Format::eR16G16B16A16Sfloat ||
         depth.info.size.width != ow || depth.info.size.height != oh ||
         !(color.usage_flags & vk::ImageUsageFlagBits::eStorage)) {

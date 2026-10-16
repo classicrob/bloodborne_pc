@@ -136,6 +136,14 @@ public:
         return CameraMotionReady(current.valid, previous.valid, current.viewport,
                                  previous.viewport, bool(depth_id));
     }
+#ifdef __APPLE__
+    // Bits: current camera, previous camera, current viewport, previous viewport, depth.
+    [[nodiscard]] u32 QualityReadinessMissing() const noexcept {
+        return u32(!current.valid) | (u32(!previous.valid) << 1) |
+               (u32(!current.viewport.Usable()) << 2) |
+               (u32(!previous.viewport.Usable()) << 3) | (u32(!depth_id) << 4);
+    }
+#endif
     [[nodiscard]] VideoCore::ImageId Depth() const noexcept {
         return depth_id;
     }
