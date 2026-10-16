@@ -1,5 +1,6 @@
 // bbport: SDL3 window for the Vulkan swapchain.
 #include <cerrno>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
@@ -20,6 +21,9 @@ namespace Frontend {
 
 #ifdef __APPLE__
 namespace {
+constexpr const char* PixelTargetWidth = "bbport.window.pixel_target_width";
+constexpr const char* PixelTargetHeight = "bbport.window.pixel_target_height";
+
 /// "AxB" (separator `sep`) as two ints, or a stop: a malformed or out-of-range value is a setup
 /// error.
 std::pair<int, int> ParsePair(const char* name, const char* value, char sep) {
@@ -61,7 +65,17 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, const char* title) : width{width_}
     // centred) and BB_WINDOW_BACKGROUND=1 (an accessory app whose window is never activated and
     // takes no focus: input comes from BB_PAD_FILE). Off by default; malformed values stop.
     const char* size_env = std::getenv("BB_WINDOW_SIZE");
+    const char* pixels_env = std::getenv("BB_WINDOW_PIXELS");
     const char* pos_env = std::getenv("BB_WINDOW_POS");
+    const bool pixel_target = pixels_env && *pixels_env;
+    int target_w = 0, target_h = 0;
+    if (pixel_target) {
+        ASSERT_MSG(!size_env || !*size_env,
+                   "BB_WINDOW_PIXELS and BB_WINDOW_SIZE cannot be combined");
+        std::tie(target_w, target_h) = ParsePair("BB_WINDOW_PIXELS", pixels_env, 'x');
+        ASSERT_MSG(target_w > 0 && target_h > 0,
+                   "BB_WINDOW_PIXELS={} must be positive", pixels_env);
+    }
     const bool background = ParseFlag("BB_WINDOW_BACKGROUND", std::getenv("BB_WINDOW_BACKGROUND"));
     if (background) {
         // Before the video subsystem registers the app with Cocoa. Override priority, and checked:
@@ -103,6 +117,10 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, const char* title) : width{width_}
     SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_RESIZABLE_BOOLEAN, true);
 #ifdef __APPLE__
     SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_METAL_BOOLEAN, true);
+    if (pixel_target) {
+        ASSERT_MSG(SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_HIGH_PIXEL_DENSITY_BOOLEAN, true),
+                   "BB_WINDOW_PIXELS: high pixel density setup failed: {}", SDL_GetError());
+    }
 #else
     SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_VULKAN_BOOLEAN, true);
 #endif
@@ -112,6 +130,10 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, const char* title) : width{width_}
     }
 #endif
     const char* fullscreen = std::getenv("BB_FULLSCREEN");
+#ifdef __APPLE__
+    ASSERT_MSG(!pixel_target || !fullscreen || fullscreen[0] != '1',
+               "BB_WINDOW_PIXELS and BB_FULLSCREEN cannot be combined");
+#endif
     SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_FULLSCREEN_BOOLEAN, fullscreen && fullscreen[0] == '1');
     base_title = title;
     window = SDL_CreateWindowWithProperties(props);
@@ -126,6 +148,33 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, const char* title) : width{width_}
         window_info.type = WindowSystemType::Metal;
         window_info.render_surface = SDL_Metal_GetLayer(metal_view);
         ASSERT_MSG(window_info.render_surface, "Failed to get Metal layer: {}", SDL_GetError());
+        if (pixel_target) {
+            const float density = SDL_GetWindowPixelDensity(window);
+            ASSERT_MSG(std::isfinite(density) && density > 0,
+                       "BB_WINDOW_PIXELS: invalid window pixel density {}: {}", density, SDL_GetError());
+            const double point_w = std::round(double(target_w) / density);
+            const double point_h = std::round(double(target_h) / density);
+            ASSERT_MSG(std::isfinite(point_w) && std::isfinite(point_h) &&
+                           point_w >= 1 && point_h >= 1 &&
+                           point_w <= std::numeric_limits<int>::max() &&
+                           point_h <= std::numeric_limits<int>::max(),
+                       "BB_WINDOW_PIXELS: {}x{} is unrepresentable at density {}", target_w, target_h, density);
+            ASSERT_MSG(SDL_SetWindowSize(window, int(point_w), int(point_h)),
+                       "BB_WINDOW_PIXELS: resize failed: {}", SDL_GetError());
+            ASSERT_MSG(SDL_SyncWindow(window), "BB_WINDOW_PIXELS: resize sync failed: {}", SDL_GetError());
+            SDL_PumpEvents();
+            int actual_w = 0, actual_h = 0;
+            ASSERT_MSG(SDL_GetWindowSizeInPixels(window, &actual_w, &actual_h),
+                       "BB_WINDOW_PIXELS: pixel query failed: {}", SDL_GetError());
+            ASSERT_MSG(actual_w == target_w && actual_h == target_h,
+                       "BB_WINDOW_PIXELS: requested {}x{}, got {}x{} after one resize at density {}",
+                       target_w, target_h, actual_w, actual_h, density);
+            const auto window_props = SDL_GetWindowProperties(window);
+            ASSERT_MSG(SDL_SetNumberProperty(window_props, PixelTargetWidth, target_w) &&
+                           SDL_SetNumberProperty(window_props, PixelTargetHeight, target_h),
+                       "BB_WINDOW_PIXELS: target tracking setup failed: {}", SDL_GetError());
+            std::printf("Window pixel target: %dx%d, measured density %.6f\n", target_w, target_h, density);
+        }
     } else {
         UNREACHABLE_MSG("Unsupported SDL video driver {}", driver ? driver : "(none)");
     }
@@ -150,15 +199,18 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, const char* title) : width{width_}
     }
 #endif
     int w = 0, h = 0;
-    SDL_GetWindowSizeInPixels(window, &w, &h);
+    ASSERT_MSG(SDL_GetWindowSizeInPixels(window, &w, &h),
+               "Window pixel size query failed: {}", SDL_GetError());
     width = w;
     height = h;
     LOG_INFO(Frontend, "Window {}x{} on {}", w, h, driver);
 #ifdef __APPLE__
-    if ((size_env && *size_env) || (pos_env && *pos_env) || background) {
-        int at_x = 0, at_y = 0;
+    if ((size_env && *size_env) || pixel_target || (pos_env && *pos_env) || background) {
+        int logical_w = 0, logical_h = 0, at_x = 0, at_y = 0;
+        ASSERT_MSG(SDL_GetWindowSize(window, &logical_w, &logical_h),
+                   "Window logical size query failed: {}", SDL_GetError());
         SDL_GetWindowPosition(window, &at_x, &at_y);
-        std::printf("Window: %dx%d points (%dx%d pixels) at %d,%d%s\n", width_, height_, w, h,
+        std::printf("Window: %dx%d points (%dx%d pixels) at %d,%d%s\n", logical_w, logical_h, w, h,
                     at_x, at_y, background ? ", background (no activation, not focusable)" : "");
         std::fflush(stdout);
     }
@@ -246,7 +298,15 @@ bool WindowSDL::PollEvents() {
         case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
         case SDL_EVENT_WINDOW_RESIZED: {
             int w = 0, h = 0;
-            SDL_GetWindowSizeInPixels(window, &w, &h);
+            ASSERT_MSG(SDL_GetWindowSizeInPixels(window, &w, &h),
+                       "Window pixel size query failed: {}", SDL_GetError());
+#ifdef __APPLE__
+            const auto props = SDL_GetWindowProperties(window);
+            const auto target_w = SDL_GetNumberProperty(props, PixelTargetWidth, 0);
+            const auto target_h = SDL_GetNumberProperty(props, PixelTargetHeight, 0);
+            ASSERT_MSG(!target_w || (w == target_w && h == target_h),
+                       "BB_WINDOW_PIXELS: drawable changed from {}x{} to {}x{}", target_w, target_h, w, h);
+#endif
             width = w;
             height = h;
             break;

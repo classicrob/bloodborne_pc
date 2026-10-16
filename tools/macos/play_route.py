@@ -427,12 +427,16 @@ def launch(args):
     # never activated) and its window does not take focus when shown. SDL3 reads hints from the
     # environment. Input comes from BB_PAD_FILE, so the window never needs keyboard focus.
     env.update(SDL_MAC_BACKGROUND_APP='1', SDL_WINDOW_ACTIVATE_WHEN_SHOWN='0')
-    # A small window in the bottom-right corner of the main display (window-code flags; the render
-    # size is unchanged). Builds without the flags ignore them: the launch then says so.
-    screen_w, screen_h = map(int, run_checked([str(window_tool()), 'screen'], 'reading the screen size').split('x'))
-    win_w, win_h = window_size
-    env.update(BB_WINDOW_SIZE=f'{win_w}x{win_h}', BB_WINDOW_BACKGROUND='1',
-               BB_WINDOW_POS=f'{max(0, screen_w - win_w - 12)},{max(0, screen_h - win_h - 12)}')
+    # Generic point-sized windows use the bottom-right corner. Native mode leaves logical size
+    # selection to SDL's measured pixel density; report_window checks the actual pixel result.
+    env['BB_WINDOW_BACKGROUND'] = '1'
+    if expected_pixels:
+        env['BB_WINDOW_PIXELS'] = 'x'.join(map(str, expected_pixels))
+    elif window_size is not None:
+        screen_w, screen_h = map(int, run_checked([str(window_tool()), 'screen'], 'reading the screen size').split('x'))
+        win_w, win_h = window_size
+        env.update(BB_WINDOW_SIZE=f'{win_w}x{win_h}',
+                   BB_WINDOW_POS=f'{max(0, screen_w - win_w - 12)},{max(0, screen_h - win_h - 12)}')
     if args.gpu_log:
         env['BB_GPU_LOG'] = args.gpu_log
     if args.perf:
@@ -474,7 +478,7 @@ def launch(args):
                               else 'empty (fresh user directory)',
               'saves': {'fixture': args.fixture, 'from': fixture} if args.fixture else 'none (fresh user directory)',
               'host': {'load_average': os.getloadavg(), 'other_bb_probe': running},
-              'heavy': heavy, 'display': {'window_points': list(window_size),
+              'heavy': heavy, 'display': {'window_points': list(window_size) if window_size else None,
                                          'expected_pixels': expected_pixels,
                                          'native_1080p_requested': args.native_1080p}}
     (run / 'manifest.json').write_text(json.dumps(record, indent=2) + '\n')
@@ -547,11 +551,15 @@ def launch_display(args):
     settings = SETTINGS[args.output]
     size = args.window_size or (960, 540)
     expected = None
+    if not args.native_1080p and any(item.partition('=')[0] == 'BB_WINDOW_PIXELS' for item in args.diag_env):
+        if args.window_size is not None:
+            die('BB_WINDOW_PIXELS cannot be combined with --window-size points')
+        size = None  # explicit generic diagnostic; no native qualification or automatic pixel claim
     if args.native_1080p:
         if args.output != '1080p' or args.ini or args.fps != '60':
             die('--native-1080p requires --output 1080p, --fps 60 and no --ini overrides')
-        if args.window_size and args.window_size != (1920, 1080):
-            die('--native-1080p requires a 1920x1080 window')
+        if args.window_size is not None:
+            die('--native-1080p targets 1920x1080 pixels; --window-size is a points override')
         allowed = {'BB_PLAYER_POS_FILE', 'BB_PIPE_VERIFY', 'BB_QUALITY_VERIFY',
                    'BB_FRAMES_AHEAD', 'BB_PERF_FRAMES'}
         if any(item.partition('=')[0] not in allowed for item in args.diag_env):
@@ -559,7 +567,7 @@ def launch_display(args):
         if args.disable_optimizations not in (None, 0):
             die('--native-1080p refuses a nonzero disabled-optimization mask')
         settings = (Path(__file__).parent / 'playtest/native-1080p.ini').read_text()
-        size, expected = (1920, 1080), [1920, 1080]
+        size, expected = None, [1920, 1080]
     for item in args.ini:
         key, sep, value = item.partition('=')
         if not sep or not re.fullmatch(r'[a-z_]+', key):
@@ -996,7 +1004,7 @@ def main():
                        help='PASS shared-preview manifest matching --probe (required with --native-1080p)')
         p.add_argument('--output', choices=sorted(SETTINGS), default='1080p')
         p.add_argument('--window-size', type=dimensions, metavar='WIDTHxHEIGHT',
-                       help='window size in points (default 960x540; render size is separate)')
+                       help='generic window size in points (default 960x540; incompatible with --native-1080p)')
         p.add_argument('--native-1080p', action='store_true',
                        help='pin existing quality at 1920x1080 and require 1920x1080 window pixels')
         p.add_argument('--label', default='')

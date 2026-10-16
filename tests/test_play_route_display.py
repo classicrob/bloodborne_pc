@@ -24,7 +24,7 @@ class NativeDisplay(unittest.TestCase):
 
     def test_native_mode_and_existing_default_are_distinct(self):
         settings, points, pixels = route.launch_display(self.args())
-        self.assertEqual((points, pixels), ((1920, 1080), [1920, 1080]))
+        self.assertEqual((points, pixels), (None, [1920, 1080]))
         self.assertIn('object_motion=1\n', settings)
         settings, points, pixels = route.launch_display(self.args(native_1080p=False))
         self.assertEqual(settings, route.SETTINGS['1080p'])
@@ -32,10 +32,20 @@ class NativeDisplay(unittest.TestCase):
 
     def test_refuses_conflicting_preset_and_diagnostic_scaling(self):
         for changes in ({'output': '4k'}, {'ini': ['effect_dof=0']}, {'fps': '30'},
-                        {'window_size': (960, 540)}, {'diag_env': ['BB_RENDER_RES=1280x720']},
+                        {'window_size': (960, 540)}, {'window_size': (1920, 1080)},
+                        {'diag_env': ['BB_RENDER_RES=1280x720']},
                         {'diag_env': ['BB_PATCHES=NoFog']}, {'disable_optimizations': 1}):
             with self.subTest(changes=changes), self.assertRaises(SystemExit):
                 route.launch_display(self.args(**changes))
+
+    def test_generic_pixel_diagnostic_does_not_claim_native_qualification(self):
+        args = self.args(native_1080p=False, diag_env=['BB_WINDOW_PIXELS=1920x1080'])
+        settings, points, pixels = route.launch_display(args)
+        self.assertEqual(settings, route.SETTINGS['1080p'])
+        self.assertEqual((points, pixels), (None, None))
+        args.window_size = (960, 540)
+        with self.assertRaises(SystemExit):
+            route.launch_display(args)
 
     def test_pixels_are_required_and_recorded_from_runtime(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -46,7 +56,7 @@ class NativeDisplay(unittest.TestCase):
                 (run / 'game.log').write_text(line + '\n')
                 with self.assertRaises(ValueError):
                     route.report_window(run, wait=.1)
-            (run / 'game.log').write_text('Window: 1920x1080 points (1920x1080 pixels)\n')
+            (run / 'game.log').write_text('Window: 960x540 points (1920x1080 pixels)\n')
             with contextlib.redirect_stderr(io.StringIO()):
                 route.report_window(run, wait=.1)
             event = json.loads((run / 'events.jsonl').read_text())

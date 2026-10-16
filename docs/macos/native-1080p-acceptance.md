@@ -1,10 +1,12 @@
 # Native 1080p acceptance plan
 
-Status, 2026-10-15: 15 deterministic Python tooling tests passed; C++ execution,
-shared-preview and runtime acceptance are pending. The lead lifted the general
-disk hold under the user's new 35 GB decimal floor. No new measurement, capture,
-build or gameplay result is claimed. The 4K baseline queue is retired. Goal
-remains sustained 60 FPS with existing quality.
+Status, 2026-10-16: one unqualified generic startup requested 1920x1080 points
+but produced 1512x850 drawable pixels on the current Retina desktop; it was stopped
+before world load. Standalone SDL controls reproduced this and produced exact
+1920x1080 pixels after a measured-density logical resize with high density enabled.
+The production pixel-target fix still requires reviewed shared build and runtime
+calibration. No accepted performance or native gameplay result is claimed. The
+35 GB decimal floor applies; 4K remains deferred.
 
 ## Exact preset and output evidence
 
@@ -17,11 +19,18 @@ Disabling a default effect or reducing internal resolution is not an accepted ar
 
 `play_route.py route --native-1080p --probe <signed-preview>/bb-probe
 --preview-manifest <signed-preview>/manifest.json
---fixture <scene> --until world --keep` selects this configuration, requests a
-1920x1080-point background window and requires its logged pixel size to be
-1920x1080. The default tool mode remains 960x540. On a display where points and
-pixels differ, a failed preflight requires explicit window sizing work; it is
-not a reason to accept a different output size. The option refuses ini,
+--fixture <scene> --until world --hold 15 --timeout 180` selects this configuration,
+requests `BB_WINDOW_PIXELS=1920x1080` and requires its logged pixel size to match.
+The Apple window path enables high pixel density, measures the actual SDL window
+density after creating its Metal view, makes one logical-size correction, syncs
+the resize and checks the actual drawable dimensions. It stops on an unsupported
+or unrepresentable target, or a later drawable size change. No display mode is
+changed. Startup logs query actual logical size and actual pixel size separately.
+`BB_WINDOW_SIZE` retains its generic logical-point semantics; combining it or
+fullscreen with the explicit pixel target is rejected. The default generic tool
+mode remains 960x540 points. Native mode rejects `--window-size` point overrides,
+and records `window_points=null` because the logical size is determined at runtime.
+The option also refuses ini,
 unreviewed diagnostic and nonzero initial optimization-mask overrides. It uses
 an empty external patch directory/selection and records generated patches.bin
 and configuration hashes before releasing the launch lock.
@@ -31,6 +40,10 @@ before pinning any artifacts. Its byte hash and source metadata are retained in
 the route manifest; staged artifacts need not reside in a git checkout. Signing
 alone cannot qualify a preview. A non-PASS preview may still be used in generic
 diagnostic mode without making a native acceptance claim.
+An explicitly authorized generic diagnostic may use the existing
+`--diag-env BB_WINDOW_PIXELS=1920x1080` interface without a points override.
+It omits the default points request but gains no native qualification or
+automatic pixel claim; its actual window/quality records must be inspected.
 
 `live_resolution=0` at 1080p still uses the host live-target path: the startup
 patch generator returns no scaled size for the game's native output. Expected
