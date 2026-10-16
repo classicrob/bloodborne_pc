@@ -792,6 +792,12 @@ void Rasterizer::PostDraw(const Pipeline* pipeline, const PreparedDraw* used_pre
                   0};
         out += sizeof(PacketStage);
         std::memcpy(out, ring.data(), ring.size() * sizeof(RingBinding));
+#ifdef __APPLE__
+        if (fixture_ring_observer) {
+            fixture_ring_observer(fixture_ring_context, *stage,
+                {reinterpret_cast<const RingBinding*>(out), ring.size()}, constant_ring.get());
+        }
+#endif
         out += ring.size() * sizeof(RingBinding);
         std::memcpy(out, stage->user_data.data(), stage->user_data.size_bytes());
         std::memcpy(out + stage->user_data.size_bytes(), stage->flattened_ud_buf.data(),

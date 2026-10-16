@@ -886,6 +886,10 @@ private:
     std::vector<PendingWrite> pending_writes;
 #ifdef __APPLE__
     Bc4ImageWriteOrder bc4_image_write_order;
+    // The queued fixture observes the exact copied packet bindings, never an allocation scan.
+    void (*fixture_ring_observer)(void*, const Shader::Info&, std::span<const RingBinding>,
+                                  ConstantRing*) = nullptr;
+    void* fixture_ring_context = nullptr;
     void SyncBc4ImageWritesBeforeSelection();
     [[nodiscard]] VideoCore::TextureCache::Bc4FloatPreflight PreflightBc4BufferAliases(
         const Pipeline* pipeline, const PreparedDraw* prepared = nullptr);
